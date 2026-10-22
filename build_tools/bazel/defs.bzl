@@ -5,6 +5,7 @@ load(
     "@hrx//loom/build_tools/bazel:defs.bzl",
     _loom_kernel_library = "loom_kernel_library",
     _loom_library = "loom_library",
+    _loom_model = "loom_model",
     _loom_test = "loom_test",
 )
 
@@ -27,10 +28,13 @@ def _label_package(label, current_package):
 def _validate_motif_dependencies(package, deps):
     for dep in deps:
         dep_package = _label_package(dep, package)
-        if dep_package != None and _is_package_or_subpackage(dep_package, "kernel"):
+        if dep_package != None and any([
+            _is_package_or_subpackage(dep_package, layer)
+            for layer in ["kernel", "model"]
+        ]):
             fail(
                 (
-                    "//%s is a motif package and cannot depend on kernel package %s; " +
+                    "//%s is a motif package and cannot depend on launch/composition package %s; " +
                     "move the reusable representation or algorithm into motif/"
                 ) % (package, dep),
             )
@@ -99,6 +103,65 @@ def _validate_kernel_qualification(name, targets, execution_profiles):
     if not targets:
         fail("%s requires at least one target profile" % name)
     _validate_execution_profiles(name, execution_profiles)
+
+def loom_library(
+        name,
+        srcs = [],
+        deps = [],
+        data = [],
+        input_format = "",
+        inputopts = [],
+        tags = [],
+        visibility = None,
+        target_compatible_with = []):
+    """Declares model-owned programs and their explicit linker dependencies."""
+    package = native.package_name()
+    if not _is_package_or_subpackage(package, "model") or "test" in package.split("/"):
+        fail("loom_library is for model/ production programs, got //%s" % package)
+    _loom_library(
+        name = name,
+        srcs = srcs,
+        deps = deps,
+        data = data,
+        input_format = input_format,
+        inputopts = inputopts,
+        tags = tags,
+        visibility = visibility,
+        target_compatible_with = target_compatible_with,
+    )
+    text_sources = [source for source in srcs if str(source).endswith(".loom")]
+    if text_sources:
+        _declare_source_policy_test(name, "model", text_sources, tags)
+
+def loom_model(
+        name,
+        card,
+        configuration,
+        model_name,
+        files,
+        assets = {},
+        programs = "",
+        encoding = "bc",
+        tags = [],
+        visibility = None,
+        target_compatible_with = []):
+    """Selects a model card and publishes its declared native serving closure."""
+    package = native.package_name()
+    if not _is_package_or_subpackage(package, "model"):
+        fail("loom_model must be declared below model/, got //%s" % package)
+    _loom_model(
+        name = name,
+        card = card,
+        configuration = configuration,
+        model_name = model_name,
+        files = files,
+        assets = assets,
+        programs = programs,
+        encoding = encoding,
+        tags = tags,
+        visibility = visibility,
+        target_compatible_with = target_compatible_with,
+    )
 
 def loom_motif_library(
         name,

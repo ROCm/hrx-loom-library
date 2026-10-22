@@ -1,6 +1,6 @@
 # Contributing to the Loom standard library
 
-This repository admits reusable compiler inputs, not a catalog of model ports. A contribution earns its place by strengthening a composable motif, exposing a deliberate launch or program ABI, or qualifying a reusable target profile. The unit of review is the complete library closure: source, documentation, correctness programs, benchmark plans, target qualification, and the dependency edges that make it reusable.
+This repository admits reusable compiler inputs and complete model compositions. A contribution earns its place by strengthening a composable motif, exposing a deliberate launch or program ABI, or delivering a checked model through those components. The unit of review is the complete library closure: source, documentation, correctness programs, benchmark plans, target qualification, and the dependency edges that make it reusable.
 
 ## Admission surfaces
 
@@ -10,9 +10,11 @@ This repository admits reusable compiler inputs, not a catalog of model ports. A
 | `kernel/` | Concrete `kernel.def` entry points implementing one operation contract and ABI. | A semantic benchmark plan, at least one target profile, at least one execution profile, and dependencies confined to production motifs. |
 | `motif/**/test/` and `kernel/**/test/` | Test-only wrapper programs used when production code has no natural launch witness. | Private root-owned test module, semantic benchmarks and correctness cases, and one execution profile. |
 | `target/` | Genuinely repository-specific target or execution policy. | A concrete policy difference that cannot be expressed by canonical HRX profiles; upstream profiles are consumed directly otherwise. |
-| `model/` | Composition roots for model and command programs. | A repository-owned model admission rule must define modules, planning, execution, and deployment behavior before source enters this layer. |
+| `model/` | Model-specific programs and portable serving compositions. | Explicit `loom_library` providers, a card published through `loom_model`, and an independently checked native service output for each supported representation. |
 
-Source-bearing `model/` and `target/` packages currently fail repository policy. That failure is intentional: raw `.loom` files cannot bypass the same build and evidence contract applied to motifs and kernels. A new source surface begins with its repository rule and production lifecycle.
+Source-bearing `target/` packages still require their own admission rule. Model programs use the repository's `loom_library` wrapper for canonical source, lint, explicit dependencies, and relocatable bytecode. The `loom_model` wrapper selects the card's configuration and exact program/assets closure through HRX's public rule. Model-local `test/` packages use the same `loom_test` contract as other layers. Full-model service tests exercise the real server with declared checkpoints, independent inputs, and checked outputs; expensive learned runs may be explicitly selected instead of joining every source-only CI run.
+
+Model identity follows the original publisher and base model under `model/<publisher>/<model>/`. Source, bytecode, and mixed inputs are program representations within a card, not separate model identities. Quantized checkpoints and services are selected through the card. Physical placement remains deployment input; request-time adapters do not become base-model parameters. Model-specific code can compose kernels and motifs; reusable code belongs in those lower layers, which cannot depend back on a model.
 
 ## Branch-local incubation
 

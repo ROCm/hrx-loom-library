@@ -58,6 +58,8 @@ def _package_policy(layer: str, relative_directory: Path) -> tuple[str, str]:
         return "test", "loom_test"
     if layer == "kernel":
         return "kernel", "loom_kernel_library"
+    if layer == "model":
+        return "model", "loom_library"
     return "motif", "loom_motif_library"
 
 
@@ -91,16 +93,12 @@ def _check_scoped_readmes(repository_root: Path) -> list[str]:
 def check_repository(repository_root: Path) -> list[str]:
     """Returns architecture-policy violations in a library checkout."""
     violations = _check_scoped_readmes(repository_root)
-    for layer in ("model", "target"):
-        layer_root = repository_root / layer
-        if not layer_root.is_dir():
-            continue
-        for source_path in sorted(layer_root.rglob("*.loom")):
-            violations.append(
-                f"{source_path.relative_to(repository_root)}: source-bearing "
-                f"{layer} packages require a repository admission rule"
-            )
-    for layer in ("kernel", "motif"):
+    for source_path in sorted((repository_root / "target").rglob("*.loom")):
+        violations.append(
+            f"{source_path.relative_to(repository_root)}: source-bearing "
+            "target packages require a repository admission rule"
+        )
+    for layer in ("kernel", "model", "motif"):
         layer_root = repository_root / layer
         if not layer_root.is_dir():
             continue
@@ -144,12 +142,34 @@ def check_repository(repository_root: Path) -> list[str]:
                         f"{build_path.relative_to(repository_root)}: "
                         f"{source_path.name} is not explicitly declared"
                     )
+    for card_path in sorted((repository_root / "model").rglob("model.json")):
+        relative_directory = card_path.parent.relative_to(repository_root)
+        build_path = card_path.with_name("BUILD.bazel")
+        if not build_path.is_file():
+            violations.append(
+                f"{relative_directory}: model card requires adjacent BUILD.bazel"
+            )
+            continue
+        build_text = _starlark_without_line_comments(build_path.read_text())
+        if LOCAL_RULES_LABEL not in build_text or UPSTREAM_RULES_LABEL in build_text:
+            violations.append(
+                f"{build_path.relative_to(repository_root)}: model cards use "
+                "repository rules from //build_tools/bazel:defs.bzl"
+            )
+        if (
+            not re.search(r"\bloom_model\s*\(", build_text)
+            or '"model.json"' not in build_text
+        ):
+            violations.append(
+                f"{build_path.relative_to(repository_root)}: model card must be "
+                "explicitly declared by loom_model"
+            )
     return violations
 
 
 def _create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--layer", choices=["kernel", "motif", "test"])
+    parser.add_argument("--layer", choices=["kernel", "model", "motif", "test"])
     parser.add_argument("--repository-root", type=Path)
     parser.add_argument("sources", metavar="SOURCE", nargs="*")
     return parser

@@ -66,10 +66,7 @@ class SourcePolicyTest(unittest.TestCase):
             [
                 (
                     "wrapper.loom",
-                    "kernel.def @wrapper() {\n"
-                    "} launch() {\n"
-                    "  kernel.return\n"
-                    "}\n",
+                    "kernel.def @wrapper() {\n} launch() {\n  kernel.return\n}\n",
                 )
             ],
         )
@@ -238,10 +235,102 @@ class SourcePolicyTest(unittest.TestCase):
                 ],
             )
 
-    def test_repository_rejects_source_in_layers_without_admission_rules(self):
+    def test_model_accepts_host_commands_kernels_and_configuration(self):
+        self.assertEqual(
+            source_policy.check_sources(
+                "model",
+                [
+                    (
+                        "program.loom",
+                        "config.decl @layers : %value: index\n"
+                        "func.def public @prepare() { func.return }\n"
+                        "command.program.def public @decode() launch() { command.return }\n"
+                        "kernel.def @project() {} launch() { kernel.return }\n",
+                    )
+                ],
+            ),
+            [],
+        )
+
+    def test_repository_accepts_model_card_programs_and_test_leaf(self):
         with TemporaryDirectory() as temporary_directory:
             repository_root = Path(temporary_directory)
-            for layer in ("model", "target"):
+            model_root = repository_root / "model" / "publisher" / "recognizer"
+            program_root = model_root / "program"
+            test_root = model_root / "test"
+            program_root.mkdir(parents=True)
+            test_root.mkdir()
+            for directory in (
+                repository_root / "model",
+                repository_root / "model" / "publisher",
+                model_root,
+                program_root,
+                test_root,
+            ):
+                (directory / "README.md").write_text("# Scope\n")
+            (model_root / "model.json").write_text("{}\n")
+            (model_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_model")\n'
+                'loom_model(name = "source", card = "model.json")\n'
+            )
+            (program_root / "control.loom").write_text(
+                "func.def public @prepare() { func.return }\n"
+            )
+            (program_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_library")\n'
+                'loom_library(name = "control", srcs = ["control.loom"])\n'
+            )
+            (test_root / "cases.loom").write_text(
+                "check.case public @case { check.return }\n"
+            )
+            (test_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_test")\n'
+                'loom_test(name = "cases", srcs = ["cases.loom"])\n'
+            )
+            self.assertEqual(source_policy.check_repository(repository_root), [])
+
+            (program_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_model")\n'
+                'exports_files(["control.loom"])\n'
+            )
+            self.assertEqual(
+                source_policy.check_repository(repository_root),
+                [
+                    "model/publisher/recognizer/program/BUILD.bazel: "
+                    "model packages must declare loom_library"
+                ],
+            )
+
+    def test_repository_model_card_requires_publication_rule(self):
+        with TemporaryDirectory() as temporary_directory:
+            repository_root = Path(temporary_directory)
+            model_root = repository_root / "model" / "publisher" / "recognizer"
+            model_root.mkdir(parents=True)
+            (model_root / "model.json").write_text("{}\n")
+            self.assertEqual(
+                source_policy.check_repository(repository_root),
+                [
+                    "model/publisher/recognizer: model card requires adjacent BUILD.bazel"
+                ],
+            )
+            (model_root / "BUILD.bazel").write_text(
+                'load("@hrx//loom/build_tools/bazel:defs.bzl", "loom_model")\n'
+                'exports_files(["model.json"])\n'
+            )
+            self.assertEqual(
+                source_policy.check_repository(repository_root),
+                [
+                    "model/publisher/recognizer/BUILD.bazel: model cards use "
+                    "repository rules from //build_tools/bazel:defs.bzl",
+                    "model/publisher/recognizer/BUILD.bazel: model card must be "
+                    "explicitly declared by loom_model",
+                ],
+            )
+
+    def test_repository_rejects_target_source_without_admission_rule(self):
+        with TemporaryDirectory() as temporary_directory:
+            repository_root = Path(temporary_directory)
+            for layer in ("target",):
                 source_root = repository_root / layer / "example"
                 source_root.mkdir(parents=True)
                 (repository_root / layer / "README.md").write_text("# Scope\n")
@@ -253,8 +342,6 @@ class SourcePolicyTest(unittest.TestCase):
             self.assertEqual(
                 source_policy.check_repository(repository_root),
                 [
-                    "model/example/program.loom: source-bearing model packages "
-                    "require a repository admission rule",
                     "target/example/program.loom: source-bearing target packages "
                     "require a repository admission rule",
                 ],
