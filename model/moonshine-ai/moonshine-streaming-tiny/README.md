@@ -13,6 +13,18 @@ a device-independent HTTP fixture does not establish learned execution there.
 
 ## Build and run
 
+Generate the complete variant, service, and file reference without fetching
+weights or compiling providers:
+
+```sh
+bazel build //model/moonshine-ai/moonshine-streaming-tiny:reference
+```
+
+The output is `bazel-bin/model/moonshine-ai/moonshine-streaming-tiny/reference.md`.
+It includes source, archive, and mixed choices, named parameter scopes, exact
+checkpoint/tokenizer links, and local destination names. The authored card is
+the source of this reference; the execution checks below own qualification.
+
 From the library repository root, explicitly select a learned deployment:
 
 ```sh

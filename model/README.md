@@ -24,6 +24,22 @@ namespace README owns supported variants, weight and tokenizer assumptions,
 service contracts, kernel and motif dependencies, independent correctness
 evidence, benchmark scenarios, and deployment status.
 
+## Generated model references
+
+Each card produces a Markdown reference listing its compatible choices,
+canonical configurations, effective JIT settings, scoped parameter shards,
+tokenizers, and exact source locations beside local destination names:
+
+```sh
+bazel build //model/moonshine-ai/moonshine-streaming-tiny:reference
+```
+
+The output appears under the same package in `bazel-bin/`, with `.md` appended
+to the target name. The action consumes only model metadata; it does not fetch
+weights or compile providers. The SDK also supplies
+`python -m loom.model.documentation --card model.json --output model.md` for
+authors working outside this repository.
+
 ## Build boundary
 
 Model-owned program sources use `loom_library` from the repository's

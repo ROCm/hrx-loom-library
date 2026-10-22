@@ -6,6 +6,7 @@ load(
     _loom_kernel_library = "loom_kernel_library",
     _loom_library = "loom_library",
     _loom_model = "loom_model",
+    _loom_model_documentation = "loom_model_documentation",
     _loom_test = "loom_test",
 )
 
@@ -13,6 +14,8 @@ _BENCHMARK_MODULE_TAG = "loom-benchmark-module"
 _BENCHMARK_MODULE_SUFFIX = "_benchmark_module"
 _MOTIF_ADMISSION_TAG = "loom-admission-motif"
 _MOTIF_ADMISSION_SUFFIX = "_admission_motif"
+
+loom_model_documentation = _loom_model_documentation
 
 def _is_package_or_subpackage(package, root):
     return package == root or package.startswith(root + "/")

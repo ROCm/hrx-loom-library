@@ -22,6 +22,9 @@ owned by this repository:
   exactly the selected closure and publishes a native serving deployment plus
   its runfiles. `encoding="preserve"` retains authored source, bytecode, or
   mixed inputs; `text` and `bc` normalize providers using the public linker.
+- `loom_model_documentation` re-exports the public metadata-only reference rule.
+  It accepts a card, an optional complete acquisition lock, and an optional
+  publication URL. The rule has no dependency on weight or provider artifacts.
 
 Each kernel and test declaration emits a private filegroup carrying the stable
 `loom-benchmark-module` tag. It forwards HRX's linked test module, which retains
