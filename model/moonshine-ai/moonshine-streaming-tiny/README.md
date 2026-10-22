@@ -58,6 +58,20 @@ The small weight-preservation policy is declared auxiliary provider data.
 Every deployment shares the same external weight/tokenizer inputs; a compiled
 provider changes neither parameter contents nor state layout.
 
+The `streaming` configuration estimates 180,000,000 bytes (about 172 MiB) for
+resident original-F32 parameters. This rounds up the 176,226,304 bytes of
+prepared parameter storage reported after a checked 3.84-second transcription
+with both source and archive providers. The observation used HRX
+`0c745245e00ea356eaa2833578d5596027fcd2cd` and this model at
+`3fd43d851cbddfb4179dce57ae98ecafc7ecbaca`, with four workers on gfx1151 through
+AMDGPU/HSA. The card carries coarse guidance, not a device-fit guarantee.
+
+Histories, workspace, idle pool caches, tokenizer, compiler, and driver overhead
+are excluded from that weight estimate. Full transient coverage is unknown, so
+the card omits `transient_bytes`. The four-history capacity below is a declared
+logical state size, not a measured whole-model peak. Explicitly selecting a
+different program set drops the canonical estimate from the fetched/built card.
+
 Send 16 kHz mono signed little-endian PCM16 to the ordinary endpoint:
 
 ```sh
