@@ -20,25 +20,29 @@ consume those projected facts and never parse the container directly.
 ## Map
 
 Model namespaces are created with their first checked composition. Each
-namespace README owns supported variants, weight and tokenizer assumptions,
-service contracts, kernel and motif dependencies, independent correctness
-evidence, benchmark scenarios, and deployment status.
+package owns a user overview with supported variants, weight and tokenizer
+assumptions, service behavior, and setup instructions. Its developer README
+covers kernel and motif dependencies, independent correctness evidence,
+benchmark scenarios, and the build workflow.
 
 ## Generated model references
 
-Each card produces a Markdown reference listing its compatible choices,
-canonical configurations, effective JIT settings, scoped parameter shards,
-tokenizers, and exact source locations beside local destination names:
+Each card produces a standalone Markdown reference combining its authored
+overview with compatible choices, canonical configurations, effective JIT
+settings, scoped parameter shards, tokenizers, and exact source locations
+beside local destination names:
 
 ```sh
 bazel build //model/moonshine-ai/moonshine-streaming-tiny:reference
 ```
 
 The output appears under the same package in `bazel-bin/`, with `.md` appended
-to the target name. The action consumes only model metadata; it does not fetch
-weights or compile providers. The SDK also supplies
-`python -m loom.model.documentation --card model.json --output model.md` for
-authors working outside this repository.
+to the target name. The overview uses absolute publication links so the page
+can be hosted independently of the repository README. The action consumes
+only the card, overview, and optional lock. The SDK also supplies
+`python -m loom.model.documentation --card model.json --overview OVERVIEW.md --output model.md`
+for authors working outside this repository. A publication `--card-url`
+resolves card-relative provider links in the generated page.
 
 ## Build boundary
 
@@ -49,14 +53,19 @@ separate linker inputs. Text sources receive formatting, lint, and model-layer
 policy checks. Bytecode is supported through the same public rule.
 
 A `loom_model` declaration selects one card configuration and maps its exact
-provider and asset files. Its default output is `serve.json`; runfiles contain
-the selected card and full closure in the authored relative namespace. Source,
-bytecode, and mixed providers use the same native service. Physical devices and
-request options are supplied independently from the portable model definition.
+providers through `files` and importer auxiliary files through `data`. It emits
+`model.json` and a separate `serve.json` in the authored relative namespace.
+Source, bytecode, and mixed providers use the same native service. Physical
+devices and request options are supplied independently from the portable model
+definition.
 
-Declared asset repositories pin remote revisions and digests. Bazel's normal
-repository cache and `--distdir` can reuse existing downloads; test execution
-receives those files as runfiles instead of depending on a developer's cache.
-The server owns no network acquisition. Tests of learned behavior supply
-independent input/output evidence and a real native execution profile. Source
+The selected card retains external parameter and tokenizer acquisition
+descriptors. `loom-fetch` combines built providers with verified cached assets
+in a runtime installation. Full checkpoints stay outside Bazel repositories,
+action inputs, outputs, and runfiles. The optional `assets` mapping is for small
+declared fixtures and swatches that need ordinary Bazel test caching.
+
+Learned checks explicitly consume a fetched installation, verify its checkpoint
+identity, and run a fresh native service against independent input/output
+evidence. Small numerical and state tests remain hermetic Bazel tests. Source
 checks and a successful card build do not establish model accuracy.

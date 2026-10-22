@@ -18,13 +18,17 @@ owned by this repository:
   and applies the model source policy without requiring host/control programs
   to masquerade as individually benchmarkable kernels.
 - `loom_model` is confined to `model/` and selects a card configuration with an
-  explicit mapping of providers and assets. HRX validates that the mapping is
-  exactly the selected closure and publishes a native serving deployment plus
-  its runfiles. `encoding="preserve"` retains authored source, bytecode, or
+  exact mapping of providers and their auxiliary compiler inputs. Runtime
+  parameter and tokenizer files retain their acquisition descriptors for
+  `loom-fetch`; small fixtures may instead be supplied as declared assets.
+  The rule publishes a selected card and native serving deployment.
+  `encoding="preserve"` retains authored source, bytecode, or
   mixed inputs; `text` and `bc` normalize providers using the public linker.
 - `loom_model_documentation` re-exports the public metadata-only reference rule.
-  It accepts a card, an optional complete acquisition lock, and an optional
-  publication URL. The rule has no dependency on weight or provider artifacts.
+  It accepts a card, with optional authored Markdown, complete acquisition
+  lock, and publication URL inputs.
+  The generated page combines user guidance, upstream links, and exact card
+  facts without depending on weight or provider artifacts.
 
 Each kernel and test declaration emits a private filegroup carrying the stable
 `loom-benchmark-module` tag. It forwards HRX's linked test module, which retains
@@ -41,11 +45,19 @@ a scoped README chain up to its layer root. Motif sources contain no
 `test/` component use `loom_test` and may declare private wrapper
 kernels without weakening the production motif contract.
 
-A `model.json` has an adjacent repository `loom_model` declaration. Provider
-paths in its `files` mapping and non-index paths in `assets` preserve the card's
-namespace; weights, tokenizers, and preparation policy files are assets, not
-linker libraries. Bazel inputs own acquisition and checksums. Native serving
-opens the resulting local files and does not download or consult fetch locks.
+A `model.json` has an adjacent repository `loom_model` declaration. Its `files`
+mapping supplies providers, and `data` supplies importer auxiliary files such
+as a weight preparation policy. Both mappings exactly cover the selected
+compiler inputs in the card's relative namespace. Optional `assets` supply
+small runtime files for fixtures or swatches; they participate in test caching
+without entering linker action inputs.
+
+Full checkpoints remain external acquisition descriptors in the selected card.
+`loom-fetch` installs those files with the built providers, verifies the lock,
+and shares cached content across installations. Native serving opens the local
+installation without downloading files or consulting fetch locks. A learned
+model check takes that installation explicitly and executes fresh; ordinary
+Bazel tests declare their complete bounded input closure.
 
 `python dev.py lint` runs the complete repository check. `python dev.py build`
 and `python dev.py test` run it before invoking Bazel, while generated Bazel

@@ -17,7 +17,26 @@ operation contract and ABI. For example, the
 [GGML Q8_1 x4 representation](motif/format/ggml/) is independent of the
 [GGML-compatible quantization entry point](kernel/ggml/quantize/) that uses it.
 
-## Quickstart
+## Run a model with installed tools
+
+With `loom-fetch` and `loom-serve` installed, source models run directly from a
+checkout without Bazel. From this repository root:
+
+```sh
+MODEL=model/moonshine-ai/moonshine-streaming-tiny
+loom-fetch "$MODEL/model.json" --configuration=streaming --output=../moonshine
+cp "$MODEL/serve.json" ../moonshine/serve.json
+loom-serve --device=amdgpu --workers=4 --listen=127.0.0.1:8080 \
+  --model=../moonshine/serve.json
+```
+
+The server JIT compiles the model's checked-in source programs. Acquisition
+uses the source lock and shares cached checkpoint files. The
+[Moonshine overview](model/moonshine-ai/moonshine-streaming-tiny/OVERVIEW.md)
+covers SDK requirements, supported inputs, and a transcription request.
+Published bytecode packages use the same fetch-and-serve workflow.
+
+## Library development quickstart
 
 Select the HRX revision pinned by this repository and build its root-owned test
 module together with the reusable kernel and motif modules:

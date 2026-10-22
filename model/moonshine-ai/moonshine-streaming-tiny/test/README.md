@@ -6,12 +6,22 @@ and frame normalization; it does not reuse the device reduction loop.
 membership, and EOF. Their benchmark declarations name these same bounded
 workloads without claiming measured performance.
 
-`transcription_test.py` exercises the native portable-card path through the
-real HTTP server. Its server, selected model closure, audio, and reference are
-declared Bazel inputs. Source, archive, and mixed cases use the same exact
-reference. Full-weight targets are explicitly selected; they are not part of
-ordinary wildcard test execution. Server diagnostics are retained in Bazel's
-undeclared test outputs, and the outer test runner owns hang detection.
+`transcription_check.py` exercises an installed model through the real HTTP
+server. Bazel supplies only the checker, server, HTTP helper, and small PCM and
+reference files. The caller supplies an explicit fetched deployment and device
+to `bazel run :transcription_check`; full checkpoints never enter its action
+inputs or runfiles, and a previous test-cache result cannot skip execution.
+The [developer workflow](../README.md) shows build, fetch, and invocation.
+
+Source, archive, and mixed cases use the same exact reference. The checker
+verifies both installed checkpoint/tokenizer digests and the input PCM digest,
+uploads the audio with deliberately odd HTTP chunk boundaries, and checks the
+exact transcript. It joins normal server retirement before publishing success.
+A fresh `--output` directory retains server diagnostics and `result.json` with
+the deployment, device, observed asset/audio digests, and checked text. A failed
+request or shutdown leaves diagnostics without a successful result. The outer
+runner or operator owns interruption and hang detection; valid native work has
+no arbitrary per-request timer.
 
 ## Audio and oracle provenance
 

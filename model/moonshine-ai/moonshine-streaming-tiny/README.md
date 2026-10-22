@@ -1,52 +1,30 @@
-# Moonshine Streaming Tiny
+# Developing Moonshine Streaming Tiny
 
-This package expresses Moonshine Streaming Tiny's learned waveform frontend,
-incremental encoder, autoregressive decoder, and recognition control in Loom.
-The portable [model card](model.json) binds original F32 safetensors and a named
-Hugging Face tokenizer to the versioned recognition service. Device placement
-is a deployment choice, not a field in this model definition.
+The [model overview](OVERVIEW.md) describes ordinary acquisition and serving,
+model behavior, and supported inputs. This page covers provider builds and
+independent execution checks from a library checkout.
 
-The implementation targets AMDGPU. Its workgroup-shaped kernels use four
-resident histories and up to four independently advancing packed rows. CPU and
-NPU execution require a target port of those workitem-based numerical programs;
-a device-independent HTTP fixture does not establish learned execution there.
+Running the default source model with installed `loom-fetch` and `loom-serve`
+requires no Bazel build. The checked-in `model.json.lock` covers that source
+selection, and `serve.json` can be copied beside the fetched card. Follow the
+overview for this user workflow; the commands below are for model development.
 
-## Build and run
+## Provider builds
 
-Generate the complete variant, service, and file reference without fetching
-weights or compiling providers:
-
-```sh
-bazel build //model/moonshine-ai/moonshine-streaming-tiny:reference
-```
-
-The output is `bazel-bin/model/moonshine-ai/moonshine-streaming-tiny/reference.md`.
-It includes source, archive, and mixed choices, named parameter scopes, exact
-checkpoint/tokenizer links, and local destination names. The authored card is
-the source of this reference; the execution checks below own qualification.
-
-From the library repository root, explicitly select a learned deployment:
+From the repository root:
 
 ```sh
 bazel build --config=amdgpu \
-  //model/moonshine-ai/moonshine-streaming-tiny:source
-
-bazel run --config=amdgpu @hrx//loom/src/loom/tools/loom-serve -- \
-  --device=amdgpu --workers=4 --listen=127.0.0.1:8080 \
-  --model=bazel-bin/model/moonshine-ai/moonshine-streaming-tiny/source/serve.json
+  //model/moonshine-ai/moonshine-streaming-tiny:source \
+  //model/moonshine-ai/moonshine-streaming-tiny:archive \
+  //model/moonshine-ai/moonshine-streaming-tiny:mixed
 ```
 
-The root module declares the checkpoint and tokenizer repositories at immutable
-Hugging Face revisions and SHA256 digests. Building a selected learned target
-may acquire approximately 178 MB of assets. Ordinary source checks do not fetch
-the checkpoint. The card's 136-byte rotary asset is materialized from its
-declared inline content; no Python inference runtime or separate weight-prep
-script runs in the server.
-
-The generated `model.json` is the portable model definition.
-The separate `serve.json` selects its configuration and served name.
-`source`, `archive`, and `mixed` build the same service with different provider
-representations:
+These targets build program files and a portable selected card without acquiring
+weights or a tokenizer. Runtime assets retain their fetch descriptors, including
+the inline rotary data. The small `program/weights.loom` policy is declared
+provider auxiliary data and remains part of the build. No full model checkpoint
+is a Bazel repository, action input, output, or runfile.
 
 | Target | Prepare/control providers | Command/kernel providers |
 | --- | --- | --- |
@@ -54,74 +32,52 @@ representations:
 | `archive` | Loom bytecode | Loom bytecode |
 | `mixed` | Loom text | Loom bytecode |
 
-The small weight-preservation policy is declared auxiliary provider data.
-Every deployment shares the same external weight/tokenizer inputs; a compiled
-provider changes neither parameter contents nor state layout.
+Each target emits `model.json` and a separate `serve.json` selecting the served
+name and configuration. The source card supplies the exact provider closure;
+changing its representation does not change learned parameters or state layout.
 
-The `streaming` configuration estimates 180,000,000 bytes (about 172 MiB) for
-resident original-F32 parameters. This rounds up the 176,226,304 bytes of
-prepared parameter storage reported after a checked 3.84-second transcription
-with both source and archive providers. The observation used HRX
-`0c745245e00ea356eaa2833578d5596027fcd2cd` and this model at
-`3fd43d851cbddfb4179dce57ae98ecafc7ecbaca`, with four workers on gfx1151 through
-AMDGPU/HSA. The card carries coarse guidance, not a device-fit guarantee.
-
-Histories, workspace, idle pool caches, tokenizer, compiler, and driver overhead
-are excluded from that weight estimate. Full transient coverage is unknown, so
-the card omits `transient_bytes`. The four-history capacity below is a declared
-logical state size, not a measured whole-model peak. Explicitly selecting a
-different program set drops the canonical estimate from the fetched/built card.
-
-Send 16 kHz mono signed little-endian PCM16 to the ordinary endpoint:
+Generate a standalone reference without acquiring runtime assets:
 
 ```sh
-curl --fail-with-body -H 'Expect:' \
-  http://127.0.0.1:8080/v1/audio/transcriptions \
-  -F model=moonshine-streaming-tiny \
-  -F 'file=@recording.pcm;headers="Content-Type: audio/pcm;rate=16000;channels=1"'
+bazel build //model/moonshine-ai/moonshine-streaming-tiny:reference
 ```
 
-The response is `{"text":"..."}`. Encoded WAV/MP3/FLAC inputs require the server's
-optional audio codecs. Raw PCM exercises the core path with no codec dependency.
-The HTTP upload endpoint collects the complete input before feeding the
-continuing recognition service; it is not a live microphone transport.
+The output is `bazel-bin/model/moonshine-ai/moonshine-streaming-tiny/reference.md`.
 
-## Execution and state contract
+## Install built providers
 
-| Property | Bound |
-| --- | --- |
-| Service input | Mono F32 at 16 kHz |
-| Encoder quantum | 320 samples / 20 ms |
-| Resident requests / compatible cohort | 4 / 4 |
-| Input length | 655,360 samples / 40.96 seconds |
-| Encoder positions | 2,048 |
-| Decoder hypothesis | 512 tokens including EOS |
-| Provisional hypothesis cadence | 6,400 samples / 400 ms |
-| Device history per resident request | 40,320,208 bytes |
-| Decoding | English, empty prompt, temperature zero |
+Use the SDK's `loom-fetch` with the generated card. The Hugging Face provider
+reuses the existing cache; `--offline` ensures this example cannot download a
+missing checkpoint or tokenizer. Without those cached files, explicit ordinary
+acquisition belongs to `loom-fetch`, not a Bazel build or test.
 
-Unknown model options and unsupported request options fail explicitly.
-These bounds belong to this package, not the generic recognition service.
-Original F32 parameters bind under `model`; rotary frequencies bind under
-`rotary`; output decoding uses tokenizer `text`.
+```sh
+REPRESENTATION=source
+PROGRAMS="$(realpath "bazel-bin/model/moonshine-ai/moonshine-streaming-tiny/$REPRESENTATION")"
+INSTALL="$PWD/.reports/model/moonshine/$REPRESENTATION"
+LOCK="$PWD/.reports/model/moonshine/$REPRESENTATION.lock.json"
+mkdir -p "$PWD/.reports/model/moonshine"
 
-The frontend normalizes 80-sample frames and applies learned compression,
-projection, and two causal stride-two convolutions. Six encoder layers retain
-32-position rings; four lookahead layers contribute 240 ms of right context.
-EOF flushes those layers while preserving the real source sample clock.
-Published encoder memory and cross-attention projections remain immutable to
-decoder steps. Each hypothesis starts a greedy prefix over the available memory.
+loom-fetch "$PROGRAMS/model.json" --configuration=streaming \
+  --offline --update-lock --lockfile="$LOCK" --output="$INSTALL"
+cp "$PROGRAMS/serve.json" "$INSTALL/serve.json"
+```
 
-Packed row ordinals identify submitted work, while resident IDs identify
-histories. The accepted cohort mapping remains valid through completion,
-including cancellation. Typed transcript packets carry one stable utterance ID,
-increasing revisions, consumed sample ranges, and a final flag. The checkpoint
-does not supply diarization or word alignment, so the package emits neither.
+The explicit lock lives outside `bazel-bin`; acquisition never writes beside a
+generated build input. Resolving the program directory immediately after its
+build keeps later Bazel invocations from redirecting it through a changed
+`bazel-bin` configuration symlink. `--update-lock` records the exact selected
+development inputs; subsequent fetches use the same `--lockfile` without `--update-lock` to
+check those identities. The installed `model.json` is published only after all
+selected files have been acquired successfully. Default shared materialization
+reuses cache files rather than making one weight copy per provider choice.
+The small deployment file is copied beside that installed card so its relative
+`model.json` reference resolves to the acquired files, not the code-only build.
+Use `archive` and `mixed` to install the other representations independently.
 
-## Checks and provenance
+## Checks
 
-Checkpoint-free numerical checks cover frame normalization, asymmetric
-shared-weight projection, and lookahead/EOF with reordered resident identities:
+Checkpoint-free numerical/state checks remain hermetic Bazel tests:
 
 ```sh
 bazel test --config=amdgpu \
@@ -129,20 +85,24 @@ bazel test --config=amdgpu \
   //model/moonshine-ai/moonshine-streaming-tiny/test/...
 ```
 
-Full learned checks are manual targets so broad test queries do not download
-weights or run full transcription. Select all provider representations with:
+The learned check is an explicitly invoked executable, not a cached test with
+ambient weights. After the preceding fetch, run:
 
 ```sh
-bazel test --config=amdgpu \
-  //model/moonshine-ai/moonshine-streaming-tiny/test:source_transcription_test \
-  //model/moonshine-ai/moonshine-streaming-tiny/test:archive_transcription_test \
-  //model/moonshine-ai/moonshine-streaming-tiny/test:mixed_transcription_test
+bazel run --config=amdgpu \
+  //model/moonshine-ai/moonshine-streaming-tiny/test:transcription_check -- \
+  --deployment="$INSTALL/serve.json" --device=amdgpu \
+  --output="$PWD/.reports/model/moonshine/check-$REPRESENTATION"
 ```
 
-Each launches the real server, uploads the same declared independent PCM input,
-checks exact reference text, and joins process retirement. No model mock,
-ambient checkpoint path, transcript generated by Loom, or timing threshold is
-involved. These checks establish correctness, not competitive performance.
-The [test provenance](test/README.md) describes the independent eager F32 oracle
-and audio attribution. The upstream model license is in
+The output directory must be new. The checker verifies the checkpoint/tokenizer
+and audio against their independent recorded digests, launches a fresh real
+server, uploads the PCM, checks exact reference text, and joins shutdown before
+writing a successful result. Device selection is explicit; the example selects
+the AMDGPU driver enabled by its build configuration. Run it once for each
+installed representation. It never fetches model files or invents a fallback
+when files are absent. These checks establish correctness, not performance.
+
+[Test provenance](test/README.md) describes the independent eager F32 oracle
+and synthetic audio attribution. The upstream model license is in
 [LICENSE.moonshine](LICENSE.moonshine).

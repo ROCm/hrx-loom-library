@@ -2,15 +2,17 @@
 # Copyright 2026 AMD ROCm™ Software
 # SPDX-License-Identifier: MIT
 
-"""Runs a declared Moonshine deployment against an independent PCM oracle."""
+"""Checks an installed Moonshine deployment against an independent PCM oracle.
+
+The caller supplies a fetched deployment outside the Bazel payload graph. Each
+invocation owns a fresh server and retains its diagnostics in a new directory.
+"""
 
 import argparse
 import hashlib
 import http.client
 import json
-import os
 from pathlib import Path
-import tempfile
 from urllib.parse import urlsplit
 
 from loom_serve_testing.http_harness import running_server
@@ -55,6 +57,7 @@ def main():
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--device", required=True)
+    parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     reference = json.loads(args.reference.read_text(encoding="utf-8"))
@@ -64,37 +67,58 @@ def main():
         raise AssertionError(f"oracle input digest differs: {digest}")
     if len(audio) != reference["audio"]["byte_length"]:
         raise AssertionError(f"oracle input byte length differs: {len(audio)}")
-    output_root = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
-    with tempfile.TemporaryDirectory() as temporary:
-        logs = Path(output_root or temporary)
-        log = logs / "moonshine.log"
-        with running_server(
-            [
-                str(args.server.absolute()),
-                f"--model={args.deployment.absolute()}",
-                f"--device={args.device}",
-                "--workers=4",
-                "--listen=127.0.0.1:0",
-            ],
-            log,
-        ) as (_, bound):
-            if bound is None:
-                raise RuntimeError(
-                    f"server failed before readiness:\n{log.read_text()}"
-                )
-            actual = transcribe(
-                urlsplit(f"http://{bound}"),
-                "moonshine-streaming-tiny",
-                audio,
-                reference["audio"]["content_type"],
+    deployment = args.deployment.absolute()
+    document = json.loads(deployment.read_text(encoding="utf-8"))
+    model_name = document["name"]
+    card = deployment.parent / document["model"]["path"]
+    assets = {}
+    for name, path in (
+        ("weights_sha256", "asset/model.safetensors"),
+        ("tokenizer_sha256", "asset/text-vocabulary.data"),
+    ):
+        with (card.parent / path).open("rb") as stream:
+            observed = hashlib.file_digest(stream, "sha256").hexdigest()
+        if observed != reference["oracle"][name]:
+            raise AssertionError(
+                f"installed {path} differs from the oracle: {observed}"
             )
-            expected = {"text": reference["transcript"]["text"]}
-            if actual != expected:
-                raise AssertionError(f"expected {expected!r}, received {actual!r}")
-            print(
-                json.dumps({"provider": args.deployment.parent.name, **actual}),
-                flush=True,
-            )
+        assets[name] = observed
+    output = args.output.absolute()
+    output.mkdir(parents=True, exist_ok=False)
+    log = output / "moonshine.log"
+    with running_server(
+        [
+            str(args.server.absolute()),
+            f"--model={deployment}",
+            f"--device={args.device}",
+            "--workers=4",
+            "--listen=127.0.0.1:0",
+        ],
+        log,
+    ) as (_, bound):
+        if bound is None:
+            raise RuntimeError(f"server failed before readiness:\n{log.read_text()}")
+        actual = transcribe(
+            urlsplit(f"http://{bound}"),
+            model_name,
+            audio,
+            reference["audio"]["content_type"],
+        )
+        expected = {"text": reference["transcript"]["text"]}
+        if actual != expected:
+            raise AssertionError(f"expected {expected!r}, received {actual!r}")
+    # A successful transcript is published only after server retirement joins.
+    result = {
+        "deployment": str(deployment),
+        "device": args.device,
+        "audio_sha256": digest,
+        **assets,
+        **actual,
+    }
+    with (output / "result.json").open("x", encoding="utf-8") as stream:
+        json.dump(result, stream, indent=2)
+        stream.write("\n")
+    print(json.dumps(result), flush=True)
 
 
 if __name__ == "__main__":
