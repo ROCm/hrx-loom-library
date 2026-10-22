@@ -11,8 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from build_tools.py.hrx_loom_kernels.commands import format as format_command
-from build_tools.py.hrx_loom_kernels.context import RepositoryContext, UserError
+from build_tools.py.hrx_loom_library.commands import format as format_command
+from build_tools.py.hrx_loom_library.context import RepositoryContext, UserError
 
 
 class LoomFormatCommandTest(unittest.TestCase):

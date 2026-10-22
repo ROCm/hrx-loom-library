@@ -1,4 +1,4 @@
-# HRX Loom Kernels
+# HRX Loom Library
 
 This repository is the composable standard library for the
 [Loom](https://github.com/ROCm/hrx-system/tree/main/loom) specializing compiler.
@@ -324,7 +324,9 @@ unstaged hunks into the commit.
 
 Compiler co-development keeps the same BUILD labels and policy checks. A local
 HRX worktree makes Bazel rebuild changed compiler tools directly from
-uncommitted source:
+uncommitted source. The checkout selection lives in `.bazelrc.hrx`;
+`.bazelrc.local` remains available for independent local settings. Returning to
+`--release` removes only the checkout selection:
 
 ```shell
 python dev.py setup --hrx-source /path/to/hrx-system

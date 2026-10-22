@@ -157,7 +157,7 @@ def loom_test(
         srcs,
         deps = [],
         args = [],
-        execution_profile = None,
+        execution_profiles = [],
         size = "small",
         tags = [],
         visibility = None):
@@ -170,14 +170,13 @@ def loom_test(
         )
     if _is_package_or_subpackage(package, "motif"):
         _validate_motif_dependencies(package, deps)
-    if execution_profile == None:
-        fail("%s requires an execution profile" % name)
+    _validate_execution_profiles(name, execution_profiles)
     _loom_test(
         name = name,
         srcs = srcs,
         args = args,
         deps = deps,
-        execution_profile = execution_profile,
+        execution_profiles = execution_profiles,
         size = size,
         tags = tags,
         visibility = visibility,

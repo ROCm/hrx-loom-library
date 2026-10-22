@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from build_tools.py.hrx_loom_kernels import qualification
-from build_tools.py.hrx_loom_kernels.context import RepositoryContext, UserError
+from build_tools.py.hrx_loom_library import qualification
+from build_tools.py.hrx_loom_library.context import RepositoryContext, UserError
 
 
 class QualificationTest(unittest.TestCase):

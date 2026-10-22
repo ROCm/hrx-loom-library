@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from build_tools.py.hrx_loom_kernels import cli
+from build_tools.py.hrx_loom_library import cli
 
 
 class CommandDiscoveryTest(unittest.TestCase):

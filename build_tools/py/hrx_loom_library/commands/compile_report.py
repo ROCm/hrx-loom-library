@@ -761,6 +761,7 @@ def toolchain_identity(repository_root: Path) -> dict[str, Any]:
             for relative_path in (
                 ".bazelrc",
                 ".bazelrc.local",
+                ".bazelrc.hrx",
                 ".bazelversion",
                 "MODULE.bazel",
                 "MODULE.bazel.lock",
@@ -778,9 +779,14 @@ def materialize_base_source(
     commit = _resolve_commit(repository_root, reference)
     local_bazelrc = repository_root / ".bazelrc.local"
     local_bazelrc_sha256 = _sha256(local_bazelrc) if local_bazelrc.is_file() else None
+    source_bazelrc = repository_root / ".bazelrc.hrx"
+    source_bazelrc_sha256 = (
+        _sha256(source_bazelrc) if source_bazelrc.is_file() else None
+    )
     source_key = {
         "commit": commit,
         "local_bazelrc_sha256": local_bazelrc_sha256,
+        "source_bazelrc_sha256": source_bazelrc_sha256,
         "schema": SOURCE_SCHEMA,
     }
     source_id = _json_digest(source_key)
@@ -807,6 +813,7 @@ def materialize_base_source(
             or existing_metadata.get("schema") != SOURCE_SCHEMA
             or existing_metadata.get("commit") != commit
             or existing_metadata.get("local_bazelrc_sha256") != local_bazelrc_sha256
+            or existing_metadata.get("source_bazelrc_sha256") != source_bazelrc_sha256
         ):
             raise Error(f"Archived source identity mismatch: {source_root}")
         current_tree = _source_tree_identity(source_root)
@@ -839,10 +846,13 @@ def materialize_base_source(
             archive.extractall(temporary_root, filter="fully_trusted")
         if local_bazelrc.is_file():
             shutil.copyfile(local_bazelrc, temporary_root / ".bazelrc.local")
+        if source_bazelrc.is_file():
+            shutil.copyfile(source_bazelrc, temporary_root / ".bazelrc.hrx")
         tree_identity = _source_tree_identity(temporary_root)
         metadata = {
             "commit": commit,
             "local_bazelrc_sha256": local_bazelrc_sha256,
+            "source_bazelrc_sha256": source_bazelrc_sha256,
             "schema": SOURCE_SCHEMA,
             "source_id": source_id,
             "tree": tree_identity,

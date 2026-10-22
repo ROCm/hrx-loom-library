@@ -8,7 +8,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from build_tools.py.hrx_loom_kernels import context
+from build_tools.py.hrx_loom_library import context
 
 
 class CommandFormattingTest(unittest.TestCase):

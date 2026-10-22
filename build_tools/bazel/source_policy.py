@@ -89,7 +89,7 @@ def _check_scoped_readmes(repository_root: Path) -> list[str]:
 
 
 def check_repository(repository_root: Path) -> list[str]:
-    """Returns architecture-policy violations in a kernel-library checkout."""
+    """Returns architecture-policy violations in a library checkout."""
     violations = _check_scoped_readmes(repository_root)
     for layer in ("model", "target"):
         layer_root = repository_root / layer
@@ -128,7 +128,7 @@ def check_repository(repository_root: Path) -> list[str]:
                 )
             if UPSTREAM_RULES_LABEL in build_text:
                 violations.append(
-                    f"{build_path.relative_to(repository_root)}: kernel-library "
+                    f"{build_path.relative_to(repository_root)}: library "
                     "packages cannot bypass repository policy wrappers"
                 )
             if not re.search(rf"\b{rule_name}\s*\(", build_text):

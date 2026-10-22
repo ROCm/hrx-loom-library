@@ -8,10 +8,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from build_tools.py.hrx_loom_kernels import qualification
-from build_tools.py.hrx_loom_kernels.commands import format as format_command
-from build_tools.py.hrx_loom_kernels.commands import test as test_command
-from build_tools.py.hrx_loom_kernels.context import RepositoryContext
+from build_tools.py.hrx_loom_library import qualification
+from build_tools.py.hrx_loom_library.commands import format as format_command
+from build_tools.py.hrx_loom_library.commands import test as test_command
+from build_tools.py.hrx_loom_library.context import RepositoryContext
 
 
 class TestCommandTest(unittest.TestCase):

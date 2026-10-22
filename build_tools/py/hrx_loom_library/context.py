@@ -29,6 +29,7 @@ def format_command(command: list[str]) -> str:
 class RepositoryContext:
     """The repository boundary shared by independently owned commands."""
 
+    # Root of the library worktree used for filesystem and process operations.
     repository_root: Path
 
     def bazel_executable(self) -> str:

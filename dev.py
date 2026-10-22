@@ -9,7 +9,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from build_tools.py.hrx_loom_kernels import cli
+from build_tools.py.hrx_loom_library import cli
 
 
 if __name__ == "__main__":

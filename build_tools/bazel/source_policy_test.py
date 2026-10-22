@@ -210,7 +210,7 @@ class SourcePolicyTest(unittest.TestCase):
                 [
                     "kernel/ggml/quantize/BUILD.bazel: load repository rules "
                     "from //build_tools/bazel:defs.bzl",
-                    "kernel/ggml/quantize/BUILD.bazel: kernel-library packages "
+                    "kernel/ggml/quantize/BUILD.bazel: library packages "
                     "cannot bypass repository policy wrappers",
                     "kernel/ggml/quantize/BUILD.bazel: q3.loom is not explicitly "
                     "declared",

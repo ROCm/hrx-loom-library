@@ -1,7 +1,7 @@
 # Copyright 2026 AMD ROCm™ Software
 # SPDX-License-Identifier: MIT
 
-"""Repository maintenance entry point for the Loom kernel library."""
+"""Repository maintenance entry point for the Loom library."""
 
 from __future__ import annotations
 

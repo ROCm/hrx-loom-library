@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from build_tools.py.hrx_loom_kernels.commands import benchmark
+from build_tools.py.hrx_loom_library.commands import benchmark
 
 
 class BenchmarkCommandTest(unittest.TestCase):

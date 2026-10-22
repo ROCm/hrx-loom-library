@@ -13,8 +13,8 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest import mock
 
-from build_tools.py.hrx_loom_kernels.commands import compile_report
-from build_tools.py.hrx_loom_kernels.context import RepositoryContext
+from build_tools.py.hrx_loom_library.commands import compile_report
+from build_tools.py.hrx_loom_library.context import RepositoryContext
 
 
 class GitRepositoryTestCase(unittest.TestCase):
@@ -78,7 +78,8 @@ class WorkingTreeIdentityTest(GitRepositoryTestCase):
 class BaseSourceTest(GitRepositoryTestCase):
     def test_materializes_one_source_workspace_per_commit_and_local_config(self):
         self._write("BUILD.bazel", "# base\n")
-        self._write(".bazelrc.local", "common --override_module=hrx=/loom\n")
+        self._write(".bazelrc.local", "build --jobs=7\n")
+        self._write(".bazelrc.hrx", "common --override_module=hrx=/loom\n")
         commit = self._commit_all()
         output_root = self.repository_root / ".reports" / "compile"
         compile_report.initialize_workspace(self.repository_root, output_root)
@@ -102,9 +103,25 @@ class BaseSourceTest(GitRepositoryTestCase):
         self.assertEqual(identity, reused_identity)
         self.assertEqual(
             (source_root / ".bazelrc.local").read_text(encoding="utf-8"),
+            "build --jobs=7\n",
+        )
+        self.assertEqual(
+            (source_root / ".bazelrc.hrx").read_text(encoding="utf-8"),
             "common --override_module=hrx=/loom\n",
         )
         self.assertFalse((source_root / ".git").exists())
+
+        self._write(".bazelrc.hrx", "common --override_module=hrx=/other-loom\n")
+        changed_root, changed_identity = compile_report.materialize_base_source(
+            self.repository_root, output_root, commit
+        )
+        self.assertNotEqual(changed_root, source_root)
+        self.assertNotEqual(changed_identity["source_id"], identity["source_id"])
+        self.assertEqual(
+            (changed_root / ".bazelrc.hrx").read_text(encoding="utf-8"),
+            "common --override_module=hrx=/other-loom\n",
+        )
+        self._write(".bazelrc.hrx", "common --override_module=hrx=/loom\n")
 
         (source_root / "BUILD.bazel").write_text("# modified\n", encoding="utf-8")
         with self.assertRaisesRegex(compile_report.Error, "was modified"):
@@ -136,9 +153,7 @@ class ProviderDiscoveryTest(unittest.TestCase):
             "@@hrx+//loom/target/amdgpu:gfx12-generic\tgfx12-generic\n"
         )
         catalog = (
-            "//kernel/example:first\n"
-            "//kernel/example:second\n"
-            "//motif/example:test\n"
+            "//kernel/example:first\n//kernel/example:second\n//motif/example:test\n"
         )
         with mock.patch.object(
             compile_report,
