@@ -29,6 +29,13 @@ Q4_K also exposes the four-code packet used by matrix staging. These forms
 read only the requested physical packets and leave coefficient application
 to the contraction, preserving reuse across activation rows.
 
+Q6_K offers signed carrier unpacking and a buffered four-value F16 reader
+for matrix staging. It handles the format's alternating word alignment
+across 210-byte blocks. Q8_1 x4 readers expose a full 32-value block, a
+16-value half-block, or one four-value word. Full and half-block readers
+return the original block scale and scaled sum; consumers own any affine
+minimum correction, including how paired half-blocks share that sum.
+
 ## References
 
 - [GGUF format specification](https://github.com/ggml-org/ggml/blob/30bf8685ed4eb0a47f2b06229543327749904150/docs/gguf.md)

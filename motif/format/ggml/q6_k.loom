@@ -8,9 +8,10 @@
 //
 // One 210-byte Q6_K block stores 256 six-bit codes in separate low four-bit
 // and high two-bit planes. The encoded values have a zero point of 32. Sixteen
-// signed group scales and one F16 block scale remain explicit caller values so
-// direct integer contraction and floating-point materialization can choose
-// different schedules around the same carrier accessors.
+// signed group scales and one F16 block scale accompany those codes. The
+// carrier accessor leaves scaling to its caller; the buffered F16 reader
+// applies it to one four-value packet for matrix staging. Both use the same
+// signed code interpretation without owning a contraction or launch schedule.
 // Merges four selected low/high fields and converts each biased six-bit code
 // to a signed i8 value in [-32, 31]. `low_nibble` selects the low or high
 // nibble of each byte; `high_pair` selects one of four two-bit fields.
@@ -49,4 +50,54 @@ func.def public inline @ggml_q6_k_unpack_codes4(%low_word: vector<1xi32>, %high_
   %signed_word = vector.ori %low5, %sign_extension : vector<1xi32>
   %codes = vector.bitcast %signed_word : vector<1xi32> to vector<4xi8>
   func.return %codes : vector<4xi8>
+}
+
+// Materializes four consecutive values from one complete 210-byte record.
+// Row origin is in bytes; group selects one of eight 32-value regions and
+// packet one of its eight four-value packets. The four packets in each
+// 16-value scale region share a signed scale. F32 coefficient application
+// precedes one F16 rounding for matrix staging. No expanded buffer is owned.
+func.def public inline @ggml_q6_k_load_values4_f16(%weight: buffer, %row_origin: offset, %block: index, %group_value: index, %packet_value: index) -> (vector<4xf16>) {
+  %group = index.assume %group_value [range(%group_value, 0, 7)] : index
+  %packet = index.assume %packet_value [range(%packet_value, 0, 7)] : index
+  %sides = index.constant 2 : index
+  %groups_per_half = index.constant 4 : index
+  %words_per_side = index.constant 8 : index
+  %words_per_half = index.constant 16 : index
+  %block_bytes = index.constant 210 : offset
+  %high_displacement = index.constant 128 : offset
+  %scale_displacement = index.constant 192 : offset
+  %factor_displacement = index.constant 208 : offset
+  %block_add = index.scale %block, %block_bytes : index, offset -> offset
+  %block_origin = index.add %row_origin, %block_add : offset
+  %high_origin = index.add %block_origin, %high_displacement : offset
+  %scale_origin = index.add %block_origin, %scale_displacement : offset
+  %factor_origin = index.add %block_origin, %factor_displacement : offset
+  %low_view = buffer.view %weight[%block_origin] : buffer -> view<32xi32>
+  %high_view = buffer.view %weight[%high_origin] : buffer -> view<16xi32>
+  %scales = buffer.view %weight[%scale_origin] : buffer -> view<16xi8>
+  %factor_view = buffer.view %weight[%factor_origin] : buffer -> view<1xf16>
+  %within_half = index.rem %group, %groups_per_half : index
+  %half = index.div %group, %groups_per_half : index
+  %side = index.rem %within_half, %sides : index
+  %low_half = index.mul %half, %words_per_half : index
+  %low_side = index.madd %side, %words_per_side, %low_half : index
+  %low_index = index.add %low_side, %packet : index
+  %high_index = index.madd %half, %words_per_side, %packet : index
+  %nibble = index.div %within_half, %sides : index
+  %packet_half = index.div %packet, %groups_per_half : index
+  %scale_index = index.madd %group, %sides, %packet_half : index
+  %low = vector.load %low_view[%low_index] : view<32xi32> -> vector<1xi32>
+  %high = vector.load %high_view[%high_index] : view<16xi32> -> vector<1xi32>
+  %codes = func.call @ggml_q6_k_unpack_codes4(%low, %high, %nibble, %within_half) : (vector<1xi32>, vector<1xi32>, index, index) -> (vector<4xi8>)
+  %centered = vector.sitofp %codes : vector<4xi8> to vector<4xf32>
+  %scale_integer = view.load %scales[%scale_index] : view<16xi8> -> i8
+  %factor_half = view.load %factor_view[0] : view<1xf16> -> f16
+  %scale = scalar.sitofp %scale_integer : i8 to f32
+  %factor = scalar.extf %factor_half : f16 to f32
+  %coefficient = scalar.mulf %scale, %factor : f32
+  %broadcast = vector.splat %coefficient : vector<4xf32>
+  %wide = vector.mulf %centered, %broadcast : vector<4xf32>
+  %values = vector.fptrunc %wide : vector<4xf32> to vector<4xf16>
+  func.return %values : vector<4xf16>
 }

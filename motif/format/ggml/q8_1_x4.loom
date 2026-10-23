@@ -74,6 +74,39 @@ func.def public inline @ggml_q8_1_x4_word(%q8_input: buffer, %row_byte_base: off
   func.return %values, %d : vector<4xi8>, f32
 }
 
+// Loads one 16-value half of a logical Q8_1 block, with the same full-block
+// scale and sum returned by ggml_q8_1_x4_block. Half is in [0, 1]. Splitting
+// the payload leaves paired contraction lanes in control of their minimum
+// correction; the returned sum is not divided or otherwise reinterpreted.
+func.def public inline @ggml_q8_1_x4_chunk16(%input: buffer, %row_origin: offset, %block: index, %half_value: index) -> (vector<16xi8>, f32, f32) {
+  %half = index.assume %half_value [range(%half_value, 0, 1)] : index
+  %step = index.constant 1 : index
+  %metadata_width = index.constant 2 : index
+  %blocks_per_group = index.constant 4 : index
+  %words_per_half = index.constant 4 : index
+  %words_per_block = index.constant 8 : index
+  %group_bytes = index.constant 144 : offset
+  %header_bytes = index.constant 16 : offset
+  %group = index.div %block, %blocks_per_group : index
+  %inner = index.rem %block, %blocks_per_group : index
+  %group_add = index.scale %group, %group_bytes : index, offset -> offset
+  %group_origin = index.add %row_origin, %group_add : offset
+  %payload_origin = index.add %group_origin, %header_bytes : offset
+  %metadata = buffer.view %input[%group_origin] : buffer -> view<8xf16>
+  %payload = buffer.view %input[%payload_origin] : buffer -> view<32xi32>
+  %within = index.mul %half, %words_per_half : index
+  %word = index.madd %inner, %words_per_block, %within : index
+  %scale_index = index.mul %inner, %metadata_width : index
+  %sum_index = index.add %scale_index, %step : index
+  %scale_half = view.load %metadata[%scale_index] : view<8xf16> -> f16
+  %sum_half = view.load %metadata[%sum_index] : view<8xf16> -> f16
+  %packed = vector.load %payload[%word] : view<32xi32> -> vector<4xi32>
+  %values = vector.bitcast %packed : vector<4xi32> to vector<16xi8>
+  %scale = scalar.extf %scale_half : f16 to f32
+  %sum = scalar.extf %sum_half : f16 to f32
+  func.return %values, %scale, %sum : vector<16xi8>, f32, f32
+}
+
 // Packs one explicit physical group. Callers provide the complete physical
 // group domain and an in-range ordinal, and guarantee that one complete
 // 32-lane wave executes after all 128 source values are visible. The uniform

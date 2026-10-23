@@ -21,3 +21,11 @@ groups, half-groups, and four-code Q4_K packets are checked exactly. Random
 and zero/all-one carriers exercise metadata bit planes and code extrema;
 generated F16 headers include zero and signed coefficients. Sentinel regions
 and unchanged-input comparisons cover the storage boundary.
+
+`q6_buffer.loom` independently reconstructs logical Q6_K elements from
+individual bytes and applies signed scales in F64 before F16 publication.
+Alternating word alignment, negative and zero factors, every group/packet,
+and output sentinels are checked bitwise. `q8_buffer.loom` checks all three
+reader widths over multiple physical groups and padded rows, including
+signed code extrema, zero and signed metadata, and untouched sum slots for
+the narrow word interface.
