@@ -66,7 +66,8 @@ microphone transport is a separate hosting concern.
 The implementation performs greedy English transcription with an empty prompt.
 It accepts up to 655,360 input samples (40.96 seconds at 16 kHz), retains four
 independent request histories, and bounds each decoder hypothesis to 512 tokens
-including EOS. The encoder advances in 320-sample quanta, and hypotheses may
+including EOS. The `streaming` preset limits the pending request queue to four.
+The encoder advances in 320-sample quanta, and hypotheses may
 revise as more audio becomes available. Finalization preserves the real input
 sample clock. Speaker diarization and word alignment are not provided.
 
