@@ -1,0 +1,244 @@
+// Independent Q6_K projection references and complete launch-family checks.
+//
+// Scalar byte extraction follows logical K order, independently of the
+// production packet/lane mapping. F64 multiplication and accumulation on
+// the CPU precede one output rounding. Random payloads exercise signed
+// codes and scales, distinct activation rows, odd output/block tails, and
+// 210-byte record alignment. Output guards and input immutability are exact.
+// Uniform workloads use nonzero codes, scales, and activations with the
+// analytical answer K * 0.1875, including every benchmark workload.
+// No reference calls a production format reader or contraction schedule.
+
+func.def @initialize_q6(%uniform: i1, %quantized: i1, %tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer) {
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %groups_per_record = index.constant 4 : index
+  %scale_count = index.constant 16 : index
+  %group_values = index.constant 32 : index
+  %high_count = index.constant 64 : index
+  %record_values = index.constant 128 : index
+  %block_values = index.constant 256 : index
+  %block_bytes = index.constant 210 : offset
+  %high_add = index.constant 128 : offset
+  %scale_add = index.constant 192 : offset
+  %factor_add = index.constant 208 : offset
+  %period = index.constant 7 : index
+  %center = scalar.constant 3.0 : f32
+  %factor_unit = scalar.constant 0.0009765625 : f32
+  %uniform_factor = scalar.constant 0.125 : f32
+  %uniform_scale = scalar.constant 3 : i8
+  %uniform_high = scalar.constant -86 : i8
+  %blocks_per_row = index.div %inputs, %block_values : index
+  %blocks = index.mul %outputs, %blocks_per_row : index
+  scf.for %block = [%begin to %blocks step %unit] {
+    %origin = index.scale %block, %block_bytes : index, offset -> offset
+    %factor_origin = index.add %origin, %factor_add : offset
+    %factor_view = buffer.view %weight[%factor_origin] : buffer -> view<1xf16>
+    %ordinal = index.rem %block, %period : index
+    %integer = index.cast %ordinal : index to i32
+    %floating = scalar.uitofp %integer : i32 to f32
+    %centered = scalar.subf %floating, %center : f32
+    %random_factor = scalar.mulf %centered, %factor_unit : f32
+    %factor = scf.select %uniform, %uniform_factor, %random_factor : f32
+    %half_factor = scalar.fptrunc %factor : f32 to f16
+    view.store %half_factor, %factor_view[0] : f16, view<1xf16>
+    scf.if %uniform {
+      %high_origin = index.add %origin, %high_add : offset
+      %scale_origin = index.add %origin, %scale_add : offset
+      %high = buffer.view %weight[%high_origin] : buffer -> view<64xi8>
+      %scales = buffer.view %weight[%scale_origin] : buffer -> view<16xi8>
+      scf.for %element = [%begin to %high_count step %unit] {
+        view.store %uniform_high, %high[%element] : i8, view<64xi8>
+      }
+      scf.for %element = [%begin to %scale_count step %unit] {
+        view.store %uniform_scale, %scales[%element] : i8, view<16xi8>
+      }
+    }
+  }
+  scf.if %quantized {
+    %record_bytes = index.constant 144 : offset
+    %header_bytes = index.constant 4 : offset
+    %payload_add = index.constant 16 : offset
+    %zero_integer = scalar.constant 0 : i32
+    %scale_unit = scalar.constant 0.00390625 : f32
+    %uniform_activation_scale = scalar.constant 0.5 : f32
+    %records = index.div %inputs, %record_values : index
+    %row_bytes = index.scale %records, %record_bytes : index, offset -> offset
+    %groups = index.div %inputs, %group_values : index
+    scf.for %row = [%begin to %tokens step %unit] {
+      %row_origin = index.scale %row, %row_bytes : index, offset -> offset
+      scf.for %group = [%begin to %groups step %unit] {
+        %record = index.div %group, %groups_per_record : index
+        %within = index.rem %group, %groups_per_record : index
+        %record_add = index.scale %record, %record_bytes : index, offset -> offset
+        %record_origin = index.add %row_origin, %record_add : offset
+        %header_add = index.scale %within, %header_bytes : index, offset -> offset
+        %header_origin = index.add %record_origin, %header_add : offset
+        %payload_origin = index.add %record_origin, %payload_add : offset
+        %codes = buffer.view %input[%payload_origin] : buffer -> view<4x32xi8>
+        %header = buffer.view %input[%header_origin] : buffer -> view<2xf16>
+        %ordinal0 = index.add %group, %row : index
+        %ordinal = index.rem %ordinal0, %period : index
+        %integer = index.cast %ordinal : index to i32
+        %floating = scalar.uitofp %integer : i32 to f32
+        %centered = scalar.subf %floating, %center : f32
+        %random_scale = scalar.mulf %centered, %scale_unit : f32
+        %scale = scf.select %uniform, %uniform_activation_scale, %random_scale : f32
+        %sum = scf.for %element = [%begin to %group_values step %unit](%running = %zero_integer : i32) -> (i32) {
+          %byte = view.load %codes[%within, %element] : view<4x32xi8> -> i8
+          %value = scalar.extsi %byte : i8 to i32
+          %next = scalar.addi %running, %value : i32
+          scf.yield %next : i32
+        }
+        %sum_float = scalar.sitofp %sum : i32 to f32
+        %scaled_sum = scalar.mulf %scale, %sum_float : f32
+        %scale_half = scalar.fptrunc %scale : f32 to f16
+        %sum_half = scalar.fptrunc %scaled_sum : f32 to f16
+        view.store %scale_half, %header[0] : f16, view<2xf16>
+        view.store %sum_half, %header[1] : f16, view<2xf16>
+      }
+    }
+  }
+  func.return
+}
+
+func.def @q6_reference(%quantized: i1, %tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %nibbles = index.constant 2 : index
+  %groups_per_record = index.constant 4 : index
+  %scale_values = index.constant 16 : index
+  %group_values = index.constant 32 : index
+  %low_half_bytes = index.constant 64 : index
+  %half_values = index.constant 128 : index
+  %block_values = index.constant 256 : index
+  %origin = index.constant 0 : offset
+  %block_bytes = index.constant 210 : offset
+  %high_add = index.constant 128 : offset
+  %scale_add = index.constant 192 : offset
+  %factor_add = index.constant 208 : offset
+  %record_bytes = index.constant 144 : offset
+  %header_bytes = index.constant 4 : offset
+  %payload_add = index.constant 16 : offset
+  %mask4 = scalar.constant 15 : i32
+  %mask2 = scalar.constant 3 : i32
+  %shift4 = scalar.constant 4 : i32
+  %shift2 = scalar.constant 2 : i32
+  %bias = scalar.constant 32 : i32
+  %sum_identity = scalar.constant 0.0 : f64
+  %blocks = index.div %inputs, %block_values : index
+  %records = index.div %inputs, %half_values : index
+  %input_row_bytes = index.scale %records, %record_bytes : index, offset -> offset
+  %results = buffer.view %output[%origin] : buffer -> view<[%tokens]x[%outputs]xf32>
+  scf.for %row = [%begin to %tokens step %unit] {
+    %input_origin = index.scale %row, %input_row_bytes : index, offset -> offset
+    scf.for %channel = [%begin to %outputs step %unit] {
+      %weight_block_base = index.mul %channel, %blocks : index
+      %sum = scf.for %element = [%begin to %inputs step %unit](%running = %sum_identity : f64) -> (f64) {
+        %block = index.div %element, %block_values : index
+        %within = index.rem %element, %block_values : index
+        %physical_block = index.add %weight_block_base, %block : index
+        %weight_origin = index.scale %physical_block, %block_bytes : index, offset -> offset
+        %high_origin = index.add %weight_origin, %high_add : offset
+        %scale_origin = index.add %weight_origin, %scale_add : offset
+        %factor_origin = index.add %weight_origin, %factor_add : offset
+        %low = buffer.view %weight[%weight_origin] : buffer -> view<128xi8>
+        %high = buffer.view %weight[%high_origin] : buffer -> view<64xi8>
+        %scales = buffer.view %weight[%scale_origin] : buffer -> view<16xi8>
+        %factor_view = buffer.view %weight[%factor_origin] : buffer -> view<1xf16>
+        %half = index.div %within, %half_values : index
+        %in_half = index.rem %within, %half_values : index
+        %quadrant = index.div %in_half, %group_values : index
+        %position = index.rem %within, %group_values : index
+        %side = index.rem %quadrant, %nibbles : index
+        %nibble = index.div %quadrant, %nibbles : index
+        %low_half = index.mul %half, %low_half_bytes : index
+        %low_side = index.madd %side, %group_values, %low_half : index
+        %low_index = index.add %low_side, %position : index
+        %high_index = index.madd %half, %group_values, %position : index
+        %scale_index = index.div %within, %scale_values : index
+        %low_byte = view.load %low[%low_index] : view<128xi8> -> i8
+        %high_byte = view.load %high[%high_index] : view<64xi8> -> i8
+        %scale_byte = view.load %scales[%scale_index] : view<16xi8> -> i8
+        %factor_half = view.load %factor_view[0] : view<1xf16> -> f16
+        %low_integer = scalar.extui %low_byte : i8 to i32
+        %high_integer = scalar.extui %high_byte : i8 to i32
+        %nibble_integer = index.cast %nibble : index to i32
+        %quadrant_integer = index.cast %quadrant : index to i32
+        %low_shift = scalar.muli %nibble_integer, %shift4 : i32
+        %high_shift = scalar.muli %quadrant_integer, %shift2 : i32
+        %shifted_low = scalar.shrui %low_integer, %low_shift : i32
+        %shifted_high = scalar.shrui %high_integer, %high_shift : i32
+        %low_bits = scalar.andi %shifted_low, %mask4 : i32
+        %high_bits = scalar.andi %shifted_high, %mask2 : i32
+        %positioned_high = scalar.shli %high_bits, %shift4 : i32
+        %biased_code = scalar.ori %low_bits, %positioned_high : i32
+        %code = scalar.subi %biased_code, %bias : i32
+        %code_float = scalar.sitofp %code : i32 to f64
+        %scale_float = scalar.sitofp %scale_byte : i8 to f64
+        %factor = scalar.extf %factor_half : f16 to f64
+        %weight_scaled = scalar.mulf %code_float, %scale_float : f64
+        %weight_value = scalar.mulf %weight_scaled, %factor : f64
+        %activation = scf.if %quantized -> (f64) {
+          %group = index.div %element, %group_values : index
+          %record = index.div %group, %groups_per_record : index
+          %within_record = index.rem %group, %groups_per_record : index
+          %record_add = index.scale %record, %record_bytes : index, offset -> offset
+          %record_origin = index.add %input_origin, %record_add : offset
+          %header_add = index.scale %within_record, %header_bytes : index, offset -> offset
+          %header_origin = index.add %record_origin, %header_add : offset
+          %payload_origin = index.add %record_origin, %payload_add : offset
+          %header = buffer.view %input[%header_origin] : buffer -> view<2xf16>
+          %payload = buffer.view %input[%payload_origin] : buffer -> view<4x32xi8>
+          %scale_half = view.load %header[0] : view<2xf16> -> f16
+          %byte = view.load %payload[%within_record, %position] : view<4x32xi8> -> i8
+          %scale = scalar.extf %scale_half : f16 to f64
+          %code = scalar.sitofp %byte : i8 to f64
+          %value = scalar.mulf %scale, %code : f64
+          scf.yield %value : f64
+        } else {
+          %values = buffer.view %input[%origin] : buffer -> view<[%tokens]x[%inputs]xf32>
+          %single = view.load %values[%row, %element] : view<[%tokens]x[%inputs]xf32> -> f32
+          %value = scalar.extf %single : f32 to f64
+          scf.yield %value : f64
+        }
+        %product = scalar.mulf %weight_value, %activation : f64
+        %next = scalar.addf %running, %product : f64
+        scf.yield %next : f64
+      }
+      %rounded = scalar.fptrunc %sum : f64 to f32
+      view.store %rounded, %results[%row, %channel] : f32, view<[%tokens]x[%outputs]xf32>
+    }
+  }
+  func.return
+}
+
+func.def @q6_f32_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %quantized = scalar.constant false : i1
+  func.call @q6_reference(%quantized, %tokens, %inputs, %outputs, %input, %weight, %output) : (i1, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @q6_q8_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %quantized = scalar.constant true : i1
+  func.call @q6_reference(%quantized, %tokens, %inputs, %outputs, %input, %weight, %output) : (i1, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+// Each weight is (33 - 32) * 3 * 0.125 and each activation is 0.5.
+func.def @q6_uniform_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %coefficient = scalar.constant 0.1875 : f32
+  %integer = index.cast %inputs : index to i32
+  %floating = scalar.uitofp %integer : i32 to f32
+  %expected = scalar.mulf %floating, %coefficient : f32
+  %destination = buffer.view %output[%origin] : buffer -> view<[%tokens]x[%outputs]xf32>
+  scf.for %row = [%begin to %tokens step %unit] {
+    scf.for %channel = [%begin to %outputs step %unit] {
+      view.store %expected, %destination[%row, %channel] : f32, view<[%tokens]x[%outputs]xf32>
+    }
+  }
+  func.return
+}

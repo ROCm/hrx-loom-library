@@ -18,6 +18,16 @@ accumulators, and publishes four rows. The single-row and four-row schedules
 share the physical format and affine arithmetic. Model-specific matrix and
 cohort schedules can compose the same format contracts independently.
 
+Q6_K has three schedules with different reuse boundaries. The F32 activation
+path shares four activation packets across two output channels. The Q8_1 path
+assigns one output channel to each 32-lane cluster, retaining low/high packed
+weight words across two dot4 packets. The 64-lane `block4` path instead advances
+across four weight blocks per iteration. Each has a four-row form with separate
+accumulators and common immutable weight addresses. Block-level primitives
+remain available to model-specific cohort and output-reduction schedules.
+All Q6 forms use the signed carrier decoder without first rounding weights to
+F16 or materializing an expanded tensor.
+
 These are reusable Loom schedules, qualified for correctness through the
 [`linear` kernels](../../../kernel/ggml/linear/). The native tests establish
 packed-byte semantics, addressing, and numerical results; they do not establish
