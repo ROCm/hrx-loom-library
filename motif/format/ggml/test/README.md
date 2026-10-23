@@ -14,6 +14,13 @@ exercise target lowering and memory access, while the same authored cases can
 serve as deterministic reference programs on targets that implement their
 vector operations.
 
+`iq4_nl.loom` compares nonlinear code expansion against scalar nibble reads
+and a separate signed codebook. Ordered carriers cover all 256 possible
+payload bytes, alongside random and repeated-code inputs. Two padded rows
+exercise nonzero origins and alternating block alignment; headers cover
+signed zero, normal and subnormal finite F16 scales, and magnitude extrema.
+Complete storage comparisons check guards and input immutability.
+
 `affine_packets.loom` checks the four-code Q4_K and Q5_K carrier readers
 against independent scalar byte decoding. All eight group selectors consume
 random, ordered, zero, and all-one packets. Full output storage comparisons

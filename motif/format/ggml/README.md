@@ -44,6 +44,12 @@ Q8_0 exposes one four-code word and its separate F32 scale from a raw
 alternating word alignment between records. Integer dot products can use
 the codes directly; matrix staging decides where to round scaled values.
 
+IQ4_NL exposes one complete 18-byte block as 32 signed I8 codebook values
+and a separate F32 scale. The first 16 values come from the low nibbles;
+the remaining values come from the high nibbles. Consumers retain these
+exact codes across activation formats and choose when to apply the scale.
+The reader accepts a byte origin without imposing a row or tensor layout.
+
 ## References
 
 - [GGUF format specification](https://github.com/ggml-org/ggml/blob/30bf8685ed4eb0a47f2b06229543327749904150/docs/gguf.md)
