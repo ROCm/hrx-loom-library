@@ -1,0 +1,123 @@
+// Native GPU sampling checks. Philox uses published integer known answers;
+// normal pairs use independently evaluated double-precision Box-Muller values
+// after the public F32 uniform conversion. The 64 pairs cross radial endpoints,
+// conversion rounding boundaries, and every angular octant.
+
+amdgpu.target<gfx11-generic> @sampling {subgroup_size = 32}
+
+template.decl @random.philox4x32(%counter0: i32, %counter1: i32, %counter2: i32, %counter3: i32, %seed0: i32, %seed1: i32) -> (i32, i32, i32, i32)
+
+template.decl @random.normal_pair(%radius_word: i32, %angle_word: i32) -> (f32, f32)
+
+// BEGIN GENERATED NORMAL ORACLE
+global.rodata.def @normal_words = align(4) bytes("0000000000000000000000000000002000000000000000400000000000000060000000000000008000000000000000a000000000000000c000000000ffffffff0100000000000000010000000000002001000000000000400100000000000060010000000000008001000000000000a001000000000000c001000000ffffffffffffff0000000000ffffff0000000020ffffff0000000040ffffff0000000060ffffff0000000080ffffff00000000a0ffffff00000000c0ffffff00ffffffff0000000100000000000000010000002000000001000000400000000100000060000000010000008000000001000000a000000001000000c000000001ffffffffffffff7f00000000ffffff7f00000020ffffff7f00000040ffffff7f00000060ffffff7f00000080ffffff7f000000a0ffffff7f000000c0ffffff7fffffffff0000008000000000000000800000002000000080000000400000008000000060000000800000008000000080000000a000000080000000c000000080ffffffff7fffffff000000007fffffff000000207fffffff000000407fffffff000000607fffffff000000807fffffff000000a07fffffff000000c07fffffffffffffffffffffff00000000ffffffff00000020ffffffff00000040ffffffff00000060ffffffff00000080ffffffff000000a0ffffffff000000c0ffffffffffffffff")
+
+global.rodata.def @normal_values = align(4) bytes("4770d8408ffda931910b9940910b9940ddbeee254770d840910b99c0910b99404770d8c0ddbe6e26910b99c0910b99c0260fb3a64770d8c04770d840ddbeeea64c2dd340a5dba5311c5395401c5395400ff1e8254c2dd3401c5395c01c5395404c2dd3c00ff168261c5395c01c5395c0cbb4aea64c2dd3c04c2dd3400ff1e8a64d225540216527315fb516405fb51640b2196b254d2255405fb516c05fb516404d2255c0b219eb255fb516c05fb516c0465330a64d2255c04d225540b2196ba64d225540216527315fb516405fb51640b2196b254d2255405fb516c05fb516404d2255c0b219eb255fb516c05fb516c0465330a64d2255c04d225540b2196ba65fb5963f7abb6c304d22553f4d22553fb73da6245fb5963f4d2255bf4d22553f5fb596bfb73d26254d2255bf4d2255bf925c79a55fb596bf5fb5963fb73da6a55fb5963f7abb6c304d22553f4d22553fb73da6245fb5963f4d2255bf4d22553f5fb596bfb73d26254d2255bf4d2255bf925c79a55fb596bf5fb5963fb73da6a5f304b539192c8e2a000080390000803906adc71ef304b539000080b900008039f304b5b906ad471f000080b9000080b9c5c1959ff304b5b9f304b53906adc79ff304b539192c8e2a000080390000803906adc71ef304b539000080b900008039f304b5b906ad471f000080b9000080b9c5c1959ff304b5b9f304b53906adc79f")
+
+// END GENERATED NORMAL ORACLE
+kernel.def target(@sampling) @normal_pairs() {
+  %one = index.constant 1 : index
+  %rows = index.constant 64 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%rows, %one, %one) : index
+} launch(%input_storage: buffer, %output_storage: buffer) {
+  %origin = index.constant 0 : offset
+  %input = buffer.view %input_storage[%origin] : buffer -> view<64x2xi32>
+  %output = buffer.view %output_storage[%origin] : buffer -> view<64x2xf32>
+  %row = kernel.workitem.id<x> : index
+  %radial = view.load %input[%row, 0] : view<64x2xi32> -> i32
+  %angular = view.load %input[%row, 1] : view<64x2xi32> -> i32
+  %first, %second = template.apply<@random.normal_pair>(%radial, %angular) : (i32, i32) -> (f32, f32)
+  view.store %first, %output[%row, 0] : f32, view<64x2xf32>
+  view.store %second, %output[%row, 1] : f32, view<64x2xf32>
+  kernel.return
+}
+
+func.def @initialize_normal(%input: buffer) {
+  %origin = index.constant 0 : offset
+  %bytes = index.constant 512 : offset
+  %words = global.load @normal_words : buffer
+  buffer.copy %words[%origin], %input[%origin], %bytes
+  func.return
+}
+
+func.def @expected_normal(%input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %bytes = index.constant 512 : offset
+  %values = global.load @normal_values : buffer
+  buffer.copy %values[%origin], %output[%origin], %bytes
+  func.return
+}
+
+check.scenario public @normal_conversion_boundaries {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(0) : tensor<64x2xi32>
+    %output = check.generate.fill value(0.0) : tensor<64x2xf32>
+    check.generate<@initialize_normal>(%input) : (tensor<64x2xi32>) -> ()
+    check.compare<@normal_pairs, @expected_normal>(%input, %output) : (tensor<64x2xi32>, tensor<64x2xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(2.0000000000000001e-09) rtol(4.9999999999999998e-07) nan(same) : tensor<64x2xf32>
+    }
+  }
+  check.return
+}
+
+kernel.def target(@sampling) @philox_words() {
+  %one = index.constant 1 : index
+  %rows = index.constant 3 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%rows, %one, %one) : index
+} launch(%input_storage: buffer, %output_storage: buffer) {
+  %origin = index.constant 0 : offset
+  %input = buffer.view %input_storage[%origin] : buffer -> view<3x6xi32>
+  %output = buffer.view %output_storage[%origin] : buffer -> view<3x4xi32>
+  %row = kernel.workitem.id<x> : index
+  %counter0 = view.load %input[%row, 0] : view<3x6xi32> -> i32
+  %counter1 = view.load %input[%row, 1] : view<3x6xi32> -> i32
+  %counter2 = view.load %input[%row, 2] : view<3x6xi32> -> i32
+  %counter3 = view.load %input[%row, 3] : view<3x6xi32> -> i32
+  %seed0 = view.load %input[%row, 4] : view<3x6xi32> -> i32
+  %seed1 = view.load %input[%row, 5] : view<3x6xi32> -> i32
+  %a, %b, %c, %d = template.apply<@random.philox4x32>(%counter0, %counter1, %counter2, %counter3, %seed0, %seed1) : (i32, i32, i32, i32, i32, i32) -> (i32, i32, i32, i32)
+  view.store %a, %output[%row, 0] : i32, view<3x4xi32>
+  view.store %b, %output[%row, 1] : i32, view<3x4xi32>
+  view.store %c, %output[%row, 2] : i32, view<3x4xi32>
+  view.store %d, %output[%row, 3] : i32, view<3x4xi32>
+  kernel.return
+}
+
+// Published Random123 words, stored little-endian for the native input ABI.
+global.rodata.def @philox_input = align(4) bytes("000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff886a3f24d308a3852e8a191344737003223809a4d0319f29")
+
+global.rodata.def @philox_output = align(4) bytes("d5e827668dc569e14cac57bcd8db009b6d278f400e3bc841c6c70ba2fd51546d09fe6cd1ebccfd9420e40150a16e1224")
+
+func.def @initialize_philox(%input: buffer) {
+  %origin = index.constant 0 : offset
+  %input_length = index.constant 72 : offset
+  %words = global.load @philox_input : buffer
+  buffer.copy %words[%origin], %input[%origin], %input_length
+  func.return
+}
+
+func.def @expected_philox(%input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %bytes = index.constant 48 : offset
+  %values = global.load @philox_output : buffer
+  buffer.copy %values[%origin], %output[%origin], %bytes
+  func.return
+}
+
+check.scenario public @philox_known_words {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(0) : tensor<3x6xi32>
+    %output = check.generate.fill value(0) : tensor<3x4xi32>
+    check.generate<@initialize_philox>(%input) : (tensor<3x6xi32>) -> ()
+    check.compare<@philox_words, @expected_philox>(%input, %output) : (tensor<3x6xi32>, tensor<3x4xi32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<3x4xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@normal_conversion_boundaries> @normal_pairs_64
+
+check.benchmark<@philox_known_words> @philox_counter_blocks
