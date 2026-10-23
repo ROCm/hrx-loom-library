@@ -1,0 +1,350 @@
+// Retained-row RMS normalization against a sequential F64 oracle.
+// Native launches cover row origins, concatenated output strides, bank
+// geometry, epsilon-dominated inputs, and both F32/F16 output representations.
+
+amdgpu.target<gfx11-generic> @rms_wave32 {subgroup_size = 32}
+
+template.decl @normalization.rms_row_f32(%width: index, %threads: index, %input_origin: offset, %output_origin: offset, %output_f16: i1, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer)
+
+// Sequential F64 reduction is independent of the device's vector packets and
+// workgroup tree. Newton refinement removes the F32 reciprocal-square-root
+// seed's error before computing the F64 reference result.
+func.def @rms_reference(%rows: index, %width: index, %half: i1, %input_origin: offset, %output_origin: offset, %stride_value: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer) {
+  %stride = index.assume %stride_value [ge(%stride_value, %width)] : index
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %three = index.constant 3 : index
+  %origin = index.constant 0 : offset
+  %zero_float = scalar.constant 0.0 : f64
+  %width_i32 = index.cast %width : index to i32
+  %width_float = scalar.uitofp %width_i32 : i32 to f64
+  %epsilon64 = scalar.extf %epsilon : f32 to f64
+  %inputs = buffer.view %input[%input_origin] : buffer -> view<[%rows]x[%width]xf32>
+  %weights = buffer.view %weight[%origin] : buffer -> view<[%width]xf32>
+  scf.for %row = [%zero to %rows step %one] {
+    %sum = scf.for %column = [%zero to %width step %one](%accumulator = %zero_float : f64) -> (f64) {
+      %value = view.load %inputs[%row, %column] : view<[%rows]x[%width]xf32> -> f32
+      %wide = scalar.extf %value : f32 to f64
+      %square = scalar.mulf %wide, %wide : f64
+      %next = scalar.addf %accumulator, %square : f64
+      scf.yield %next : f64
+    }
+    %mean = scalar.divf %sum, %width_float : f64
+    %biased = scalar.addf %mean, %epsilon64 : f64
+    %seed_input = scalar.fptrunc %biased : f64 to f32
+    %seed = scalar.rsqrtf<afn> %seed_input : f32
+    %seed64 = scalar.extf %seed : f32 to f64
+    %one_half = scalar.constant 0.5 : f64
+    %three_halves = scalar.constant 1.5 : f64
+    %half_input = scalar.mulf %biased, %one_half : f64
+    %inverse = scf.for %iteration = [%zero to %three step %one](%prior = %seed64 : f64) -> (f64) {
+      %square = scalar.mulf %prior, %prior : f64
+      %product = scalar.mulf %half_input, %square : f64
+      %correction = scalar.subf %three_halves, %product : f64
+      %next = scalar.mulf %prior, %correction : f64
+      scf.yield %next : f64
+    }
+    scf.for %column = [%zero to %width step %one] {
+      %value = view.load %inputs[%row, %column] : view<[%rows]x[%width]xf32> -> f32
+      %scale = view.load %weights[%column] : view<[%width]xf32> -> f32
+      %wide = scalar.extf %value : f32 to f64
+      %scale64 = scalar.extf %scale : f32 to f64
+      %normalized = scalar.mulf %wide, %inverse : f64
+      %result64 = scalar.mulf %normalized, %scale64 : f64
+      %result = scalar.fptrunc %result64 : f64 to f32
+      scf.if %half {
+        %outputs = buffer.view %output[%output_origin] : buffer -> view<[%rows]x[%stride]xf16>
+        %rounded = scalar.fptrunc %result : f32 to f16
+        view.store %rounded, %outputs[%row, %column] : f16, view<[%rows]x[%stride]xf16>
+      } else {
+        %outputs = buffer.view %output[%output_origin] : buffer -> view<[%rows]x[%stride]xf32>
+        view.store %result, %outputs[%row, %column] : f32, view<[%rows]x[%stride]xf32>
+      }
+    }
+  }
+  func.return
+}
+
+kernel.def target(@rms_wave32) @normalize_1024_f32(%rows: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%rows, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%rows: index, %input_origin: offset, %output_origin: offset, %stride: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer) {
+  %width = index.constant 1024 : index
+  %threads = index.constant 128 : index
+  %half = scalar.constant false : i1
+  %row_value = kernel.workgroup.id<x> : index
+  %row = index.assume %row_value [ge(%row_value, 0), lt(%row_value, %rows)] : index
+  %word = index.constant 4 : offset
+  %output_element = index.constant 4 : offset
+  %input_row_bytes = index.scale %width, %word : index, offset -> offset
+  %output_row_bytes = index.scale %stride, %output_element : index, offset -> offset
+  %input_displacement = index.scale %row, %input_row_bytes : index, offset -> offset
+  %output_displacement = index.scale %row, %output_row_bytes : index, offset -> offset
+  %input_begin = index.add %input_origin, %input_displacement : offset
+  %output_begin = index.add %output_origin, %output_displacement : offset
+  template.apply<@normalization.rms_row_f32>(%width, %threads, %input_begin, %output_begin, %half, %epsilon, %input, %weight, %output) : (index, index, offset, offset, i1, f32, buffer, buffer, buffer)
+  kernel.return
+}
+
+func.def @normalize_1024_f32_reference(%rows: index, %input_origin: offset, %output_origin: offset, %stride: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer) {
+  %width = index.constant 1024 : index
+  %half = scalar.constant false : i1
+  func.call @rms_reference(%rows, %width, %half, %input_origin, %output_origin, %stride, %epsilon, %input, %weight, %output) : (index, index, i1, offset, offset, index, f32, buffer, buffer, buffer)
+  func.return
+}
+
+kernel.def target(@rms_wave32) @normalize_1024_f16(%rows: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%rows, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%rows: index, %input_origin: offset, %output_origin: offset, %stride: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer) {
+  %width = index.constant 1024 : index
+  %threads = index.constant 128 : index
+  %half = scalar.constant true : i1
+  %row_value = kernel.workgroup.id<x> : index
+  %row = index.assume %row_value [ge(%row_value, 0), lt(%row_value, %rows)] : index
+  %word = index.constant 4 : offset
+  %output_element = index.constant 2 : offset
+  %input_row_bytes = index.scale %width, %word : index, offset -> offset
+  %output_row_bytes = index.scale %stride, %output_element : index, offset -> offset
+  %input_displacement = index.scale %row, %input_row_bytes : index, offset -> offset
+  %output_displacement = index.scale %row, %output_row_bytes : index, offset -> offset
+  %input_begin = index.add %input_origin, %input_displacement : offset
+  %output_begin = index.add %output_origin, %output_displacement : offset
+  template.apply<@normalization.rms_row_f32>(%width, %threads, %input_begin, %output_begin, %half, %epsilon, %input, %weight, %output) : (index, index, offset, offset, i1, f32, buffer, buffer, buffer)
+  kernel.return
+}
+
+func.def @normalize_1024_f16_reference(%rows: index, %input_origin: offset, %output_origin: offset, %stride: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer) {
+  %width = index.constant 1024 : index
+  %half = scalar.constant true : i1
+  func.call @rms_reference(%rows, %width, %half, %input_origin, %output_origin, %stride, %epsilon, %input, %weight, %output) : (index, index, i1, offset, offset, index, f32, buffer, buffer, buffer)
+  func.return
+}
+
+kernel.def target(@rms_wave32) @normalize_5120_f32(%rows: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%rows: index, %input_origin: offset, %output_origin: offset, %stride: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer) {
+  %width = index.constant 5120 : index
+  %threads = index.constant 256 : index
+  %half = scalar.constant false : i1
+  %row_value = kernel.workgroup.id<x> : index
+  %row = index.assume %row_value [ge(%row_value, 0), lt(%row_value, %rows)] : index
+  %word = index.constant 4 : offset
+  %output_element = index.constant 4 : offset
+  %input_row_bytes = index.scale %width, %word : index, offset -> offset
+  %output_row_bytes = index.scale %stride, %output_element : index, offset -> offset
+  %input_displacement = index.scale %row, %input_row_bytes : index, offset -> offset
+  %output_displacement = index.scale %row, %output_row_bytes : index, offset -> offset
+  %input_begin = index.add %input_origin, %input_displacement : offset
+  %output_begin = index.add %output_origin, %output_displacement : offset
+  template.apply<@normalization.rms_row_f32>(%width, %threads, %input_begin, %output_begin, %half, %epsilon, %input, %weight, %output) : (index, index, offset, offset, i1, f32, buffer, buffer, buffer)
+  kernel.return
+}
+
+func.def @normalize_5120_f32_reference(%rows: index, %input_origin: offset, %output_origin: offset, %stride: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer) {
+  %width = index.constant 5120 : index
+  %half = scalar.constant false : i1
+  func.call @rms_reference(%rows, %width, %half, %input_origin, %output_origin, %stride, %epsilon, %input, %weight, %output) : (index, index, i1, offset, offset, index, f32, buffer, buffer, buffer)
+  func.return
+}
+
+kernel.def target(@rms_wave32) @normalize_5120_f16(%rows: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%rows: index, %input_origin: offset, %output_origin: offset, %stride: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer) {
+  %width = index.constant 5120 : index
+  %threads = index.constant 256 : index
+  %half = scalar.constant true : i1
+  %row_value = kernel.workgroup.id<x> : index
+  %row = index.assume %row_value [ge(%row_value, 0), lt(%row_value, %rows)] : index
+  %word = index.constant 4 : offset
+  %output_element = index.constant 2 : offset
+  %input_row_bytes = index.scale %width, %word : index, offset -> offset
+  %output_row_bytes = index.scale %stride, %output_element : index, offset -> offset
+  %input_displacement = index.scale %row, %input_row_bytes : index, offset -> offset
+  %output_displacement = index.scale %row, %output_row_bytes : index, offset -> offset
+  %input_begin = index.add %input_origin, %input_displacement : offset
+  %output_begin = index.add %output_origin, %output_displacement : offset
+  template.apply<@normalization.rms_row_f32>(%width, %threads, %input_begin, %output_begin, %half, %epsilon, %input, %weight, %output) : (index, index, offset, offset, i1, f32, buffer, buffer, buffer)
+  kernel.return
+}
+
+func.def @normalize_5120_f16_reference(%rows: index, %input_origin: offset, %output_origin: offset, %stride: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer) {
+  %width = index.constant 5120 : index
+  %half = scalar.constant true : i1
+  func.call @rms_reference(%rows, %width, %half, %input_origin, %output_origin, %stride, %epsilon, %input, %weight, %output) : (index, index, i1, offset, offset, index, f32, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @decode_f32 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %rows = check.literal value(1) : index
+    %input_origin = check.literal value(0) : offset
+    %output_origin = check.literal value(0) : offset
+    %stride = check.literal value(5120) : index
+    %epsilon = check.literal value(9.9999999999999995e-07) : f32
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-2.0 to 2.0) : tensor<5120xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-2.0 to 2.0) : tensor<5120xf32>
+    %output = check.generate.fill value(-99.0) : tensor<5120xf32>
+    check.compare<@normalize_5120_f32, @normalize_5120_f32_reference>[%rows](%rows, %input_origin, %output_origin, %stride, %epsilon, %input, %weight, %output) : [index](index, offset, offset, index, f32, tensor<5120xf32>, tensor<5120xf32>, tensor<5120xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(9.9999999999999995e-07) rtol(9.9999999999999995e-07) nan(different) : tensor<5120xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @prefill_f32 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %rows = check.literal value(16) : index
+    %input_origin = check.literal value(0) : offset
+    %output_origin = check.literal value(0) : offset
+    %stride = check.literal value(5120) : index
+    %epsilon = check.literal value(9.9999999999999995e-07) : f32
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-2.0 to 2.0) : tensor<81920xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-2.0 to 2.0) : tensor<5120xf32>
+    %output = check.generate.fill value(-99.0) : tensor<81920xf32>
+    check.compare<@normalize_5120_f32, @normalize_5120_f32_reference>[%rows](%rows, %input_origin, %output_origin, %stride, %epsilon, %input, %weight, %output) : [index](index, offset, offset, index, f32, tensor<81920xf32>, tensor<5120xf32>, tensor<81920xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(9.9999999999999995e-07) rtol(9.9999999999999995e-07) nan(different) : tensor<81920xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @shifted_f32 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %rows = check.literal value(3) : index
+    %input_origin = check.literal value(32) : offset
+    %output_origin = check.literal value(20496) : offset
+    %stride = check.literal value(10256) : index
+    %epsilon = check.literal value(9.9999999999999995e-07) : f32
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-2.0 to 2.0) : tensor<15368xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-2.0 to 2.0) : tensor<5120xf32>
+    %output = check.generate.fill value(-99.0) : tensor<35892xf32>
+    check.compare<@normalize_5120_f32, @normalize_5120_f32_reference>[%rows](%rows, %input_origin, %output_origin, %stride, %epsilon, %input, %weight, %output) : [index](index, offset, offset, index, f32, tensor<15368xf32>, tensor<5120xf32>, tensor<35892xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(9.9999999999999995e-07) rtol(9.9999999999999995e-07) nan(different) : tensor<35892xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @shifted_f16 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %rows = check.literal value(3) : index
+    %input_origin = check.literal value(32) : offset
+    %output_origin = check.literal value(10256) : offset
+    %stride = check.literal value(10256) : index
+    %epsilon = check.literal value(9.9999999999999995e-07) : f32
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-2.0 to 2.0) : tensor<15368xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-2.0 to 2.0) : tensor<5120xf32>
+    %output = check.generate.fill value(-99.0) : tensor<35896xf16>
+    check.compare<@normalize_5120_f16, @normalize_5120_f16_reference>[%rows](%rows, %input_origin, %output_origin, %stride, %epsilon, %input, %weight, %output) : [index](index, offset, offset, index, f32, tensor<15368xf32>, tensor<5120xf32>, tensor<35896xf16>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(9.9999999999999995e-08) rtol(0.001) nan(different) : tensor<35896xf16>
+    }
+  }
+  check.return
+}
+
+check.scenario public @epsilon_dominated {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %rows = check.literal value(2) : index
+    %input_origin = check.literal value(16) : offset
+    %output_origin = check.literal value(16) : offset
+    %stride = check.literal value(1040) : index
+    %epsilon = check.literal value(9.9999999999999995e-07) : f32
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0000000000000001e-05 to 1.0000000000000001e-05) : tensor<2052xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-2.0 to 2.0) : tensor<1024xf32>
+    %output = check.generate.fill value(-99.0) : tensor<2084xf32>
+    check.compare<@normalize_1024_f32, @normalize_1024_f32_reference>[%rows](%rows, %input_origin, %output_origin, %stride, %epsilon, %input, %weight, %output) : [index](index, offset, offset, index, f32, tensor<2052xf32>, tensor<1024xf32>, tensor<2084xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(9.9999999999999995e-07) rtol(9.9999999999999995e-07) nan(different) : tensor<2084xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @small_f16 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %rows = check.literal value(2) : index
+    %input_origin = check.literal value(16) : offset
+    %output_origin = check.literal value(16) : offset
+    %stride = check.literal value(1040) : index
+    %epsilon = check.literal value(9.9999999999999995e-07) : f32
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-2.0 to 2.0) : tensor<2052xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-2.0 to 2.0) : tensor<1024xf32>
+    %output = check.generate.fill value(-99.0) : tensor<2088xf16>
+    check.compare<@normalize_1024_f16, @normalize_1024_f16_reference>[%rows](%rows, %input_origin, %output_origin, %stride, %epsilon, %input, %weight, %output) : [index](index, offset, offset, index, f32, tensor<2052xf32>, tensor<1024xf32>, tensor<2088xf16>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(9.9999999999999995e-08) rtol(0.001) nan(different) : tensor<2088xf16>
+    }
+  }
+  check.return
+}
+
+check.scenario public @zero_f32 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %rows = check.literal value(1) : index
+    %input_origin = check.literal value(0) : offset
+    %output_origin = check.literal value(0) : offset
+    %stride = check.literal value(5120) : index
+    %epsilon = check.literal value(9.9999999999999995e-07) : f32
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.fill value(0.0) : tensor<5120xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-2.0 to 2.0) : tensor<5120xf32>
+    %output = check.generate.fill value(-99.0) : tensor<5120xf32>
+    check.compare<@normalize_5120_f32, @normalize_5120_f32_reference>[%rows](%rows, %input_origin, %output_origin, %stride, %epsilon, %input, %weight, %output) : [index](index, offset, offset, index, f32, tensor<5120xf32>, tensor<5120xf32>, tensor<5120xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(0.0) rtol(0.0) nan(different) : tensor<5120xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @zero_f16 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %rows = check.literal value(1) : index
+    %input_origin = check.literal value(0) : offset
+    %output_origin = check.literal value(0) : offset
+    %stride = check.literal value(5120) : index
+    %epsilon = check.literal value(9.9999999999999995e-07) : f32
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.fill value(0.0) : tensor<5120xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-2.0 to 2.0) : tensor<5120xf32>
+    %output = check.generate.fill value(-99.0) : tensor<5120xf16>
+    check.compare<@normalize_5120_f16, @normalize_5120_f16_reference>[%rows](%rows, %input_origin, %output_origin, %stride, %epsilon, %input, %weight, %output) : [index](index, offset, offset, index, f32, tensor<5120xf32>, tensor<5120xf32>, tensor<5120xf16>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(0.0) rtol(0.0) nan(different) : tensor<5120xf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@decode_f32> @decode_f32_benchmark
+
+check.benchmark<@prefill_f32> @prefill_f32_benchmark
+
+check.benchmark<@shifted_f16> @shifted_f16_benchmark
+
+check.benchmark<@epsilon_dominated> @epsilon_dominated_benchmark

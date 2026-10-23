@@ -1,4 +1,4 @@
-# Sampling correctness and benchmark workloads
+# Tensor correctness and benchmark workloads
 
 `random.loom` executes the three published
 [Random123 known-answer vectors](https://github.com/DEShawResearch/random123/blob/d8a0c25e49992685c0b9d91b553c1d04f81b6b4b/tests/kat_vectors)
@@ -40,3 +40,13 @@ tail, tied maxima, and merging 61 disjoint partial lists. The complete
 two-dispatch case expects the sixteen lowest IDs among equal winners from
 separate tiles. Its benchmark declarations retain these different input and
 merge shapes rather than reporting one synthetic size.
+
+`rmsnorm.loom` compares retained-row normalization with a sequential F64
+sum of squares and Newton-refined inverse square root. Widths 1024 and 5120,
+workgroups of 128 and 256 threads, and F32/F16 publication exercise distinct
+register-bank and rounding paths. Multiple rows, nonzero input/output byte
+origins, and concatenated output strides retain sentinels outside the live
+rows. Epsilon-dominated and zero inputs cover the normalization denominator.
+F32 results use a `1e-6` absolute and relative bound. F16 comparisons use
+`1e-7 + 0.001 * abs(expected)` because F32 reduction can move a midpoint
+across the final rounding boundary. Zero outputs are checked exactly.

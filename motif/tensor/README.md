@@ -1,4 +1,4 @@
-# Tensor selection and sampling
+# Tensor numerical motifs
 
 `random.loom` supplies stateless Philox4x32-10 and F32 normal-pair templates.
 A caller assigns counter words to request, position, layer, or tensor element
@@ -45,6 +45,20 @@ Equal values choose the lowest unique nonnegative ID. Short tiles fill missing
 winners with negative infinity and `INT_MAX`; valid input logits are finite.
 Inputs and outputs are separate, and the composition owns both launch geometry
 and temporary partial-list storage.
+
+`rmsnorm.loom` computes `x * rsqrt(mean(x*x) + epsilon) * weight` for one
+F32 row per workgroup. A thread retains its four-element packets across the
+reduction, so normalization reads each input once. The caller specializes the
+row width and thread count and supplies byte origins for each input and output
+row. Output is either F32 or rounded directly to F16; an output origin can
+place the result into a larger concatenated row without another copy.
+
+Widths are positive multiples of four times the workgroup size. Input,
+weights, and output do not overlap, and origins support aligned four-element
+accesses. The arithmetic contract requires finite operands, a positive
+normal `mean(x*x) + epsilon`, and finite F32 intermediates. The motif neither
+allocates persistent state nor chooses a target, launch grid, or global
+configuration.
 
 The [checks](test/README.md) use published integer answers, independent
 double-precision random transforms, and serial order-statistic references.
