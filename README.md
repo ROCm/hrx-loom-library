@@ -24,10 +24,9 @@ checkout without Bazel. From this repository root:
 
 ```sh
 MODEL=model/moonshine-ai/moonshine-streaming-tiny
-loom-fetch "$MODEL/model.json" --configuration=streaming --output=../moonshine
-cp "$MODEL/serve.json" ../moonshine/serve.json
+loom-fetch "$MODEL/model.json" --preset=streaming --output=../moonshine
 loom-serve --device=amdgpu --workers=4 --listen=127.0.0.1:8080 \
-  --model=../moonshine/serve.json
+  --model=../moonshine/model.json
 ```
 
 The server JIT compiles the model's checked-in source programs. Acquisition

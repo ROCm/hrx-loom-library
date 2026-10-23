@@ -139,7 +139,7 @@ def loom_library(
 def loom_model(
         name,
         card,
-        configuration,
+        preset,
         model_name,
         files,
         assets = {},
@@ -157,7 +157,7 @@ def loom_model(
     _loom_model(
         name = name,
         card = card,
-        configuration = configuration,
+        preset = preset,
         model_name = model_name,
         files = files,
         assets = assets,

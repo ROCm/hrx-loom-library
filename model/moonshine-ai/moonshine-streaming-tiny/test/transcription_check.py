@@ -2,10 +2,11 @@
 # Copyright 2026 AMD ROCm™ Software
 # SPDX-License-Identifier: MIT
 
-"""Checks an installed Moonshine deployment against an independent PCM oracle.
+"""Checks an installed Moonshine model against an independent PCM oracle.
 
-The caller supplies a fetched deployment outside the Bazel payload graph. Each
-invocation owns a fresh server and retains its diagnostics in a new directory.
+The caller supplies a fetched card or serving deployment outside the Bazel
+payload graph. Each invocation owns a fresh server and retains its diagnostics
+in a new directory.
 """
 
 import argparse
@@ -53,7 +54,7 @@ def transcribe(address, model, audio, content_type):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=Path, required=True)
-    parser.add_argument("--deployment", type=Path, required=True)
+    parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--device", required=True)
@@ -67,10 +68,14 @@ def main():
         raise AssertionError(f"oracle input digest differs: {digest}")
     if len(audio) != reference["audio"]["byte_length"]:
         raise AssertionError(f"oracle input byte length differs: {len(audio)}")
-    deployment = args.deployment.absolute()
-    document = json.loads(deployment.read_text(encoding="utf-8"))
-    model_name = document["name"]
-    card = deployment.parent / document["model"]["path"]
+    model = args.model.absolute()
+    document = json.loads(model.read_text(encoding="utf-8"))
+    if "schema_version" in document:
+        model_name = document["model"]["id"]
+        card = model
+    else:
+        model_name = document["name"]
+        card = model.parent / document["model"]["path"]
     assets = {}
     for name, path in (
         ("weights_sha256", "asset/model.safetensors"),
@@ -89,7 +94,7 @@ def main():
     with running_server(
         [
             str(args.server.absolute()),
-            f"--model={deployment}",
+            f"--model={model}",
             f"--device={args.device}",
             "--workers=4",
             "--listen=127.0.0.1:0",
@@ -109,7 +114,7 @@ def main():
             raise AssertionError(f"expected {expected!r}, received {actual!r}")
     # A successful transcript is published only after server retirement joins.
     result = {
-        "deployment": str(deployment),
+        "model": str(model),
         "device": args.device,
         "audio_sha256": digest,
         **assets,

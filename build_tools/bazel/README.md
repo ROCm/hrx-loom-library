@@ -17,7 +17,7 @@ owned by this repository:
   source verification, lint, strict linking, and relocatable bytecode to HRX,
   and applies the model source policy without requiring host/control programs
   to masquerade as individually benchmarkable kernels.
-- `loom_model` is confined to `model/` and selects a card configuration with an
+- `loom_model` is confined to `model/` and selects a card preset with an
   exact mapping of providers and their auxiliary compiler inputs. Runtime
   parameter and tokenizer files retain their acquisition descriptors for
   `loom-fetch`; small fixtures may instead be supplied as declared assets.

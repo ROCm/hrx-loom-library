@@ -28,7 +28,7 @@ benchmark scenarios, and the build workflow.
 ## Generated model references
 
 Each card produces a standalone Markdown reference combining its authored
-overview with compatible choices, canonical configurations, effective JIT
+overview with compatible choices, canonical presets, effective JIT
 settings, scoped parameter shards, tokenizers, and exact source locations
 beside local destination names:
 
@@ -52,7 +52,7 @@ dependency and relocatable bytecode behavior; lower-level libraries remain
 separate linker inputs. Text sources receive formatting, lint, and model-layer
 policy checks. Bytecode is supported through the same public rule.
 
-A `loom_model` declaration selects one card configuration and maps its exact
+A `loom_model` declaration selects one card preset and maps its exact
 providers through `files` and importer auxiliary files through `data`. It emits
 `model.json` and a separate `serve.json` in the authored relative namespace.
 Source, bytecode, and mixed providers use the same native service. Physical

@@ -6,7 +6,7 @@ independent execution checks from a library checkout.
 
 Running the default source model with installed `loom-fetch` and `loom-serve`
 requires no Bazel build. The checked-in `model.json.lock` covers that source
-selection, and `serve.json` can be copied beside the fetched card. Follow the
+selection. Serve the fetched `model.json` directly. Follow the
 overview for this user workflow; the commands below are for model development.
 
 ## Provider builds
@@ -33,7 +33,7 @@ is a Bazel repository, action input, output, or runfile.
 | `mixed` | Loom text | Loom bytecode |
 
 Each target emits `model.json` and a separate `serve.json` selecting the served
-name and configuration. The source card supplies the exact provider closure;
+name and preset. The source card supplies the exact provider closure;
 changing its representation does not change learned parameters or state layout.
 
 Generate a standalone reference without acquiring runtime assets:
@@ -58,9 +58,8 @@ INSTALL="$PWD/.reports/model/moonshine/$REPRESENTATION"
 LOCK="$PWD/.reports/model/moonshine/$REPRESENTATION.lock.json"
 mkdir -p "$PWD/.reports/model/moonshine"
 
-loom-fetch "$PROGRAMS/model.json" --configuration=streaming \
+loom-fetch "$PROGRAMS/model.json" --preset=streaming \
   --offline --update-lock --lockfile="$LOCK" --output="$INSTALL"
-cp "$PROGRAMS/serve.json" "$INSTALL/serve.json"
 ```
 
 The explicit lock lives outside `bazel-bin`; acquisition never writes beside a
@@ -71,8 +70,7 @@ development inputs; subsequent fetches use the same `--lockfile` without `--upda
 check those identities. The installed `model.json` is published only after all
 selected files have been acquired successfully. Default shared materialization
 reuses cache files rather than making one weight copy per provider choice.
-The small deployment file is copied beside that installed card so its relative
-`model.json` reference resolves to the acquired files, not the code-only build.
+The installed card serves directly; its model ID is the request selector.
 Use `archive` and `mixed` to install the other representations independently.
 
 ## Checks
@@ -91,7 +89,7 @@ ambient weights. After the preceding fetch, run:
 ```sh
 bazel run --config=amdgpu \
   //model/moonshine-ai/moonshine-streaming-tiny/test:transcription_check -- \
-  --deployment="$INSTALL/serve.json" --device=amdgpu \
+  --model="$INSTALL/model.json" --device=amdgpu \
   --output="$PWD/.reports/model/moonshine/check-$REPRESENTATION"
 ```
 

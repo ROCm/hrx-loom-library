@@ -22,8 +22,7 @@ Bazel is not required for this workflow:
 ```sh
 git clone https://github.com/ROCm/hrx-loom-library.git
 MODEL=hrx-loom-library/model/moonshine-ai/moonshine-streaming-tiny
-loom-fetch "$MODEL/model.json" --configuration=streaming --output=./moonshine
-cp "$MODEL/serve.json" ./moonshine/serve.json
+loom-fetch "$MODEL/model.json" --preset=streaming --output=./moonshine
 ```
 
 The checked-in lock covers the default `source` program set. Bytecode and mixed
@@ -35,27 +34,17 @@ Hugging Face acquisition uses the optional `hf` SDK extra; install it in the
 same Python environment as `loom-fetch` when requested. The resulting
 `moonshine/model.json` describes local files and needs no network access to run.
 
-The copied `moonshine/serve.json` is a separate host configuration. For a card
-acquired by URL, create that file with the same contents:
-
-```json
-{
-  "name": "moonshine-streaming-tiny",
-  "model": {
-    "path": "model.json",
-    "configuration": "streaming"
-  },
-  "definition": {
-    "kind": "recognition"
-  }
-}
-```
+The fetched card retains the selected preset, so it can be passed directly to
+`loom-serve`. Requests use the card's model ID,
+`moonshine-ai/moonshine-streaming-tiny`. A separate serving document is useful
+for a custom routing alias, device placement, or execution overrides, but is
+not needed for this setup.
 
 Start a server with an available AMDGPU device:
 
 ```sh
 loom-serve --device=amdgpu --workers=4 --listen=127.0.0.1:8080 \
-  --model=./moonshine/serve.json
+  --model=./moonshine/model.json
 ```
 
 Send 16 kHz mono signed little-endian PCM16 audio:
@@ -63,7 +52,7 @@ Send 16 kHz mono signed little-endian PCM16 audio:
 ```sh
 curl --fail-with-body -H 'Expect:' \
   http://127.0.0.1:8080/v1/audio/transcriptions \
-  -F model=moonshine-streaming-tiny \
+  -F model=moonshine-ai/moonshine-streaming-tiny \
   -F 'file=@recording.pcm;headers="Content-Type: audio/pcm;rate=16000;channels=1"'
 ```
 
