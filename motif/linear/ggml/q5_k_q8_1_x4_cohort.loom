@@ -1,0 +1,114 @@
+// Q5_K cohorts over Q8_1 x4 activations.
+//
+// ggml_linear_q5k_q8_1_cohort accepts a compile-time row-bank extent,
+// weight_channels=1 for raw rows or 8 for complete interleaved groups,
+// K and N, and disjoint activation/weight/output buffers. K is 256..32768,
+// divisible by 256; N is 1..262144, divisible by eight for channel8.
+// Storage is rows*K/128*144 activation bytes, N*K/256*176 weight bytes,
+// and rows*N F32 outputs. Rows must be positive and known at specialization.
+//
+// One subgroup owns a channel and retains one accumulator per row. Sixteen
+// lanes split each weight block into half-group packets, decoded once before
+// all activation rows consume them. The caller supplies a whole number of
+// 32- or 64-lane subgroups per X workgroup and ceil(N/subgroups) workgroups.
+// Y and Z are one. Missing blocks and channels are masked before loads.
+
+func.decl @ggml_q8_1_x4_chunk16(%input: buffer, %row: offset, %block: index, %half: index) -> (vector<16xi8>, f32, f32)
+
+func.decl @ggml_q5_k_load_chunk16(%weight: buffer, %row: offset, %block: index, %group: index, %half: index) -> (vector<16xi8>, f32, f32)
+
+template.decl @ggml.qk.unsigned_q8_1_dot(%weights: vector<16xi8>, %scale: f32, %minimum: f32, %values: vector<16xi8>, %d: f32, %s: f32) -> (f32)
+
+func.def public inline @ggml_linear_q5k_q8_1_cohort(%rows: index, %weight_channels: index, %inputs0: index, %outputs0: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %input_noalias, %weight_noalias, %output_noalias = buffer.assume.noalias %input, %weight, %output : buffer, buffer, buffer
+  %inputs = index.assume %inputs0 [range(%inputs0, 256, 32768), multiple_of(%inputs0, 256)] : index
+  %outputs = index.assume %outputs0 [range(%outputs0, 1, 262144)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %block_values = index.constant 256 : index
+  %q8_values = index.constant 128 : index
+  %q5_bytes = index.constant 176 : offset
+  %q8_bytes = index.constant 144 : offset
+  %f32_bytes = index.constant 4 : offset
+  %initial_accumulators = vector.constant 0.0 : vector<[%rows]xf32>
+  %group = kernel.workgroup.id<x> : index
+  %subgroup = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %width = target.subgroup.size : index
+  %workgroup_size = kernel.workgroup.size<x> : index
+  %channels_per_group = index.div %workgroup_size, %width : index
+  %channel_base = index.mul %group, %channels_per_group : index
+  %channel0 = index.add %channel_base, %subgroup : index
+  %valid = index.cmp ult, %channel0, %outputs : index
+  %partials = scf.if %valid -> (vector<[%rows]xf32>) {
+    %channel = index.assume %channel0 [lt(%channel0, %outputs)] : index
+    %blocks = index.div %inputs, %block_values : index
+    %weight_row_bytes = index.scale %blocks, %q5_bytes : index, offset -> offset
+    %weight_group_bytes = index.scale %weight_channels, %weight_row_bytes : index, offset -> offset
+    %weight_group = index.div %channel, %weight_channels : index
+    %weight_channel = index.rem %channel, %weight_channels : index
+    %weight_group_origin = index.scale %weight_group, %weight_group_bytes : index, offset -> offset
+    %weight_channel_add = index.scale %weight_channel, %q5_bytes : index, offset -> offset
+    %weight_origin = index.add %weight_group_origin, %weight_channel_add : offset
+    %weight_block_stride = index.scale %weight_channels, %q5_bytes : index, offset -> offset
+    %input_groups = index.div %inputs, %q8_values : index
+    %input_stride = index.scale %input_groups, %q8_bytes : index, offset -> offset
+    %blocks_per_iteration = index.div %width, %c16 : index
+    %padding = index.sub %blocks_per_iteration, %c1 : index
+    %padded_blocks = index.add %blocks, %padding : index
+    %iterations = index.div %padded_blocks, %blocks_per_iteration : index
+    %lane_block = index.div %lane, %c16 : index
+    %group0 = index.div %lane, %c2 : index
+    %scale_group = index.rem %group0, %c8 : index
+    %half = index.rem %lane, %c2 : index
+    %q8_groups_per_iteration = index.div %width, %c8 : index
+    %lane_q8_group = index.div %lane, %c8 : index
+    %q8_inner = index.rem %group0, %c4 : index
+    %sums = scf.for %iteration = [%c0 to %iterations step %c1](%bank = %initial_accumulators : vector<[%rows]xf32>) -> (vector<[%rows]xf32>) {
+      %block_base = index.mul %iteration, %blocks_per_iteration : index
+      %block = index.add %block_base, %lane_block : index
+      %active = index.cmp ult, %block, %blocks : index
+      %next = scf.if %active -> (vector<[%rows]xf32>) {
+        %block_add = index.scale %block, %weight_block_stride : index, offset -> offset
+        %origin = index.add %weight_origin, %block_add : offset
+        %codes, %scale, %minimum = func.call @ggml_q5_k_load_chunk16(%weight_noalias, %origin, %c0, %scale_group, %half) : (buffer, offset, index, index, index) -> (vector<16xi8>, f32, f32)
+        %q8_group_base = index.mul %iteration, %q8_groups_per_iteration : index
+        %q8_group = index.add %q8_group_base, %lane_q8_group : index
+        %q8_block = index.madd %q8_group, %c4, %q8_inner : index
+        %updated = scf.for %row = [%c0 to %rows step %c1](%values = %bank : vector<[%rows]xf32>) -> (vector<[%rows]xf32>) unroll {
+          %input_origin = index.scale %row, %input_stride : index, offset -> offset
+          %quantized, %d, %s = func.call @ggml_q8_1_x4_chunk16(%input_noalias, %input_origin, %q8_block, %half) : (buffer, offset, index, index) -> (vector<16xi8>, f32, f32)
+          %dot = template.apply<@ggml.qk.unsigned_q8_1_dot>(%codes, %scale, %minimum, %quantized, %d, %s) : (vector<16xi8>, f32, f32, vector<16xi8>, f32, f32) -> (f32)
+          %prior = vector.extract %values[%row] : vector<[%rows]xf32> -> f32
+          %sum = scalar.addf<reassoc|nnan|ninf|nsz> %prior, %dot : f32
+          %result = vector.insert %sum into %values[%row] : f32, vector<[%rows]xf32>
+          scf.yield %result : vector<[%rows]xf32>
+        }
+        scf.yield %updated : vector<[%rows]xf32>
+      } else {
+        scf.yield %bank : vector<[%rows]xf32>
+      }
+      scf.yield %next : vector<[%rows]xf32>
+    }
+    scf.yield %sums : vector<[%rows]xf32>
+  } else {
+    scf.yield %initial_accumulators : vector<[%rows]xf32>
+  }
+  %leader = index.cmp eq, %lane, %c0 : index
+  %write = scalar.andi %leader, %valid : i1
+  %output_stride = index.scale %outputs, %f32_bytes : index, offset -> offset
+  scf.for %row = [%c0 to %rows step %c1] unroll {
+    %partial = vector.extract %partials[%row] : vector<[%rows]xf32> -> f32
+    %value = kernel.subgroup.reduce<addf> %partial : f32
+    scf.if %write {
+      %origin = index.scale %row, %output_stride : index, offset -> offset
+      %view = buffer.view %output_noalias[%origin] : buffer -> view<[%outputs]xf32>
+      view.store %value, %view[%channel0] : f32, view<[%outputs]xf32>
+    }
+  }
+  func.return
+}

@@ -12,7 +12,9 @@ owned by this repository:
   the normal format, planning, final-product compilation, and execution checks.
 - `loom_test` is confined to explicit `test/` packages and delegates to HRX's
   root-owned linked test module. Test leaves require one execution profile but
-  do not manufacture standalone target products.
+  do not manufacture standalone target products. `configs` and named `variants`
+  use the public workload-selection contract, so one source module can qualify
+  each specialization with independent cached execution results.
 - `loom_library` is confined to production `model/` packages. It delegates
   source verification, lint, strict linking, and relocatable bytecode to HRX,
   and applies the model source policy without requiring host/control programs

@@ -34,6 +34,16 @@ on wave64. One subgroup reduces an output channel, masking absent blocks and
 tail channels before reads. The launch can dispatch fewer token rows than
 the supplied buffer capacity without touching the remaining rows.
 
+Cohort forms accept a row-bank extent fixed by model composition before JIT.
+Q5 raw/channel8 schedules decode each weight packet before applying it to all
+rows. Q6 Q8 schedules support 16 or 32 lanes per block, and Q6 F32 schedules
+share activation packets across paired output channels. Each retains separate
+row accumulators before advancing K. Their private model-shaped leaves and
+independent CPU references live in
+[`kernel/ggml/linear/test`](../../../kernel/ggml/linear/test/), where named row
+specializations execute both subgroup widths. The motifs carry no global
+configuration or concrete target records.
+
 These are reusable Loom schedules, qualified for correctness through the
 [`linear` kernels](../../../kernel/ggml/linear/). The native tests establish
 packed-byte semantics, addressing, and numerical results; they do not establish

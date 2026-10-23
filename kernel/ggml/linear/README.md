@@ -39,7 +39,7 @@ process exactly four rows with separate accumulators.
 The three Q6 kernel libraries compile their providers independently, so each
 resulting device binary has unique export names. Their adjacent test sources
 check all six implementations against the private CPU scalar-byte decoder in
-`q6_k_reference.loom`, with F64 accumulation. One-, three-, and five-block
+`test/reference.loom`, with F64 accumulation. One-, three-, and five-block
 workloads exercise incomplete subgroup iterations, one-channel outputs, and
 odd channel tails.
 Random data covers signed six-bit values, signed group scales, zero and signed
