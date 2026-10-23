@@ -35,6 +35,13 @@ and zero/all-one carriers exercise metadata bit planes and code extrema;
 generated F16 headers include zero and signed coefficients. Sentinel regions
 and unchanged-input comparisons cover the storage boundary.
 
+`q5_1.loom` checks the buffered carrier loader and both retained half
+decoders against independent scalar bytes. Walking high-plane bits and
+ordered low nibbles cover every code position; random and repeated
+carriers exercise the same path. Independent signed F16 scale/minimum
+pairs, differently aligned rows, complete output guards, and immutable
+inputs preserve the record and storage contracts.
+
 `q6_buffer.loom` independently reconstructs logical Q6_K elements from
 individual bytes and applies signed scales in F64 before F16 publication.
 Alternating word alignment, negative and zero factors, every group/packet,

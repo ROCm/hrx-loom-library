@@ -32,6 +32,12 @@ low-word loads. These forms read only the requested physical packets and
 leave coefficient application to the contraction, preserving reuse across
 activation rows.
 
+Q5_1 loads its 24-byte record into retained nibble pairs, one high-bit word,
+and independent F32 scale and minimum. A separate half-block decoder consumes
+those carriers, including carriers already staged in shared memory. Both
+16-value halves can reuse the original header across several activation
+rows; consumers own the affine arithmetic and its rounding boundaries.
+
 Q6_K offers signed carrier unpacking and a buffered four-value F16 reader
 for matrix staging. It handles the format's alternating word alignment
 across 210-byte blocks. Q8_1 x4 readers expose a full 32-value block, a
