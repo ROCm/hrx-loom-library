@@ -1,0 +1,159 @@
+// Four-code packets retained by matrix staging lanes.
+// Every Q4 nibble and Q5 high-plane selector is checked against scalar byte
+// decoding. Each input word is tested under all eight selectors without a
+// complete quantized record; output guards and source bytes remain unchanged.
+
+func.decl @ggml_q4_k_unpack_codes4(%low: vector<1xi32>, %nibble: index) -> (vector<4xi8>)
+
+func.decl @ggml_q5_k_unpack_codes4(%low: vector<1xi32>, %high: vector<1xi32>, %group: index) -> (vector<4xi8>)
+
+kernel.def @unpack_packets() {
+  %unit = index.constant 1 : index
+  %groups = index.constant 8 : index
+  %packets = index.constant 64 : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%packets, %unit, %unit) : index
+} launch(%low_input: buffer, %high_input: buffer, %q4_output: buffer, %q5_output: buffer) {
+  %origin = index.constant 0 : offset
+  %pair = index.constant 2 : index
+  %width = index.constant 4 : index
+  %group = kernel.workgroup.id<x> : index
+  %packet = kernel.workitem.id<x> : index
+  %nibble = index.rem %group, %pair : index
+  %element = index.mul %packet, %width : index
+  %low_view = buffer.view %low_input[%origin] : buffer -> view<64xi32>
+  %high_view = buffer.view %high_input[%origin] : buffer -> view<64xi32>
+  %q4_view = buffer.view %q4_output[%origin] : buffer -> view<8x256xi8>
+  %q5_view = buffer.view %q5_output[%origin] : buffer -> view<8x256xi8>
+  %low = vector.load %low_view[%packet] : view<64xi32> -> vector<1xi32>
+  %high = vector.load %high_view[%packet] : view<64xi32> -> vector<1xi32>
+  %q4 = func.call @ggml_q4_k_unpack_codes4(%low, %nibble) : (vector<1xi32>, index) -> (vector<4xi8>)
+  %q5 = func.call @ggml_q5_k_unpack_codes4(%low, %high, %group) : (vector<1xi32>, vector<1xi32>, index) -> (vector<4xi8>)
+  vector.store %q4, %q4_view[%group, %element] : vector<4xi8>, view<8x256xi8>
+  vector.store %q5, %q5_view[%group, %element] : vector<4xi8>, view<8x256xi8>
+  kernel.return
+}
+
+func.def @reference(%low_input: buffer, %high_input: buffer, %q4_output: buffer, %q5_output: buffer) {
+  %origin = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %pair = index.constant 2 : index
+  %groups = index.constant 8 : index
+  %elements = index.constant 256 : index
+  %nibble_width = scalar.constant 4 : i32
+  %nibble_mask = scalar.constant 15 : i32
+  %bit_mask = scalar.constant 1 : i32
+  %low = buffer.view %low_input[%origin] : buffer -> view<256xi8>
+  %high = buffer.view %high_input[%origin] : buffer -> view<256xi8>
+  %q4 = buffer.view %q4_output[%origin] : buffer -> view<8x256xi8>
+  %q5 = buffer.view %q5_output[%origin] : buffer -> view<8x256xi8>
+  scf.for %group = [%begin to %groups step %step] {
+    %nibble = index.rem %group, %pair : index
+    %nibble_integer = index.cast %nibble : index to i32
+    %shift = scalar.muli %nibble_integer, %nibble_width : i32
+    %high_shift = index.cast %group : index to i32
+    scf.for %element = [%begin to %elements step %step] {
+      %low_byte = view.load %low[%element] : view<256xi8> -> i8
+      %high_byte = view.load %high[%element] : view<256xi8> -> i8
+      %low_integer = scalar.extui %low_byte : i8 to i32
+      %high_integer = scalar.extui %high_byte : i8 to i32
+      %selected_low = scalar.shrui %low_integer, %shift : i32
+      %low_code = scalar.andi %selected_low, %nibble_mask : i32
+      %selected_high = scalar.shrui %high_integer, %high_shift : i32
+      %high_bit = scalar.andi %selected_high, %bit_mask : i32
+      %high_code = scalar.shli %high_bit, %nibble_width : i32
+      %combined = scalar.ori %low_code, %high_code : i32
+      %q4_value = scalar.trunci %low_code : i32 to i8
+      %q5_value = scalar.trunci %combined : i32 to i8
+      view.store %q4_value, %q4[%group, %element] : i8, view<8x256xi8>
+      view.store %q5_value, %q5[%group, %element] : i8, view<8x256xi8>
+    }
+  }
+  func.return
+}
+
+check.scenario public @random_packets_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %low_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %high_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %low = check.generate.random.uniform seed(%low_seed) range(-128 to 127) : tensor<256xi8>
+    %high = check.generate.random.uniform seed(%high_seed) range(-128 to 127) : tensor<256xi8>
+    %q4_storage = check.generate.fill value(-1) : tensor<2064xi8>
+    %q5_storage = check.generate.fill value(-1) : tensor<2064xi8>
+    %q4 = check.tensor.view %q4_storage offset(8) : tensor<2064xi8> -> tensor<8x256xi8>
+    %q5 = check.tensor.view %q5_storage offset(8) : tensor<2064xi8> -> tensor<8x256xi8>
+    check.compare<@unpack_packets, @reference>(%low, %high, %q4, %q5) : (tensor<256xi8>, tensor<256xi8>, tensor<8x256xi8>, tensor<8x256xi8>) -> () {
+      check.expect.bitwise actual(%q4_storage) expected(%q4_storage) : tensor<2064xi8>
+      check.expect.bitwise actual(%q5_storage) expected(%q5_storage) : tensor<2064xi8>
+      check.expect.bitwise actual(%low) expected(%low) : tensor<256xi8>
+      check.expect.bitwise actual(%high) expected(%high) : tensor<256xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@random_packets_case> @independent_packets
+
+check.scenario public @byte_order_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %low = check.generate.iota offset(-128) step(1) : tensor<256xi8>
+    %high = check.generate.iota offset(127) step(-1) : tensor<256xi8>
+    %q4_storage = check.generate.fill value(-1) : tensor<2064xi8>
+    %q5_storage = check.generate.fill value(-1) : tensor<2064xi8>
+    %q4 = check.tensor.view %q4_storage offset(8) : tensor<2064xi8> -> tensor<8x256xi8>
+    %q5 = check.tensor.view %q5_storage offset(8) : tensor<2064xi8> -> tensor<8x256xi8>
+    check.compare<@unpack_packets, @reference>(%low, %high, %q4, %q5) : (tensor<256xi8>, tensor<256xi8>, tensor<8x256xi8>, tensor<8x256xi8>) -> () {
+      check.expect.bitwise actual(%q4_storage) expected(%q4_storage) : tensor<2064xi8>
+      check.expect.bitwise actual(%q5_storage) expected(%q5_storage) : tensor<2064xi8>
+      check.expect.bitwise actual(%low) expected(%low) : tensor<256xi8>
+      check.expect.bitwise actual(%high) expected(%high) : tensor<256xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@byte_order_case> @ordered_packets
+
+check.scenario public @zero_codes_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %low = check.generate.fill value(0) : tensor<256xi8>
+    %high = check.generate.fill value(0) : tensor<256xi8>
+    %q4_storage = check.generate.fill value(-1) : tensor<2064xi8>
+    %q5_storage = check.generate.fill value(-1) : tensor<2064xi8>
+    %q4 = check.tensor.view %q4_storage offset(8) : tensor<2064xi8> -> tensor<8x256xi8>
+    %q5 = check.tensor.view %q5_storage offset(8) : tensor<2064xi8> -> tensor<8x256xi8>
+    check.compare<@unpack_packets, @reference>(%low, %high, %q4, %q5) : (tensor<256xi8>, tensor<256xi8>, tensor<8x256xi8>, tensor<8x256xi8>) -> () {
+      check.expect.bitwise actual(%q4_storage) expected(%q4_storage) : tensor<2064xi8>
+      check.expect.bitwise actual(%q5_storage) expected(%q5_storage) : tensor<2064xi8>
+      check.expect.bitwise actual(%low) expected(%low) : tensor<256xi8>
+      check.expect.bitwise actual(%high) expected(%high) : tensor<256xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@zero_codes_case> @zero_packets
+
+check.scenario public @maximum_codes_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %low = check.generate.fill value(-1) : tensor<256xi8>
+    %high = check.generate.fill value(-1) : tensor<256xi8>
+    %q4_storage = check.generate.fill value(-1) : tensor<2064xi8>
+    %q5_storage = check.generate.fill value(-1) : tensor<2064xi8>
+    %q4 = check.tensor.view %q4_storage offset(8) : tensor<2064xi8> -> tensor<8x256xi8>
+    %q5 = check.tensor.view %q5_storage offset(8) : tensor<2064xi8> -> tensor<8x256xi8>
+    check.compare<@unpack_packets, @reference>(%low, %high, %q4, %q5) : (tensor<256xi8>, tensor<256xi8>, tensor<8x256xi8>, tensor<8x256xi8>) -> () {
+      check.expect.bitwise actual(%q4_storage) expected(%q4_storage) : tensor<2064xi8>
+      check.expect.bitwise actual(%q5_storage) expected(%q5_storage) : tensor<2064xi8>
+      check.expect.bitwise actual(%low) expected(%low) : tensor<256xi8>
+      check.expect.bitwise actual(%high) expected(%high) : tensor<256xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@maximum_codes_case> @maximum_packets

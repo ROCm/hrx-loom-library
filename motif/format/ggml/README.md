@@ -25,9 +25,12 @@ source-less aggregate cannot masquerade as a re-exporting archive.
 Q4_K and Q5_K share one affine metadata interpretation. A retained 16-byte
 header can supply coefficients for several groups, while buffer accessors
 load a selected half-group from an explicit row origin and block ordinal.
-Q4_K also exposes the four-code packet used by matrix staging. These forms
-read only the requested physical packets and leave coefficient application
-to the contraction, preserving reuse across activation rows.
+Both formats decode four-code carrier words directly; their sixteen-code
+readers compose that same interpretation over four retained words. Matrix
+staging can therefore retain and reuse a high-plane word independently of
+low-word loads. These forms read only the requested physical packets and
+leave coefficient application to the contraction, preserving reuse across
+activation rows.
 
 Q6_K offers signed carrier unpacking and a buffered four-value F16 reader
 for matrix staging. It handles the format's alternating word alignment

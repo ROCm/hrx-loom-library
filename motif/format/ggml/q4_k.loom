@@ -12,18 +12,36 @@
 // packets; buffer accessors add explicit row/block addressing and affine
 // coefficients. Callers retain control of memory placement, packet reuse,
 // floating-point materialization, contraction, and launch geometry.
-// Selects one nibble plane from 16 consecutive packed-code bytes. `nibble` is
+// Selects one nibble plane from four consecutive packed-code bytes. `nibble` is
 // zero for the low plane and one for the high plane.
-func.def public inline @ggml_q4_k_unpack_codes16(%packed_codes: vector<4xi32>, %nibble: index) -> (vector<16xi8>) {
+func.def public inline @ggml_q4_k_unpack_codes4(%packed_codes: vector<1xi32>, %nibble: index) -> (vector<4xi8>) {
   %bounded_nibble = index.assume %nibble [range(%nibble, 0, 1)] : index
   %c4 = index.constant 4 : index
-  %nibble_mask = vector.constant 252645135 : vector<4xi32>
+  %nibble_mask = vector.constant 252645135 : vector<1xi32>
   %shift_index = index.mul %bounded_nibble, %c4 : index
   %shift_i32 = index.cast %shift_index : index to i32
-  %shift = vector.splat %shift_i32 : vector<4xi32>
-  %shifted_codes = vector.shrui %packed_codes, %shift : vector<4xi32>
-  %masked_codes = vector.andi %shifted_codes, %nibble_mask : vector<4xi32>
-  %codes = vector.bitcast %masked_codes : vector<4xi32> to vector<16xi8>
+  %shift = vector.splat %shift_i32 : vector<1xi32>
+  %shifted_codes = vector.shrui %packed_codes, %shift : vector<1xi32>
+  %masked_codes = vector.andi %shifted_codes, %nibble_mask : vector<1xi32>
+  %codes = vector.bitcast %masked_codes : vector<1xi32> to vector<4xi8>
+  func.return %codes : vector<4xi8>
+}
+
+// Applies the same four-code carrier interpretation to four retained words.
+func.def public inline @ggml_q4_k_unpack_codes16(%packed_codes: vector<4xi32>, %nibble: index) -> (vector<16xi8>) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %words = index.constant 4 : index
+  %initial = vector.constant 0 : vector<4xi32>
+  %unpacked = scf.for %word = [%begin to %words step %step](%current = %initial : vector<4xi32>) -> (vector<4xi32>) unroll {
+    %low = vector.slice %packed_codes[%word] : vector<4xi32> -> vector<1xi32>
+    %codes = func.call @ggml_q4_k_unpack_codes4(%low, %nibble) : (vector<1xi32>, index) -> (vector<4xi8>)
+    %packed = vector.bitcast %codes : vector<4xi8> to vector<1xi32>
+    %value = vector.extract %packed[0] : vector<1xi32> -> i32
+    %next = vector.insert %value into %current[%word] : i32, vector<4xi32>
+    scf.yield %next : vector<4xi32>
+  }
+  %codes = vector.bitcast %unpacked : vector<4xi32> to vector<16xi8>
   func.return %codes : vector<16xi8>
 }
 
@@ -103,7 +121,6 @@ func.def public inline @ggml_q4_k_load_codes4(%weight: buffer, %row_origin: offs
   %group = index.assume %group_value [range(%group_value, 0, 7)] : index
   %packet = index.assume %packet_value [range(%packet_value, 0, 7)] : index
   %groups_per_page = index.constant 2 : index
-  %bits_per_code = index.constant 4 : index
   %words_per_page = index.constant 8 : index
   %block_bytes = index.constant 144 : offset
   %header_bytes = index.constant 16 : offset
@@ -113,15 +130,9 @@ func.def public inline @ggml_q4_k_load_codes4(%weight: buffer, %row_origin: offs
   %page = index.div %group, %groups_per_page : index
   %word = index.madd %page, %words_per_page, %packet : index
   %nibble = index.rem %group, %groups_per_page : index
-  %shift_index = index.mul %nibble, %bits_per_code : index
-  %shift_word = index.cast %shift_index : index to i32
-  %shift = vector.splat %shift_word : vector<1xi32>
-  %mask = vector.constant 252645135 : vector<1xi32>
   %words = buffer.view %weight[%payload_origin] : buffer -> view<32xi32>
   %packed = vector.load %words[%word] : view<32xi32> -> vector<1xi32>
-  %shifted = vector.shrui %packed, %shift : vector<1xi32>
-  %codes = vector.andi %shifted, %mask : vector<1xi32>
-  %bytes = vector.bitcast %codes : vector<1xi32> to vector<4xi8>
+  %bytes = func.call @ggml_q4_k_unpack_codes4(%packed, %nibble) : (vector<1xi32>, index) -> (vector<4xi8>)
   %values = vector.uitofp %bytes : vector<4xi8> to vector<4xf32>
   func.return %values : vector<4xf32>
 }

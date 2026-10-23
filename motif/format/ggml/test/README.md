@@ -14,6 +14,12 @@ exercise target lowering and memory access, while the same authored cases can
 serve as deterministic reference programs on targets that implement their
 vector operations.
 
+`affine_packets.loom` checks the four-code Q4_K and Q5_K carrier readers
+against independent scalar byte decoding. All eight group selectors consume
+random, ordered, zero, and all-one packets. Full output storage comparisons
+include guard bytes and source immutability. The sixteen-code readers compose
+these same word-sized operations and retain their record-level coverage.
+
 `affine_buffers.loom` checks the Q4_K and Q5_K buffer accessors against a
 scalar byte-by-byte reference with F64 coefficient evaluation. Six complete
 blocks span two padded rows with nonzero input and output origins. All
