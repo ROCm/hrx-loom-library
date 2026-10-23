@@ -1,0 +1,37 @@
+# Qwen3.8 sequence layout
+
+The dense Qwen3.8 and Flash-Next programs share these sequence carriers while
+retaining their own numerical kernels, preparation, and scheduling. Functions
+consume validated, caller-owned storage and preserve the original public
+`qwen38_*` linking vocabulary. They allocate nothing and choose no target or
+configuration.
+
+`input.loom` reads and updates contiguous token IDs or the ID field of an
+eight-word media record. The composition supplies the layout choice. Media
+records retain temporal, height, and width coordinates in words 2–4; the
+32 rotary pairs interleave those axes with counts 11, 11, and 10, and both
+halves use the same coordinate. Position lookup accepts records 0–511 and
+lanes 0–63. Token lookup and mutation instead use the caller's positive
+capacity and preserve every other record field.
+
+`span.loom` interprets the three-word epoch header and five-word descriptors,
+including a 22-bit source position and 10-bit selected-output code. The code
+is zero for no selection and otherwise holds the selected ID plus one, so
+the supplied selection is `-1` or 0–1022. Causal positions and source
+coordinates remain distinct. The ordinary span-binding helper serves the
+dense model's 512-token packet; Flash's larger packets use their own binding
+while sharing the descriptor encoding.
+
+Each retained row contains four I64 words: immutable anchor origin, private
+writer origin, K/V origin, and fork position. The recurrent binding reports
+whether a span begins at the fork; its caller chooses the corresponding
+state and owns the aliasing contract. K/V layer origins are 256-byte aligned.
+Optional page tables follow the 64-row header and map 64-token logical pages
+to physical pages. Logical capacity determines table stride, while physical
+capacity bounds the mapped pages. A zero physical capacity selects dense
+addressing without reading a map.
+
+Epoch metadata and retained origins stay immutable until queued work retires.
+Page mappings must be published before their consumers; writers cannot
+overlap another live row's anchor or writer. These are producer contracts,
+not repeated runtime validation inside each accessor.
