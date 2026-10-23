@@ -6,10 +6,11 @@ Strix Halo NPU composition that executes all 28 transformer layers across
 32 AIE2P cores arranged in eight columns and four rows. It returns an
 L2-normalized prefix of between one and 1,024 dimensions.
 
-**Execution status:** this package contains the model description. Its native
-providers and prepared resident-weight archive are not included, so the card
-does not yet form a runnable Loom installation. The NPU layout is specific to
-this composition; it is not a generic repacking of arbitrary embedding models.
+**Execution status:** source, bytecode, and mixed providers implement embedding
+service ABI 1. This port uses an eight-column Strix Halo NPU context on Linux
+with fixed resident backing. The prepared bank is reproducible from the pinned
+checkpoint, but it is not hosted here. The repository card is excluded from
+the public picker until a complete prepared publication is available.
 
 ## Original and prepared assets
 
@@ -29,11 +30,51 @@ The exact regions, dimensions, and offsets appear in the card below.
 
 The card installs this archive as `parameter/resident.safetensors` from its
 card-relative `prepared/weights.safetensors` source. That prepared archive is
-not supplied by the original HF repository. A model publisher must provide the
-reproducible native conversion and its output before publishing a complete
-package. `loom-fetch` does not perform this BFP conversion as part of its
+not supplied by the original HF repository. The library includes its pinned
+converter and publishes a standalone card and lock alongside the generated
+archive. `loom-fetch` does not perform this BFP conversion as part of its
 Safetensors alignment support. The original checkpoint is a preparation input,
 not a second runtime parameter bank.
+
+## Prepare and serve
+
+Install the Loom SDK using the
+[installation guide](https://rocm.github.io/hrx-system/loom/getting-started/acquiring-loom/).
+The first PyPI release is pending; development wheels provide the same native
+tools. With [uv](https://docs.astral.sh/uv/) installed, clone the
+[library](https://github.com/ROCm/hrx-loom-library), then run from its root:
+
+```sh
+uv run model/Qwen/Qwen3-Embedding-0.6B/prepare_assets.py \
+  --output=../qwen3-embedding
+
+loom-serve --model=../qwen3-embedding/model.json \
+  --device='xdna://0?columns=8' --pool_backing=fixed \
+  --listen=127.0.0.1:8080
+```
+
+Preparation writes an approximately 808 MB bank plus the tokenizer and source
+closure, while retaining the original checkpoint in the HF cache. It verifies
+the exact prepared payload before publishing the card. Add `--offline` to use
+only checkpoint files already cached; `uv run --offline` separately controls
+Python package acquisition. Serving the result requires neither Bazel nor the
+preparation Python dependencies. The fixed-pool option is explicit deployment
+configuration, separate from the model's program representation.
+
+Request a 256-dimensional embedding:
+
+```sh
+curl http://127.0.0.1:8080/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3-Embedding-0.6B","input":"The library is open on Saturday.","dimensions":256,"encoding_format":"float"}'
+```
+
+The response contains one normalized vector of 256 numbers and reports eight
+prompt tokens, including the end token. `encoding_format: "base64"` returns
+little-endian F32 bytes instead of a JSON array. The prepared directory is a
+portable source publication: a publisher can host it, and a recipient can fetch
+its `model.json` URL with `loom-fetch` before serving with the same device and
+pool options.
 
 ## Input and cohort contract
 
@@ -66,8 +107,9 @@ transient-memory peak. A resident invocation still transfers intermediate data
 through global memory; it does not imply that every intermediate stays in NPU
 local memory.
 
-Qualification requires independent embedding comparisons, sequence isolation
-and ordering, normalized prefixes, token usage, cohort rejection, cancellation,
-and service shutdown on the actual NPU. The source model's general capabilities
+Native service checks compare independent publisher embeddings and exact
+regression outputs, sequence isolation and ordering, concurrent requests,
+normalized prefixes, token usage, cohort rejection, and joined shutdown on the
+actual NPU. The source model's general capabilities
 and intended uses are documented in the
 [publisher's model card](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B).

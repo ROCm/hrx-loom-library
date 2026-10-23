@@ -60,10 +60,15 @@ It returns streaming 24 kHz mono audio and supports custom reference-voice
 publications. Both Moonshine and Pocket provide source, bytecode, and mixed
 packages with native service checks.
 
+[Qwen3 Embedding](model/Qwen/Qwen3-Embedding-0.6B/OVERVIEW.md) runs on the
+Strix Halo NPU with source, bytecode, or mixed providers. Its pinned converter
+creates a standalone installation from the publisher checkpoint. The prepared
+bank is not hosted yet, so this model is not listed by the public picker.
+
 The [model map](model/README.md#map) also includes descriptions for image
-generation, text and vision, sharded text models, and NPU embeddings. Those
-descriptions identify compatible assets and intended programs; their executable
-ports are not yet included.
+generation, text and vision, and sharded text models. Those descriptions
+identify compatible assets and intended programs; their executable ports are
+not yet included.
 
 ## Library development quickstart
 
