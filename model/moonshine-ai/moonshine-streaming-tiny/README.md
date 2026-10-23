@@ -83,23 +83,42 @@ bazel test --config=amdgpu \
   //model/moonshine-ai/moonshine-streaming-tiny/test/...
 ```
 
-The learned check is an explicitly invoked executable, not a cached test with
-ambient weights. After the preceding fetch, run:
+Learned transcription checks are ordinary cacheable tests. They are tagged
+`manual` because their runner needs provisioned weights. After the preceding
+fetch, run all three representations against that installation:
 
 ```sh
-bazel run --config=amdgpu \
-  //model/moonshine-ai/moonshine-streaming-tiny/test:transcription_check -- \
-  --model="$INSTALL/model.json" --device=amdgpu \
-  --output="$PWD/.reports/model/moonshine/check-$REPRESENTATION"
+bazel test --config=asan --config=amdgpu \
+  --strategy=TestRunner=standalone \
+  --test_env=LOOM_MODEL_ASSETS="$INSTALL" \
+  //model/moonshine-ai/moonshine-streaming-tiny/test:transcription_source_test \
+  //model/moonshine-ai/moonshine-streaming-tiny/test:transcription_archive_test \
+  //model/moonshine-ai/moonshine-streaming-tiny/test:transcription_mixed_test
 ```
 
-The output directory must be new. The checker verifies the checkpoint/tokenizer
-and audio against their independent recorded digests, launches a fresh real
-server, uploads the PCM, checks exact reference text, and joins shutdown before
-writing a successful result. Device selection is explicit; the example selects
-the AMDGPU driver enabled by its build configuration. Run it once for each
-installed representation. It never fetches model files or invents a fallback
-when files are absent. These checks establish correctness, not performance.
+This example executes tests locally while leaving the build execution strategy
+unchanged. A remote test runner needs the same assets provisioned at its
+configured path and an available AMDGPU runtime. The test's hardware requirements
+use the shared Loom execution profile.
+
+Each test combines its current built providers and auxiliary files with shared
+parameters and tokenizers from `LOOM_MODEL_ASSETS`. Installed program files are
+ignored, so one installation supports all three tests and compiler iteration
+requires no refetch. Model files are linked into temporary storage; retained
+test outputs contain only server diagnostics and `result.json`.
+
+The original `model.json`, checked-in `model.json.lock`, built programs, server,
+test code, PCM/reference, and test configuration determine the cache identity.
+Weights are not hashed, downloaded, or passed through Bazel. Users and CI own
+keeping provisioned assets consistent with the lock. Changing them without
+updating the lock intentionally permits a cached result. Updating the lock
+invalidates tests without recompiling providers. A normal cache hit performs no
+asset access. `--nocache_test_results` explicitly requests a fresh execution.
+
+On execution, the checker verifies the small input PCM's digest, launches a
+fresh real server, uploads the PCM, checks exact reference text, and joins
+shutdown before writing success. Missing runtime files fail visibly. These
+checks establish correctness, not performance.
 
 [Test provenance](test/README.md) describes the independent eager F32 oracle
 and synthetic audio attribution. The upstream model license is in

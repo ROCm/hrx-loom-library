@@ -6,22 +6,31 @@ and frame normalization; it does not reuse the device reduction loop.
 membership, and EOF. Their benchmark declarations name these same bounded
 workloads without claiming measured performance.
 
-`transcription_check.py` exercises an installed model through the real HTTP
-server. Bazel supplies only the checker, server, HTTP helper, and small PCM and
-reference files. The caller supplies a fetched card or serving deployment and
-device to `bazel run :transcription_check`; full checkpoints never enter its action
-inputs or runfiles, and a previous test-cache result cannot skip execution.
+`transcription_check.py` exercises current built model programs through the real
+HTTP server. Bazel supplies the card, acquisition lock, providers, checker,
+server, test helpers, and small PCM/reference files. The caller supplies runtime
+assets through `LOOM_MODEL_ASSETS`; full checkpoints never enter action inputs,
+runfiles, or retained test outputs. The three `transcription_*_test` targets use
+normal Bazel caching. They are explicit `manual` targets because their runner
+needs provisioned assets and an AMDGPU device.
 The [developer workflow](../README.md) shows build, fetch, and invocation.
 
 Source, archive, and mixed cases use the same exact reference. The checker
-verifies both installed checkpoint/tokenizer digests and the input PCM digest,
-uploads the audio with deliberately odd HTTP chunk boundaries, and checks the
-exact transcript. It joins normal server retirement before publishing success.
-A fresh `--output` directory retains server diagnostics and `result.json` with
-the model path, device, observed asset/audio digests, and checked text. A failed
-request or shutdown leaves diagnostics without a successful result. The outer
+verifies the input PCM digest, uploads the audio with deliberately odd HTTP
+chunk boundaries, and checks the exact transcript. It joins normal server
+retirement before publishing success. Bazel test outputs retain server
+diagnostics and `result.json` with the model path, device, observed audio digest,
+and checked text. A failed request or shutdown leaves diagnostics without a
+successful result. The outer
 runner or operator owns interruption and hang detection; valid native work has
 no arbitrary per-request timer.
+
+The acquisition lock is a trusted cache identity for provisioned weights and
+tokenizers. Tests do not verify those bytes. Updating the lock, model card,
+program outputs, runtime, or other declared test inputs invalidates the result;
+external asset edits without a lock update intentionally do not. The recorded
+oracle hashes below describe the independent reference's provenance. They are
+not rescanned on every regression run.
 
 ## Audio and oracle provenance
 

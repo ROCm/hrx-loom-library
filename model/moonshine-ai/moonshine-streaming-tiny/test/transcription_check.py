@@ -2,21 +2,24 @@
 # Copyright 2026 AMD ROCm™ Software
 # SPDX-License-Identifier: MIT
 
-"""Checks an installed Moonshine model against an independent PCM oracle.
+"""Checks built Moonshine programs against an independent PCM oracle.
 
-The caller supplies a fetched card or serving deployment outside the Bazel
-payload graph. Each invocation owns a fresh server and retains its diagnostics
-in a new directory.
+The caller provisions runtime assets outside Bazel. The authored card and lock,
+built programs, server, and oracle inputs determine the test's cache identity.
+Each execution owns a fresh server and checks its complete output and shutdown.
 """
 
 import argparse
 import hashlib
 import http.client
 import json
+import os
+import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from loom_serve_testing.http_harness import running_server
+from loom_serve_testing.model_staging import stage_model
 
 
 def transcribe(address, model, audio, content_type):
@@ -58,8 +61,23 @@ def main():
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--device", required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--assets", type=Path, default=os.environ.get("LOOM_MODEL_ASSETS")
+    )
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.assets is None:
+        parser.error(
+            "set LOOM_MODEL_ASSETS or --assets to an installation populated by "
+            "loom-fetch; model weights are provisioned outside Bazel"
+        )
+    if args.output is not None:
+        output = args.output.absolute()
+        output.mkdir(parents=True, exist_ok=False)
+    elif os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR"):
+        output = Path(os.environ["TEST_UNDECLARED_OUTPUTS_DIR"])
+    else:
+        parser.error("--output is required outside a Bazel test")
 
     reference = json.loads(args.reference.read_text(encoding="utf-8"))
     audio = args.audio.read_bytes()
@@ -70,54 +88,40 @@ def main():
         raise AssertionError(f"oracle input byte length differs: {len(audio)}")
     model = args.model.absolute()
     document = json.loads(model.read_text(encoding="utf-8"))
-    if "schema_version" in document:
-        model_name = document["model"]["id"]
-        card = model
-    else:
-        model_name = document["name"]
-        card = model.parent / document["model"]["path"]
-    assets = {}
-    for name, path in (
-        ("weights_sha256", "asset/model.safetensors"),
-        ("tokenizer_sha256", "asset/text-vocabulary.data"),
-    ):
-        with (card.parent / path).open("rb") as stream:
-            observed = hashlib.file_digest(stream, "sha256").hexdigest()
-        if observed != reference["oracle"][name]:
-            raise AssertionError(
-                f"installed {path} differs from the oracle: {observed}"
-            )
-        assets[name] = observed
-    output = args.output.absolute()
-    output.mkdir(parents=True, exist_ok=False)
+    model_name = document["model"]["id"]
     log = output / "moonshine.log"
-    with running_server(
-        [
-            str(args.server.absolute()),
-            f"--model={model}",
-            f"--device={args.device}",
-            "--workers=4",
-            "--listen=127.0.0.1:0",
-        ],
-        log,
-    ) as (_, bound):
-        if bound is None:
-            raise RuntimeError(f"server failed before readiness:\n{log.read_text()}")
-        actual = transcribe(
-            urlsplit(f"http://{bound}"),
-            model_name,
-            audio,
-            reference["audio"]["content_type"],
-        )
-        expected = {"text": reference["transcript"]["text"]}
-        if actual != expected:
-            raise AssertionError(f"expected {expected!r}, received {actual!r}")
+    # Only logs/results are retained as test outputs; shared assets stay in the
+    # temporary tree so output collection cannot upload checkpoint bytes.
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR")) as temporary:
+        staged = stage_model(model, args.assets.absolute(), Path(temporary) / "model")
+        with running_server(
+            [
+                str(args.server.absolute()),
+                f"--model={staged}",
+                f"--device={args.device}",
+                "--workers=4",
+                "--listen=127.0.0.1:0",
+            ],
+            log,
+        ) as (_, bound):
+            if bound is None:
+                raise RuntimeError(
+                    f"server failed before readiness:\n{log.read_text()}"
+                )
+            actual = transcribe(
+                urlsplit(f"http://{bound}"),
+                model_name,
+                audio,
+                reference["audio"]["content_type"],
+            )
+            expected = {"text": reference["transcript"]["text"]}
+            if actual != expected:
+                raise AssertionError(f"expected {expected!r}, received {actual!r}")
     # A successful transcript is published only after server retirement joins.
     result = {
         "model": str(model),
         "device": args.device,
         "audio_sha256": digest,
-        **assets,
         **actual,
     }
     with (output / "result.json").open("x", encoding="utf-8") as stream:

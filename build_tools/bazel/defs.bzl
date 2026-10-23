@@ -142,6 +142,7 @@ def loom_model(
         preset,
         model_name,
         files,
+        lockfile = None,
         assets = {},
         data = {},
         programs = "",
@@ -157,6 +158,7 @@ def loom_model(
     _loom_model(
         name = name,
         card = card,
+        lockfile = lockfile,
         preset = preset,
         model_name = model_name,
         files = files,
