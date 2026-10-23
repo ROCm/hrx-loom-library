@@ -50,3 +50,11 @@ rows. Epsilon-dominated and zero inputs cover the normalization denominator.
 F32 results use a `1e-6` absolute and relative bound. F16 comparisons use
 `1e-7 + 0.001 * abs(expected)` because F32 reduction can move a midpoint
 across the final rounding boundary. Zero outputs are checked exactly.
+
+`grouped_convolution.loom` uses a scalar F64 oracle that combines the static
+and dynamic coefficients before multiplication and explicitly pads every
+tap. It checks three independent eight-position, 5120-channel blocks,
+ordinary and residual output, a 516-channel tail, and a single position with
+four taps. The different branch and group sizes exercise coefficient
+addressing, while bitwise input checks guard the separate-output contract.
+All four shapes have benchmark declarations.

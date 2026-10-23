@@ -60,6 +60,20 @@ normal `mean(x*x) + epsilon`, and finite F32 intermediates. The motif neither
 allocates persistent state nor chooses a target, launch grid, or global
 configuration.
 
+`grouped_convolution.loom` applies a causal F32 convolution independently to
+each block. A coefficient combines a static per-channel weight with a dynamic
+weight shared by a contiguous group of channels. Dynamic weights vary by
+block, position, branch, and tap. The selected branch produces a new tensor
+or adds its update to a separate residual tensor. Taps before position zero
+are padding; they never read another block's history.
+
+The vector primitive returns four adjacent channels for a caller-owned
+position. Its whole-tensor forms use 128 threads and a 512-channel tile, with
+the grid supplied by the leaf. Group widths are positive multiples of four
+that divide the channel count. Input and coefficient storage never overlap
+the output; only the residual destination is updated in place. The source
+documents the exact row-major coefficient layouts and branch bounds.
+
 The [checks](test/README.md) use published integer answers, independent
 double-precision random transforms, and serial order-statistic references.
 These motifs participate in native GPU model programs while their composition

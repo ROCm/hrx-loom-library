@@ -11,7 +11,7 @@ and specialize them with the value facts available at their composition roots.
 | --- | --- |
 | [`format/`](format/) | Physical tensor representations and their reusable operations. |
 | [`text/`](text/) | Unicode properties, full uppercase, UTF-8 traversal, and trimming. |
-| [`tensor/`](tensor/) | Stateless counter words and normal samples for tensor programs. |
+| [`tensor/`](tensor/) | Sampling, ordered selection, row normalization, and grouped causal convolution. |
 | `quantize/` | Representation-independent quantization algorithms once concrete formats establish a shared contract. |
 | `attention/` | Reusable attention algorithms and schedules. |
 | `target/` | Target-specific realizations of otherwise shared motifs. |
