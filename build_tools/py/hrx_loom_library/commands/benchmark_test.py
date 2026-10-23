@@ -24,7 +24,7 @@ class BenchmarkCommandTest(unittest.TestCase):
             [
                 "benchmark",
                 "--config=amdgpu",
-                "--device=amdgpu://0",
+                "--device=amdgpu2://0",
                 "--output-dir=.reports/benchmark/gfx1100",
                 "--target=//kernel/gemm/...",
                 "--target=//motif/format/ggml/test/...",
@@ -34,7 +34,7 @@ class BenchmarkCommandTest(unittest.TestCase):
         )
 
         self.assertEqual(args.configs, ["amdgpu"])
-        self.assertEqual(args.device, "amdgpu://0")
+        self.assertEqual(args.device, "amdgpu2://0")
         self.assertEqual(
             args.targets,
             ["//kernel/gemm/...", "//motif/format/ggml/test/..."],
@@ -255,7 +255,7 @@ class BenchmarkCommandTest(unittest.TestCase):
             args = SimpleNamespace(
                 configs=["amdgpu"],
                 benchmark_args=["--", "--dry-run"],
-                device="amdgpu://0",
+                device="amdgpu2://0",
                 output_dir=str(output_root),
                 rerun_all=False,
                 targets=["//kernel/example:first", "//kernel/example:second"],
@@ -523,7 +523,7 @@ class BenchmarkCommandTest(unittest.TestCase):
             args = SimpleNamespace(
                 configs=["amdgpu"],
                 benchmark_args=[],
-                device="amdgpu://0",
+                device="amdgpu2://0",
                 output_dir=str(output_root),
                 rerun_all=False,
                 targets=["//kernel/example:first"],

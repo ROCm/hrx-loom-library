@@ -67,7 +67,7 @@ ports are admitted. Installed SDK users can list or select from a local checkout
 loom-fetch --catalog=./catalog.json --list --json | jq '.models | keys'
 loom-fetch --catalog=./catalog.json --model=moonshine-ai/moonshine-streaming-tiny \
   --preset=streaming --output=./moonshine
-loom-serve --model=./moonshine/model.json --device=amdgpu
+loom-serve --model=./moonshine/model.json --device=amdgpu2
 ```
 
 The same relative card paths resolve within a published GitHub catalog snapshot.

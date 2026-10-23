@@ -80,7 +80,7 @@ A focused performance capture adds an explicit target and device:
 ```shell
 python dev.py benchmark \
   --config=amdgpu \
-  --device=amdgpu://0 \
+  --device=amdgpu2://0 \
   --output-dir=/tmp/hrx-loom-library-candidate \
   --target=//kernel/ggml/quantize:q8_1_x4_f32 \
   -- \

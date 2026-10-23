@@ -40,10 +40,12 @@ The fetched card retains the selected preset, so it can be passed directly to
 for a custom routing alias, device placement, or execution overrides, but is
 not needed for this setup.
 
-Start a server with an available AMDGPU device:
+The SDK uses libamdf to access AMD GPUs through the operating system device
+driver. No ROCm SDK installation is required. Start a server with an available
+AMD GPU:
 
 ```sh
-loom-serve --device=amdgpu --workers=4 --listen=127.0.0.1:8080 \
+loom-serve --device=amdgpu2 --workers=4 --listen=127.0.0.1:8080 \
   --model=./moonshine/model.json
 ```
 

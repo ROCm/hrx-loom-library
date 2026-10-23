@@ -25,7 +25,7 @@ checkout without Bazel. From this repository root:
 ```sh
 MODEL=model/moonshine-ai/moonshine-streaming-tiny
 loom-fetch "$MODEL/model.json" --preset=streaming --output=../moonshine
-loom-serve --device=amdgpu --workers=4 --listen=127.0.0.1:8080 \
+loom-serve --device=amdgpu2 --workers=4 --listen=127.0.0.1:8080 \
   --model=../moonshine/model.json
 ```
 
@@ -65,13 +65,13 @@ Run every public correctness case on an AMD GPU:
 bazelisk run -c opt --config=amdgpu \
   @hrx//loom/src/loom/tools/iree-test-loom -- \
   "$LOOM_TEST_MODULE" \
-  --device=amdgpu://0 \
+  --device=amdgpu2://0 \
   --sanitizer=access
 ```
 
-When ROCr is not available through the dynamic loader path, set
-`IREE_HAL_AMDGPU_LIBHSA_PATH` to the absolute path of
-`libhsa-runtime64.so.1` before running the tool.
+The native AMD driver uses libamdf. It requires a supported operating-system
+device driver and permission to open the GPU; no ROCm SDK installation is
+required.
 
 Benchmark a declared workload from the same module closure:
 
@@ -79,7 +79,7 @@ Benchmark a declared workload from the same module closure:
 bazelisk run -c opt --config=amdgpu \
   @hrx//loom/src/loom/tools/iree-benchmark-loom -- \
   "$LOOM_TEST_MODULE" \
-  --device=amdgpu://0 \
+  --device=amdgpu2://0 \
   --benchmark=@ggml_quantize_q8_1_x4_f32_decode \
   --measure=dispatch_complete \
   --batch-size=64 \
@@ -117,7 +117,7 @@ sweep workspace:
 SWEEP_ROOT=.reports/benchmark/gfx1100
 python dev.py benchmark \
   --config=amdgpu \
-  --device=amdgpu://0 \
+  --device=amdgpu2://0 \
   --output-dir="$SWEEP_ROOT" \
   -- \
   --measure=dispatch_complete \
@@ -172,7 +172,7 @@ repeating the option forms a union:
 ```shell
 python dev.py benchmark \
   --config=amdgpu \
-  --device=amdgpu://0 \
+  --device=amdgpu2://0 \
   --output-dir="$SWEEP_ROOT" \
   --target=//kernel/ggml/... \
   --target=//motif/format/ggml/test/... \
