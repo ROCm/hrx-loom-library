@@ -41,7 +41,9 @@ do not carry benchmark-discovery metadata.
 the contract. Every motif, kernel, and model source package has an adjacent `BUILD.bazel`,
 explicitly declares each `.loom` source, loads the repository wrappers, and has
 a scoped README chain up to its layer root. Motif sources contain no
-`kernel.def`; kernel packages contain at least one. Sources below an explicit
+`kernel.def`, `config.*`, or concrete target records; kernel packages contain
+at least one `kernel.def`. External target declarations and contextual target
+queries remain valid in motifs. Sources below an explicit
 `test/` component use `loom_test` and may declare private wrapper
 kernels without weakening the production motif contract.
 

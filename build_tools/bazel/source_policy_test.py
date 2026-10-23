@@ -37,20 +37,91 @@ class SourcePolicyTest(unittest.TestCase):
             ["bad.loom: motif sources cannot declare kernel.def"],
         )
 
-    def test_motif_rejects_configuration_declaration(self):
-        violations = source_policy.check_sources(
-            "motif",
-            [
-                (
-                    "bad.loom",
-                    "config.decl @workgroup_size : %value: index\n"
-                    "// config.decl @commented_out\n",
+    def test_motif_rejects_configuration_operations(self):
+        for operation, source in (
+            ("config.decl", "config.decl @workgroup_size : index\n"),
+            ("config.def", "config.def @workgroup_size = 64 : index\n"),
+            (
+                "config.get",
+                "func.def @workgroup_size() -> (index) {\n"
+                "  %size = config.get @workgroup_size : index\n"
+                "  func.return %size : index\n}\n",
+            ),
+        ):
+            with self.subTest(operation=operation):
+                self.assertEqual(
+                    source_policy.check_sources("motif", [("bad.loom", source)]),
+                    [
+                        f"bad.loom: motif sources cannot use {operation}; "
+                        "pass configuration values from a composition leaf"
+                    ],
                 )
-            ],
+                for layer in ("model", "test"):
+                    self.assertEqual(
+                        source_policy.check_sources(layer, [("leaf.loom", source)]),
+                        [],
+                    )
+
+    def test_motif_rejects_concrete_target_records(self):
+        for operation, selector in (
+            ("aie2p.target", "array"),
+            ("amdgpu.target", "gfx1100"),
+            ("spirv.target", "vulkan1_3"),
+            ("test.target", "low_core"),
+            ("vm.target", "core"),
+            ("wasm.target", "simd128"),
+            ("x86.target", "avx512"),
+            ("target.generic", "reference"),
+        ):
+            with self.subTest(operation=operation):
+                source = f"{operation}<{selector}> @selected\n"
+                self.assertEqual(
+                    source_policy.check_sources("motif", [("bad.loom", source)]),
+                    [
+                        f"bad.loom: motif sources cannot declare {operation}; "
+                        "define concrete targets at a composition leaf"
+                    ],
+                )
+                self.assertEqual(
+                    source_policy.check_sources("test", [("leaf.loom", source)]), []
+                )
+
+    def test_motif_accepts_external_targets_and_contextual_queries(self):
+        source = (
+            "target.decl @external_target\n"
+            "func.def @subgroup_size() -> (index) {\n"
+            "  %size = target.subgroup.size : index\n"
+            "  func.return %size : index\n}\n"
         )
         self.assertEqual(
-            violations,
-            ["bad.loom: motif sources cannot declare config.decl"],
+            source_policy.check_sources("motif", [("motif.loom", source)]), []
+        )
+
+    def test_operation_names_in_literals_comments_and_symbols_are_not_code(self):
+        source = (
+            "// kernel.def @commented_out\n"
+            "test.decl @example(%values: test.array<i32, "
+            'metadata = {label = "config.get // kernel.def\\""}>)\n'
+            "func.decl @config.decl()\n"
+            "func.decl @amdgpu.target()\n"
+            "func.def @call() { func.call @config.decl() : () func.return }\n"
+        )
+        self.assertEqual(
+            source_policy.check_sources("motif", [("motif.loom", source)]), []
+        )
+        self.assertEqual(
+            source_policy.check_sources("kernel", [("empty.loom", source)]),
+            ["kernel package has no kernel.def declaration: empty.loom"],
+        )
+
+    def test_inline_operations_retain_their_layer_contract(self):
+        source = "target.decl @target kernel.def @entry() {} launch() { kernel.return }"
+        self.assertEqual(
+            source_policy.check_sources("motif", [("bad.loom", source)]),
+            ["bad.loom: motif sources cannot declare kernel.def"],
+        )
+        self.assertEqual(
+            source_policy.check_sources("kernel", [("leaf.loom", source)]), []
         )
 
     def test_test_package_accepts_configuration_declaration(self):

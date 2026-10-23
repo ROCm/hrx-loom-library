@@ -27,6 +27,12 @@ may depend on other motifs and on external Loom libraries. They never depend on
 `kernel/` or declare `kernel.def`; launch configuration and public execution ABI
 belong to kernel or composition roots.
 
+Configuration values enter motifs through function or template arguments.
+The `config.decl`, `config.def`, and `config.get` operations stay in composition
+and test leaves. Concrete target records such as `amdgpu.target` also belong
+to those leaves; motifs may declare an external target contract or query their
+execution context without embedding a target choice in every linked use.
+
 Format-specific and target-specific motifs remain motifs. Reuse is the layer
 boundary; universality is not. Shared abstractions are extracted only after
 multiple concrete implementations establish the same invariant.

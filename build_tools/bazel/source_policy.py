@@ -14,14 +14,22 @@ from pathlib import Path
 from typing import Iterable
 
 
-CONFIG_DECLARATION_PATTERN = re.compile(r"^\s*config\.decl(?:\s|@)", re.MULTILINE)
-KERNEL_DEFINITION_PATTERN = re.compile(r"^\s*kernel\.def(?:\s|@)", re.MULTILINE)
+SOURCE_NON_CODE_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|//[^\r\n]*')
+LAYER_OPERATION_PATTERN = re.compile(
+    r"(?<![\w.$%@#^-])"
+    r"(?:config\.[A-Za-z_][A-Za-z0-9_.]*|kernel\.def|"
+    r"[A-Za-z_][A-Za-z0-9_.]*\.target|target\.generic)"
+    r"(?![\w.-])"
+)
 LOCAL_RULES_LABEL = '"//build_tools/bazel:defs.bzl"'
 UPSTREAM_RULES_LABEL = '"@hrx//loom/build_tools/bazel:defs.bzl"'
 
 
-def _code_without_line_comments(source: str) -> str:
-    return "\n".join(line.partition("//")[0] for line in source.splitlines())
+def _layer_operations(source: str) -> set[str]:
+    # The compiler owns grammar validation. These lexical layer checks ignore
+    # literals, comments, and sigil-prefixed references to operation-like names.
+    code = SOURCE_NON_CODE_PATTERN.sub(" ", source)
+    return set(LAYER_OPERATION_PATTERN.findall(code))
 
 
 def _starlark_without_line_comments(source: str) -> str:
@@ -33,20 +41,29 @@ def check_sources(layer: str, sources: Iterable[tuple[str, str]]) -> list[str]:
     source_definitions = [
         (
             name,
-            _code_without_line_comments(text),
+            _layer_operations(text),
         )
         for name, text in sources
     ]
     if layer == "motif":
         violations = []
-        for name, code in source_definitions:
-            if KERNEL_DEFINITION_PATTERN.search(code):
+        for name, operations in source_definitions:
+            if "kernel.def" in operations:
                 violations.append(f"{name}: motif sources cannot declare kernel.def")
-            if CONFIG_DECLARATION_PATTERN.search(code):
-                violations.append(f"{name}: motif sources cannot declare config.decl")
+            for operation in sorted(operations - {"kernel.def"}):
+                if operation.startswith("config."):
+                    violations.append(
+                        f"{name}: motif sources cannot use {operation}; "
+                        "pass configuration values from a composition leaf"
+                    )
+                else:
+                    violations.append(
+                        f"{name}: motif sources cannot declare {operation}; "
+                        "define concrete targets at a composition leaf"
+                    )
         return violations
     if layer == "kernel" and not any(
-        KERNEL_DEFINITION_PATTERN.search(code) for _, code in source_definitions
+        "kernel.def" in operations for _, operations in source_definitions
     ):
         names = ", ".join(name for name, _ in source_definitions)
         return [f"kernel package has no kernel.def declaration: {names}"]
