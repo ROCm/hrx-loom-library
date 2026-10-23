@@ -10,7 +10,9 @@ Launch dimensions follow the current workload. There are no package-global
 capacity settings, so a single program can use different projections without
 rebinding a library configuration. Concrete target selection belongs to the
 caller or a target-specific kernel leaf; the schedules require 32- or 64-lane
-subgroups. The supplied target and hardware qualification uses gfx11.
+subgroups. Generic leaves have gfx11 and gfx9-4 compilation profiles; the
+same numerical scenarios execute on either family, exercising the native
+subgroup width. The explicitly bound gfx11 provider remains gfx11-only.
 
 Q5's `channel8` entry points consume complete groups of eight interleaved weight
 channels, and its `m4` entry points process exactly four activation rows while
