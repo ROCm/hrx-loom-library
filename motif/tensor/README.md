@@ -74,6 +74,20 @@ that divide the channel count. Input and coefficient storage never overlap
 the output; only the residual destination is updated in place. The source
 documents the exact row-major coefficient layouts and branch bounds.
 
+`pointwise.loom` supplies BF16 SiLU, tanh-polynomial GELU, and gated residual
+arithmetic. Activations evaluate in F32 and return a BF16 scalar. The residual
+rounds `update * gate` to BF16 before adding the old value and rounding again.
+Those two tensor boundaries are part of the operation: a fused multiply-add
+or a single final rounding computes a different function.
+
+`diffusion.loom` exposes the corresponding Euler scheduler step. Its velocity
+and sample are BF16, while its time delta remains F32. The F32 velocity product
+rounds to BF16 before the sample addition and final BF16 rounding. Each call
+returns one scalar; the composition owns tensor access, in-place updates, and
+launch geometry. Neither module imposes a workgroup size or target. Operands
+and arithmetic intermediates are finite; approximate activation math does not
+promise bitwise agreement across devices.
+
 The [checks](test/README.md) use published integer answers, independent
 double-precision random transforms, and serial order-statistic references.
 These motifs participate in native GPU model programs while their composition

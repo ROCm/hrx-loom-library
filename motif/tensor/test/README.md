@@ -58,3 +58,24 @@ ordinary and residual output, a 516-channel tail, and a single position with
 four taps. The different branch and group sizes exercise coefficient
 addressing, while bitwise input checks guard the separate-output contract.
 All four shapes have benchmark declarations.
+
+`pointwise.loom` checks all four BF16 arithmetic contracts through native
+runtime inputs. SiLU and tanh GELU use binary64 libm formulas at 265 points,
+including both curves' negative minima, small signed inputs, and tails through
+±16. Their error bound is `2e-6 + abs(expected) / 256`: the relative term is
+BF16 round-to-nearest's maximum error, while the absolute term admits F32
+approximation and cancellation near the negative tail. The expected values
+retain the independent formula's F32 precision rather than rounding to BF16.
+
+The 128 residual and 132 Euler cases compare exact bits against rational
+arithmetic with integer ties-to-even rounding. They cover positive and negative
+products, both midpoint parities, cancellation, nonzero residuals, and a time
+delta that must remain F32. Directed Euler inputs also place F32 multiplication
+on either side of BF16 midpoints. The corpus includes explicit differences
+from a fused update and from prematurely rounding the time delta. Each family
+has its own benchmark declaration, and nonmultiple launch tails are bounded
+by the wrapper kernel. Regenerate the authored answers with:
+
+```sh
+python3 -B motif/tensor/test/generate_pointwise_oracle.py
+```

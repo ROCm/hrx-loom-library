@@ -1,0 +1,47 @@
+// BF16 scalar activations and gated residual arithmetic.
+// SiLU and tanh GELU evaluate in F32 with approximate transcendental
+// operations, then round to BF16. The gated residual rounds its product
+// before addition: round_bf16(value + round_bf16(update * gate)).
+// Inputs and arithmetic intermediates are finite. Callers own tensor layout,
+// memory access, launch geometry, and target selection; these templates have
+// no storage or synchronization. Native checks use independent libm formulas
+// for activations and exact rational rounding for the residual expression.
+
+template.decl @activation.silu_bf16(%value: bf16) -> (bf16)
+
+template.decl @activation.gelu_bf16(%value: bf16) -> (bf16)
+
+template.decl @residual.gated_bf16(%value: bf16, %update: bf16, %gate: bf16) -> (bf16)
+
+// SiLU rounds before a caller's subsequent BF16 product.
+template.def<@activation.silu_bf16> @silu_bf16(%value: bf16) -> (bf16) {
+  %input = scalar.extf %value : bf16 to f32
+  %negative = scalar.negf %input : f32
+  %exponential = scalar.expf<afn> %negative : f32
+  %unit = scalar.constant 1.0 : f32
+  %denominator = scalar.addf %unit, %exponential : f32
+  %activated = scalar.divf<arcp> %input, %denominator : f32
+  %result = scalar.fptrunc %activated : f32 to bf16
+  template.return %result : bf16
+}
+
+// GELU uses the tanh-polynomial family, not the Gaussian-CDF family.
+template.def<@activation.gelu_bf16> @gelu_bf16(%value: bf16) -> (bf16) {
+  %input = scalar.extf %value : bf16 to f32
+  %activated = scalar.geluf<tanh, afn> %input : f32
+  %result = scalar.fptrunc %activated : f32 to bf16
+  template.return %result : bf16
+}
+
+// Both the gated update and residual addition have BF16 tensor boundaries.
+template.def<@residual.gated_bf16> @gated_residual_bf16(%value: bf16, %update: bf16, %gate: bf16) -> (bf16) {
+  %update_f32 = scalar.extf %update : bf16 to f32
+  %gate_f32 = scalar.extf %gate : bf16 to f32
+  %product = scalar.mulf %update_f32, %gate_f32 : f32
+  %product_bf16 = scalar.fptrunc %product : f32 to bf16
+  %rounded = scalar.extf %product_bf16 : bf16 to f32
+  %value_f32 = scalar.extf %value : bf16 to f32
+  %sum = scalar.addf %value_f32, %rounded : f32
+  %result = scalar.fptrunc %sum : f32 to bf16
+  template.return %result : bf16
+}
