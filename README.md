@@ -19,21 +19,35 @@ operation contract and ABI. For example, the
 
 ## Run a model with installed tools
 
-With `loom-fetch` and `loom-serve` installed, source models run directly from a
-checkout without Bazel. From this repository root:
+Install the `hrx-loom` SDK in a Python 3.12+ virtual environment, with the
+optional `[hf]` provider for Hugging Face assets. The
+[installation guide](https://rocm.github.io/hrx-system/loom/getting-started/acquiring-loom/)
+covers Linux and Windows prerequisites and development wheels; the first PyPI
+release is pending. Once a release is published, installation is
+`python -m pip install 'hrx-loom[hf]'`.
+
+Fetch Moonshine Streaming Tiny directly from its published card, then serve it
+on an AMD GPU:
 
 ```sh
-MODEL=model/moonshine-ai/moonshine-streaming-tiny
-loom-fetch "$MODEL/model.json" --preset=streaming --output=../moonshine
-loom-serve --device=amdgpu2 --workers=4 --listen=127.0.0.1:8080 \
-  --model=../moonshine/model.json
+loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/21637a18079d1f1dd9b8e20d26f700a62e60db4f/model/moonshine-ai/moonshine-streaming-tiny/model.json --preset=streaming --output=./moonshine
+loom-serve --device=amdgpu2 --workers=4 --listen=127.0.0.1:8080 --model=./moonshine/model.json
 ```
 
-The server JIT compiles the model's checked-in source programs. Acquisition
-uses the source lock and shares cached checkpoint files. The
-[Moonshine overview](model/moonshine-ai/moonshine-streaming-tiny/OVERVIEW.md)
-covers SDK requirements, supported inputs, and a transcription request.
-Published bytecode packages use the same fetch-and-serve workflow.
+The URL pins the model, its programs, and acquisition lock to one library
+revision. A clone can instead use
+`model/moonshine-ai/moonshine-streaming-tiny/model.json` as the card argument.
+The server JIT compiles its source programs using the installed SDK; both paths
+run without Bazel. Fetch verifies the selected files and shares cached weights.
+AMD execution uses libamdf and the operating system device driver, without a
+ROCm SDK installation.
+
+The [Moonshine overview](model/moonshine-ai/moonshine-streaming-tiny/OVERVIEW.md)
+includes an audio recording, a complete transcription request, and the expected
+response. The
+[fetch-to-serve walkthrough](https://rocm.github.io/hrx-system/loom/serving/workflows/fetch-and-serve/)
+explains presets, gated models, discovery, Windows commands, and offline use.
+Published bytecode packages use the same acquisition and startup commands.
 
 The [runnable-model catalog](model/README.md#discover-runnable-packages) supports
 discovery with `loom-fetch --catalog=./catalog.json --list` and selection by model

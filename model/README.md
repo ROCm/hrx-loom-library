@@ -61,7 +61,14 @@ resolves card-relative provider links in the generated page.
 
 The repository-root `catalog.json` lists packages with supplied providers and
 qualified execution. Descriptive cards enter this index when their executable
-ports are admitted. Installed SDK users can list or select from a local checkout:
+ports are admitted. Installed SDK users can inspect a published snapshot
+without a clone:
+
+```sh
+loom-fetch --catalog=github:ROCm/hrx-loom-library@21637a18079d1f1dd9b8e20d26f700a62e60db4f --list --json
+```
+
+A local checkout supports the same discovery and selection:
 
 ```sh
 loom-fetch --catalog=./catalog.json --list --json | jq '.models | keys'

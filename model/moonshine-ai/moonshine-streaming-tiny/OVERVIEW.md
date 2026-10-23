@@ -15,24 +15,32 @@ port of the numerical kernels.
 
 ## Acquire and serve
 
-With `loom-fetch` and `loom-serve` installed, a repository checkout can run the
-source model directly. The server JIT compiles the authored Loom programs;
-Bazel is not required for this workflow:
+Install the `hrx-loom` SDK with its optional Hugging Face provider in a Python
+3.12+ virtual environment. The
+[installation guide](https://rocm.github.io/hrx-system/loom/getting-started/acquiring-loom/)
+explains Linux and Windows prerequisites and how to install a development wheel
+before the first PyPI release. A published SDK uses
+`python -m pip install 'hrx-loom[hf]'`.
+
+With the SDK installed, fetch this model directly from its publication URL:
 
 ```sh
-git clone https://github.com/ROCm/hrx-loom-library.git
-MODEL=hrx-loom-library/model/moonshine-ai/moonshine-streaming-tiny
-loom-fetch "$MODEL/model.json" --preset=streaming --output=./moonshine
+loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/21637a18079d1f1dd9b8e20d26f700a62e60db4f/model/moonshine-ai/moonshine-streaming-tiny/model.json --list
+loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/21637a18079d1f1dd9b8e20d26f700a62e60db4f/model/moonshine-ai/moonshine-streaming-tiny/model.json --preset=streaming --output=./moonshine
 ```
 
-The checked-in lock covers the default `source` program set. Bytecode and mixed
-packages are produced by model publishers; using a published package also
-requires no user build. The card argument can be a publication URL instead of
-a local path. `loom-fetch` downloads only
-the selected program and asset files and reuses available cached content.
-Hugging Face acquisition uses the optional `hf` SDK extra; install it in the
-same Python environment as `loom-fetch` when requested. The resulting
-`moonshine/model.json` describes local files and needs no network access to run.
+These URLs pin one library revision. Fetch checks its adjacent acquisition
+lock, installs only the selected program and asset files, and shares available
+cached weights. The resulting `moonshine/model.json` describes local files and
+needs no network access to run. A repository checkout can use its local
+`model/moonshine-ai/moonshine-streaming-tiny/model.json` with the same commands.
+Neither path requires a Bazel build.
+
+The checked-in lock covers the default `source` program set. The server JIT
+compiles those authored Loom programs with the SDK's compiler. Bytecode and
+mixed packages are produced separately by model publishers and use the same
+fetch-and-serve workflow. The `streaming` preset selects source here; its name
+does not imply a file format or a request transport.
 
 The fetched card retains the selected preset, so it can be passed directly to
 `loom-serve`. Requests use the card's model ID,
@@ -49,16 +57,24 @@ loom-serve --device=amdgpu2 --workers=4 --listen=127.0.0.1:8080 \
   --model=./moonshine/model.json
 ```
 
-Send 16 kHz mono signed little-endian PCM16 audio:
+Send 16 kHz mono signed little-endian PCM16 audio. For a first check, download
+the small reference recording:
 
 ```sh
+curl --fail --location https://raw.githubusercontent.com/ROCm/hrx-loom-library/21637a18079d1f1dd9b8e20d26f700a62e60db4f/model/moonshine-ai/moonshine-streaming-tiny/test/short.pcm --output=recording.pcm
 curl --fail-with-body -H 'Expect:' \
   http://127.0.0.1:8080/v1/audio/transcriptions \
   -F model=moonshine-ai/moonshine-streaming-tiny \
   -F 'file=@recording.pcm;headers="Content-Type: audio/pcm;rate=16000;channels=1"'
 ```
 
-The response contains the transcript as `{"text":"..."}`. WAV, MP3, and FLAC
+The reference recording produces
+`{"text":"Good day, streaming speech should remain clear when the listener interrupts."}`.
+Replace `recording.pcm` with your own PCM recording for another transcription.
+For Windows PowerShell, the
+[walkthrough](https://rocm.github.io/hrx-system/loom/serving/workflows/fetch-and-serve/#transcribe-a-recording)
+provides the equivalent `curl.exe` command with literal multipart-header quoting.
+WAV, MP3, and FLAC
 uploads require the corresponding optional server codecs. This HTTP endpoint
 collects the upload before feeding the incremental recognition service; live
 microphone transport is a separate hosting concern.
