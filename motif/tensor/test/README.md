@@ -23,3 +23,20 @@ The benchmarks select complete counter blocks and a 64-pair normal workload.
 They exercise runtime buffer inputs so native arithmetic remains in the
 generated kernel. These are correctness and reproducibility checks, not a
 claim about model throughput or a selected tuning configuration.
+
+`sampling.loom` compares native categorical draws against an ordinal-rank
+reference that directly counts each logit's predecessors. The reference
+evaluates exponential-race scores with F64 logarithms and does not call the
+production sampler's support-selection or random-transform helpers. Philox
+counter generation shares the separately verified integer primitive. The
+cases cross greedy and sampled requests, bounded and unbounded top-k, nucleus
+filtering, four exclusion choices, and a 67-element vocabulary with ties.
+A 248320-element case has an analytically known nineteen-token support, which
+checks the production vocabulary extent without a quadratic full-size oracle.
+
+`topk.loom` checks exact values and IDs against a serial strict-order oracle.
+It covers the 248320-element vocabulary, multiple rows, a short nine-element
+tail, tied maxima, and merging 61 disjoint partial lists. The complete
+two-dispatch case expects the sixteen lowest IDs among equal winners from
+separate tiles. Its benchmark declarations retain these different input and
+merge shapes rather than reporting one synthetic size.
