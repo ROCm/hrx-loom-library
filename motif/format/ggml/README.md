@@ -22,6 +22,13 @@ Consumers name each format library whose public symbols they use. Loom keeps
 those modules distinct through linking and requires direct dependencies, so a
 source-less aggregate cannot masquerade as a re-exporting archive.
 
+Q4_K and Q5_K share one affine metadata interpretation. A retained 16-byte
+header can supply coefficients for several groups, while buffer accessors
+load a selected half-group from an explicit row origin and block ordinal.
+Q4_K also exposes the four-code packet used by matrix staging. These forms
+read only the requested physical packets and leave coefficient application
+to the contraction, preserving reuse across activation rows.
+
 ## References
 
 - [GGUF format specification](https://github.com/ggml-org/ggml/blob/30bf8685ed4eb0a47f2b06229543327749904150/docs/gguf.md)
