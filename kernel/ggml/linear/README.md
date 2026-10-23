@@ -49,3 +49,14 @@ include the 17,408-value F32 reduction, wide Q8 projections, and prefill through
 so large workloads retain correctness coverage without a large CPU reference
 contraction. Prefix and suffix output guards and unchanged inputs are checked
 bit for bit.
+
+Q8_0 uses the same Q8_1 activation carrier with raw 34-byte signed weight
+records. Its grid configuration names the live row count, while the first
+launch argument bounds the available row capacity. This permits a prefill
+stage to reuse a larger allocation without computing inactive rows. The
+adjacent tests cover that distinction explicitly, signed-byte extrema,
+signed and zero scales, two-byte-aligned weight origins, partial channel
+tiles, reductions through 32,768 values, and prefill through 2,048 rows.
+Small cases use independent scalar-byte F64 accumulation; larger cases use
+a nonzero analytical result. Inputs, output guards, and inactive rows remain
+bit exact.

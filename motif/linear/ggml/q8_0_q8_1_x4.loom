@@ -1,0 +1,106 @@
+// Q8_0 weight contractions against Q8_1 x4 activation rows.
+//
+// The body accepts (row_capacity, K, N, activations, weights, output),
+// with disjoint buffers of row_capacity*K/128*144, N*K/32*34, and
+// row_capacity*N*4 bytes. K is 128..32768 and divisible by 128;
+// N is 1..262144 and row_capacity is 1..2048. The caller launches
+// 256-thread groups with ceil(N/(256/subgroup_size)) groups in X and
+// live_rows <= row_capacity groups in Y. Rows beyond live_rows remain intact.
+//
+// One subgroup owns one output channel. Eight lanes consume one weight
+// block using signed dot4 packets, advancing four blocks on wave32 or
+// eight on wave64. Absent blocks and tail channels are masked before loads.
+// Format readers retain raw code packets and separate F32 scales; the
+// contraction never rounds scaled weights to F16 or expands a weight tensor.
+
+func.decl @ggml_q8_0_word(%input: buffer, %row_byte_base: offset, %block: index, %word_in_block: index) -> (vector<4xi8>, f32)
+
+func.decl @ggml_q8_1_x4_word(%input: buffer, %row_byte_base: offset, %block: index, %word_in_block: index) -> (vector<4xi8>, f32)
+
+template.decl @ggml.q8_0.q8_1_x4.body(%row_capacity: index, %input_size: index, %output_size: index, %q8_input: buffer, %weight: buffer, %output: buffer)
+
+func.def inline @ggml_q8_0_q8_1_x4_row_lane(%input_size: index, %weight: buffer, %weight_row_byte_base: offset, %q8_input: buffer, %q8_row_byte_base: offset, %lane0: index) -> (f32) {
+  %bounded_input_size = index.assume %input_size [range(%input_size, 128, 32768), multiple_of(%input_size, 128)] : index
+  %lane = index.assume %lane0 [range(%lane0, 0, 63)] : index
+  %c0 = index.constant 0 : index
+  %c8 = index.constant 8 : index
+  %c32 = index.constant 32 : index
+  %c0_i32v = vector.constant 0 : vector<1xi32>
+  %c0_f32 = scalar.constant 0.0 : f32
+  %subgroup_size = target.subgroup.size : index
+  %blocks_per_iteration = index.div %subgroup_size, %c8 : index
+  %block_slot0 = index.div %lane, %c8 : index
+  %block_slot = index.assume %block_slot0 [range(%block_slot0, 0, 7)] : index
+  %word0 = index.rem %lane, %c8 : index
+  %word = index.assume %word0 [range(%word0, 0, 7)] : index
+  %block_count = index.div %bounded_input_size, %c32 : index
+  %result = scf.for %block_base = [%c0 to %block_count step %blocks_per_iteration](%row_acc = %c0_f32 : f32) -> (f32) {
+    %block0 = index.add %block_base, %block_slot : index
+    %valid_block = index.cmp ult, %block0, %block_count : index
+    %contribution = scf.if %valid_block -> (f32) {
+      %block = index.assume %block0 [range(%block0, 0, 1023), lt(%block0, %block_count)] : index
+      %weight_values, %weight_d = func.call @ggml_q8_0_word(%weight, %weight_row_byte_base, %block, %word) : (buffer, offset, index, index) -> (vector<4xi8>, f32)
+      %q8_values, %q8_d = func.call @ggml_q8_1_x4_word(%q8_input, %q8_row_byte_base, %block, %word) : (buffer, offset, index, index) -> (vector<4xi8>, f32)
+      %dot = vector.dot4i<s8s8> %weight_values, %q8_values, %c0_i32v : vector<4xi8>, vector<4xi8>, vector<1xi32>
+      %dot_i32 = vector.extract %dot[0] : vector<1xi32> -> i32
+      %dot_f32 = scalar.sitofp %dot_i32 : i32 to f32
+      %scale = scalar.mulf<reassoc|nnan|ninf|nsz> %weight_d, %q8_d : f32
+      %scaled_dot = scalar.mulf<reassoc|nnan|ninf|nsz> %dot_f32, %scale : f32
+      scf.yield %scaled_dot : f32
+    } else {
+      scf.yield %c0_f32 : f32
+    }
+    %next = scalar.addf<reassoc|nnan|ninf|nsz> %row_acc, %contribution : f32
+    scf.yield %next : f32
+  }
+  func.return %result : f32
+}
+
+template.def<@ggml.q8_0.q8_1_x4.body> device @ggml_q8_0_q8_1_x4_body(%row_capacity: index, %input_size: index, %output_size: index, %q8_input: buffer, %weight: buffer, %output: buffer) {
+  %q8_noalias, %weight_noalias, %output_noalias = buffer.assume.noalias %q8_input, %weight, %output : buffer, buffer, buffer
+  %bounded_row_capacity = index.assume %row_capacity [range(%row_capacity, 1, 2048)] : index
+  %bounded_input_size = index.assume %input_size [range(%input_size, 128, 32768), multiple_of(%input_size, 128)] : index
+  %bounded_output_size = index.assume %output_size [range(%output_size, 1, 262144)] : index
+  %token0 = kernel.workgroup.id<y> : index
+  %token = index.assume %token0 [lt(%token0, %bounded_row_capacity)] : index
+  %tile = kernel.workgroup.id<x> : index
+  %subgroup = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %workgroup_size = index.constant 256 : index
+  %subgroup_size = target.subgroup.size : index
+  %subgroups_per_workgroup = index.div %workgroup_size, %subgroup_size : index
+  %tile_channel_base = index.mul %tile, %subgroups_per_workgroup : index
+  %channel0 = index.add %tile_channel_base, %subgroup : index
+  %valid_channel = index.cmp ult, %channel0, %bounded_output_size : index
+  %c0 = index.constant 0 : index
+  %c32 = index.constant 32 : index
+  %c34_bytes = index.constant 34 : offset
+  %c128 = index.constant 128 : index
+  %c144_bytes = index.constant 144 : offset
+  %safe_channel0 = scf.select %valid_channel, %channel0, %c0 : index
+  %safe_channel = index.assume %safe_channel0 [lt(%safe_channel0, %bounded_output_size)] : index
+  %block_count = index.div %bounded_input_size, %c32 : index
+  %weight_row_bytes = index.scale %block_count, %c34_bytes : index, offset -> offset
+  %weight_row_byte_base = index.scale %safe_channel, %weight_row_bytes : index, offset -> offset
+  %q8_group_count = index.div %bounded_input_size, %c128 : index
+  %q8_row_bytes = index.scale %q8_group_count, %c144_bytes : index, offset -> offset
+  %q8_row_byte_base = index.scale %token, %q8_row_bytes : index, offset -> offset
+  %lane_acc = scf.if %valid_channel -> (f32) {
+    %value = func.call @ggml_q8_0_q8_1_x4_row_lane(%bounded_input_size, %weight_noalias, %weight_row_byte_base, %q8_noalias, %q8_row_byte_base, %lane) : (index, buffer, offset, buffer, offset, index) -> (f32)
+    scf.yield %value : f32
+  } else {
+    %c0_f32 = scalar.constant 0.0 : f32
+    scf.yield %c0_f32 : f32
+  }
+  %dot = kernel.subgroup.reduce<addf> %lane_acc : f32
+  %is_lane_zero = index.cmp eq, %lane, %c0 : index
+  scf.if %valid_channel {
+    scf.if %is_lane_zero {
+      %channel = index.assume %channel0 [lt(%channel0, %bounded_output_size)] : index
+      %c0_offset = index.constant 0 : offset
+      %output_view = buffer.view %output_noalias[%c0_offset] : buffer -> view<[%bounded_row_capacity]x[%bounded_output_size]xf32>
+      view.store %dot, %output_view[%token, %channel] : f32, view<[%bounded_row_capacity]x[%bounded_output_size]xf32>
+    }
+  }
+  template.return
+}

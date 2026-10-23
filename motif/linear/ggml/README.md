@@ -28,6 +28,12 @@ remain available to model-specific cohort and output-reduction schedules.
 All Q6 forms use the signed carrier decoder without first rounding weights to
 F16 or materializing an expanded tensor.
 
+Q8_0 contracts raw signed-byte records with Q8_1 x4 activations. Eight lanes
+own one 32-value block, so a subgroup advances four blocks on wave32 or eight
+on wave64. One subgroup reduces an output channel, masking absent blocks and
+tail channels before reads. The launch can dispatch fewer token rows than
+the supplied buffer capacity without touching the remaining rows.
+
 These are reusable Loom schedules, qualified for correctness through the
 [`linear` kernels](../../../kernel/ggml/linear/). The native tests establish
 packed-byte semantics, addressing, and numerical results; they do not establish

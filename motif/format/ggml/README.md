@@ -36,6 +36,11 @@ across 210-byte blocks. Q8_1 x4 readers expose a full 32-value block, a
 return the original block scale and scaled sum; consumers own any affine
 minimum correction, including how paired half-blocks share that sum.
 
+Q8_0 exposes one four-code word and its separate F32 scale from a raw
+34-byte record. Its word reader preserves signed I8 codes and handles the
+alternating word alignment between records. Integer dot products can use
+the codes directly; matrix staging decides where to round scaled values.
+
 ## References
 
 - [GGUF format specification](https://github.com/ggml-org/ggml/blob/30bf8685ed4eb0a47f2b06229543327749904150/docs/gguf.md)
