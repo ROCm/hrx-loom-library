@@ -15,6 +15,7 @@ inherit the execution contract of the software that originated the encoding.
 | Path | Contents |
 | --- | --- |
 | [`ggml/`](ggml/) | Persistent GGUF-carried encodings and transient GGML backend formats. |
+| [`bfp16ebs8/`](bfp16ebs8/) | Native AIE2P leading and residual block-floating operands. |
 
 Algorithms shared across several unrelated representations belong in a sibling
 algorithm motif such as `motif/quantize/`. Representation-specific byte layout
