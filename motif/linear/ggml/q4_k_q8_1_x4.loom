@@ -1,0 +1,121 @@
+// Q4_K x Q8_1 subgroup vector-contraction schedules.
+//
+// Sixteen lanes split each 256-value weight block into paired 16-value dots.
+// Wave32 processes two blocks per iteration; wave64 processes four. Partial
+// iterations mask absent blocks. One subgroup publishes one output channel.
+// The caller supplies a 256-thread workgroup and the exact token grid. Input
+// width is 256..32768, divisible by 256; output channels are 1..262144 and
+// token count is 1..2048.
+//
+// Buffers are disjoint. Activations use contiguous Q8_1 x4 rows; weights use
+// complete GGML blocks; output is contiguous row-major F32. The format motifs
+// own packed-byte interpretation. These schedules neither expand whole weight
+// tensors nor choose a concrete target or global configuration.
+
+func.decl @ggml_q4_k_load_chunk16(%weight: buffer, %row_byte_base: offset, %q4_block: index, %q4_group: index, %q4_half: index) -> (vector<16xi8>, f32, f32)
+
+func.decl @ggml_q8_1_x4_chunk16(%input: buffer, %row: offset, %block: index, %half: index) -> (vector<16xi8>, f32, f32)
+
+template.decl @ggml.qk.unsigned_q8_1_dot(%quantized_values: vector<16xi8>, %d_scale: f32, %dmin_scale: f32, %q8_values: vector<16xi8>, %q8_d: f32, %q8_s: f32) -> (f32)
+
+func.def inline @ggml_q4k_q8_1_x4_row_lane(%input_size: index, %weight: buffer, %weight_row_byte_base: offset, %q8_input: buffer, %q8_row_byte_base: offset, %lane: index) -> (f32) {
+  %bounded_input_size = index.assume %input_size [range(%input_size, 256, 32768), multiple_of(%input_size, 256)] : index
+  %subgroup_size = target.subgroup.size : index
+  %first_index = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %pair_width = index.constant 2 : index
+  %q8_blocks_per_group = index.constant 4 : index
+  %groups_per_weight_block = index.constant 8 : index
+  %lanes_per_weight_block = index.constant 16 : index
+  %values_per_q8_group = index.constant 128 : index
+  %values_per_weight_block = index.constant 256 : index
+  %sum_identity = scalar.constant 0.0 : f32
+  %q4_block_count = index.div %bounded_input_size, %values_per_weight_block : index
+  %q8_group_count = index.div %bounded_input_size, %values_per_q8_group : index
+  %blocks_per_iteration = index.div %subgroup_size, %lanes_per_weight_block : index
+  %q8_groups_per_iteration = index.div %subgroup_size, %groups_per_weight_block : index
+  %values_per_iteration = index.mul %subgroup_size, %lanes_per_weight_block : index
+  %iteration_padding = index.sub %values_per_iteration, %unit : index
+  %padded_input_size = index.add %bounded_input_size, %iteration_padding : index
+  %iteration_count = index.div %padded_input_size, %values_per_iteration : index
+  %q4_group0 = index.div %lane, %pair_width : index
+  %q4_group1 = index.rem %q4_group0, %groups_per_weight_block : index
+  %q4_group = index.assume %q4_group1 [range(%q4_group1, 0, 7)] : index
+  %q4_half0 = index.rem %lane, %pair_width : index
+  %q4_half = index.assume %q4_half0 [range(%q4_half0, 0, 1)] : index
+  %lane_q4_block = index.div %lane, %lanes_per_weight_block : index
+  %lane_q8_group = index.div %lane, %groups_per_weight_block : index
+  %q8_inner_block0 = index.div %lane, %pair_width : index
+  %q8_inner_block1 = index.rem %q8_inner_block0, %q8_blocks_per_group : index
+  %q8_inner_block = index.assume %q8_inner_block1 [range(%q8_inner_block1, 0, 3)] : index
+  %sum = scf.for %iteration = [%first_index to %iteration_count step %unit](%iteration_acc = %sum_identity : f32) -> (f32) {
+    %iteration_q4_block = index.mul %iteration, %blocks_per_iteration : index
+    %q4_block0 = index.add %iteration_q4_block, %lane_q4_block : index
+    %valid_q4_block = index.cmp ult, %q4_block0, %q4_block_count : index
+    %contribution = scf.if %valid_q4_block -> (f32) {
+      %q4_block = index.assume %q4_block0 [lt(%q4_block0, %q4_block_count)] : index
+      %iteration_q8_group = index.mul %iteration, %q8_groups_per_iteration : index
+      %q8_group0 = index.add %iteration_q8_group, %lane_q8_group : index
+      %q8_group = index.assume %q8_group0 [lt(%q8_group0, %q8_group_count)] : index
+      %q8_block = index.madd %q8_group, %q8_blocks_per_group, %q8_inner_block : index
+      %q8_values, %q8_d, %q8_s = func.call @ggml_q8_1_x4_chunk16(%q8_input, %q8_row_byte_base, %q8_block, %q4_half) : (buffer, offset, index, index) -> (vector<16xi8>, f32, f32)
+      %q4_values, %d_scale, %dmin_scale = func.call @ggml_q4_k_load_chunk16(%weight, %weight_row_byte_base, %q4_block, %q4_group, %q4_half) : (buffer, offset, index, index, index) -> (vector<16xi8>, f32, f32)
+      %dot = template.apply<@ggml.qk.unsigned_q8_1_dot>(%q4_values, %d_scale, %dmin_scale, %q8_values, %q8_d, %q8_s) : (vector<16xi8>, f32, f32, vector<16xi8>, f32, f32) -> (f32)
+      scf.yield %dot : f32
+    } else {
+      scf.yield %sum_identity : f32
+    }
+    %next = scalar.addf<reassoc|nnan|ninf|nsz> %iteration_acc, %contribution : f32
+    scf.yield %next : f32
+  }
+  func.return %sum : f32
+}
+
+template.decl @ggml.q4k.q8_1_x4.single.body(%token_count: index, %input_size: index, %output_size: index, %q8_input: buffer, %weight: buffer, %output: buffer)
+
+template.def<@ggml.q4k.q8_1_x4.single.body> device @ggml_q4k_q8_1_x4_single_body(%token_count: index, %input_size: index, %output_size: index, %q8_input: buffer, %weight: buffer, %output: buffer) {
+  %q8_noalias, %weight_noalias, %output_noalias = buffer.assume.noalias %q8_input, %weight, %output : buffer, buffer, buffer
+  %bounded_token_count = index.assume %token_count [range(%token_count, 1, 2048)] : index
+  %bounded_input_size = index.assume %input_size [range(%input_size, 256, 32768), multiple_of(%input_size, 256)] : index
+  %bounded_output_size = index.assume %output_size [range(%output_size, 1, 262144)] : index
+  %subgroup_size = target.subgroup.size : index
+  %workgroup_size = index.constant 256 : index
+  %first_index = index.constant 0 : index
+  %values_per_q8_group = index.constant 128 : index
+  %packed_group_bytes = index.constant 144 : offset
+  %values_per_weight_block = index.constant 256 : index
+  %subgroups_per_workgroup = index.div %workgroup_size, %subgroup_size : index
+  %channel_tile = kernel.workgroup.id<x> : index
+  %token0 = kernel.workgroup.id<y> : index
+  %token = index.assume %token0 [lt(%token0, %bounded_token_count)] : index
+  %subgroup = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %channel_base = index.mul %channel_tile, %subgroups_per_workgroup : index
+  %channel0 = index.add %channel_base, %subgroup : index
+  %valid_channel = index.cmp ult, %channel0, %bounded_output_size : index
+  %safe_channel0 = scf.select %valid_channel, %channel0, %first_index : index
+  %safe_channel = index.assume %safe_channel0 [lt(%safe_channel0, %bounded_output_size)] : index
+  %q4_block_count = index.div %bounded_input_size, %values_per_weight_block : index
+  %weight_row_bytes = index.scale %q4_block_count, %packed_group_bytes : index, offset -> offset
+  %weight_row_byte_base = index.scale %safe_channel, %weight_row_bytes : index, offset -> offset
+  %q8_group_count = index.div %bounded_input_size, %values_per_q8_group : index
+  %q8_row_bytes = index.scale %q8_group_count, %packed_group_bytes : index, offset -> offset
+  %q8_row_byte_base = index.scale %token, %q8_row_bytes : index, offset -> offset
+  %lane_acc = scf.if %valid_channel -> (f32) {
+    %value = func.call @ggml_q4k_q8_1_x4_row_lane(%bounded_input_size, %weight_noalias, %weight_row_byte_base, %q8_noalias, %q8_row_byte_base, %lane) : (index, buffer, offset, buffer, offset, index) -> (f32)
+    scf.yield %value : f32
+  } else {
+    %sum_identity = scalar.constant 0.0 : f32
+    scf.yield %sum_identity : f32
+  }
+  %dot = kernel.subgroup.reduce<addf> %lane_acc : f32
+  %is_lane_zero = index.cmp eq, %lane, %first_index : index
+  scf.if %valid_channel {
+    scf.if %is_lane_zero {
+      %origin = index.constant 0 : offset
+      %output_view = buffer.view %output_noalias[%origin] : buffer -> view<[%bounded_token_count]x[%bounded_output_size]xf32>
+      view.store %dot, %output_view[%token, %channel0] : f32, view<[%bounded_token_count]x[%bounded_output_size]xf32>
+    }
+  }
+  template.return
+}

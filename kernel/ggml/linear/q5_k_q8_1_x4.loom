@@ -1,0 +1,88 @@
+// Dense Q5_K weight projection of Q8_1 x4 activation rows.
+//
+// Configuration ABI: (token_count, input_size, output_size), all index values.
+// Launch ABI: the same dimensions followed by (activations, weights, output).
+// Buffers are disjoint; output is contiguous [token_count, output_size] F32.
+// Activations occupy token_count * input_size / 128 * 144 bytes. Weights
+// occupy output_size * input_size / 256 * 176 bytes in raw row order.
+// Input size is 256..32768 and divisible by 256; token count is 1..2048;
+// output size is 1..262144. Launch geometry follows these workload values.
+// Channel8 entry points require an output count divisible by eight and
+// weights ordered [channel_group, input_block, channel_in_group, block_byte].
+// The m4 entry points require exactly four token rows and share decoded weight
+// packets across them. Other entry points launch one grid row per token.
+// A 256-thread group assigns one output channel to each subgroup. The schedule
+// accepts wave32 or wave64; the caller supplies the target. Tail channels are
+// masked. The motif owns integer dots, scaling, reduction, and weight reuse.
+
+template.decl @ggml.q5k.q8_1_x4.single.body(%weight_channels: index, %token_count: index, %input_size: index, %output_size: index, %q8_input: buffer, %weight: buffer, %output: buffer)
+
+template.decl @ggml.q5k.q8_1_x4.four.body(%weight_channels: index, %token_count: index, %input_size: index, %output_size: index, %q8_input: buffer, %weight: buffer, %output: buffer)
+
+kernel.def export("ggml_linear_q5k_q8_1_x4") @ggml_linear_q5k_q8_1_x4(%token_count: index, %input_size: index, %output_size: index) {
+  %bounded_token_count = index.assume %token_count [range(%token_count, 1, 2048)] : index
+  %bounded_output_size = index.assume %output_size [range(%output_size, 1, 262144)] : index
+  %subgroup_size = target.subgroup.size : index
+  %workgroup_size = index.constant 256 : index
+  %unit = index.constant 1 : index
+  %subgroups_per_workgroup = index.div %workgroup_size, %subgroup_size : index
+  %output_padding = index.sub %subgroups_per_workgroup, %unit : index
+  %padded_output_size = index.add %bounded_output_size, %output_padding : index
+  %output_tiles = index.div %padded_output_size, %subgroups_per_workgroup : index
+  kernel.launch.config workgroups(%output_tiles, %bounded_token_count, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%token_count: index, %input_size: index, %output_size: index, %q8_input: buffer, %weight: buffer, %output: buffer) {
+  %weight_channels = index.constant 1 : index
+  template.apply<@ggml.q5k.q8_1_x4.single.body>(%weight_channels, %token_count, %input_size, %output_size, %q8_input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def export("ggml_linear_q5k_q8_1_x4_channel8") @ggml_linear_q5k_q8_1_x4_channel8(%token_count: index, %input_size: index, %output_size: index) {
+  %bounded_token_count = index.assume %token_count [range(%token_count, 1, 2048)] : index
+  %bounded_output_size = index.assume %output_size [range(%output_size, 8, 262144), multiple_of(%output_size, 8)] : index
+  %subgroup_size = target.subgroup.size : index
+  %workgroup_size = index.constant 256 : index
+  %unit = index.constant 1 : index
+  %subgroups_per_workgroup = index.div %workgroup_size, %subgroup_size : index
+  %output_padding = index.sub %subgroups_per_workgroup, %unit : index
+  %padded_output_size = index.add %bounded_output_size, %output_padding : index
+  %output_tiles = index.div %padded_output_size, %subgroups_per_workgroup : index
+  kernel.launch.config workgroups(%output_tiles, %bounded_token_count, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%token_count: index, %input_size: index, %output_size: index, %q8_input: buffer, %weight: buffer, %output: buffer) {
+  %weight_channels = index.constant 8 : index
+  template.apply<@ggml.q5k.q8_1_x4.single.body>(%weight_channels, %token_count, %input_size, %output_size, %q8_input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def export("ggml_linear_q5k_q8_1_x4_m4") @ggml_linear_q5k_q8_1_x4_m4(%token_count: index, %input_size: index, %output_size: index) {
+  %bounded_token_count = index.assume %token_count [range(%token_count, 4, 4)] : index
+  %bounded_output_size = index.assume %output_size [range(%output_size, 1, 262144)] : index
+  %subgroup_size = target.subgroup.size : index
+  %workgroup_size = index.constant 256 : index
+  %unit = index.constant 1 : index
+  %subgroups_per_workgroup = index.div %workgroup_size, %subgroup_size : index
+  %output_padding = index.sub %subgroups_per_workgroup, %unit : index
+  %padded_output_size = index.add %bounded_output_size, %output_padding : index
+  %output_tiles = index.div %padded_output_size, %subgroups_per_workgroup : index
+  kernel.launch.config workgroups(%output_tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%token_count: index, %input_size: index, %output_size: index, %q8_input: buffer, %weight: buffer, %output: buffer) {
+  %weight_channels = index.constant 1 : index
+  template.apply<@ggml.q5k.q8_1_x4.four.body>(%weight_channels, %token_count, %input_size, %output_size, %q8_input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def export("ggml_linear_q5k_q8_1_x4_m4_channel8") @ggml_linear_q5k_q8_1_x4_m4_channel8(%token_count: index, %input_size: index, %output_size: index) {
+  %bounded_token_count = index.assume %token_count [range(%token_count, 4, 4)] : index
+  %bounded_output_size = index.assume %output_size [range(%output_size, 8, 262144), multiple_of(%output_size, 8)] : index
+  %subgroup_size = target.subgroup.size : index
+  %workgroup_size = index.constant 256 : index
+  %unit = index.constant 1 : index
+  %subgroups_per_workgroup = index.div %workgroup_size, %subgroup_size : index
+  %output_padding = index.sub %subgroups_per_workgroup, %unit : index
+  %padded_output_size = index.add %bounded_output_size, %output_padding : index
+  %output_tiles = index.div %padded_output_size, %subgroups_per_workgroup : index
+  kernel.launch.config workgroups(%output_tiles, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%token_count: index, %input_size: index, %output_size: index, %q8_input: buffer, %weight: buffer, %output: buffer) {
+  %weight_channels = index.constant 8 : index
+  template.apply<@ggml.q5k.q8_1_x4.four.body>(%weight_channels, %token_count, %input_size, %output_size, %q8_input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}

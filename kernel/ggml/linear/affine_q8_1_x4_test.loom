@@ -1,0 +1,825 @@
+// Independent packed-byte affine projection references and workloads.
+//
+// Small randomized cases decode scalar bytes and accumulate each 32-value
+// affine group in F64 on the CPU. They exercise every public launch form,
+// signed activations, signed/zero coefficients, odd block counts, channel
+// tails, distinct token rows, and complete eight-channel weight groups.
+// Large workloads use a constant nonzero construction with an exact result.
+// References never call production format readers or contraction motifs.
+
+kernel.decl @ggml_linear_q4k_q8_1_x4(%configured_tokens: index, %configured_inputs: index, %configured_outputs: index) launch(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q5k_q8_1_x4(%configured_tokens: index, %configured_inputs: index, %configured_outputs: index) launch(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q5k_q8_1_x4_channel8(%configured_tokens: index, %configured_inputs: index, %configured_outputs: index) launch(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q5k_q8_1_x4_m4(%configured_tokens: index, %configured_inputs: index, %configured_outputs: index) launch(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q5k_q8_1_x4_m4_channel8(%configured_tokens: index, %configured_inputs: index, %configured_outputs: index) launch(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.def @initialize_affine(%uniform: i1, %fifth_bit: i1, %token_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer) {
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %q8_blocks_per_group = index.constant 4 : index
+  %groups_per_weight_block = index.constant 8 : index
+  %metadata_bytes = index.constant 12 : index
+  %group_values = index.constant 32 : index
+  %weight_values = index.constant 256 : index
+  %q8_group_values = index.constant 128 : index
+  %q4_bytes = index.constant 144 : offset
+  %q5_bytes = index.constant 176 : offset
+  %q8_group_bytes = index.constant 144 : offset
+  %header_bytes = index.constant 4 : offset
+  %payload_add = index.constant 16 : offset
+  %word_bytes = index.constant 4 : offset
+  %block_bytes = scf.select %fifth_bit, %q5_bytes, %q4_bytes : offset
+  %blocks_per_row = index.div %input_size, %weight_values : index
+  %weight_blocks = index.mul %output_size, %blocks_per_row : index
+  %zero_integer = scalar.constant 0 : i32
+  %unit_coefficient = scalar.constant 1 : i8
+  %paired_nibbles = scalar.constant 17 : i8
+  %high_bits = scalar.constant -1 : i8
+  %scale_unit = scalar.constant 0.0078125 : f32
+  %minimum_unit = scalar.constant 0.00390625 : f32
+  %center = scalar.constant 3.0 : f32
+  %coefficient_period = index.constant 7 : index
+  %uniform_scale = scalar.constant 0.125 : f32
+  %uniform_minimum = scalar.constant 0.03125 : f32
+  scf.for %block = [%begin to %weight_blocks step %unit] {
+    %origin = index.scale %block, %block_bytes : index, offset -> offset
+    %header = buffer.view %weight[%origin] : buffer -> view<2xf16>
+    %ordinal = index.rem %block, %coefficient_period : index
+    %integer = index.cast %ordinal : index to i32
+    %floating = scalar.uitofp %integer : i32 to f32
+    %centered = scalar.subf %floating, %center : f32
+    %random_scale = scalar.mulf %centered, %scale_unit : f32
+    %random_minimum = scalar.mulf %centered, %minimum_unit : f32
+    %scale = scf.select %uniform, %uniform_scale, %random_scale : f32
+    %minimum = scf.select %uniform, %uniform_minimum, %random_minimum : f32
+    %scale_half = scalar.fptrunc %scale : f32 to f16
+    %minimum_half = scalar.fptrunc %minimum : f32 to f16
+    view.store %scale_half, %header[0] : f16, view<2xf16>
+    view.store %minimum_half, %header[1] : f16, view<2xf16>
+    scf.if %uniform {
+      %metadata_origin = index.add %origin, %header_bytes : offset
+      %metadata = buffer.view %weight[%metadata_origin] : buffer -> view<12xi8>
+      scf.for %index = [%begin to %groups_per_weight_block step %unit] {
+        view.store %unit_coefficient, %metadata[%index] : i8, view<12xi8>
+      }
+      scf.for %index = [%groups_per_weight_block to %metadata_bytes step %unit] {
+        view.store %paired_nibbles, %metadata[%index] : i8, view<12xi8>
+      }
+      scf.if %fifth_bit {
+        %high_origin = index.add %origin, %payload_add : offset
+        %high = buffer.view %weight[%high_origin] : buffer -> view<32xi8>
+        scf.for %index = [%begin to %group_values step %unit] {
+          view.store %high_bits, %high[%index] : i8, view<32xi8>
+        }
+      }
+    }
+  }
+  %q8_groups = index.div %input_size, %q8_group_values : index
+  %q8_row_bytes = index.scale %q8_groups, %q8_group_bytes : index, offset -> offset
+  %q8_blocks = index.div %input_size, %group_values : index
+  %activation_unit = scalar.constant 0.03125 : f32
+  %uniform_activation_scale = scalar.constant 0.5 : f32
+  scf.for %row = [%begin to %token_count step %unit] {
+    %row_origin = index.scale %row, %q8_row_bytes : index, offset -> offset
+    scf.for %block = [%begin to %q8_blocks step %unit] {
+      %group = index.div %block, %q8_blocks_per_group : index
+      %within = index.rem %block, %q8_blocks_per_group : index
+      %group_add = index.scale %group, %q8_group_bytes : index, offset -> offset
+      %group_origin = index.add %row_origin, %group_add : offset
+      %header_add = index.scale %within, %word_bytes : index, offset -> offset
+      %header_origin = index.add %group_origin, %header_add : offset
+      %payload_origin = index.add %group_origin, %payload_add : offset
+      %codes = buffer.view %input[%payload_origin] : buffer -> view<4x32xi8>
+      %header = buffer.view %input[%header_origin] : buffer -> view<2xf16>
+      %ordinal0 = index.add %block, %row : index
+      %ordinal = index.rem %ordinal0, %coefficient_period : index
+      %integer = index.cast %ordinal : index to i32
+      %floating = scalar.uitofp %integer : i32 to f32
+      %centered = scalar.subf %floating, %center : f32
+      %random_scale = scalar.mulf %centered, %activation_unit : f32
+      %scale = scf.select %uniform, %uniform_activation_scale, %random_scale : f32
+      %sum = scf.for %element = [%begin to %group_values step %unit](%running = %zero_integer : i32) -> (i32) {
+        %byte = view.load %codes[%within, %element] : view<4x32xi8> -> i8
+        %value = scalar.extsi %byte : i8 to i32
+        %next = scalar.addi %running, %value : i32
+        scf.yield %next : i32
+      }
+      %sum_float = scalar.sitofp %sum : i32 to f32
+      %scaled_sum = scalar.mulf %scale, %sum_float : f32
+      %scale_half = scalar.fptrunc %scale : f32 to f16
+      %sum_half = scalar.fptrunc %scaled_sum : f32 to f16
+      view.store %scale_half, %header[0] : f16, view<2xf16>
+      view.store %sum_half, %header[1] : f16, view<2xf16>
+    }
+  }
+  func.return
+}
+
+func.def @affine_reference(%fifth_bit: i1, %weight_channels: index, %token_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %groups_per_page = index.constant 2 : index
+  %q8_blocks_per_group = index.constant 4 : index
+  %groups_per_weight_block = index.constant 8 : index
+  %group_values = index.constant 32 : index
+  %weight_values = index.constant 256 : index
+  %q8_group_values = index.constant 128 : index
+  %origin = index.constant 0 : offset
+  %q4_bytes = index.constant 144 : offset
+  %q5_bytes = index.constant 176 : offset
+  %q8_group_bytes = index.constant 144 : offset
+  %header_add = index.constant 4 : offset
+  %q4_payload_add = index.constant 16 : offset
+  %q5_payload_add = index.constant 48 : offset
+  %word_bytes = index.constant 4 : offset
+  %mask4 = scalar.constant 15 : i32
+  %mask6 = scalar.constant 63 : i32
+  %mask1 = scalar.constant 1 : i32
+  %shift4 = scalar.constant 4 : i32
+  %shift6 = scalar.constant 6 : i32
+  %zero_integer = scalar.constant 0 : i64
+  %sum_identity = scalar.constant 0.0 : f64
+  %block_bytes = scf.select %fifth_bit, %q5_bytes, %q4_bytes : offset
+  %payload_add = scf.select %fifth_bit, %q5_payload_add, %q4_payload_add : offset
+  %blocks = index.div %input_size, %weight_values : index
+  %groups = index.div %input_size, %group_values : index
+  %q8_groups = index.div %input_size, %q8_group_values : index
+  %q8_row_bytes = index.scale %q8_groups, %q8_group_bytes : index, offset -> offset
+  %results = buffer.view %output[%origin] : buffer -> view<[%token_count]x[%output_size]xf32>
+  scf.for %row = [%begin to %token_count step %unit] {
+    %input_origin = index.scale %row, %q8_row_bytes : index, offset -> offset
+    scf.for %channel = [%begin to %output_size step %unit] {
+      %channel_group = index.div %channel, %weight_channels : index
+      %within_channel = index.rem %channel, %weight_channels : index
+      %group_block_base = index.mul %channel_group, %blocks : index
+      %sum = scf.for %group = [%begin to %groups step %unit](%running = %sum_identity : f64) -> (f64) {
+        %block = index.div %group, %groups_per_weight_block : index
+        %within = index.rem %group, %groups_per_weight_block : index
+        %group_block = index.add %group_block_base, %block : index
+        %physical_block = index.madd %group_block, %weight_channels, %within_channel : index
+        %weight_origin = index.scale %physical_block, %block_bytes : index, offset -> offset
+        %metadata_origin = index.add %weight_origin, %header_add : offset
+        %payload_origin = index.add %weight_origin, %payload_add : offset
+        %high_origin = index.add %weight_origin, %q4_payload_add : offset
+        %header = buffer.view %weight[%weight_origin] : buffer -> view<2xf16>
+        %metadata = buffer.view %weight[%metadata_origin] : buffer -> view<12xi8>
+        %payload = buffer.view %weight[%payload_origin] : buffer -> view<128xi8>
+        %high = buffer.view %weight[%high_origin] : buffer -> view<32xi8>
+        %scale_half = view.load %header[0] : view<2xf16> -> f16
+        %minimum_half = view.load %header[1] : view<2xf16> -> f16
+        %scale = scalar.extf %scale_half : f16 to f64
+        %minimum = scalar.extf %minimum_half : f16 to f64
+        %direct = index.cmp ult, %within, %q8_blocks_per_group : index
+        %scale_code, %minimum_code = scf.if %direct -> (i32, i32) {
+          %minimum_index = index.add %within, %q8_blocks_per_group : index
+          %scale_byte = view.load %metadata[%within] : view<12xi8> -> i8
+          %minimum_byte = view.load %metadata[%minimum_index] : view<12xi8> -> i8
+          %scale_integer = scalar.extui %scale_byte : i8 to i32
+          %minimum_integer = scalar.extui %minimum_byte : i8 to i32
+          %scale_code = scalar.andi %scale_integer, %mask6 : i32
+          %minimum_code = scalar.andi %minimum_integer, %mask6 : i32
+          scf.yield %scale_code, %minimum_code : i32, i32
+        } else {
+          %low_index = index.add %within, %q8_blocks_per_group : index
+          %scale_high_index = index.sub %within, %q8_blocks_per_group : index
+          %packed_byte = view.load %metadata[%low_index] : view<12xi8> -> i8
+          %scale_high_byte = view.load %metadata[%scale_high_index] : view<12xi8> -> i8
+          %minimum_high_byte = view.load %metadata[%within] : view<12xi8> -> i8
+          %packed = scalar.extui %packed_byte : i8 to i32
+          %scale_upper = scalar.extui %scale_high_byte : i8 to i32
+          %minimum_upper = scalar.extui %minimum_high_byte : i8 to i32
+          %scale_low = scalar.andi %packed, %mask4 : i32
+          %minimum_low = scalar.shrui %packed, %shift4 : i32
+          %scale_bits = scalar.shrui %scale_upper, %shift6 : i32
+          %minimum_bits = scalar.shrui %minimum_upper, %shift6 : i32
+          %scale_high = scalar.shli %scale_bits, %shift4 : i32
+          %minimum_high = scalar.shli %minimum_bits, %shift4 : i32
+          %scale_code = scalar.ori %scale_low, %scale_high : i32
+          %minimum_code = scalar.ori %minimum_low, %minimum_high : i32
+          scf.yield %scale_code, %minimum_code : i32, i32
+        }
+        %activation_group = index.div %group, %q8_blocks_per_group : index
+        %activation_within = index.rem %group, %q8_blocks_per_group : index
+        %activation_group_add = index.scale %activation_group, %q8_group_bytes : index, offset -> offset
+        %activation_origin = index.add %input_origin, %activation_group_add : offset
+        %activation_header_add = index.scale %activation_within, %word_bytes : index, offset -> offset
+        %activation_header_origin = index.add %activation_origin, %activation_header_add : offset
+        %activation_payload_origin = index.add %activation_origin, %q4_payload_add : offset
+        %activation_header = buffer.view %input[%activation_header_origin] : buffer -> view<2xf16>
+        %activation_payload = buffer.view %input[%activation_payload_origin] : buffer -> view<4x32xi8>
+        %activation_scale_half = view.load %activation_header[0] : view<2xf16> -> f16
+        %activation_sum_half = view.load %activation_header[1] : view<2xf16> -> f16
+        %activation_scale = scalar.extf %activation_scale_half : f16 to f64
+        %activation_sum = scalar.extf %activation_sum_half : f16 to f64
+        %page = index.div %within, %groups_per_page : index
+        %nibble = index.rem %within, %groups_per_page : index
+        %nibble_integer = index.cast %nibble : index to i32
+        %nibble_shift = scalar.muli %nibble_integer, %shift4 : i32
+        %high_shift = index.cast %within : index to i32
+        %dot = scf.for %element = [%begin to %group_values step %unit](%dot_sum = %zero_integer : i64) -> (i64) {
+          %code_index = index.madd %page, %group_values, %element : index
+          %code_byte = view.load %payload[%code_index] : view<128xi8> -> i8
+          %code_integer = scalar.extui %code_byte : i8 to i32
+          %shifted = scalar.shrui %code_integer, %nibble_shift : i32
+          %low = scalar.andi %shifted, %mask4 : i32
+          %code = scf.if %fifth_bit -> (i32) {
+            %high_byte = view.load %high[%element] : view<32xi8> -> i8
+            %high_integer = scalar.extui %high_byte : i8 to i32
+            %selected = scalar.shrui %high_integer, %high_shift : i32
+            %bit = scalar.andi %selected, %mask1 : i32
+            %high_code = scalar.shli %bit, %shift4 : i32
+            %combined = scalar.ori %low, %high_code : i32
+            scf.yield %combined : i32
+          } else {
+            scf.yield %low : i32
+          }
+          %activation_byte = view.load %activation_payload[%activation_within, %element] : view<4x32xi8> -> i8
+          %activation_integer = scalar.extsi %activation_byte : i8 to i64
+          %weight_integer = scalar.extui %code : i32 to i64
+          %product = scalar.muli %weight_integer, %activation_integer : i64
+          %next = scalar.addi %dot_sum, %product : i64
+          scf.yield %next : i64
+        }
+        %dot_float = scalar.sitofp %dot : i64 to f64
+        %scale_float = scalar.uitofp %scale_code : i32 to f64
+        %minimum_float = scalar.uitofp %minimum_code : i32 to f64
+        %weight_scale = scalar.mulf %scale, %scale_float : f64
+        %combined_scale = scalar.mulf %weight_scale, %activation_scale : f64
+        %scaled_dot = scalar.mulf %combined_scale, %dot_float : f64
+        %weight_minimum = scalar.mulf %minimum, %minimum_float : f64
+        %correction = scalar.mulf %weight_minimum, %activation_sum : f64
+        %contribution = scalar.subf %scaled_dot, %correction : f64
+        %next = scalar.addf %running, %contribution : f64
+        scf.yield %next : f64
+      }
+      %rounded = scalar.fptrunc %sum : f64 to f32
+      view.store %rounded, %results[%row, %channel] : f32, view<[%token_count]x[%output_size]xf32>
+    }
+  }
+  func.return
+}
+
+func.def @q4_channels1_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %fifth_bit = scalar.constant false : i1
+  %channels = index.constant 1 : index
+  func.call @affine_reference(%fifth_bit, %channels, %tokens, %inputs, %outputs, %input, %weight, %output) : (i1, index, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @q5_channels1_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %fifth_bit = scalar.constant true : i1
+  %channels = index.constant 1 : index
+  func.call @affine_reference(%fifth_bit, %channels, %tokens, %inputs, %outputs, %input, %weight, %output) : (i1, index, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @q5_channels8_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %fifth_bit = scalar.constant true : i1
+  %channels = index.constant 8 : index
+  func.call @affine_reference(%fifth_bit, %channels, %tokens, %inputs, %outputs, %input, %weight, %output) : (i1, index, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+// Each activation is 0.5; Q4 weights are 1 * 0.125 - 0.03125.
+func.def @q4_uniform_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %coefficient = scalar.constant 0.046875 : f32
+  %integer = index.cast %inputs : index to i32
+  %floating = scalar.uitofp %integer : i32 to f32
+  %expected = scalar.mulf %floating, %coefficient : f32
+  %destination = buffer.view %output[%origin] : buffer -> view<[%tokens]x[%outputs]xf32>
+  scf.for %row = [%begin to %tokens step %unit] {
+    scf.for %channel = [%begin to %outputs step %unit] {
+      view.store %expected, %destination[%row, %channel] : f32, view<[%tokens]x[%outputs]xf32>
+    }
+  }
+  func.return
+}
+
+// Q5 adds the high bit: each weight is 17 * 0.125 - 0.03125.
+func.def @q5_uniform_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %coefficient = scalar.constant 1.046875 : f32
+  %integer = index.cast %inputs : index to i32
+  %floating = scalar.uitofp %integer : i32 to f32
+  %expected = scalar.mulf %floating, %coefficient : f32
+  %destination = buffer.view %output[%origin] : buffer -> view<[%tokens]x[%outputs]xf32>
+  scf.for %row = [%begin to %tokens step %unit] {
+    scf.for %channel = [%begin to %outputs step %unit] {
+      view.store %expected, %destination[%row, %channel] : f32, view<[%tokens]x[%outputs]xf32>
+    }
+  }
+  func.return
+}
+
+check.scenario public @q4_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %uniform = check.literal value(false) : i1
+    %fifth_bit = check.literal value(false) : i1
+    %tokens = check.literal value(1) : index
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(65) : index
+    %input = check.generate.random.uniform seed(%input_seed) range(-16 to 15) : tensor<288xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<9360xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<288xi8>, tensor<9360xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<73xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<73xf32> -> tensor<1x65xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<73xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(276) : tensor<73xf32> -> tensor<4xf32>
+    check.compare<@ggml_linear_q4k_q8_1_x4, @q4_channels1_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<288xi8>, tensor<9360xi8>, tensor<1x65xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0001) rtol(1.9999999999999999e-06) nan(different) : tensor<73xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<288xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<9360xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q4_random> @q4_tail
+
+check.scenario public @q4_blocks_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %uniform = check.literal value(false) : i1
+    %fifth_bit = check.literal value(false) : i1
+    %tokens = check.literal value(3) : index
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(17) : index
+    %input = check.generate.random.uniform seed(%input_seed) range(-16 to 15) : tensor<2592xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<7344xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<2592xi8>, tensor<7344xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<59xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<59xf32> -> tensor<3x17xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<59xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(220) : tensor<59xf32> -> tensor<4xf32>
+    check.compare<@ggml_linear_q4k_q8_1_x4, @q4_channels1_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<2592xi8>, tensor<7344xi8>, tensor<3x17xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0001) rtol(1.9999999999999999e-06) nan(different) : tensor<59xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2592xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<7344xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q4_blocks_random> @q4_blocks_tail
+
+check.scenario public @q5_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %uniform = check.literal value(false) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %tokens = check.literal value(1) : index
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(65) : index
+    %input = check.generate.random.uniform seed(%input_seed) range(-16 to 15) : tensor<288xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<11440xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<288xi8>, tensor<11440xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<73xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<73xf32> -> tensor<1x65xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<73xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(276) : tensor<73xf32> -> tensor<4xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4, @q5_channels1_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<288xi8>, tensor<11440xi8>, tensor<1x65xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0001) rtol(1.9999999999999999e-06) nan(different) : tensor<73xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<288xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<11440xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_random> @q5_tail
+
+check.scenario public @q5_blocks_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %uniform = check.literal value(false) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %tokens = check.literal value(3) : index
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(17) : index
+    %input = check.generate.random.uniform seed(%input_seed) range(-16 to 15) : tensor<2592xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<8976xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<2592xi8>, tensor<8976xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<59xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<59xf32> -> tensor<3x17xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<59xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(220) : tensor<59xf32> -> tensor<4xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4, @q5_channels1_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<2592xi8>, tensor<8976xi8>, tensor<3x17xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0001) rtol(1.9999999999999999e-06) nan(different) : tensor<59xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2592xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<8976xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_blocks_random> @q5_blocks_tail
+
+check.scenario public @q5_channel8_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %uniform = check.literal value(false) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %tokens = check.literal value(3) : index
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(72) : index
+    %input = check.generate.random.uniform seed(%input_seed) range(-16 to 15) : tensor<2592xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<38016xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<2592xi8>, tensor<38016xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<224xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<224xf32> -> tensor<3x72xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<224xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(880) : tensor<224xf32> -> tensor<4xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4_channel8, @q5_channels8_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<2592xi8>, tensor<38016xi8>, tensor<3x72xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0001) rtol(1.9999999999999999e-06) nan(different) : tensor<224xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2592xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<38016xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_channel8_random> @q5_channel8_tail
+
+check.scenario public @q5_m4_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %uniform = check.literal value(false) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %tokens = check.literal value(4) : index
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(65) : index
+    %input = check.generate.random.uniform seed(%input_seed) range(-16 to 15) : tensor<3456xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<34320xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<3456xi8>, tensor<34320xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<268xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<268xf32> -> tensor<4x65xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<268xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(1056) : tensor<268xf32> -> tensor<4xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4_m4, @q5_channels1_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<3456xi8>, tensor<34320xi8>, tensor<4x65xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0001) rtol(1.9999999999999999e-06) nan(different) : tensor<268xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<3456xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<34320xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_m4_random> @q5_m4_tail
+
+check.scenario public @q5_m4_channel8_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %uniform = check.literal value(false) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %tokens = check.literal value(4) : index
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(72) : index
+    %input = check.generate.random.uniform seed(%input_seed) range(-16 to 15) : tensor<3456xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<38016xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<3456xi8>, tensor<38016xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<296xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<296xf32> -> tensor<4x72xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<296xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(1168) : tensor<296xf32> -> tensor<4xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4_m4_channel8, @q5_channels8_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<3456xi8>, tensor<38016xi8>, tensor<4x72xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0001) rtol(1.9999999999999999e-06) nan(different) : tensor<296xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<3456xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<38016xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_m4_channel8_random> @q5_m4_channel8_tail
+
+check.scenario public @q4_uniform_1 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(1) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(false) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x144xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x144xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q4k_q8_1_x4, @q4_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x144xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q4_uniform_1> @q4_uniform_1_latency
+
+check.scenario public @q4_uniform_32 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(32) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(false) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x144xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x144xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q4k_q8_1_x4, @q4_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x144xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q4_uniform_32> @q4_uniform_32_latency
+
+check.scenario public @q4_uniform_128 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(128) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(false) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x144xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x144xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q4k_q8_1_x4, @q4_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x144xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q4_uniform_128> @q4_uniform_128_latency
+
+check.scenario public @q4_uniform_512 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(512) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(false) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x144xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x144xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q4k_q8_1_x4, @q4_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x144xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q4_uniform_512> @q4_uniform_512_latency
+
+check.scenario public @q5_uniform_1 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(1) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x176xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4, @q5_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_uniform_1> @q5_uniform_1_latency
+
+check.scenario public @q5_uniform_32 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(32) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x176xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4, @q5_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_uniform_32> @q5_uniform_32_latency
+
+check.scenario public @q5_uniform_128 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(128) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x176xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4, @q5_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_uniform_128> @q5_uniform_128_latency
+
+check.scenario public @q5_uniform_512 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(512) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x176xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4, @q5_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_uniform_512> @q5_uniform_512_latency
+
+check.scenario public @q5_channel8_uniform_1 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(1) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x176xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4_channel8, @q5_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_channel8_uniform_1> @q5_channel8_uniform_1_latency
+
+check.scenario public @q5_channel8_uniform_32 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(32) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x176xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4_channel8, @q5_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_channel8_uniform_32> @q5_channel8_uniform_32_latency
+
+check.scenario public @q5_channel8_uniform_128 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(128) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x176xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4_channel8, @q5_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_channel8_uniform_128> @q5_channel8_uniform_128_latency
+
+check.scenario public @q5_channel8_uniform_512 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(512) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x176xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4_channel8, @q5_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_channel8_uniform_512> @q5_channel8_uniform_512_latency
+
+check.scenario public @q5_m4_uniform_4 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(4) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x176xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4_m4, @q5_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_m4_uniform_4> @q5_m4_uniform_4_latency
+
+check.scenario public @q5_m4_channel8_uniform_4 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(4) : index
+    %inputs = check.literal value(5120) : index
+    %outputs = check.literal value(48) : index
+    %uniform = check.literal value(true) : i1
+    %fifth_bit = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%tokens]x5760xi8>
+    %weight = check.generate.fill value(17) : tensor<48x20x176xi8>
+    check.generate<@initialize_affine>(%uniform, %fifth_bit, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x48xf32>
+    check.compare<@ggml_linear_q5k_q8_1_x4_m4_channel8, @q5_uniform_reference>[%tokens, %inputs, %outputs](%tokens, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, tensor<[%tokens]x5760xi8>, tensor<48x20x176xi8>, tensor<[%tokens]x48xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%tokens]x48xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_m4_channel8_uniform_4> @q5_m4_channel8_uniform_4_latency
