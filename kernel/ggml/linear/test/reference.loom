@@ -1,8 +1,9 @@
 // Independent scalar references for GGML packed linear projections.
 //
 // Q4_K/Q5_K decode byte fields in logical groups with I64 signed products
-// and F64 affine scaling. Q6_K decodes logical elements and accumulates in
-// F64 before one F32 rounding. Input constructors supply signed payloads,
+// and F64 affine scaling, or explicit F32 rounding for serial matrix sums.
+// Q6_K decodes logical elements and accumulates in F64 before one F32 rounding.
+// Input constructors supply signed payloads,
 // finite signed/zero block factors, and consistent Q8_1 sum headers.
 // Uniform constructors have nonzero analytical results for larger workloads.
 //
@@ -112,7 +113,10 @@ func.def @initialize_affine(%uniform: i1, %fifth_bit: i1, %token_count: index, %
   func.return
 }
 
-func.def @affine_reference(%fifth_bit: i1, %weight_channels: index, %token_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer) {
+// F16 block coefficients multiplied by six-bit metadata are exact in F32.
+// Serial matrix accumulation rounds each product, affine correction, and sum;
+// subgroup reductions instead compare against the F64 mathematical result.
+func.def @affine_accumulation_reference(%serial_f32: i1, %fifth_bit: i1, %weight_channels: index, %token_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer) {
   %begin = index.constant 0 : index
   %unit = index.constant 1 : index
   %groups_per_page = index.constant 2 : index
@@ -241,18 +245,47 @@ func.def @affine_reference(%fifth_bit: i1, %weight_channels: index, %token_count
         %scale_float = scalar.uitofp %scale_code : i32 to f64
         %minimum_float = scalar.uitofp %minimum_code : i32 to f64
         %weight_scale = scalar.mulf %scale, %scale_float : f64
-        %combined_scale = scalar.mulf %weight_scale, %activation_scale : f64
-        %scaled_dot = scalar.mulf %combined_scale, %dot_float : f64
         %weight_minimum = scalar.mulf %minimum, %minimum_float : f64
-        %correction = scalar.mulf %weight_minimum, %activation_sum : f64
-        %contribution = scalar.subf %scaled_dot, %correction : f64
-        %next = scalar.addf %running, %contribution : f64
+        %next = scf.if %serial_f32 -> (f64) {
+          %dot_single = scalar.sitofp %dot : i64 to f32
+          %scale_single = scalar.fptrunc %weight_scale : f64 to f32
+          %minimum_single = scalar.fptrunc %weight_minimum : f64 to f32
+          %activation_scale_single = scalar.fptrunc %activation_scale : f64 to f32
+          %activation_sum_single = scalar.fptrunc %activation_sum : f64 to f32
+          %running_single = scalar.fptrunc %running : f64 to f32
+          %combined_scale = scalar.mulf %scale_single, %activation_scale_single : f32
+          %scaled_dot = scalar.mulf %combined_scale, %dot_single : f32
+          %correction = scalar.mulf %minimum_single, %activation_sum_single : f32
+          %contribution = scalar.subf %scaled_dot, %correction : f32
+          %sum = scalar.addf %running_single, %contribution : f32
+          %extended = scalar.extf %sum : f32 to f64
+          scf.yield %extended : f64
+        } else {
+          %combined_scale = scalar.mulf %weight_scale, %activation_scale : f64
+          %scaled_dot = scalar.mulf %combined_scale, %dot_float : f64
+          %correction = scalar.mulf %weight_minimum, %activation_sum : f64
+          %contribution = scalar.subf %scaled_dot, %correction : f64
+          %sum = scalar.addf %running, %contribution : f64
+          scf.yield %sum : f64
+        }
         scf.yield %next : f64
       }
       %rounded = scalar.fptrunc %sum : f64 to f32
       view.store %rounded, %results[%row, %channel] : f32, view<[%token_count]x[%output_size]xf32>
     }
   }
+  func.return
+}
+
+func.def @affine_reference(%fifth_bit: i1, %weight_channels: index, %token_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %serial_f32 = scalar.constant false : i1
+  func.call @affine_accumulation_reference(%serial_f32, %fifth_bit, %weight_channels, %token_count, %input_size, %output_size, %input, %weight, %output) : (i1, i1, index, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @affine_serial_f32_reference(%fifth_bit: i1, %weight_channels: index, %token_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %serial_f32 = scalar.constant true : i1
+  func.call @affine_accumulation_reference(%serial_f32, %fifth_bit, %weight_channels, %token_count, %input_size, %output_size, %input, %weight, %output) : (i1, i1, index, index, index, index, buffer, buffer, buffer)
   func.return
 }
 

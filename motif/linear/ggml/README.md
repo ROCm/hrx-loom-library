@@ -44,6 +44,13 @@ independent CPU references live in
 specializations execute both subgroup widths. The motifs carry no global
 configuration or concrete target records.
 
+The CDNA Q5 matrix schedule stages a 128-channel by 256-element weight panel
+and a 64-row activation panel in 61.5 KiB of shared memory. Eight 64-lane
+subgroups reuse those panels with integer matrix products, applying F32
+affine coefficients after each 32-element group. Raw and channel8 inputs
+share the same schedule. Concrete targets and the live row count remain
+caller-owned; packed weights never become a persistent expanded tensor.
+
 These are reusable Loom schedules, qualified for correctness through the
 [`linear` kernels](../../../kernel/ggml/linear/). The native tests establish
 packed-byte semantics, addressing, and numerical results; they do not establish
