@@ -57,6 +57,34 @@ only the card, overview, and optional lock. The SDK also supplies
 for authors working outside this repository. A publication `--card-url`
 resolves card-relative provider links in the generated page.
 
+## Discover runnable packages
+
+The repository-root `catalog.json` lists packages with supplied providers and
+qualified execution. Descriptive cards enter this index when their executable
+ports are admitted. Installed SDK users can list or select from a local checkout:
+
+```sh
+loom-fetch --catalog=./catalog.json --list --json | jq '.models | keys'
+loom-fetch --catalog=./catalog.json --model=moonshine-ai/moonshine-streaming-tiny \
+  --preset=streaming --output=./moonshine
+loom-serve --model=./moonshine/model.json --device=amdgpu
+```
+
+The same relative card paths resolve within a published GitHub catalog snapshot.
+Release wheels can associate that snapshot with their qualified library tag.
+Development wheels require an explicit catalog. Update the checked-in index
+from its admitted cards with the SDK:
+
+```sh
+python -m loom.model.catalog \
+  --card=model/moonshine-ai/moonshine-streaming-tiny/model.json=model/moonshine-ai/moonshine-streaming-tiny/model.json \
+  --output=catalog.json
+```
+
+`//build_tools/bazel:catalog_test` checks that discovery metadata stays in sync
+with these cards. Neither generation nor this test reads program payloads or
+model weights.
+
 ## Build boundary
 
 Model-owned program sources use `loom_library` from the repository's

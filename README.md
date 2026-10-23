@@ -35,6 +35,10 @@ uses the source lock and shares cached checkpoint files. The
 covers SDK requirements, supported inputs, and a transcription request.
 Published bytecode packages use the same fetch-and-serve workflow.
 
+The [runnable-model catalog](model/README.md#discover-runnable-packages) supports
+discovery with `loom-fetch --catalog=./catalog.json --list` and selection by model
+ID. Each listed package supplies the programs needed by its default preset.
+
 The [model map](model/README.md#map) also includes descriptions for image
 generation, speech synthesis, text and vision, sharded text models, and NPU
 embeddings. Those descriptions identify their compatible assets and intended
