@@ -323,7 +323,43 @@ class SourcePolicyTest(unittest.TestCase):
                     "model/publisher/recognizer/BUILD.bazel: model cards use "
                     "repository rules from //build_tools/bazel:defs.bzl",
                     "model/publisher/recognizer/BUILD.bazel: model card must be "
-                    "explicitly declared by loom_model",
+                    "explicitly declared by loom_model or loom_model_documentation",
+                ],
+            )
+
+    def test_repository_accepts_description_before_executable_port(self):
+        with TemporaryDirectory() as temporary_directory:
+            repository_root = Path(temporary_directory)
+            model_root = repository_root / "model" / "publisher" / "image"
+            model_root.mkdir(parents=True)
+            (model_root / "model.json").write_text("{}\n")
+            (model_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_model_documentation")\n'
+                'loom_model_documentation(name = "reference", card = "model.json")\n'
+            )
+            self.assertEqual(source_policy.check_repository(repository_root), [])
+
+            program_root = model_root / "program"
+            program_root.mkdir()
+            for directory in (
+                repository_root / "model",
+                model_root.parent,
+                model_root,
+                program_root,
+            ):
+                (directory / "README.md").write_text("# Scope\n")
+            (program_root / "control.loom").write_text(
+                "func.def public @image_control_v1() { func.return }\n"
+            )
+            (program_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_library")\n'
+                'loom_library(name = "control", srcs = ["control.loom"])\n'
+            )
+            self.assertEqual(
+                source_policy.check_repository(repository_root),
+                [
+                    "model/publisher/image/BUILD.bazel: model programs require "
+                    "loom_model; a generated reference does not qualify executable providers"
                 ],
             )
 

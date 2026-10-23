@@ -156,13 +156,24 @@ def check_repository(repository_root: Path) -> list[str]:
                 f"{build_path.relative_to(repository_root)}: model cards use "
                 "repository rules from //build_tools/bazel:defs.bzl"
             )
-        if (
-            not re.search(r"\bloom_model\s*\(", build_text)
-            or '"model.json"' not in build_text
-        ):
+        has_model = re.search(r"\bloom_model\s*\(", build_text)
+        has_reference = re.search(r"\bloom_model_documentation\s*\(", build_text)
+        if not (has_model or has_reference) or '"model.json"' not in build_text:
             violations.append(
                 f"{build_path.relative_to(repository_root)}: model card must be "
-                "explicitly declared by loom_model"
+                "explicitly declared by loom_model or loom_model_documentation"
+            )
+        has_providers = any(
+            re.search(
+                r"\bloom_library\s*\(",
+                _starlark_without_line_comments(provider_build.read_text()),
+            )
+            for provider_build in card_path.parent.rglob("BUILD.bazel")
+        )
+        if not has_model and has_providers:
+            violations.append(
+                f"{build_path.relative_to(repository_root)}: model programs require "
+                "loom_model; a generated reference does not qualify executable providers"
             )
     return violations
 

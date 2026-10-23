@@ -19,8 +19,12 @@ consume those projected facts and never parse the container directly.
 
 ## Map
 
-Model namespaces are created with their first checked composition. Each
-package owns a user overview with supported variants, weight and tokenizer
+Model namespaces can begin with a portable card and generated reference before
+their executable programs are ported. Such packages describe the required
+provider and asset closure and state their execution status in the overview;
+they do not supply a runnable installation. An executable port adds the actual
+providers, acquisition lock, build declarations, and independent service checks.
+Each package owns a user overview with supported variants, weight and tokenizer
 assumptions, service behavior, and setup instructions. Its developer README
 covers kernel and motif dependencies, independent correctness evidence,
 benchmark scenarios, and the build workflow.
@@ -65,7 +69,10 @@ in a runtime installation. Full checkpoints stay outside Bazel repositories,
 action inputs, outputs, and runfiles. The optional `assets` mapping is for small
 declared fixtures and swatches that need ordinary Bazel test caching.
 
-Learned checks explicitly consume a fetched installation, verify its checkpoint
-identity, and run a fresh native service against independent input/output
-evidence. Small numerical and state tests remain hermetic Bazel tests. Source
+Learned checks explicitly consume a provisioned installation and run the current
+built programs against independent input/output evidence. Their declared card,
+lock, and providers determine the Bazel cache identity; they trust the provisioned
+weights to match the lock instead of hashing full checkpoints on every test.
+`loom-fetch` verifies acquisition identities. Small numerical and state tests
+remain hermetic Bazel tests. Source
 checks and a successful card build do not establish model accuracy.
