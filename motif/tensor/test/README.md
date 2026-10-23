@@ -79,3 +79,13 @@ by the wrapper kernel. Regenerate the authored answers with:
 ```sh
 python3 -B motif/tensor/test/generate_pointwise_oracle.py
 ```
+
+`prefix_norm.loom` compares native NPU output with a serial binary64 sum of
+squares and reciprocal norm. Widths 32, 64, 96, and 1024 exercise prefix lengths
+on either side of 16- and 32-element boundaries, including single-element and
+complete prefixes. Zero and floor-dominated rows cover the normalization
+denominator. Nonzero buffer origins, exact guards, and unchanged input checks
+retain storage ownership; the complete output row checks that the selected
+prefix controls the scale without suppressing later lanes. The error bound is
+`2e-7 + 2e-6 * abs(expected)`. Benchmark declarations retain each row width;
+their execution is a workload smoke check, with no throughput claim.

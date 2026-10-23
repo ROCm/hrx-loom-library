@@ -93,6 +93,16 @@ double-precision random transforms, and serial order-statistic references.
 These motifs participate in native GPU model programs while their composition
 owns tensor layout, launch configuration, and batch membership.
 
+`prefix_norm.loom` scales a BF16 row by the reciprocal L2 norm of a selected
+prefix, producing F32 values. The caller supplies the row width, prefix length,
+positive squared-norm floor, and two nonoverlapping views. Width is a multiple
+of 32 through 65,504, and the views are dense and 64-byte aligned. Every output
+lane receives the same scale; exposing only the selected prefix belongs to the
+caller. Three BF16 limbs carry the F32 reciprocal norm into native dot products,
+preserving precision without requiring a target-specific declaration or a
+model-specific row width. The typed views can refer directly to channel-owned
+storage, without transferring that storage's ownership to the motif.
+
 ```sh
 bazel test --config=asan --config=amdgpu //motif/tensor/...
 ```

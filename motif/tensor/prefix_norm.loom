@@ -1,0 +1,67 @@
+// Normalize a BF16 row by the L2 norm of a selected prefix, producing F32.
+// Width is a positive multiple of 32 through 65504; dimension_count is in
+// 1..width. Views are dense, 64-byte aligned, and do not overlap.
+// Inputs and F32 intermediates are finite, and minimum_norm_squared is a
+// positive normal F32 value. The caller exposes only the desired prefix;
+// every output lane receives the same scale, including lanes beyond it.
+//
+// F32 square sums retain 16 partial lanes. Three BF16 limbs of the reciprocal
+// norm preserve F32-scale precision on targets with native BF16 dot products.
+// The motif owns no target, launch geometry, model width, or storage lifetime.
+
+global.rodata.def @normalization.prefix_lanes = align(64) bytes("00000100020003000400050006000700080009000a000b000c000d000e000f0010001100120013001400150016001700180019001a001b001c001d001e001f00")
+
+template.decl @normalization.l2_prefix_bf16(%width: index, %dimension_count: i32, %minimum_norm_squared: f32, %normalized: view<[%width]xbf16>, %output: view<[%width]xf32>)
+
+template.def<@normalization.l2_prefix_bf16> @normalization_l2_prefix_bf16(%width: index, %dimension_count: i32, %minimum_norm_squared: f32, %normalized: view<[%width]xbf16>, %output: view<[%width]xf32>) {
+  %begin = index.constant 0 : index
+  %end = index.assume %width [range(%width, 32, 65504)] : index
+  %step = index.constant 32 : index
+  %output_step = index.constant 16 : index
+  %bounded_count = scalar.assume %dimension_count [range(%dimension_count, 1, 65504)] : i32
+  %dimensions = scalar.trunci %bounded_count : i32 to i16
+  %dimension_vector = vector.splat %dimensions : vector<32xi16>
+  %lane_storage = global.load @normalization.prefix_lanes : buffer
+  %lane_origin = index.constant 0 : offset
+  %lanes = buffer.view %lane_storage[%lane_origin] : buffer -> view<32xi16>
+  %lane_indices = vector.load %lanes[0] : view<32xi16> -> vector<32xi16>
+  %initial_products = vector.constant 0.0 : vector<16xf32>
+  %low_limb_padding = vector.constant 0.0 : vector<16xbf16>
+  %excluded_values = vector.constant 0.0 : vector<32xbf16>
+  %squares = scf.for %position = [%begin to %end step %step](%partial = %initial_products : vector<16xf32>) -> (vector<16xf32>) {
+    %position32 = index.cast %position : index to i32
+    %position16 = scalar.trunci %position32 : i32 to i16
+    %positions = vector.splat %position16 : vector<32xi16>
+    %indices = vector.addi %lane_indices, %positions : vector<32xi16>
+    %included = vector.cmpi ult, %indices, %dimension_vector : vector<32xi16> -> vector<32xi1>
+    %values = vector.load %normalized[%position] : view<[%width]xbf16> -> vector<32xbf16>
+    %masked = vector.select %included, %values, %excluded_values : vector<32xbf16>
+    %next = vector.dot2f %masked, %masked, %partial : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+    scf.yield %next : vector<16xf32>
+  }
+  %reduction_initial = scalar.constant 0.0 : f32
+  %sum = vector.reduce<addf, reassoc|nnan|ninf|nsz> %squares, %reduction_initial : vector<16xf32>, f32
+  %sum_vector = vector.splat %sum : vector<16xf32>
+  %minimum = vector.splat %minimum_norm_squared : vector<16xf32>
+  %bounded = vector.maxnumf<nnan|ninf|nsz> %sum_vector, %minimum : vector<16xf32>
+  %denominator = vector.extract %bounded[0] : vector<16xf32> -> f32
+  %inverse = scalar.rsqrtf<afn> %denominator : f32
+  %inverse_vector = vector.splat %inverse : vector<16xf32>
+  %high = vector.fptrunc<daz> %inverse_vector : vector<16xf32> to vector<16xbf16>
+  %high_wide = vector.extf<daz> %high : vector<16xbf16> to vector<16xf32>
+  %remainder = vector.subf<nnan|ninf|nsz> %inverse_vector, %high_wide : vector<16xf32>
+  %middle = vector.fptrunc<daz> %remainder : vector<16xf32> to vector<16xbf16>
+  %middle_wide = vector.extf<daz> %middle : vector<16xbf16> to vector<16xf32>
+  %residual = vector.subf<nnan|ninf|nsz> %remainder, %middle_wide : vector<16xf32>
+  %tail = vector.fptrunc<daz> %residual : vector<16xf32> to vector<16xbf16>
+  %factor = vector.interleave<0> %high, %middle : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %tail_factor = vector.interleave<0> %tail, %low_limb_padding : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  scf.for %position = [%begin to %end step %output_step] {
+    %values = vector.load %normalized[%position] : view<[%width]xbf16> -> vector<16xbf16>
+    %repeated = vector.interleave<0> %values, %values : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+    %leading = vector.dot2f %repeated, %factor, %initial_products : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+    %result = vector.dot2f %repeated, %tail_factor, %leading : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+    vector.store %result, %output[%position] : vector<16xf32>, view<[%width]xf32>
+  }
+  template.return
+}
