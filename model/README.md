@@ -23,7 +23,7 @@ consume those projected facts and never parse the container directly.
 | --- | --- | --- | --- |
 | [Moonshine Streaming Tiny](moonshine-ai/moonshine-streaming-tiny/OVERVIEW.md) | Streaming speech recognition | Original F32; source, bytecode, and mixed providers | Runnable on AMDGPU; independent transcript checks |
 | [Krea 2 Turbo](krea/Krea-2-Turbo/OVERVIEW.md) | Image generation | BF16 and INT8 ConvRot | Description; native providers await porting |
-| [Pocket TTS](kyutai/pocket-tts/OVERVIEW.md) | Streaming speech synthesis | English with four prepared reference voices | Description; native providers and prepared voice/rotary archives await porting |
+| [Pocket TTS](kyutai/pocket-tts/OVERVIEW.md) | Streaming speech synthesis | Three-voice default and four-voice noncommercial bank; source, bytecode, and mixed providers | Runnable on AMDGPU; independent numerical/text references and native PCM lifecycle checks |
 | [Qwen3.8 27B](Qwen/Qwen3.8-27B/OVERVIEW.md) | Text generation with optional image input | UD-Q5_K_XL, vision projector, and DFlash2 draft weights | Description; native providers await porting |
 | [Qwen3.8 Flash-Next](Qwen/Qwen3.8-Flash-Next/OVERVIEW.md) | Text generation | Four ordered UD-Q4_K_XL shards, with optional MTP weights | Description; native providers await porting |
 | [Qwen3 Embedding 0.6B](Qwen/Qwen3-Embedding-0.6B/OVERVIEW.md) | Text embeddings | Prepared BFP16EBS8 resident bank for the NPU | Description; native providers and packed archive await porting |
@@ -84,6 +84,7 @@ from its admitted cards with the SDK:
 
 ```sh
 python -m loom.model.catalog \
+  --card=model/kyutai/pocket-tts/model.json=model/kyutai/pocket-tts/model.json \
   --card=model/moonshine-ai/moonshine-streaming-tiny/model.json=model/moonshine-ai/moonshine-streaming-tiny/model.json \
   --output=catalog.json
 ```
@@ -111,7 +112,8 @@ The selected card retains external parameter and tokenizer acquisition
 descriptors. `loom-fetch` combines built providers with verified cached assets
 in a runtime installation. Full checkpoints stay outside Bazel repositories,
 action inputs, outputs, and runfiles. The optional `assets` mapping is for small
-declared fixtures and swatches that need ordinary Bazel test caching.
+declared fixtures, swatches, and prepared constants such as Pocket's reference
+waveforms and rotary table that need ordinary Bazel test caching.
 
 Learned checks explicitly consume a provisioned installation and run the current
 built programs against independent input/output evidence. Their declared card,

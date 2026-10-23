@@ -1,26 +1,148 @@
-# Pocket TTS composition
+# Developing Pocket TTS
 
-`model.json` preserves the speech provider composition, all preparation-option
-bounds, four reference voices, and typed model/voice/rotary parameter scopes.
-The tokenizer has its own identity. `OVERVIEW.md` describes the exact upstream
-inputs and prepared archive layouts independently of this README.
+The [model overview](OVERVIEW.md) gives the installed fetch-to-serve workflow,
+voice choices, exact upstream assets, and request behavior. Stock voices run
+with the installed SDK and require no Bazel build or Python preparation step.
+This page covers model development and custom voice publications.
 
-The native providers and prepared voice/rotary archives are absent. The
-description builds without checkpoint acquisition:
+## Build the provider packages
+
+From the repository root:
+
+```sh
+bazel build --config=amdgpu \
+  //model/kyutai/pocket-tts:source \
+  //model/kyutai/pocket-tts:archive \
+  //model/kyutai/pocket-tts:mixed
+```
+
+`source` retains Loom text, `archive` uses bytecode, and `mixed` retains text
+preparation/control with bytecode numerical and shared motif providers. All
+three expose speech ABI 1 and remain inputs to runtime linking and JIT
+specialization. The seven numerical phases share scoped `model`, `rotary`, and
+`voices` parameter sources; the tokenizer identity is `text`.
+
+Each target produces a selected `model.json`, a deployment `serve.json`, its
+program closure, and the small checked-in reference bank and rotary table.
+Those two prepared assets are copied from Git so the output can be relocated.
+The 219 MB learned checkpoint and tokenizer retain their upstream acquisition
+descriptors. No build contacts those origins or passes a full checkpoint
+through Bazel's repositories, actions, outputs, or runfiles.
+
+The `_noncommercial` target suffix selects the four-voice bank and preset,
+for example `:mixed_noncommercial`. The model's provider code is shared across
+both banks; only the selected card and prepared voice asset differ.
+
+Generate the standalone model reference with:
 
 ```sh
 bazel build //model/kyutai/pocket-tts:reference
 ```
 
-The native port implements `speech_prepare_v1` and `speech_control_v1`, loads
-the three parameter scopes, and retains independent request state across the
-voice encoder, FlowLM, and Mimi stages. Voice metadata travels as declared
-speech options; filenames do not identify semantic roles. `weights.loom` is
-an explicit auxiliary preparation input.
+The resulting `bazel-bin/model/kyutai/pocket-tts/reference.md` combines the
+standalone overview with facts generated from the card.
 
-Executable admission requires the provider libraries, reproducible prepared
-archives, and a lock for their actual published bytes. Checks must cover
-independent voices and request rows, chunk boundaries, cancellation, capacity
-rejection, joined shutdown, and audio compared with an independent reference.
-The card describes those inputs without executing an arbitrary preparation
-script during fetch or moving full weights through Bazel.
+## Acquire and test
+
+Provision the default installation once:
+
+```sh
+loom-fetch model/kyutai/pocket-tts/model.json \
+  --preset=streaming --output=../pocket-tts
+```
+
+The authored lock covers both voice variants' source programs and runtime
+assets. Shared Unicode, UTF-8, and sampling motifs come from an immutable
+library origin. `--origin=library="$PWD"` selects the current checkout when
+iterating on those sources; their bytes must match the lock unless an explicit
+development lock mode is selected. The pinned compiler or local HRX override
+used by Bazel always builds the current declared motif sources directly.
+
+Hermetic numerical, text, and state cases need no learned checkpoint:
+
+```sh
+bazel test --config=asan --config=amdgpu \
+  //model/kyutai/pocket-tts/program/... \
+  //model/kyutai/pocket-tts/test/...
+```
+
+Full speech checks use the current built providers and provisioned assets:
+
+```sh
+bazel test --config=asan --config=amdgpu \
+  --strategy=TestRunner=standalone \
+  --test_env=LOOM_MODEL_ASSETS="$(realpath ../pocket-tts)" \
+  //model/kyutai/pocket-tts/test:speech_source_test \
+  //model/kyutai/pocket-tts/test:speech_archive_test \
+  //model/kyutai/pocket-tts/test:speech_mixed_test
+```
+
+These explicit `manual` targets run a real native server, compare seeded PCM
+across changing cohorts and reused rows, replay multi-chunk text, verify
+cancellation through owner state and counters, reject malformed requests, and
+join shutdown. The tests retain only small synthesized audio, diagnostics,
+and structured results. [Test documentation](test/README.md) describes the
+independent numerical and normalization references.
+
+For the four-voice package, fetch `--preset=streaming-noncommercial` into a
+separate installation, point `LOOM_MODEL_ASSETS` there, and select
+`:speech_source_noncommercial_test`, `:speech_archive_noncommercial_test`, and
+`:speech_mixed_noncommercial_test`. Tests trust that provisioned assets match
+the authored lock. The card, lock, built programs, server, checker, and test
+configuration determine cache identity. A cache hit reads no external weights;
+changing weights without updating the lock intentionally permits that hit.
+
+A generated package is also directly fetchable. Use its absolute card path
+immediately after building it and write its publication lock outside Bazel's
+output tree:
+
+```sh
+mkdir -p .reports/pocket
+PROGRAMS="$(realpath bazel-bin/model/kyutai/pocket-tts/mixed)"
+loom-fetch "$PROGRAMS/model.json" --offline --update-lock \
+  --lockfile="$PWD/.reports/pocket/mixed.lock.json" \
+  --output="$PWD/.reports/pocket/mixed"
+```
+
+This example requires the checkpoint and tokenizer in the HF cache. The new
+lock records the built bytes; the authored source lock cannot attest to newly
+generated bytecode. Subsequent fetches use that lock without `--update-lock`.
+
+## Register custom reference voices
+
+The pinned preparation environment is an authoring tool, separate from the
+SDK and native server. It reads reference audio and writes a new source model
+publication without downloading or loading the learned checkpoint:
+
+```sh
+uv run model/kyutai/pocket-tts/prepare_assets.py \
+  --output=../pocket-narrator-source \
+  --voice=narrator=/path/to/reference.wav --voice=alba
+
+loom-fetch ../pocket-narrator-source/model.json --preset=streaming \
+  --update-lock --output=../pocket-narrator
+
+loom-serve --model=../pocket-narrator/model.json --device=amdgpu2
+```
+
+Each `--voice` supplies a pinned stock name or `ID=PATH`; IDs are unique and
+1–64 UTF-8 bytes. A publication can register 1–256 voices. Preparation preserves
+the complete admitted recording, grows context and rotary capacities, and
+rejects extents outside the model's bounds. The output card retains the base
+model ID `kyutai/pocket-tts`; select `"voice":"narrator"` in its requests.
+Review the reference recordings' licenses when publishing a custom bank.
+`--offline` forbids voice-recording downloads, while `uv run --offline`
+separately forbids Python dependency downloads.
+
+[Prepared asset documentation](prepared/README.md) covers stock reproduction.
+After changing published assets or providers, replace the source lock with
+exactly the compatible source variants:
+
+```sh
+loom-fetch model/kyutai/pocket-tts/model.json \
+  --update-lock --all-variants --programs=source
+```
+
+The full checkpoint stays in the normal fetch cache. Origin overrides and
+`--offline` apply to this operation, and unchanged sources are acquired only
+once even when several variants share them.

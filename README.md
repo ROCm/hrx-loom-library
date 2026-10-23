@@ -53,11 +53,17 @@ The [runnable-model catalog](model/README.md#discover-runnable-packages) support
 discovery with `loom-fetch --catalog=./catalog.json --list` and selection by model
 ID. Each listed package supplies the programs needed by its default preset.
 
+[Pocket TTS](model/kyutai/pocket-tts/OVERVIEW.md) supplies English speech
+synthesis with the same fetch-to-serve workflow. Its default preset includes
+Alba, Marius, and Anna; a separate preset adds the noncommercial Jean reference.
+It returns streaming 24 kHz mono audio and supports custom reference-voice
+publications. Both Moonshine and Pocket provide source, bytecode, and mixed
+packages with native service checks.
+
 The [model map](model/README.md#map) also includes descriptions for image
-generation, speech synthesis, text and vision, sharded text models, and NPU
-embeddings. Those descriptions identify their compatible assets and intended
-programs; their executable ports are not yet included. Moonshine is the
-currently runnable model package.
+generation, text and vision, sharded text models, and NPU embeddings. Those
+descriptions identify compatible assets and intended programs; their executable
+ports are not yet included.
 
 ## Library development quickstart
 
