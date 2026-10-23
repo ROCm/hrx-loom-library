@@ -5,12 +5,38 @@
 // https://github.com/ggml-org/llama.cpp/blob/030ebb558a5820b444a8f836ed5cdd46c9b4bd7a/ggml/src/ggml-common.h
 //
 // Each 34-byte record contains one little-endian F16 scale followed by
-// 32 signed I8 codes. A logical value is scale * code. The word reader
-// accepts a byte origin for a row, a record ordinal within that row, and
-// a four-code word in 0..7. It returns the signed codes and original scale
-// separately, without rounding the scaled values or expanding other words.
-// Row origins need only F16 alignment; successive records alternate the
-// four-byte alignment of their code words. The caller owns buffer bounds.
+// 32 signed I8 codes. A logical value is scale * code. Readers return exact
+// signed codes and the F32-expanded scale separately; consumers own scale
+// application and rounding. The caller owns buffer bounds and packet extents.
+//
+// Full and half-block readers accept independent scale and code byte origins,
+// so original records and prepared scale/code planes share one representation.
+// The scale origin needs F16 alignment; the code origin selects the first byte
+// of the requested packet. The raw word reader instead accepts a row origin,
+// record ordinal, and four-code word in 0..7. Raw row origins need only F16
+// alignment; successive records alternate the alignment of their code words.
+
+// Retains one complete block for reuse across activation rows. No consumer
+// format or arithmetic is imposed on the exact signed integer codes.
+func.def public inline @ggml_q8_0_load_block(%input: buffer, %scale_origin: offset, %code_origin: offset) -> (vector<32xi8>, f32) {
+  %scale_view = buffer.view %input[%scale_origin] : buffer -> view<1xf16>
+  %code_view = buffer.view %input[%code_origin] : buffer -> view<32xi8>
+  %scale_half = view.load %scale_view[0] : view<1xf16> -> f16
+  %scale = scalar.extf %scale_half : f16 to f32
+  %codes = vector.load %code_view[0] : view<32xi8> -> vector<32xi8>
+  func.return %codes, %scale : vector<32xi8>, f32
+}
+
+// Loads only the selected 16-code packet. The caller chooses its code origin
+// independently of the block scale, including a lane-owned half-block.
+func.def public inline @ggml_q8_0_load_chunk16(%input: buffer, %scale_origin: offset, %code_origin: offset) -> (vector<16xi8>, f32) {
+  %scale_view = buffer.view %input[%scale_origin] : buffer -> view<1xf16>
+  %code_view = buffer.view %input[%code_origin] : buffer -> view<16xi8>
+  %scale_half = view.load %scale_view[0] : view<1xf16> -> f16
+  %scale = scalar.extf %scale_half : f16 to f32
+  %codes = vector.load %code_view[0] : view<16xi8> -> vector<16xi8>
+  func.return %codes, %scale : vector<16xi8>, f32
+}
 
 func.def public inline @ggml_q8_0_word(%input: buffer, %row_byte_base: offset, %block: index, %word_in_block: index) -> (vector<4xi8>, f32) {
   %word = index.assume %word_in_block [range(%word_in_block, 0, 7)] : index

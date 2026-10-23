@@ -45,10 +45,13 @@ across 210-byte blocks. Q8_1 x4 readers expose a full 32-value block, a
 return the original block scale and scaled sum; consumers own any affine
 minimum correction, including how paired half-blocks share that sum.
 
-Q8_0 exposes one four-code word and its separate F32 scale from a raw
-34-byte record. Its word reader preserves signed I8 codes and handles the
-alternating word alignment between records. Integer dot products can use
-the codes directly; matrix staging decides where to round scaled values.
+Q8_0 exposes exact signed I8 codes with a separate F32 scale. Full 32-code
+and half-block readers accept independent scale and code byte origins, so
+raw records and prepared scale/code planes use the same representation
+without repacking. A four-code word reader addresses raw 34-byte records
+and handles their alternating word alignment. Consumers retain packets
+across activation rows and decide where to round scaled values; cooperative
+matrix staging owns its separate scale publication schedule.
 
 IQ4_NL exposes one complete 18-byte block as 32 signed I8 codebook values
 and a separate F32 scale. The first 16 values come from the low nibbles;

@@ -49,3 +49,10 @@ and output sentinels are checked bitwise. `q8_buffer.loom` checks all three
 reader widths over multiple physical groups and padded rows, including
 signed code extrema, zero and signed metadata, and untouched sum slots for
 the narrow word interface.
+
+`q8_0.loom` checks complete blocks and selected halves in both original
+records and prepared channel-four scale/code planes, plus raw four-code
+words. Ordered signed bytes, random payloads, and both signed extrema
+exercise every packet position. Headers cover signed zero and finite F16
+endpoints; row/group padding, output sentinels, unused metadata slots, and
+unchanged input bytes are included in complete storage comparisons.
