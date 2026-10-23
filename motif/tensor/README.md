@@ -37,6 +37,13 @@ logit remains. The sampler keeps no probability array or mutable random state;
 support selection partitions a strict logit/ID ordering using workgroup
 reductions.
 
+The same module exposes `sampling_key` for consumers that select from a
+different candidate domain, such as a draft vocabulary. Unsigned greater
+keys select larger finite logits and break ties by smaller nonnegative I32
+IDs, treating both signed zeros equally. The complemented ID occupies the
+low 32 bits, and zero is below every valid key. Sharing this order keeps
+target sampling and subset selection consistent without sharing their scans.
+
 `topk.loom` exposes a different result: the ordered values and IDs themselves.
 Each 256-thread workgroup retains sixteen values per thread, producing up to
 sixteen winners from a 4096-element tile. Its merge consumes disjoint partial

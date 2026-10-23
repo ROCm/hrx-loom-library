@@ -34,6 +34,12 @@ filtering, four exclusion choices, and a 67-element vocabulary with ties.
 A 248320-element case has an analytically known nineteen-token support, which
 checks the production vocabulary extent without a quadratic full-size oracle.
 
+`sampling_key.loom` compares every pair of runtime logit/ID records against
+direct numeric and ID comparisons. Directed inputs cover finite extrema,
+signed zero, normal/subnormal endpoints, and tied IDs through `INT_MAX`;
+random logits cover ordinary orders. Complemented-ID recovery, the empty
+candidate sentinel, output guards, and unchanged inputs are checked exactly.
+
 `topk.loom` checks exact values and IDs against a serial strict-order oracle.
 It covers the 248320-element vocabulary, multiple rows, a short nine-element
 tail, tied maxima, and merging 61 disjoint partial lists. The complete
