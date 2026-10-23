@@ -45,19 +45,23 @@ a scoped README chain up to its layer root. Motif sources contain no
 `test/` component use `loom_test` and may declare private wrapper
 kernels without weakening the production motif contract.
 
-A `model.json` has an adjacent repository `loom_model` declaration. Its `files`
-mapping supplies providers, and `data` supplies importer auxiliary files such
-as a weight preparation policy. Both mappings exactly cover the selected
-compiler inputs in the card's relative namespace. Optional `assets` supply
-small runtime files for fixtures or swatches; they participate in test caching
-without entering linker action inputs.
+A `model.json` has an adjacent repository `loom_model` or
+`loom_model_documentation` declaration. A description can precede its executable
+port. Once a package declares program providers, it also supplies `loom_model`:
+its `files` mapping supplies providers, and `data` supplies importer auxiliary
+files such as a weight preparation policy. Both mappings exactly cover the
+selected compiler inputs in the card's relative namespace. Optional `assets`
+supply small runtime files for fixtures or swatches; they participate in test
+caching without entering linker action inputs.
 
 Full checkpoints remain external acquisition descriptors in the selected card.
 `loom-fetch` installs those files with the built providers, verifies the lock,
 and shares cached content across installations. Native serving opens the local
 installation without downloading files or consulting fetch locks. A learned
-model check takes that installation explicitly and executes fresh; ordinary
-Bazel tests declare their complete bounded input closure.
+model check takes a provisioned installation explicitly, trusts that its weights
+match the declared acquisition lock, and executes the current built providers.
+Its card, lock, providers, and test inputs determine the Bazel cache identity.
+Small fixture tests declare their full bounded input closure.
 
 `python dev.py lint` runs the complete repository check. `python dev.py build`
 and `python dev.py test` run it before invoking Bazel, while generated Bazel

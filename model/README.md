@@ -19,6 +19,15 @@ consume those projected facts and never parse the container directly.
 
 ## Map
 
+| Model | Service | Described variants | Execution status |
+| --- | --- | --- | --- |
+| [Moonshine Streaming Tiny](moonshine-ai/moonshine-streaming-tiny/OVERVIEW.md) | Streaming speech recognition | Original F32; source, bytecode, and mixed providers | Runnable on AMDGPU; independent transcript checks |
+| [Krea 2 Turbo](krea/Krea-2-Turbo/OVERVIEW.md) | Image generation | BF16 and INT8 ConvRot | Description; native providers await porting |
+| [Pocket TTS](kyutai/pocket-tts/OVERVIEW.md) | Streaming speech synthesis | English with four prepared reference voices | Description; native providers and prepared voice/rotary archives await porting |
+| [Qwen3.8 27B](Qwen/Qwen3.8-27B/OVERVIEW.md) | Text generation with optional image input | UD-Q5_K_XL, vision projector, and DFlash2 draft weights | Description; native providers await porting |
+| [Qwen3.8 Flash-Next](Qwen/Qwen3.8-Flash-Next/OVERVIEW.md) | Text generation | Four ordered UD-Q4_K_XL shards, with optional MTP weights | Description; native providers await porting |
+| [Qwen3 Embedding 0.6B](Qwen/Qwen3-Embedding-0.6B/OVERVIEW.md) | Text embeddings | Prepared BFP16EBS8 resident bank for the NPU | Description; native providers and packed archive await porting |
+
 Model namespaces can begin with a portable card and generated reference before
 their executable programs are ported. Such packages describe the required
 provider and asset closure and state their execution status in the overview;
@@ -74,5 +83,5 @@ built programs against independent input/output evidence. Their declared card,
 lock, and providers determine the Bazel cache identity; they trust the provisioned
 weights to match the lock instead of hashing full checkpoints on every test.
 `loom-fetch` verifies acquisition identities. Small numerical and state tests
-remain hermetic Bazel tests. Source
-checks and a successful card build do not establish model accuracy.
+remain hermetic Bazel tests. Source checks and a successful card build do not
+establish model accuracy.

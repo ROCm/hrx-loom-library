@@ -35,6 +35,12 @@ uses the source lock and shares cached checkpoint files. The
 covers SDK requirements, supported inputs, and a transcription request.
 Published bytecode packages use the same fetch-and-serve workflow.
 
+The [model map](model/README.md#map) also includes descriptions for image
+generation, speech synthesis, text and vision, sharded text models, and NPU
+embeddings. Those descriptions identify their compatible assets and intended
+programs; their executable ports are not yet included. Moonshine is the
+currently runnable model package.
+
 ## Library development quickstart
 
 Select the HRX revision pinned by this repository and build its root-owned test
