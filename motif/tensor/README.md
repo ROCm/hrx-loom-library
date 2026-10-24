@@ -81,6 +81,19 @@ that divide the channel count. Input and coefficient storage never overlap
 the output; only the residual destination is updated in place. The source
 documents the exact row-major coefficient layouts and branch bounds.
 
+`embedding.loom` selects one channel from an immutable row-major BF16
+embedding table. The caller supplies the vocabulary size, row width, token
+ID, and channel. The lookup preserves the stored bits, including signed
+zeros, subnormals, infinities, and NaN payloads; it performs no arithmetic
+conversion.
+
+Vocabulary and width are positive, the nonnegative I32 token ID is below
+the vocabulary size, and the channel is below the width. The table is
+naturally aligned and large enough for the declared geometry. Request
+validation establishes the token bounds before launching device work. The
+motif returns one value without owning the output, launch, or padding, so
+the leaf can distribute channels and represent padded rows independently.
+
 `pointwise.loom` supplies BF16 SiLU, tanh-polynomial GELU, and gated residual
 arithmetic. Activations evaluate in F32 and return a BF16 scalar. The residual
 rounds `update * gate` to BF16 before adding the old value and rounding again.

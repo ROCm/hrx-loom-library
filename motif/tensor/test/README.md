@@ -180,6 +180,25 @@ references and launch bodies.
 python3 -B motif/tensor/test/generate_convolution_matrix_oracle.py --check
 ```
 
+`embedding.loom` compares selected BF16 elements with complete row copies.
+The independent reference computes byte ranges from the requested IDs and
+copies each row without floating-point evaluation or the production lookup
+template. Integer-generated storage exercises all 65,536 BF16 bit patterns,
+including NaN payloads, signed zeros, subnormals, and infinities.
+
+Five cases cover a single element, odd widths and launch tails, repeated and
+reversed IDs, the 151,936-row vocabulary boundary, and the encoder's
+2,560-channel width. The vocabulary-boundary table uses a non-power-of-two
+word period so narrowing a row ID to sixteen bits selects different data.
+Input and output views have nonzero origins. Output
+words, prefix/suffix guards, the entire ID allocation, and the entire immutable
+table are checked bitwise. Native and access-instrumented execution share
+these cases and their benchmark declarations.
+
+```sh
+python3 -B motif/tensor/test/generate_embedding_cases.py --check
+```
+
 `time.loom` compares sinusoidal features with binary64 exponential and
 trigonometric evaluation after explicit F32 frequency and phase boundaries.
 The independent reference constructs whole frequency rows, then concatenates
