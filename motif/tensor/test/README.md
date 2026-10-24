@@ -78,6 +78,21 @@ python3 -B motif/tensor/test/generate_linear_oracle.py --check
 python3 -B motif/tensor/test/generate_linear_epilogue_oracle.py --check
 ```
 
+`layer_mix.loom` independently checks all twelve gathered values, the base
+contraction, and the composed result. Eleven scenarios cover both checkpoint
+representations, conversion midpoints, ordered cancellation, F32 accumulation,
+ranks 1/7/16/32/33, odd widths, multiple token rows, and the real width 2560.
+Exact rational arithmetic models each fused operation and rounding boundary;
+the generator verifies that removing each boundary changes an observation.
+Signed-zero strengths preserve negative-zero base results and suppress reads
+of deliberately undersized, NaN-filled factor buffers. Subnormal values,
+immutable inputs, and complete output guards compare bitwise under native,
+access, and race instrumentation. Each scenario includes a benchmark.
+
+```sh
+python3 -B motif/tensor/test/generate_layer_mix_oracle.py --check
+```
+
 `linear_tiled.loom` compares ten cooperative projection shapes with the same
 independent whole-matrix oracle. The 16-, 32-, and 48-row tails exercise
 workgroup-wide staging and retirement when some waves own no output. Multiple

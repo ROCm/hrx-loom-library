@@ -85,6 +85,22 @@ owns every value it reads and writes. Partial overlap is unsupported. These
 helpers allocate no scratch, publish no global partials, and add no dispatch
 or synchronization boundary.
 
+`layer_mix.loom` reduces twelve BF16 layer taps for one token/channel. A lane
+reads 24 bytes from `[row, layer, channel]` input once and retains twelve F32
+values for the base and optional low-rank contractions. Adjacent lanes gather
+adjacent channels; no transpose or intermediate rank tensor is materialized.
+The caller owns the selected coordinates, launch, and separate result storage.
+
+Base coefficients may be BF16 or F32 storage. F32 coefficients round to BF16
+before ordered F32 fused multiply-adds, and the result rounds to BF16. For
+enabled low-rank factors, each F32 down/up coefficient also rounds to BF16.
+Each down result rounds before the up contraction; its complete delta and
+scaled delta round separately before the final addition and BF16 result.
+An inactive adapter does not read its strength or factors. Either signed-zero
+strength returns the base bits without accessing factor storage. These scalar
+and gather providers are target-neutral, with finite active arithmetic and
+naturally aligned immutable inputs.
+
 `linear_tiled.loom` shares BF16 activation and weight panels across eight
 wave32 subgroups. A 256-thread workgroup owns a 64×64 output tile and acquires
 64 reduction elements at a time into two padded 64×72 workgroup-memory views.
