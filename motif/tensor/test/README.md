@@ -78,6 +78,26 @@ python3 -B motif/tensor/test/generate_linear_oracle.py --check
 python3 -B motif/tensor/test/generate_linear_epilogue_oracle.py --check
 ```
 
+`linear_tiled.loom` compares ten cooperative projection shapes with the same
+independent whole-matrix oracle. The 16-, 32-, and 48-row tails exercise
+workgroup-wide staging and retirement when some waves own no output. Multiple
+K256 blocks, complete and incomplete traversal groups, oversized groups, and
+the real 6144/16384 reduction widths cover panel lifetimes and indexing.
+Dense, column-major, and padded physical results, guards, and immutable
+allocations compare bitwise under native, access, and race instrumentation.
+
+`linear_coordinates.loom` checks eighteen grids by enumerating groups, then
+columns, then rows in a VM reference. It does not reuse the production
+division/remainder formulas. Cases include every remainder of an eight-row
+group, singleton and oversized groups, several complete groups, model grids,
+and the maximum 1024×256 grid. Every coordinate pair and both storage guards
+are exact under native and access instrumentation. Both corpora include
+benchmark declarations.
+
+```sh
+python3 -B motif/tensor/test/generate_linear_tiled_oracle.py --check
+```
+
 `rmsnorm.loom` compares retained-row normalization with a sequential F64
 sum of squares and Newton-refined inverse square root. Widths 1024 and 5120,
 workgroups of 128 and 256 threads, and F32/F16 publication exercise distinct

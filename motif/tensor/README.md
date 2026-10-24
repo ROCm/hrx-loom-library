@@ -85,6 +85,31 @@ owns every value it reads and writes. Partial overlap is unsupported. These
 helpers allocate no scratch, publish no global partials, and add no dispatch
 or synchronization boundary.
 
+`linear_tiled.loom` shares BF16 activation and weight panels across eight
+wave32 subgroups. A 256-thread workgroup owns a 64×64 output tile and acquires
+64 reduction elements at a time into two padded 64×72 workgroup-memory views.
+Four independent K16 accumulator chains combine every 256 inputs, matching
+the single-wave four-chain recurrence. Publication and retirement barriers
+protect the shared panels while a two-deep pipeline acquires global inputs.
+Partial row tiles zero-fill missing rows without removing barrier participants.
+
+Rows are positive multiples of sixteen, reduction widths of 256, and output
+widths of 64. The leaf launches `ceil(rows/64) × (outputs/64)` workgroups and
+supplies an injective result layout, separate immutable input/weight storage,
+and finite arithmetic. Full output tiles write 8 KiB. Each K64 step acquires
+at most 8 KiB from activations and 8 KiB from weights, with 18 KiB of padded
+workgroup memory shared by the complete tile. No global partial tensor or
+checkpoint preparation is required.
+
+`projection.linear_tiled_coordinates` maps the physical launch grid into
+bounded groups of row tiles, traversing columns within each group to retain
+input-panel locality. A final incomplete group uses its actual row count;
+groups spanning the full height preserve the original coordinates. The
+caller supplies positive grid extents and group size. This coordinate helper
+is target-neutral. The cooperative matrix provider uses the external
+`tensor_projection_tiled_rdna3` fragment-layout binding, and composition
+selects its wave32 launch target separately.
+
 `rmsnorm.loom` computes `x * rsqrt(mean(x*x) + epsilon) * weight` for one
 F32 row per workgroup. A thread retains its four-element packets across the
 reduction, so normalization reads each input once. The caller specializes the

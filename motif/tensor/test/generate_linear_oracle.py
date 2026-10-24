@@ -85,7 +85,7 @@ def observations(shape):
     converted = [rounded_float(value, 8) for value in weights]
     wide = []
     contribution_sums = []
-    nonzero_products = []
+    minimum_product = float("inf")
     unrounded_differences = 0
     for row in range(shape.rows):
         values = inputs[row * shape.inputs:(row + 1) * shape.inputs]
@@ -102,7 +102,7 @@ def observations(shape):
             if shape.precision:
                 assert rounded_float(total, 8) != total
             contribution_sums.append(sum(abs(product) for product in products))
-            nonzero_products.extend(abs(product) for product in products if product)
+            minimum_product = min(minimum_product, min(abs(product) for product in products if product))
             if shape.midpoints:
                 raw = sum(left * right for left, right in zip(values, weights[begin:begin + shape.inputs]))
                 unrounded_differences += raw != total
@@ -112,7 +112,7 @@ def observations(shape):
     # binary bits relative to input contributions, independently of observed
     # GPU error. This remains smaller than half one ordinary nonzero term.
     tolerance = max(contribution_sums) * 2.0**-20
-    assert tolerance < min(nonzero_products) / 2
+    assert tolerance < minimum_product / 2
     row_stride, column_stride, count = output_geometry(shape)
     output = [123.0] * count
     for row in range(shape.rows):
