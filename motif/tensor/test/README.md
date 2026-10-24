@@ -180,6 +180,29 @@ references and launch bodies.
 python3 -B motif/tensor/test/generate_convolution_matrix_oracle.py --check
 ```
 
+`time.loom` compares sinusoidal features with binary64 exponential and
+trigonometric evaluation after explicit F32 frequency and phase boundaries.
+The independent reference constructs whole frequency rows, then concatenates
+cosine and sine halves. Expected values keep F32 precision so the check
+observes BF16 publication error. Nine cases cover the model's complete
+256-feature grid, negative and small times, alternative periods and scales,
+one/odd/129-frequency halves, channel tails, several launch widths, and
+logical rows shorter than physical storage.
+
+The error requirement separates BF16 rounding (`abs(expected) / 256`) from
+approximate F32 phase and transcendental evaluation. The latter's absolute
+budget is `(largest_abs_phase + 1) / 2^20`: sixteen F32 unit roundoffs per
+unit phase, plus the same absolute floor. This is an accuracy requirement,
+not a target-specific expected result. Positive zero time and zero scale
+are checked bitwise. Padded rows must independently contain exact cosine
+ones and sine zeros; native access instrumentation checks that their
+construction does not read beyond the logical input. Input bytes and output
+guards remain exact, and every shape has a benchmark declaration.
+
+```sh
+python3 -B motif/tensor/test/generate_time_oracle.py --check
+```
+
 `prefix_norm.loom` compares native NPU output with a serial binary64 sum of
 squares and reciprocal norm. Widths 32, 64, 96, and 1024 exercise prefix lengths
 on either side of 16- and 32-element boundaries, including single-element and

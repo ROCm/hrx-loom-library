@@ -139,6 +139,19 @@ intermediates must fit their types. The motif returns a scalar. The leaf owns
 thread distribution, tails, output placement, and any residual addition, so
 it can preserve a separate rounding or combine the value with other work.
 
+`time.loom` evaluates one BF16 sinusoidal time feature. The caller supplies
+the number of frequencies, selected channel, negative logarithm of the
+frequency period, time scale, and BF16 time. Cosine features precede sine
+features. The implementation constructs the frequency with approximate
+exponential math, separately rounds scaled time and phase in F32, evaluates
+the selected approximate trigonometric function, and rounds the result to BF16.
+
+Half-width is positive and fits U32, the channel is below twice that width,
+and all arithmetic remains finite. The motif has no buffer or launch ownership.
+Krea uses 128 frequencies, period 10000, and time scale 1000; its leaf owns
+the padded row count and supplies positive zero time for padding. Other
+frequency grids and launch widths do not require copying the arithmetic.
+
 `convolution_matrix.loom` cooperatively computes a 3×3 channel-first image
 convolution. Its original F32 inputs and OI(T)HW weights are converted to BF16
 inside a workgroup, with F32 matrix accumulation and separate F32 bias and
