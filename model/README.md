@@ -75,6 +75,8 @@ loom-fetch --catalog=github:ROCm/hrx-loom-library@bedb7bbf149066c7979f45ce753da3
 ```
 
 This snapshot lists Moonshine Streaming Tiny, Pocket TTS, and Qwen3.8 Flash-Next.
+The checkout's catalog additionally includes Qwen3 Embedding for the Strix Halo
+NPU, acquired directly from the original publisher checkpoint.
 
 A local checkout supports the same discovery and selection:
 
@@ -92,6 +94,7 @@ from its admitted cards with the SDK:
 
 ```sh
 python -m loom.model.catalog \
+  --card=model/Qwen/Qwen3-Embedding-0.6B/model.json=model/Qwen/Qwen3-Embedding-0.6B/model.json \
   --card=model/Qwen/Qwen3.8-Flash-Next/model.json=model/Qwen/Qwen3.8-Flash-Next/model.json \
   --card=model/kyutai/pocket-tts/model.json=model/kyutai/pocket-tts/model.json \
   --card=model/moonshine-ai/moonshine-streaming-tiny/model.json=model/moonshine-ai/moonshine-streaming-tiny/model.json \
