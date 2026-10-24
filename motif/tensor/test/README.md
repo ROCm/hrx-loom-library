@@ -88,6 +88,31 @@ python3 -B motif/tensor/test/generate_rmsnorm_bf16_scalar_oracle.py --check
 python3 -B motif/tensor/test/generate_rmsnorm_bf16_row_oracle.py --check
 ```
 
+The rotary corpus distinguishes adjacent pairs with F32 tables from half-split
+pairs with BF16 products. `rotary_scalar.loom` checks 304 exact pair outputs,
+including cancellation, signed zeros, subnormals, and wide exponents. Omitting
+any one of the four intermediate BF16 product roundings changes the corpus.
+
+`rotary_rows.loom` checks all three row providers over six shapes each. Widths
+64, 96, 128, and 256 cover one wave, a partially occupied last wave, and multiple
+waves. Distinct token/head inputs and token coefficient rows detect table and
+pair-index errors. Every output, storage guard, and immutable buffer compares
+bitwise, including exact input/output aliasing. Native, access-instrumented,
+and race-instrumented profiles exercise the row cases.
+
+The normalized cases derive a whole-row inverse from binary64 arithmetic,
+then enclose the RMS corpus's `2^-16` inverse accuracy requirement with
+outward-rounded F32 endpoints. The generator verifies that both endpoints
+produce the same BF16 normalized tensor through the independent epilogue.
+Monotonic scalar rounding therefore makes the expected tensor unique over
+that interval. Exact rotary arithmetic can then detect cancellation errors
+without a broad output tolerance. Scalar RMS cases independently exercise
+normalization midpoints. No expectation depends on a device's observed output.
+
+```sh
+python3 -B motif/tensor/test/generate_rotary_oracle.py --check
+```
+
 `grouped_convolution.loom` uses a scalar F64 oracle that combines the static
 and dynamic coefficients before multiplication and explicitly pads every
 tap. It checks three independent eight-position, 5120-channel blocks,

@@ -88,6 +88,26 @@ may equal input exactly or occupy disjoint storage. Immutable weights remain
 separate. Every participant finishes the reduction before row stores begin,
 and each lane then owns its original strided channels.
 
+`rotary.loom` preserves two channel layouts and their tensor rounding rules.
+`attention.normalize_rotary_bf16` normalizes with the zero-centered RMS
+epilogue, then rotates adjacent channels using F32 coefficient tables and
+F32 arithmetic before its final BF16 output. The normalized values remain
+in registers at their BF16 boundary.
+
+`attention.half_pair_bf16` instead joins corresponding channels from the two
+halves of a row. Each cosine and sine product rounds to BF16 before the final
+sum rounds again. `attention.normalize_half_rotary_bf16` combines that pair
+operation with scaled BF16 RMS; `attention.half_rotary_bf16` applies it without
+normalization. Both use BF16 coefficient tables.
+
+Composition supplies positive token/head counts, an even width fitting U32,
+and exactly `width/2` threads per head row. Tables index tokens and channels,
+sharing each token's coefficients across its heads. Normalized variants take
+epsilon explicitly. Each thread reads both pair values before either store,
+allowing output to equal input exactly. Weights and tables remain immutable
+and separate from output. Launch geometry and coefficient generation belong
+to the caller.
+
 `grouped_convolution.loom` applies a causal F32 convolution independently to
 each block. A coefficient combines a static per-channel weight with a dynamic
 weight shared by a contiguous group of channels. Dynamic weights vary by
