@@ -93,6 +93,34 @@ access, and race instrumentation. Each scenario includes a benchmark.
 python3 -B motif/tensor/test/generate_layer_mix_oracle.py --check
 ```
 
+`attention_shared.loom` checks both K16 and K32 against whole binary64
+contractions and a dense masked softmax. Twenty-six scenarios cover complete
+query/key tiles, multiple KV heads, the model's twelve-KV-head layout, arbitrary
+nonzero mask bytes, leading/interior/trailing empty tiles, a single valid key,
+late maxima, and finite logits below a conventional finite sentinel. General
+accuracy includes explicitly budgeted BF16 probability conversion, native
+contraction, F32 recurrence, and output/gate rounding. The budget is derived
+from input magnitude, independently of observed device errors.
+
+Single-tile probability cases instead round the unnormalized probabilities
+explicitly and retain the unrounded denominator. Their probabilities and final
+contexts stay away from BF16 midpoints under the fixed arithmetic budget, so
+the BF16 outputs compare bitwise. Zero, single-key, and identical very-negative
+score cases also compare bitwise. Mutation checks distinguish masking, KV-head
+ownership, all score channels, and probability conversion.
+
+`attention_shared_store.loom` checks the gate epilogue separately. Exact
+references include both neighbors of BF16 context midpoints and gate values
+whose sigmoid conversion remains unambiguous under approximate math. Omitting
+either context or sigmoid rounding changes the expected bits. Ungated cases
+pass output as the unused gate, matching the production caller. Full immutable
+input storage and output guards compare bitwise in native, access, and race
+profiles. Every scenario includes a benchmark declaration.
+
+```sh
+python3 -B motif/tensor/test/generate_shared_attention_oracle.py --check
+```
+
 `segmented_attention.loom` uses an independent binary64 dense QK contraction,
 whole-segment softmax, and weighted-value contraction. Twelve scenarios cover
 segment lengths 1/2/3/12/31/32/33, multiple segments and heads, incomplete

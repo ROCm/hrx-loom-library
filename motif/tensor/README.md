@@ -101,6 +101,35 @@ strength returns the base bits without accessing factor storage. These scalar
 and gather providers are target-neutral, with finite active arithmetic and
 naturally aligned immutable inputs.
 
+`attention_shared.loom` and `attention_shared_k32.loom` implement noncausal
+128-channel BF16 attention with four query heads sharing each KV head. A
+128-thread workgroup contains four wave32 subgroups, each owning sixteen
+queries of one head. Q, gate, and output are row-major
+`[tokens, 4 * key_value_heads * 128]`; K is row-major
+`[tokens, key_value_heads * 128]`, and V is physically transposed to
+`[key_value_heads * 128, tokens]`. Inputs are immutable, naturally aligned,
+and complete; output is disjoint. The token count is a positive multiple of
+sixteen for K16 and thirty-two for K32. Every workgroup thread participates
+in shared-memory publication and retirement.
+
+The query panels remain resident in registers and shared memory while all
+four waves share each K/V tile. K16 uses 19,712 shared bytes; K32 uses 32,256.
+Read-ahead carriers clamp the final prefetch to a valid complete tile. A byte
+mask enables keys by nonzero value, with at least one enabled key overall;
+leading, interior, and trailing empty tiles are supported. Negative infinity
+represents the empty maximum. Its indeterminate rescale delta selects zero
+through `minnum`, preserving the empty accumulator until a valid key arrives.
+
+Unnormalized probabilities round to BF16 for the value contraction, while
+normalization retains their unrounded F32 sum. Gating rounds both context and
+sigmoid to BF16 before multiplying and rounding the output. With gating
+disabled, the gate buffer is never read and may name output. The store
+provider exposes this same epilogue for a caller-owned sixteen-by-sixteen
+result fragment. The external `tensor_shared_attention_rdna3` target qualifies
+the fragment layout; composition supplies its concrete backend and wave32
+launch. Active inputs, contractions, and normalized values are finite, with
+native matrix intermediate precision following the target contract.
+
 `segmented_attention.loom` attends within independent packed segments of
 128-channel BF16 heads. One complete 32-lane subgroup owns a query/head, with
 four adjacent channels per lane. Positive row, segment, and head extents are
