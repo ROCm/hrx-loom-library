@@ -50,9 +50,11 @@ bazel build //model/moonshine-ai/moonshine-streaming-tiny:reference
 ```
 
 The output appears under the same package in `bazel-bin/`, with `.md` appended
-to the target name. The overview uses absolute publication links so the page
-can be hosted independently of the repository README. The action consumes
-only the card, overview, and optional lock. The SDK also supplies
+to the target name. Each reference links to its published model card and resolves
+card-relative file locations against that URL. The overview also uses absolute
+publication links, so the page can be hosted independently of the repository
+README. The action consumes only the card, overview, and optional lock. The SDK
+also supplies
 `python -m loom.model.documentation --card model.json --overview OVERVIEW.md --output model.md`
 for authors working outside this repository. A publication `--card-url`
 resolves card-relative provider links in the generated page.
