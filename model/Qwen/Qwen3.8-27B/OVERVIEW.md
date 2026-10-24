@@ -9,18 +9,20 @@ separate draft checkpoint. Drafting remains part of the text service.
 The composition contains native AMD text and image providers with source,
 relocatable-bytecode, and mixed representations. The source preset works with
 the installed SDK without building the library. After installing `hrx-loom`
-with its `hf` extra, select text chat or image-conditioned chat explicitly:
+with its `hf` extra, select text chat:
 
 ```sh
 loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/Qwen/Qwen3.8-27B/model.json \
-  --preset vision --output "$HOME/models/qwen3.8-27b"
+  --preset chat --output "$HOME/models/qwen3.8-27b"
 loom-serve --model="$HOME/models/qwen3.8-27b/model.json" \
   --device=amdgpu2://0
 ```
 
-Use `--preset chat` for checkpoint MTP without the image projector, or
-`--preset target-only` for ordinary target decoding. Fetch resolves the exact
-asset and compiler-input closure and reuses cached weights; serving opens the
+The `chat` preset uses checkpoint MTP without the image projector;
+`target-only` selects ordinary target decoding. The `vision` and `dflash2`
+presets retain the native allocation qualification gate described below.
+Fetch resolves the exact asset and compiler-input closure and reuses cached
+weights; serving opens the
 resulting local card. The implementation and numerical checks are published
 in the [library model package](https://github.com/ROCm/hrx-loom-library/tree/main/model/Qwen/Qwen3.8-27B).
 
@@ -45,13 +47,15 @@ versioned `image` component of the text service, with separate preparation and
 request control. It is not an image-generation service. The DFlash2 checkpoint
 is additional model storage, not a request adapter.
 
-Text, checkpoint MTP, and vision have complete service checks with all three
-program representations; CDNA text is checked on MI300. DFlash2 has source and
-numerical coverage, but its full-checkpoint service gate is blocked by native
+Text, checkpoint MTP, and vision have service checks for all three program
+representations; CDNA text is checked on MI300. Current SDK verification passes
+text and CDNA execution but reproduces a native allocation failure during the
+concurrent vision cohort. DFlash2's full-checkpoint run also remains blocked by
 GPU host-memory registration returning `EAGAIN` before inference. The allocation
-operation's restart and cancellation contract needs repair before that preset
-can be qualified. Use `chat`, `target-only`, `vision`, or `cdna-text` for the
-qualified serving paths.
+operation's restart and cancellation contract needs repair, followed by the
+complete vision and DFlash2 checks. Earlier successful vision results do not
+qualify this failing SDK execution. The package remains outside model discovery
+until those runtime gates pass.
 
 The original model, selected quantization, and selected draft repository declare
 Apache-2.0. Their original cards are available from

@@ -23,8 +23,8 @@ consume those projected facts and never parse the container directly.
 | --- | --- | --- | --- |
 | [Moonshine Streaming Tiny](moonshine-ai/moonshine-streaming-tiny/OVERVIEW.md) | Streaming speech recognition | Original F32; source, bytecode, and mixed providers | Runnable on AMDGPU; independent transcript checks |
 | [Krea 2 Turbo](krea/Krea-2-Turbo/OVERVIEW.md) | Image generation | BF16 and INT8 ConvRot | Description; native providers await porting |
-| [Pocket TTS](kyutai/pocket-tts/OVERVIEW.md) | Streaming speech synthesis | Three-voice default and four-voice noncommercial bank; source, bytecode, and mixed providers | Runnable on AMDGPU; independent numerical/text references and native PCM lifecycle checks |
-| [Qwen3.8 27B](Qwen/Qwen3.8-27B/OVERVIEW.md) | Text generation with optional image input | UD-Q5_K_XL, vision projector, and DFlash2 draft weights; source, bytecode, and mixed providers | Runnable text on AMD RDNA/CDNA and vision on RDNA; separate DFlash2 service qualification is pending |
+| [Pocket TTS](kyutai/pocket-tts/OVERVIEW.md) | Streaming speech synthesis | Three-voice default, four-voice noncommercial variant, and native custom uploads; source, bytecode, and mixed providers | Runnable on AMDGPU; original-recording preparation, independent numerics, and native PCM lifecycle checks |
+| [Qwen3.8 27B](Qwen/Qwen3.8-27B/OVERVIEW.md) | Text generation with optional image input | UD-Q5_K_XL, vision projector, and DFlash2 draft weights; source, bytecode, and mixed providers | Runnable text on AMD RDNA/CDNA; native allocation repair precedes complete vision and DFlash2 qualification |
 | [Qwen3.8 Flash-Next](Qwen/Qwen3.8-Flash-Next/OVERVIEW.md) | Text generation | Four ordered UD-Q4_K_XL shards, optional MTP weights; source, bytecode, and mixed providers | Runnable on AMD RDNA; independent recall, checkpoint forks, and parameter lifecycle checks |
 | [Qwen3 Embedding 0.6B](Qwen/Qwen3-Embedding-0.6B/OVERVIEW.md) | Text embeddings | Original BF16 checkpoint with runtime BFP16EBS8 conversion; source, bytecode, and mixed providers | Runnable on the Strix Halo NPU; independent publisher checks |
 
@@ -66,9 +66,9 @@ qualified execution. Packages enter this index when their executable ports are
 admitted and all selected assets have published acquisition sources. The embedding
 port loads the original Qwen BF16 checkpoint and performs its native representation
 conversion during model loading. Qwen3.8-27B remains outside the index until
-the full-checkpoint DFlash2 service gate passes. Its text, MTP, and vision
-presets can be fetched directly from the card. Installed SDK users can inspect
-a published snapshot without a clone:
+the complete vision and DFlash2 service gates pass. Its presets can be fetched
+directly from the card, with execution status documented in the overview.
+Installed SDK users can inspect a published snapshot without a clone:
 
 ```sh
 loom-fetch --catalog=github:ROCm/hrx-loom-library@bedb7bbf149066c7979f45ce753da3b9b8875842 --list --json
@@ -120,12 +120,13 @@ Source, bytecode, and mixed providers use the same native service. Physical
 devices and request options are supplied independently from the portable model
 definition.
 
-The selected card retains external parameter and tokenizer acquisition
-descriptors. `loom-fetch` combines built providers with verified cached assets
+The selected card retains external parameter, tokenizer, and voice-recording
+acquisition descriptors. `loom-fetch` combines built providers with verified cached assets
 in a runtime installation. Full checkpoints stay outside Bazel repositories,
 action inputs, outputs, and runfiles. The optional `assets` mapping is for small
-declared fixtures, swatches, and prepared constants such as Pocket's reference
-waveforms and rotary table that need ordinary Bazel test caching.
+declared fixtures and swatches that need ordinary Bazel test caching. Pocket's
+original recordings remain fetch inputs; CPU Loom prepares their audio and
+generates rotary tables during native model initialization and registration.
 
 Learned checks explicitly consume a provisioned installation and run the current
 built programs against independent input/output evidence. Their declared card,

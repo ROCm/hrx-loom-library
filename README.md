@@ -62,9 +62,11 @@ ID. Each listed package supplies the programs needed by its default preset.
 [Pocket TTS](model/kyutai/pocket-tts/OVERVIEW.md) supplies English speech
 synthesis with the same fetch-to-serve workflow. Its default preset includes
 Alba, Marius, and Anna; a separate preset adds the noncommercial Jean reference.
-It returns streaming 24 kHz mono audio and supports custom reference-voice
-publications. Both Moonshine and Pocket provide source, bytecode, and mixed
-packages with native service checks.
+It returns streaming 24 kHz mono audio and accepts custom voice recordings
+through the same native media path as dictation. CPU Loom processes each
+recording once; later speech requests reuse its conditioning. Both Moonshine
+and Pocket provide source, bytecode, and mixed packages with native service
+checks.
 
 [Qwen3 Embedding](model/Qwen/Qwen3-Embedding-0.6B/OVERVIEW.md) runs on the
 Strix Halo NPU with source, bytecode, or mixed providers. Fetch acquires Qwen's
@@ -81,10 +83,10 @@ the installed SDK directly, including when fetched from a library checkout.
 [Qwen3.8 27B](model/Qwen/Qwen3.8-27B/OVERVIEW.md) provides text generation,
 checkpoint multi-token prediction, and image-conditioned chat with the same
 source, bytecode, and mixed packaging. Its text service runs on RDNA and CDNA;
-the image projector uses RDNA. The separate DFlash2 draft composition has
-numerical coverage, while its full-checkpoint service gate awaits the native
-allocation repair described in the overview. This package remains outside
-the picker until that gate passes.
+the image projector uses RDNA. Native allocation failures currently prevent
+complete qualification of concurrent vision requests and the separate DFlash2
+draft composition. The overview describes the remaining runtime repair and
+service checks. This package remains outside the picker until those gates pass.
 
 The [model map](model/README.md#map) also describes Krea image generation,
 including compatible assets and service contracts. Its executable port is
