@@ -545,3 +545,18 @@ A sixty-four-term case first produces 64, then adds three sixteen-term tiles
 of 1/1024. F16 accumulation retains 64, while F32 accumulation publishes
 64.0625 in F16. This precision distinction remains exact. Every shape has a
 benchmark workload; correctness timings do not establish a throughput claim.
+
+The signed I8 projection corpus in `linear_i8.loom` uses complete integer dot
+products and independently rounded F32 scale products, I32-to-F32 conversions,
+and BF16 results. Fourteen scenarios cover every 16-row tail in a 128-row tile,
+K64 and K128 panels, partial output tiles, grouped traversal, and the model's
+6144- and 16384-element reductions. Dense, column-major, and padded outputs
+retain complete guard regions. All four input arrays also compare bitwise.
+Signed extremes, positive and negative scales, zero scales, large integer
+sums, and positive/negative BF16 midpoints exercise the arithmetic boundaries.
+Native, access-sanitized, and race-sanitized profiles use the same expected
+values. The generator requires only Python's standard library:
+
+```sh
+python3 -B motif/tensor/test/generate_linear_i8_oracle.py --check
+```

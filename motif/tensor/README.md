@@ -201,6 +201,26 @@ is target-neutral. The cooperative matrix provider uses the external
 `tensor_projection_tiled_rdna3` fragment-layout binding, and composition
 selects its wave32 launch target separately.
 
+`linear_i8.loom` contracts signed I8 activation and weight rows with exact
+I32 accumulation. It multiplies each activation-row scale by the corresponding
+weight-channel scale in F32, converts the completed integer dot product to
+F32, multiplies by that scale, and rounds once to BF16. Scales and intermediate
+products are finite and normal or zero; the complete integer dot product
+fits I32. The caller supplies separate input, scale, weight, and output buffers
+and an injective output layout.
+
+A 256-thread wave32 workgroup owns a 128×128 output tile. Eight subgroups reuse
+two activation fragments and four weight fragments across eight accumulators.
+K128 panels are used when the reduction width is divisible by 128; otherwise
+K64 panels cover a width divisible by 64. Each step acquires at most 32 KiB
+or 16 KiB of operands, with 36 KiB or 20 KiB of padded workgroup storage.
+A two-stage pipeline overlaps acquisition and matrix work without a global
+partial-result tensor. Missing rows and columns zero-fill acquisition; all
+threads retain both barriers, and whole unused output fragments suppress
+publication. Rows are positive multiples of sixteen and output channels of
+sixty-four. The existing grouped traversal and external
+`tensor_projection_tiled_rdna3` binding are shared with the BF16 provider.
+
 `linear_temporal.loom` retains twelve F32 result fragments per wave across
 the complete reduction. Four wave32 subgroups own a 128×96 output tile and
 alternate between two workgroup-memory banks. Each K64 panel acquires at
