@@ -67,6 +67,27 @@ normal `mean(x*x) + epsilon`, and finite F32 intermediates. The motif neither
 allocates persistent state nor chooses a target, launch grid, or global
 configuration.
 
+The BF16 RMS providers expose the row inverse and two different epilogues.
+`normalization.rms_inverse_bf16` reduces an immutable row in F32, divides by
+its width, adds the caller's epsilon, and evaluates an approximate reciprocal
+square root. Every workgroup lane participates; positive width fits U32 and
+is divisible by the actual thread count. The biased mean is positive and
+normal, and the sums remain finite.
+
+`normalization.zero_centered_bf16` rounds its F32 weight to BF16, adds one
+and rounds the scale to BF16, then performs normalization and scaling in F32
+before the final BF16 result. `normalization.scaled_bf16` instead rounds the
+normalized value to BF16 before multiplying its BF16 weight. Its scale has
+no added one. These helpers preserve distinct tensor boundaries when fused
+with other work.
+
+The corresponding whole-row providers take epsilon explicitly and use one
+complete workgroup per row. Input is read during the reduction and again by
+the epilogue; no normalized tensor is materialized. Naturally aligned output
+may equal input exactly or occupy disjoint storage. Immutable weights remain
+separate. Every participant finishes the reduction before row stores begin,
+and each lane then owns its original strided channels.
+
 `grouped_convolution.loom` applies a causal F32 convolution independently to
 each block. A coefficient combines a static per-channel weight with a dynamic
 weight shared by a contiguous group of channels. Dynamic weights vary by

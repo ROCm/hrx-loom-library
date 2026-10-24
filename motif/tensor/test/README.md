@@ -57,6 +57,37 @@ F32 results use a `1e-6` absolute and relative bound. F16 comparisons use
 `1e-7 + 0.001 * abs(expected)` because F32 reduction can move a midpoint
 across the final rounding boundary. Zero outputs are checked exactly.
 
+The BF16 RMS corpus separates scalar rounding, reduction accuracy, and row
+storage. `rmsnorm_bf16_scalar.loom` compares 186 pairs of epilogue results
+bitwise against exact rational arithmetic, covering weight/scale midpoints,
+the normalized-value boundary, signed zeros, and subnormals. The generator
+checks that omitting each of those intermediate roundings changes the corpus.
+
+`rmsnorm_bf16_inverse.loom` compares seven whole-row inverse norms with a
+binary64 sum and reciprocal square root. Its relative accuracy requirement
+is `2^-16`. `rmsnorm_bf16_rows.loom` covers both epilogues across the same
+shapes plus exact input/output aliasing. Widths 32, 64, 128, 2560, and 6144
+exercise one or multiple values per lane; epsilon values include zero with
+positive mean, `1e-6`, and `1e-5`. Zero and unit rows have bitwise outputs.
+
+For other rows, the relative budget is
+`(1 + 2^-16) * (1 + 2^-24)^2 * (1 + 2^-8)^n / (1 - 2^-8) - 1`,
+with zero absolute tolerance. This accounts for the inverse requirement,
+two F32 products, one BF16 boundary for zero-centered output or two for scaled
+output (`n`), and the reference's BF16 publication. The scalar cases separately
+verify the rounding boundaries exactly. These are workload accuracy
+requirements, independent of a device's observed error.
+
+All storage guards and immutable inputs are exact. Native, access-instrumented,
+and race-instrumented execution cover reduction and whole-row ownership;
+native and access profiles cover scalar arithmetic. Each scenario has a
+benchmark declaration.
+
+```sh
+python3 -B motif/tensor/test/generate_rmsnorm_bf16_scalar_oracle.py --check
+python3 -B motif/tensor/test/generate_rmsnorm_bf16_row_oracle.py --check
+```
+
 `grouped_convolution.loom` uses a scalar F64 oracle that combines the static
 and dynamic coefficients before multiplication and explicitly pads every
 tap. It checks three independent eight-position, 5120-channel blocks,

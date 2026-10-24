@@ -43,6 +43,22 @@ def f32(value: float) -> float:
     return struct.unpack("<f", struct.pack("<f", value))[0]
 
 
+def rounded_float(value: Fraction | float, precision: int) -> float:
+    """Round finite F32/BF16 arithmetic, preserving zero's sign and subnormals."""
+    result = float(round_binary(Fraction(value), precision, minimum_exponent=-126))
+    return math.copysign(0.0, float(value)) if result == 0 else result
+
+
+def add_f32(left: float, right: float) -> float:
+    exact = Fraction(left) + Fraction(right)
+    return rounded_float(exact if exact else left + right, 24)
+
+
+def multiply_f32(left: float, right: float) -> float:
+    exact = Fraction(left) * Fraction(right)
+    return rounded_float(exact if exact else left * right, 24)
+
+
 def round_binary_sqrt(value: Fraction, precision: int) -> Fraction:
     """Round a nonnegative rational's normal square root, ties to even.
 

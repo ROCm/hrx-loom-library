@@ -5,28 +5,15 @@
 """Author exact BF16 modulation observations with independent rational rounding."""
 
 import argparse
-import math
 import random
 import struct
 from fractions import Fraction
 from pathlib import Path
 
-from binary_reference import f32, round_binary
-
-
-def rounded(value, precision):
-    result = float(round_binary(Fraction(value), precision, minimum_exponent=-126))
-    return math.copysign(0.0, float(value)) if result == 0 else result
-
-
-def add(left, right):
-    exact = Fraction(left) + Fraction(right)
-    return rounded(exact if exact else left + right, 24)
-
-
-def multiply(left, right):
-    exact = Fraction(left) * Fraction(right)
-    return rounded(exact if exact else left * right, 24)
+from binary_reference import add_f32 as add
+from binary_reference import f32
+from binary_reference import multiply_f32 as multiply
+from binary_reference import rounded_float as rounded
 
 
 def evaluate(row, omitted=""):
