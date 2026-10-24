@@ -139,6 +139,30 @@ intermediates must fit their types. The motif returns a scalar. The leaf owns
 thread distribution, tails, output placement, and any residual addition, so
 it can preserve a separate rounding or combine the value with other work.
 
+`convolution_matrix.loom` cooperatively computes a 3×3 channel-first image
+convolution. Its original F32 inputs and OI(T)HW weights are converted to BF16
+inside a workgroup, with F32 matrix accumulation and separate F32 bias and
+optional residual additions. Matrix arithmetic follows the target's native
+intermediate precision and rounding; it does not promise the bits of an ordered
+scalar FMA reduction. Padding, nearest expansion, and final temporal-plane
+selection follow the scalar convolution's indexing contract.
+
+Composition binds `tensor_convolution_rdna3` to an identity-only RDNA 3 target
+and launches four wave32 subgroups per workgroup. One workgroup computes
+32 output channels by 32 output pixels; input and output channel counts are
+positive multiples of 32. The launch grid is `ceil(output_pixels / 32)` by
+`output_channels / 32`. All 128 threads enter the motif, including threads
+outside a partial spatial tile. Each reduction block publishes 32×32 input
+and weight panels in padded BF16 workgroup storage totaling 4736 bytes. Both
+workgroup barriers are collective: the second retires readers before the next
+block reuses that storage.
+
+Input, weight, and bias storage is immutable and naturally aligned. Output
+may exactly alias the residual, but overlaps no other input. Geometry and
+index expressions fit their types, and BF16 conversions and F32 intermediates
+remain finite. Nearest expansion gathers repeated positions directly from
+physical input; it does not allocate an expanded image or converted weights.
+
 `matrix.loom` contracts a caller-owned sixteen-row F16 panel against a
 sixteen-column window of another matrix. The left panel may use explicit
 physical strides, including a transposed and padded probability tile; the

@@ -7,37 +7,11 @@
 import argparse
 import random
 import struct
-from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
 from binary_reference import round_binary
-
-
-@dataclass(frozen=True)
-class Case:
-    # Stable scenario and benchmark name.
-    name: str
-    # Physical input height, in pixels.
-    height: int
-    # Physical input width, in pixels.
-    width: int
-    # Number of input channels.
-    inputs: int
-    # Number of output channels.
-    outputs: int
-    # Odd spatial kernel width and height.
-    extent: int = 1
-    # Stored temporal planes; the final plane carries the active coefficients.
-    planes: int = 1
-    # Integer nearest-neighbor expansion factor in each spatial dimension.
-    upsample: int = 1
-    # Threads per workgroup in the caller's launch.
-    threads: int = 32
-    # Whether the caller adds a residual after the rounded bias addition.
-    residual: bool = False
-    # Whether output uses the residual's storage exactly.
-    alias: bool = False
+from convolution_fixture import Case, render_fixture
 
 
 CASES = (
@@ -56,10 +30,6 @@ CASES = (
     Case("bias_after_sum", 1, 1, 2, 1),
     Case("residual_after_bias", 1, 1, 2, 1, residual=True, alias=True),
 )
-
-
-def float_bytes(values):
-    return b"".join(struct.pack("<f", value) for value in values)
 
 
 def random_float(source):
@@ -140,58 +110,18 @@ def fixtures(case):
     return {"input": values, "weight": weight, "bias": bias, "residual": residual}, expected
 
 
-def render_case(case):
-    arrays, expected = fixtures(case)
+def render_kernel(case):
     name = case.name
-    count = len(expected)
     pixels = case.height * case.width * case.upsample**2
     groups = (pixels + case.threads - 1) // case.threads
-    counts = {key: len(values) for key, values in arrays.items()}
-    storage = {key: float_bytes([123.25] * 16 + values + [123.25] * 16)
-               for key, values in arrays.items()}
     output_argument = "" if case.alias else ", %output: buffer"
     output = "%residual" if case.alias else "%output"
-    arguments = ", ".join("%" + key for key in arrays) + ("" if case.alias else ", %output")
-    types = ", ".join(f"tensor<{value}xf32>" for value in counts.values())
-    if not case.alias:
-        types += f", tensor<{count}xf32>"
-    declarations = "\n\n".join(
-        f'global.rodata.def @{name}_{key} = align(4) bytes("{data.hex()}")'
-        for key, data in {**storage, "expected": float_bytes(expected)}.items()
-    )
-    initialize_arguments = ", ".join(f"%{key}: buffer" for key in arrays)
-    initialize = "\n".join(f"""  %bytes_{key} = index.constant {len(data)} : offset
-  %values_{key} = global.load @{name}_{key} : buffer
-  buffer.copy %values_{key}[%origin], %{key}[%origin], %bytes_{key}"""
-                           for key, data in storage.items())
-    allocations = "\n".join(
-        f"    %{key}_storage = check.generate.fill value(123.25) : tensor<{value + 32}xf32>"
-        for key, value in counts.items()
-    )
-    storage_arguments = ", ".join(f"%{key}_storage" for key in arrays)
-    storage_types = ", ".join(f"tensor<{value + 32}xf32>" for value in counts.values())
-    views = "\n".join(
-        f"    %{key} = check.tensor.view %{key}_storage offset(64) : tensor<{value + 32}xf32> -> tensor<{value}xf32>"
-        for key, value in counts.items()
-    )
-    if not case.alias:
-        views += f"""
-    %output_storage = check.generate.fill value(123.25) : tensor<{count + 32}xf32>
-    %output = check.tensor.view %output_storage offset(64) : tensor<{count + 32}xf32> -> tensor<{count}xf32>"""
-    output_storage = "%residual_storage" if case.alias else "%output_storage"
-    unchanged = "\n".join(
-        f"      check.expect.bitwise actual(%{key}_storage) expected(%{key}_storage) : tensor<{value + 32}xf32>"
-        for key, value in counts.items() if key != "residual" or not case.alias
-    )
     residual = f"""    %residual_view = buffer.view %residual[%origin] : buffer -> view<[%outputs]x[%pixels]xf32>
     %skip = view.load %residual_view[%channel, %pixel] : view<[%outputs]x[%pixels]xf32> -> f32
     %combined = scalar.addf %value, %skip : f32
 """ if case.residual else ""
     result = "%combined" if case.residual else "%value"
-    return f"""
-{declarations}
-
-kernel.def target(@convolution_wave32) @convolve_{name}() {{
+    return f"""kernel.def target(@convolution_wave32) @convolve_{name}() {{
   %groups = index.constant {groups} : index
   %channels = index.constant {case.outputs} : index
   %threads = index.constant {case.threads} : index
@@ -219,42 +149,12 @@ kernel.def target(@convolution_wave32) @convolve_{name}() {{
     view.store {result}, %output_view[%channel, %pixel] : f32, view<[%outputs]x[%pixels]xf32>
   }}
   kernel.return
-}}
+}}"""
 
-func.def @initialize_{name}({initialize_arguments}) {{
-  %origin = index.constant 0 : offset
-{initialize}
-  func.return
-}}
 
-func.def @reference_{name}(%input: buffer, %weight: buffer, %bias: buffer, %residual: buffer{output_argument}) {{
-  %origin = index.constant 0 : offset
-  %bytes = index.constant {count * 4} : offset
-  %values = global.load @{name}_expected : buffer
-  buffer.copy %values[%origin], {output}[%origin], %bytes
-  func.return
-}}
-
-check.scenario public @{name} {{
-  check.requires<hal.amdgpu.target> {{target = "gfx11-generic"}}
-  check.trial[1](%trial: index, %entropy: check.entropy) {{
-{allocations}
-    check.generate<@initialize_{name}>({storage_arguments}) : ({storage_types}) -> ()
-{views}
-    %prefix = check.tensor.view {output_storage} offset(0) : tensor<{count + 32}xf32> -> tensor<16xf32>
-    %suffix = check.tensor.view {output_storage} offset({(count + 16) * 4}) : tensor<{count + 32}xf32> -> tensor<16xf32>
-    check.compare<@convolve_{name}, @reference_{name}>({arguments}) : ({types}) -> () {{
-      check.expect.bitwise actual({output}) expected({output}) : tensor<{count}xf32>
-      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<16xf32>
-      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<16xf32>
-{unchanged}
-    }}
-  }}
-  check.return
-}}
-
-check.benchmark<@{name}> @{name}_convolve
-"""
+def render_case(case):
+    arrays, expected = fixtures(case)
+    return render_fixture(case, arrays, expected, render_kernel(case))
 
 
 def render():
