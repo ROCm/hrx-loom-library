@@ -1,0 +1,565 @@
+# Copyright 2026 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+"""Qwen framing and history through the production native text caller."""
+
+import base64
+import json
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+CHECKER = Path(sys.argv.pop(1)).resolve()
+MODEL_CARD = Path(sys.argv.pop(1)).absolute()
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    }
+]
+
+
+class RequestCheckTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        vocabulary = {chr(index): index for index in range(128)}
+        special_tokens = (("<bos>", 128), ("<eos>", 129), ("<|image_pad|>", 131))
+        vocabulary.update({"λ": 130, **dict(special_tokens)})
+        tokenizer = {
+            "model": {"type": "BPE", "vocab": vocabulary, "merges": []},
+            "added_tokens": [
+                {
+                    "id": index,
+                    "content": spelling,
+                    "single_word": False,
+                    "lstrip": False,
+                    "rstrip": False,
+                    "normalized": False,
+                    "special": True,
+                }
+                for spelling, index in special_tokens
+            ],
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": "<bos>", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "<eos>", "type_id": 0}},
+                ],
+                "pair": [],
+                "special_tokens": {
+                    spelling: {"id": spelling, "ids": [index], "tokens": [spelling]}
+                    for spelling, index in (("<bos>", 128), ("<eos>", 129))
+                },
+            },
+        }
+        self.tokenizer = self.directory / "tokenizer.json"
+        self.tokenizer.write_text(json.dumps(tokenizer), encoding="utf-8", newline="\n")
+
+    def execute(
+        self, request, response=None, capacity=4096, chunk_size=0, defaults=None
+    ):
+        request_path = self.directory / "request.json"
+        request_path.write_text(
+            request if isinstance(request, str) else json.dumps(request),
+            encoding="utf-8",
+            newline="\n",
+        )
+        defaults_json = (
+            defaults if isinstance(defaults, str) else json.dumps(defaults or {})
+        )
+        command = [
+            str(CHECKER),
+            f"--model={MODEL_CARD}",
+            f"--tokenizer={self.tokenizer}",
+            f"--request={request_path}",
+            f"--capacity={capacity}",
+            f"--response_chunk_size={chunk_size}",
+            f"--options={defaults_json}",
+        ]
+        if response is not None:
+            response_path = self.directory / "response.txt"
+            response_path.write_text(response, encoding="utf-8", newline="\n")
+            command.append(f"--response={response_path}")
+        return subprocess.run(
+            command, capture_output=True, encoding="utf-8", check=False
+        )
+
+    def success(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        expected_tokens = []
+        for index, text in enumerate(value["prompt"].split("<|image_pad|>")):
+            if index:
+                expected_tokens.append(131)
+            expected_tokens.extend(
+                130 if character == "λ" else ord(character) for character in text
+            )
+        self.assertEqual(
+            value["tokens"],
+            expected_tokens,
+        )
+        return value
+
+    def image(self, color, width=256, height=256):
+        pam = (
+            f"P7\nWIDTH {width}\nHEIGHT {height}\nDEPTH 3\nMAXVAL 255\n"
+            "TUPLTYPE RGB\nENDHDR\n"
+        ).encode("ascii") + bytes(color) * (width * height)
+        url = "data:image/x-portable-arbitrarymap;base64," + base64.b64encode(
+            pam
+        ).decode("ascii")
+        return {"type": "image_url", "image_url": {"url": url}}
+
+    def request(self, model="qwen3.8-policy-test", **options):
+        return {
+            "model": model,
+            "stream": True,
+            "enable_thinking": False,
+            "messages": [{"role": "user", "content": "Hello λ."}],
+            **options,
+        }
+
+    def test_production_prompt_and_plain_completion(self):
+        request = self.request()
+        value = self.success(self.execute(request))
+        prompt = "<|im_start|>user\nHello λ.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        self.assertEqual(value["model"], "qwen3.8-policy-test")
+        self.assertEqual(value["prompt"], prompt)
+        self.assertNotIn("checkpoint", value)
+        value = self.success(self.execute(request, "Hi."))
+        self.assertEqual(value["checkpoint"], prompt + "Hi.<|im_end|>\n")
+        self.assertEqual(value["output_cursor"], 3)
+        self.assertEqual(value["tool_calls"], [])
+        self.assertTrue(value["reusable"])
+
+    def test_normalized_output_requires_replay(self):
+        call = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"
+        for response in (" Hi.", "Hi.\n", "Ready.\n\n" + call + "\n"):
+            for chunk_size in (0, 1, 7):
+                with self.subTest(response=response, chunk_size=chunk_size):
+                    value = self.success(
+                        self.execute(
+                            self.request(tools=TOOLS),
+                            response,
+                            chunk_size=chunk_size,
+                        )
+                    )
+                    self.assertFalse(value["reusable"])
+                    self.assertTrue(value["checkpoint"].endswith("<|im_end|>\n"))
+
+    def test_thinking_defaults_off_and_remains_request_selectable(self):
+        for tools in ([], TOOLS):
+            with self.subTest(tools=bool(tools)):
+                request = self.request(tools=tools)
+                disabled = self.success(self.execute(request))
+                self.assertTrue(disabled["prompt"].endswith("<think>\n\n</think>\n\n"))
+                self.assertNotIn(
+                    "Reasoning effort is set to xhigh.", disabled["prompt"]
+                )
+
+                del request["enable_thinking"]
+                default = self.success(self.execute(request))
+                self.assertEqual(default["prompt"], disabled["prompt"])
+                self.assertEqual(default["tokens"], disabled["tokens"])
+
+                request["enable_thinking"] = True
+                enabled = self.success(self.execute(request))
+                self.assertTrue(enabled["prompt"].endswith("<think>\n"))
+                self.assertIn("Reasoning effort is set to xhigh.", enabled["prompt"])
+
+    def test_images_reject_non_data_urls(self):
+        result = self.execute(
+            self.request(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": "image.png"}}
+                        ],
+                    }
+                ]
+            ),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("image_url must be a base64", result.stderr)
+
+    def test_text_parts_preserve_order_and_have_no_media_spans(self):
+        request = self.request()
+        expected = self.success(self.execute(request))
+        request["messages"][0]["content"] = [
+            {"type": "text", "text": text} for text in ("Hello ", "λ", ".")
+        ]
+        actual = self.success(self.execute(request))
+        self.assertEqual(actual["prompt"], expected["prompt"])
+        self.assertEqual(actual["tokens"], expected["tokens"])
+        self.assertEqual(actual["media_spans"], [])
+
+    def test_ordered_multiple_images_preserve_input_spans(self):
+        parts = [
+            {"type": "text", "text": "  Compare first: "},
+            self.image((255, 0, 0)),
+            {"type": "text", "text": " with second: "},
+            self.image((0, 0, 255)),
+            {"type": "text", "text": " and explain.  "},
+        ]
+        request = self.request(messages=[{"role": "user", "content": parts}])
+        value = self.success(self.execute(request))
+        marker = "<|vision_start|>" + "<|image_pad|>" * 64 + "<|vision_end|>"
+        expected = "Compare first: " + marker + " with second: " + marker
+        self.assertIn(expected + " and explain.<|im_end|>", value["prompt"])
+        spans = value["media_spans"]
+        self.assertEqual([span[0] for span in spans], [0, 1])
+        for image, offset, count in spans:
+            self.assertEqual(count, 64)
+            self.assertEqual(value["tokens"][offset : offset + count], [131] * 64)
+            self.assertNotEqual(value["tokens"][offset - 1], 131)
+            self.assertNotEqual(value["tokens"][offset + count], 131)
+        self.assertGreater(spans[1][1], spans[0][1] + 64)
+
+    def test_images_across_turns_and_occurrence_limit(self):
+        image = self.image((0, 255, 0))
+        request = self.request(
+            messages=[
+                {"role": "user", "content": [image, image]},
+                {"role": "assistant", "content": "Two green images."},
+                {"role": "user", "content": [image, image]},
+            ]
+        )
+        value = self.success(self.execute(request))
+        self.assertEqual([span[0] for span in value["media_spans"]], [0, 1, 2, 3])
+        request["messages"][-1]["content"].append(image)
+        result = self.execute(request)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_general_image_shapes_and_request_budget(self):
+        for width, height, budget, expected_rows in (
+            (320, 224, 1024, 70),
+            (224, 320, 1024, 70),
+            (333, 257, 1024, 80),
+            (1024, 768, 128, 117),
+            (1024, 768, 1024, 768),
+            (1, 1, 1024, 64),
+        ):
+            with self.subTest(width=width, height=height, budget=budget):
+                request = self.request(
+                    model_options={"max_image_tokens": budget},
+                    messages=[
+                        {"role": "user", "content": "Look carefully."},
+                        {"role": "assistant", "content": "Ready."},
+                        {
+                            "role": "user",
+                            "content": [self.image((3, 17, 29), width, height)],
+                        },
+                    ],
+                )
+                value = self.success(self.execute(request))
+                self.assertEqual(len(value["media_spans"]), 1)
+                image, offset, count = value["media_spans"][0]
+                self.assertEqual((image, count), (0, expected_rows))
+                self.assertEqual(
+                    value["tokens"][offset : offset + count], [131] * count
+                )
+
+    def test_image_budget_validation(self):
+        for options in (
+            {"max_image_tokens": 0},
+            {"max_image_tokens": 127},
+            {"max_image_tokens": 16385},
+            {"max_image_tokens": -1},
+            {"max_image_tokens": 1024.5},
+            {"max_image_tokens": True},
+            {"max_image_tokens": "1024"},
+            {"unknown": 1024},
+            [],
+        ):
+            with self.subTest(options=options):
+                result = self.execute(self.request(model_options=options))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_production_xml_completion(self):
+        call = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"
+        value = self.success(
+            self.execute(self.request(tools=TOOLS), "Ready.\n\n" + call)
+        )
+        self.assertEqual(value["output_cursor"], len("Ready.\n\n"))
+        self.assertEqual(
+            value["checkpoint"], value["prompt"] + "Ready.\n\n" + call + "<|im_end|>\n"
+        )
+        self.assertEqual(value["tool_calls"][0]["id"], "call_1_0")
+        function = value["tool_calls"][0]["function"]
+        self.assertEqual(function["name"], "read")
+        self.assertEqual(json.loads(function["arguments"]), {"path": "a.txt"})
+        self.assertTrue(value["reusable"])
+
+    def test_tool_catalog_matches_native_admission(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": f"tool_{index}",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for index in range(33)
+        ]
+        value = self.success(self.execute(self.request(tools=tools), capacity=8192))
+        catalog = value["prompt"].split("<tools>\n", 1)[1].split("\n</tools>", 1)[0]
+        self.assertEqual([json.loads(line) for line in catalog.splitlines()], tools)
+
+    def test_thinking_stream_fragments_and_retained_tool_history(self):
+        call = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"
+        request = self.request(enable_thinking=True, tools=TOOLS)
+        response = "Check λ first.\n</think>\n\nReady.\n\n" + call
+        reference = self.success(self.execute(request, response))
+        self.assertEqual(reference["reasoning_content"], "Check λ first.\n")
+        self.assertEqual(reference["content"], "Ready.\n\n")
+        self.assertTrue(reference["reusable"])
+        self.assertIn("Reasoning effort is set to xhigh.", reference["prompt"])
+        self.assertTrue(
+            reference["prompt"].endswith("<|im_start|>assistant\n<think>\n")
+        )
+        for chunk_size in (1, 2, 3, 7, 8, 13, 64):
+            with self.subTest(chunk_size=chunk_size):
+                value = self.success(
+                    self.execute(
+                        request,
+                        response,
+                        chunk_size=chunk_size,
+                    )
+                )
+                self.assertEqual(value, reference)
+        following = self.request(
+            enable_thinking=True,
+            tools=TOOLS,
+            messages=[
+                *request["messages"],
+                {
+                    "role": "assistant",
+                    "content": reference["content"],
+                    "reasoning_content": reference["reasoning_content"],
+                    "tool_calls": [
+                        {key: value for key, value in call.items() if key != "index"}
+                        for call in reference["tool_calls"]
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1_0", "content": "Found it."},
+            ],
+        )
+        value = self.success(self.execute(following))
+        self.assertTrue(value["prompt"].startswith(reference["checkpoint"]))
+
+    def test_truncated_thinking_cannot_reuse_closed_history(self):
+        for response in (
+            "still thinking",
+            "unfinished </thin",
+            "<tool_call> is an example",
+        ):
+            for chunk_size in (0, 1, 7):
+                with self.subTest(response=response, chunk_size=chunk_size):
+                    value = self.success(
+                        self.execute(
+                            self.request(enable_thinking=True),
+                            response,
+                            chunk_size=chunk_size,
+                        )
+                    )
+                    self.assertEqual(value["reasoning_content"], response)
+                    self.assertEqual(value["content"], "")
+                    self.assertEqual(value["tool_calls"], [])
+                    self.assertFalse(value["reusable"])
+
+    def test_retained_history_requires_unchanged_generated_text(self):
+        call = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"
+        cases = [
+            (False, "Ready.", True),
+            (False, "Ready.\n\n", False),
+            (False, "\tReady.", False),
+            (False, " \t", False),
+            (True, "Check.\n</think>\n\nReady.", True),
+            (True, "Check.  \n</think> \nReady.", False),
+            (True, "\n</think>\n\nReady.", True),
+            (True, "</think>\n\nReady.", False),
+            (False, call, True),
+            (False, call.replace("\n<function", "\n  <function"), False),
+        ]
+        for thinking, response, reusable in cases:
+            with self.subTest(thinking=thinking, response=response):
+                value = self.success(
+                    self.execute(
+                        self.request(enable_thinking=thinking, tools=TOOLS),
+                        response,
+                        chunk_size=7,
+                    )
+                )
+                self.assertEqual(value["reusable"], reusable)
+                if reusable:
+                    self.assertEqual(
+                        value["checkpoint"],
+                        value["prompt"] + response + "<|im_end|>\n",
+                    )
+
+    def test_empty_reasoning_and_incomplete_answer_marker(self):
+        for prefix in ("", "\n"):
+            for chunk_size in (0, 1, 7):
+                value = self.success(
+                    self.execute(
+                        self.request(enable_thinking=True),
+                        prefix + "</think>\n\nUse <tool_ca",
+                        chunk_size=chunk_size,
+                    )
+                )
+                self.assertEqual(value["reasoning_content"], prefix)
+                self.assertEqual(value["content"], "Use <tool_ca")
+                self.assertEqual(value["reusable"], bool(prefix))
+
+    def test_source_sampling_defaults_and_request_overrides(self):
+        defaults = {
+            "sampling": {
+                "temperature": 0.7,
+                "top_p": 0.95,
+                "top_k": 20,
+                "seed": 9007199254740993,
+            }
+        }
+        value = self.success(self.execute(self.request(), defaults=defaults))
+        temperature, top_p, top_k, explicit_seed, seed = struct.unpack(
+            "<ffiiq", bytes(value["request_options"])
+        )
+        self.assertAlmostEqual(temperature, 0.7)
+        self.assertAlmostEqual(top_p, 0.95)
+        self.assertEqual((top_k, explicit_seed, seed), (20, 1, 9007199254740993))
+        value = self.success(
+            self.execute(
+                self.request(
+                    temperature=0, top_p=1, top_k=0, seed=-9223372036854775808
+                ),
+                defaults=defaults,
+            )
+        )
+        self.assertEqual(
+            struct.unpack("<ffiiq", bytes(value["request_options"])),
+            (0, 1, 0, 1, -9223372036854775808),
+        )
+        value = self.success(self.execute(self.request()))
+        self.assertEqual(
+            struct.unpack("<ffiiq", bytes(value["request_options"])), (0, 1, 0, 0, 1)
+        )
+
+    def test_invalid_sampling_fails_before_admission(self):
+        for field, values in {
+            "temperature": [-1, 1e100, 1e-45, None, "0.7"],
+            "top_p": [0, -1, 1.01, 1e-45, None],
+            "top_k": [-1, 1.5, 2147483648],
+            "seed": [1.5, 9223372036854775808, -9223372036854775809],
+        }.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    result = self.execute(self.request(**{field: value}))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+        for defaults in (
+            {"sampling": {"top_p": 0}},
+            {"sampling": {"typo": 1}},
+            {"samplng": {}},
+            {"sampling": []},
+            {"sampling": {"tool_choice": "none"}},
+        ):
+            with self.subTest(defaults=defaults):
+                result = self.execute(self.request(), defaults=defaults)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_tool_permission_is_request_local_and_preserves_history(self):
+        for thinking in (False, True):
+            request = self.request(enable_thinking=thinking, tools=TOOLS)
+            ordinary = self.success(self.execute(request))
+            for choice, expected_flag in (("auto", 0), ("none", 2)):
+                request["tool_choice"] = choice
+                value = self.success(self.execute(request))
+                self.assertEqual(value["prompt"], ordinary["prompt"])
+                self.assertEqual(value["tokens"], ordinary["tokens"])
+                catalog = (
+                    value["prompt"].split("<tools>\n", 1)[1].split("\n</tools>", 1)[0]
+                )
+                self.assertEqual(
+                    [json.loads(line) for line in catalog.splitlines()], TOOLS
+                )
+                self.assertEqual(
+                    struct.unpack("<ffiiq", bytes(value["request_options"])),
+                    (0, 1, 0, expected_flag, 1),
+                )
+            # Seed and turn permission compose regardless of JSON field order,
+            # and a request-local choice does not modify deployment defaults.
+            for order in (
+                {"seed": 17, "tool_choice": "none"},
+                {"tool_choice": "none", "seed": 17},
+            ):
+                value = self.success(self.execute(self.request(tools=TOOLS, **order)))
+                self.assertEqual(
+                    struct.unpack("<ffiiq", bytes(value["request_options"])),
+                    (0, 1, 0, 3, 17),
+                )
+            request["tool_choice"] = "none"
+            value = self.success(
+                self.execute(request, defaults={"sampling": {"seed": 19}})
+            )
+            self.assertEqual(
+                struct.unpack("<ffiiq", bytes(value["request_options"])),
+                (0, 1, 0, 3, 19),
+            )
+
+    def test_sampling_spelling_and_extreme_exponents(self):
+        request = json.dumps(
+            self.request(temperature=0.7, top_p=0.95, seed=9007199254740993)
+        )
+        ordinary = self.success(self.execute(request))
+        defaults = '{"sampl\\u0069ng":{"temperat\\u0075re":0.7,"top_p":0.95,"s\\u0065ed":9007199254740993}}'
+        self.assertEqual(
+            self.success(self.execute(self.request(), defaults=defaults)),
+            ordinary,
+        )
+        for literal in ("1e-999", "1e999", "-1e-999", "5e-324"):
+            with self.subTest(literal=literal):
+                result = self.execute(
+                    request.replace('"temperature": 0.7', f'"temperature": {literal}'),
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+        duplicate = '{"sampling":{"temperature":0.7,"temperat\\u0075re":0.5}}'
+        result = self.execute(self.request(), defaults=duplicate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_capacity_and_model_identity_rejections_are_atomic(self):
+        for request, capacity, diagnostic in (
+            (self.request(), 1, "complete input exceeds token capacity"),
+            (self.request(model="another-model"), 4096, "select model"),
+        ):
+            with self.subTest(capacity=capacity, request=request):
+                result = self.execute(request, capacity=capacity)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(diagnostic, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

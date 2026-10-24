@@ -11,7 +11,7 @@ from pathlib import Path
 from .context import RepositoryContext, UserError
 
 
-LOOM_BENCHMARK_ROOTS = ("experimental", "kernel", "model", "motif")
+LOOM_BENCHMARK_ROOTS = ("experimental", "kernel", "model", "motif", "program")
 LOOM_BENCHMARK_TAG = "loom-benchmark-module"
 LOOM_MOTIF_ADMISSION_TAG = "loom-admission-motif"
 

@@ -20,6 +20,7 @@ class QualificationTest(unittest.TestCase):
                 "experimental/model",
                 "kernel/example",
                 "motif/test",
+                "program/text/test",
             ):
                 package_root = repository_root / package
                 package_root.mkdir(parents=True)
@@ -33,7 +34,7 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(
             expression,
             'attr(tags, "loom-benchmark-module", '
-            "//experimental/... union //kernel/... union //motif/...)",
+            "//experimental/... union //kernel/... union //motif/... union //program/...)",
         )
 
     def test_motif_admission_uses_repository_tags_and_dependency_edges(self):

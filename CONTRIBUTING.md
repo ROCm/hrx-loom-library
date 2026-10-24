@@ -8,14 +8,15 @@ This repository admits reusable compiler inputs and complete model compositions.
 | --- | --- | --- |
 | `motif/` | Target-neutral data representations and algorithms expressed as `func.def`, `template.def`, encodings, and related declarations. | Canonical and lint-clean source, scoped documentation, no launch surface, and reachability from a qualified kernel or test leaf. |
 | `kernel/` | Concrete `kernel.def` entry points implementing one operation contract and ABI. | A semantic benchmark plan, at least one target profile, at least one execution profile, and dependencies confined to production motifs. |
-| `motif/**/test/` and `kernel/**/test/` | Test-only wrapper programs used when production code has no natural launch witness. | Private root-owned test module, semantic benchmarks and correctness cases, and one execution profile. |
+| `program/` | Shared service policy and executable compositions used by multiple models. | Explicit `loom_library` providers, scoped documentation, real service or command callers, and dependencies that do not point back to a model. |
+| `motif/**/test/`, `kernel/**/test/`, and `program/**/test/` | Test-only programs that exercise production contracts. | Private root-owned test module, semantic benchmarks and correctness cases, and one execution profile. |
 | `target/` | Genuinely repository-specific target or execution policy. | A concrete policy difference that cannot be expressed by canonical HRX profiles; upstream profiles are consumed directly otherwise. |
 | `model/` descriptions | Portable model facts, asset variants, service contracts, and provider composition. | A card validated through `loom_model_documentation`, a standalone overview with exact upstream links, and an explicit execution status. |
 | `model/` executable ports | Model-specific programs and portable serving compositions. | Explicit `loom_library` providers, a card published through `loom_model`, and an independently checked native service output for each supported representation. |
 
 Source-bearing `target/` packages still require their own admission rule. Model programs use the repository's `loom_library` wrapper for canonical source, lint, explicit dependencies, and relocatable bytecode. The `loom_model` wrapper selects the card's preset and exact providers and auxiliary compiler inputs through HRX's public rule. Full checkpoints retain their acquisition descriptors for `loom-fetch` and stay outside Bazel's payload graph. Model-local `test/` packages use the same `loom_test` contract as other layers; small fixtures and swatches declare their full input closure for test caching. Full-model checks consume provisioned weights, trust that they match the declared acquisition lock, and run current built programs against independent inputs and checked outputs. The card, lock, and providers participate in Bazel cache identity; full checkpoint hashing belongs to acquisition.
 
-Model identity follows the original publisher and base model under `model/<publisher>/<model>/`. Source, bytecode, and mixed inputs are program representations within a card, not separate model identities. Quantized checkpoints and services are selected through the card. Physical placement remains deployment input; request-time adapters do not become base-model parameters. Model-specific code can compose kernels and motifs; reusable code belongs in those lower layers, which cannot depend back on a model.
+Model identity follows the original publisher and base model under `model/<publisher>/<model>/`. Source, bytecode, and mixed inputs are program representations within a card, not separate model identities. Quantized checkpoints and services are selected through the card. Physical placement remains deployment input; request-time adapters do not become base-model parameters. Model-specific code composes shared programs, kernels, and motifs. Shared programs own service policy and multi-stage execution; kernels own individual launch contracts; motifs own reusable representations and algorithms. These layers cannot depend back on a model, and motifs cannot depend on a program or kernel.
 
 ## Branch-local incubation
 
@@ -29,7 +30,7 @@ standard-library layer.
 Pull requests and pushes targeting the repository release line fail while the
 candidate tree tracks any `experimental/**` path. The gate reads the candidate
 tree rather than branch history, so a branch may carry experiments for as long
-as needed, extract reusable work into `motif/`, `kernel/`, `model/`, or
+as needed, extract reusable work into `motif/`, `kernel/`, `program/`, `model/`, or
 `target/`, and remove the incubation payload before promotion. Feature branches
 may compose experimental targets with sources at any repository path; those
 paths are working locations until the candidate tree passes release admission.

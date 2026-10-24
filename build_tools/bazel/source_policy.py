@@ -75,15 +75,15 @@ def _package_policy(layer: str, relative_directory: Path) -> tuple[str, str]:
         return "test", "loom_test"
     if layer == "kernel":
         return "kernel", "loom_kernel_library"
-    if layer == "model":
-        return "model", "loom_library"
+    if layer in ("model", "program"):
+        return layer, "loom_library"
     return "motif", "loom_motif_library"
 
 
 def _check_scoped_readmes(repository_root: Path) -> list[str]:
     violations: list[str] = []
     checked_directories: set[Path] = set()
-    for root_name in ("kernel", "model", "motif", "target"):
+    for root_name in ("kernel", "model", "motif", "program", "target"):
         source_root = repository_root / root_name
         if not source_root.is_dir():
             continue
@@ -115,7 +115,7 @@ def check_repository(repository_root: Path) -> list[str]:
             f"{source_path.relative_to(repository_root)}: source-bearing "
             "target packages require a repository admission rule"
         )
-    for layer in ("kernel", "model", "motif"):
+    for layer in ("kernel", "model", "motif", "program"):
         layer_root = repository_root / layer
         if not layer_root.is_dir():
             continue
@@ -197,7 +197,9 @@ def check_repository(repository_root: Path) -> list[str]:
 
 def _create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--layer", choices=["kernel", "model", "motif", "test"])
+    parser.add_argument(
+        "--layer", choices=["kernel", "model", "motif", "program", "test"]
+    )
     parser.add_argument("--repository-root", type=Path)
     parser.add_argument("sources", metavar="SOURCE", nargs="*")
     return parser

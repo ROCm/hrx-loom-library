@@ -7,6 +7,7 @@ load(
     _loom_library = "loom_library",
     _loom_model = "loom_model",
     _loom_model_documentation = "loom_model_documentation",
+    _loom_module = "loom_module",
     _loom_test = "loom_test",
 )
 
@@ -16,6 +17,8 @@ _MOTIF_ADMISSION_TAG = "loom-admission-motif"
 _MOTIF_ADMISSION_SUFFIX = "_admission_motif"
 
 loom_model_documentation = _loom_model_documentation
+# Final linked products compose providers admitted by their owning source rule.
+loom_module = _loom_module
 
 def _is_package_or_subpackage(package, root):
     return package == root or package.startswith(root + "/")
@@ -33,7 +36,7 @@ def _validate_motif_dependencies(package, deps):
         dep_package = _label_package(dep, package)
         if dep_package != None and any([
             _is_package_or_subpackage(dep_package, layer)
-            for layer in ["kernel", "model"]
+            for layer in ["kernel", "program", "model"]
         ]):
             fail(
                 (
@@ -62,6 +65,15 @@ def _validate_kernel_dependencies(package, deps):
                     "//%s is a kernel package and can depend only on motif/ " +
                     "libraries, got %s"
                 ) % (package, dep),
+            )
+
+def _validate_program_dependencies(package, deps):
+    for dep in deps:
+        dep_package = _label_package(dep, package)
+        if dep_package != None and _is_package_or_subpackage(dep_package, "model"):
+            fail(
+                "//%s is a shared program and cannot depend on model package %s; " % (package, dep) +
+                "supply model identity and preparation from the model composition",
             )
 
 def _declare_source_policy_test(name, layer, srcs, tags):
@@ -117,10 +129,14 @@ def loom_library(
         tags = [],
         visibility = None,
         target_compatible_with = []):
-    """Declares model-owned programs and their explicit linker dependencies."""
+    """Declares shared or model-owned programs with explicit linker dependencies."""
     package = native.package_name()
-    if not _is_package_or_subpackage(package, "model") or "test" in package.split("/"):
-        fail("loom_library is for model/ production programs, got //%s" % package)
+    shared = _is_package_or_subpackage(package, "program")
+    model = _is_package_or_subpackage(package, "model")
+    if not (shared or model) or "test" in package.split("/"):
+        fail("loom_library is for program/ or model/ production programs, got //%s" % package)
+    if shared:
+        _validate_program_dependencies(package, deps)
     _loom_library(
         name = name,
         srcs = srcs,
@@ -134,7 +150,7 @@ def loom_library(
     )
     text_sources = [source for source in srcs if str(source).endswith(".loom")]
     if text_sources:
-        _declare_source_policy_test(name, "model", text_sources, tags)
+        _declare_source_policy_test(name, "program" if shared else "model", text_sources, tags)
 
 def loom_model(
         name,
@@ -244,6 +260,8 @@ def loom_test(
         )
     if _is_package_or_subpackage(package, "motif"):
         _validate_motif_dependencies(package, deps)
+    if _is_package_or_subpackage(package, "program"):
+        _validate_program_dependencies(package, deps)
     _validate_execution_profiles(name, execution_profiles)
     _loom_test(
         name = name,

@@ -56,7 +56,7 @@ class SourcePolicyTest(unittest.TestCase):
                         "pass configuration values from a composition leaf"
                     ],
                 )
-                for layer in ("model", "test"):
+                for layer in ("model", "program", "test"):
                     self.assertEqual(
                         source_policy.check_sources(layer, [("leaf.loom", source)]),
                         [],
@@ -369,6 +369,47 @@ class SourcePolicyTest(unittest.TestCase):
                 [
                     "model/publisher/recognizer/program/BUILD.bazel: "
                     "model packages must declare loom_library"
+                ],
+            )
+
+    def test_shared_program_requires_its_own_source_and_test_admission(self):
+        with TemporaryDirectory() as temporary_directory:
+            repository_root = Path(temporary_directory)
+            program_root = repository_root / "program" / "text" / "example"
+            test_root = program_root / "test"
+            test_root.mkdir(parents=True)
+            for directory in (
+                repository_root / "program",
+                repository_root / "program" / "text",
+                program_root,
+                test_root,
+            ):
+                (directory / "README.md").write_text("# Scope\n")
+            (program_root / "control.loom").write_text(
+                'func.decl import("runner") @execute(%stage: i32) -> (i64)\n'
+            )
+            (program_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_library")\n'
+                'loom_library(name = "control", srcs = ["control.loom"])\n'
+            )
+            (test_root / "cases.loom").write_text(
+                "check.case public @case { check.return }\n"
+            )
+            (test_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_test")\n'
+                'loom_test(name = "cases", srcs = ["cases.loom"])\n'
+            )
+            self.assertEqual(source_policy.check_repository(repository_root), [])
+
+            (program_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_module")\n'
+                'loom_module(name = "control", srcs = ["control.loom"])\n'
+            )
+            self.assertEqual(
+                source_policy.check_repository(repository_root),
+                [
+                    "program/text/example/BUILD.bazel: "
+                    "program packages must declare loom_library"
                 ],
             )
 

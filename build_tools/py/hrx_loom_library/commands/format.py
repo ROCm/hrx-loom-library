@@ -13,7 +13,7 @@ from ..context import RepositoryContext, UserError
 
 
 LOOM_FORMAT_TARGET = "@hrx//loom/src/loom/tools/loom-format"
-LOOM_SOURCE_ROOTS = ("experimental", "kernel", "model", "motif", "target")
+LOOM_SOURCE_ROOTS = ("experimental", "kernel", "model", "motif", "program", "target")
 
 
 def _is_loom_source_path(path: str) -> bool:

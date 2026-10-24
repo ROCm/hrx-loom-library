@@ -17,6 +17,12 @@ operation contract and ABI. For example, the
 [GGML Q8_1 x4 representation](motif/format/ggml/) is independent of the
 [GGML-compatible quantization entry point](kernel/ggml/quantize/) that uses it.
 
+Shared programs compose service policy and execution stages across models.
+The [Qwen text program](program/text/qwen3_8/), for example, supplies chat
+framing, streaming output parsing, and epoch encoding. Each model provides its
+own identity, parameters, and compute stages while linking the shared service
+program as source or bytecode.
+
 ## Run a model with installed tools
 
 Install the `hrx-loom` SDK in a Python 3.12+ virtual environment, with the

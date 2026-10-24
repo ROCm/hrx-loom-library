@@ -16,13 +16,19 @@ from build_tools.py.hrx_loom_library.context import RepositoryContext, UserError
 
 
 class LoomFormatCommandTest(unittest.TestCase):
-    def test_default_discovery_includes_experimental_sources(self):
+    def test_default_discovery_includes_shared_programs_and_experimental_sources(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository_root = Path(temporary_directory)
             experimental_source = repository_root / "experimental/model/program.loom"
             kernel_source = repository_root / "kernel/example/kernel.loom"
+            program_source = repository_root / "program/text/control.loom"
             ignored_source = repository_root / "scratch/ignored.loom"
-            for source in (experimental_source, kernel_source, ignored_source):
+            for source in (
+                experimental_source,
+                kernel_source,
+                program_source,
+                ignored_source,
+            ):
                 source.parent.mkdir(parents=True, exist_ok=True)
                 source.write_text("module {\n}\n", encoding="utf-8")
 
@@ -30,7 +36,13 @@ class LoomFormatCommandTest(unittest.TestCase):
 
         self.assertEqual(
             sources,
-            sorted([experimental_source.resolve(), kernel_source.resolve()]),
+            sorted(
+                [
+                    experimental_source.resolve(),
+                    kernel_source.resolve(),
+                    program_source.resolve(),
+                ]
+            ),
         )
 
     def test_runs_one_batch_formatter_command(self):
