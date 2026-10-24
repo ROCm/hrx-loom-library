@@ -126,6 +126,19 @@ input/output overlap is unsupported. The complete reduction precedes output
 stores, so the in-place form preserves the same arithmetic. Input is read
 once for the reduction and once for output, without an intermediate tensor.
 
+`convolution.loom` computes one selected channel-first F32 image output. It
+reads original OI(T)HW coefficients from the final temporal plane, accumulates
+input channels and spatial taps in order with F32 FMA, and adds bias after
+the reduction. Nearest-neighbor upsampling is an input-coordinate transform;
+padding applies to the expanded image before mapping to physical input.
+
+Geometry and plane counts are positive, the spatial extent is odd, and the
+caller selects a valid output channel and pixel. Inputs, coefficients, and
+bias are immutable and naturally aligned; index expressions and finite F32
+intermediates must fit their types. The motif returns a scalar. The leaf owns
+thread distribution, tails, output placement, and any residual addition, so
+it can preserve a separate rounding or combine the value with other work.
+
 `matrix.loom` contracts a caller-owned sixteen-row F16 panel against a
 sixteen-column window of another matrix. The left panel may use explicit
 physical strides, including a transposed and padded probability tile; the

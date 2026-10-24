@@ -131,6 +131,25 @@ executions share these scenarios and their benchmark declarations.
 python3 -B motif/tensor/test/generate_channel_norm_oracle.py --check
 ```
 
+`convolution.loom` checks selected-pixel F32 convolution against independently
+expanded and padded logical images. Active coefficients are authored before
+their final temporal-plane placement; earlier planes contain distinct values.
+Exact rational arithmetic rounds every F32 FMA, final bias, and leaf residual
+addition separately. Directed cases distinguish fused products, bias before
+the reduction, and reordered bias/residual addition.
+
+Thirteen cases cover 1×1, 3×3, and 5×5 extents; one and multiple temporal
+planes; nearest-neighbor scales one, two, and three; rectangular images;
+complete, tail, and multiple workgroups; 384 input or output channels; and
+the decoder's final 96-to-3 convolution. Output may alias the residual in
+the wrapper. Every output bit, storage guard, and immutable input is checked
+in both native and access-instrumented execution. Each shape also has a
+benchmark declaration.
+
+```sh
+python3 -B motif/tensor/test/generate_convolution_oracle.py --check
+```
+
 `prefix_norm.loom` compares native NPU output with a serial binary64 sum of
 squares and reciprocal norm. Widths 32, 64, 96, and 1024 exercise prefix lengths
 on either side of 16- and 32-element boundaries, including single-element and
