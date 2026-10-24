@@ -108,6 +108,26 @@ allowing output to equal input exactly. Weights and tables remain immutable
 and separate from output. Launch geometry and coefficient generation belong
 to the caller.
 
+`quantization.loom` prepares BF16 activation rows for ConvRot-256 signed INT8
+projections. Each 256-element block receives the fourth Kronecker power of
+the regular H4 matrix, normalized by `1/16`, and rounds to BF16. One maximum
+over the complete row determines its scale: `max(amax / 127, 1e-30)` in F32.
+The divisor rounds to BF16, and the quotient rounds to BF16 before nearest-even
+integer rounding and saturation to `[-128, 127]`. The published row scale
+retains F32 precision for the subsequent integer contraction.
+
+One 128-thread workgroup with four wave32 subgroups owns each row. Positive
+column counts are multiples of 256 up to 16384. Each input is loaded once;
+the rotated BF16 row stays in workgroup memory across the maximum reduction.
+A workgroup barrier publishes both the row and the four subgroup maxima.
+Input, signed-I8 output, and F32 scales occupy disjoint, naturally aligned
+storage. Composition can reuse one prepared row across multiple projections
+while retaining the original BF16 input for other consumers.
+
+`quantization.convrot_digit` supplies one regular H4 digit over a complete
+32-lane subgroup with distance 1 or 4. Its eight independent F32 components
+correspond to different positions in the enclosing 256-element transform.
+
 `grouped_convolution.loom` applies a causal F32 convolution independently to
 each block. A coefficient combines a static per-channel weight with a dynamic
 weight shared by a contiguous group of channels. Dynamic weights vary by
