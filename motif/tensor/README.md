@@ -108,6 +108,20 @@ launch geometry. Neither module imposes a workgroup size or target. Operands
 and arithmetic intermediates are finite; approximate activation math does not
 promise bitwise agreement across devices.
 
+`modulation.loom` combines time-dependent BF16 values with learned checkpoint
+tables. `modulation.combine_bf16` rounds the F32 table value to BF16, adds the
+modulation value in F32, and rounds the sum back to BF16. Its affine form
+combines scale and shift separately, rounds scale-plus-one to BF16, rounds
+the scaled input to BF16, and then adds the combined shift and rounds again.
+Removing an intermediate rounding changes the function.
+
+The caller supplies finite values whose arithmetic intermediates remain
+finite. Each helper returns a scalar without owning buffers, normalization,
+or launch geometry. A model can fuse normalization and modulation without
+materializing an expanded scale/shift tensor. Checkpoint storage selection
+stays in the leaf: an F32 table and a widened BF16 table use the same scalar
+contract.
+
 `image_unpack.loom` decodes one F32 pixel from a tensor of packed 2×2 BF16
 patches. Patches are ordered by spatial row and column, then channel, then the
 four pixels within the patch. The affine table contains one positive inverse

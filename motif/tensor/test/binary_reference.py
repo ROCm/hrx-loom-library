@@ -8,11 +8,15 @@ import struct
 from fractions import Fraction
 
 
-def round_binary(value: Fraction, precision: int) -> Fraction:
-    """Round a finite rational to a normal binary significand, ties to even.
+def round_binary(
+    value: Fraction, precision: int, minimum_exponent: int | None = None
+) -> Fraction:
+    """Round a finite rational to a binary significand, ties to even.
 
-    The authored corpora stay far from overflow and underflow. This oracle
-    expresses significand rounding, rather than simulating host instructions.
+    With a minimum normal exponent, subnormals use fixed spacing down to zero.
+    Otherwise the exponent is unbounded. This oracle expresses significand
+    rounding, rather than simulating host instructions; overflow is excluded
+    by the authored corpora.
     """
     if not value:
         return value
@@ -22,6 +26,8 @@ def round_binary(value: Fraction, precision: int) -> Fraction:
     power = Fraction(2) ** exponent
     if value < power:
         exponent -= 1
+    if minimum_exponent is not None:
+        exponent = max(exponent, minimum_exponent)
     spacing = Fraction(2) ** (exponent - precision + 1)
     scaled = value / spacing
     quotient, remainder = divmod(scaled.numerator, scaled.denominator)
