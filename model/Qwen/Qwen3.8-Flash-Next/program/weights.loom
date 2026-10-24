@@ -1,0 +1,51 @@
+// Parameter preparation policy selected by the model program. Only GDN QKV
+// tensors receive an in-place code/scale permutation; every other tensor
+// retains its original GGUF bytes and identity.
+
+func.decl import("prepare") @stage(%root: buffer, %tag: i64) -> (i32)
+
+// UTF-8 bytes for "blk.", ".attn_qkv.weight", and "flash_next_prepare_qkv".
+global.rodata.def @block = bytes("626c6b2e")
+
+global.rodata.def @qkv = bytes("2e6174746e5f716b762e776569676874")
+
+global.rodata.def @prepare = bytes("666c6173685f6e6578745f707265706172655f716b76")
+
+// All 36 GDN QKV tensors are K2560/N10240 Q8_0. Preparation permutes their
+// existing allocation into four-channel code/scale planes; ordinary, mixed,
+// and speculative consumers all read that layout. Other tensors stay in GGUF
+// order. Reactivation reloads original bytes before running the same command.
+func.def public @prepare_weight(%key: buffer) -> (i64) {
+  %length = buffer.length %key
+  %prefix = global.load @block : buffer
+  %suffix = global.load @qkv : buffer
+  %prefix_length = buffer.length %prefix
+  %suffix_length = buffer.length %suffix
+  %minimum_length = index.add %prefix_length, %suffix_length : offset
+  %fits = index.cmp uge, %length, %minimum_length : offset
+  %matches = scf.if %fits -> (i1) {
+    %origin = index.constant 0 : offset
+    %prefix_comparison = buffer.compare %key[%origin], %prefix[%origin], %prefix_length
+    %suffix_origin = index.sub %length, %suffix_length : offset
+    %suffix_comparison = buffer.compare %key[%suffix_origin], %suffix[%origin], %suffix_length
+    %c0 = scalar.constant 0 : i32
+    %prefix_equal = scalar.cmpi eq, %prefix_comparison, %c0 : i32
+    %suffix_equal = scalar.cmpi eq, %suffix_comparison, %c0 : i32
+    %equal = scalar.andi %prefix_equal, %suffix_equal : i1
+    scf.yield %equal : i1
+  } else {
+    %false = scalar.constant false : i1
+    scf.yield %false : i1
+  }
+  %bytes = scf.if %matches -> (i64) {
+    %prepare = global.load @prepare : buffer
+    %tag = scalar.constant 0 : i64
+    %stage = func.call @stage(%prepare, %tag) : (buffer, i64) -> (i32)
+    %size = scalar.constant 27852800 : i64
+    scf.yield %size : i64
+  } else {
+    %size = scalar.constant 0 : i64
+    scf.yield %size : i64
+  }
+  func.return %bytes : i64
+}

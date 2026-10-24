@@ -1,0 +1,76 @@
+// Sparse attention over paged K/V and selected compressed blocks. Per-token
+// ownership supplies retained row and causal position; publication preserves
+// the checkpoint's gated BF16 result.
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+config.decl @flash_next.context_capacity : %value: index where [range(%value, 64, 262144), multiple_of(%value, 64)]
+
+config.decl @flash_next.pool_capacity : %value: index where [range(%value, 64, 4194304), multiple_of(%value, 64)]
+
+func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
+
+func.decl @flash_next_token_binding(%mapping: buffer, %token: index) -> (index, index, index, index)
+
+func.decl @flash_next_physical_token(%rows: buffer, %row: index, %position: index) -> (index)
+
+func.decl @flash_next_cache_origin(%rows: buffer, %row: index, %plane_origin: offset) -> (offset)
+
+amdgpu.target<gfx11-generic> @qsa_attention_wave32 {subgroup_size = 32}
+
+func.decl @qsa_normalize_rotate(%width: index, %position: index, %input: buffer, %input_origin: offset, %weight: buffer, %output: buffer, %output_origin: offset, %output_group_stride: index)
+
+// Four-token panels remain entirely within each 64-token physical cache page.
+// K uses [block, head, channel/16, member, channel%16]; V uses
+// [block, head, channel, member]. This permits contiguous matrix operand loads
+// without a second cache or a repacking pass. Page byte size, copy-on-write,
+// and retention ownership are unchanged. Each appender writes only its member.
+kernel.def target(@qsa_attention_wave32) @qsa_append_kv() {
+  %heads = index.constant 2 : index
+  %tokens = config.get @flash_next.token_count : index
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%heads, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer) {
+  %tokens = config.get @flash_next.token_count : index
+  %capacity = config.get @flash_next.context_capacity : index
+  %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
+  %token = kernel.workgroup.id<y> : index
+  %active = index.cmp ult, %token, %end : index
+  scf.if %active {
+    %head = kernel.workgroup.id<x> : index
+    %position, %row, %begin, %first = func.call @flash_next_token_binding(%mapping, %token) : (buffer, index) -> (index, index, index, index)
+    %physical = func.call @flash_next_physical_token(%rows, %row, %position) : (buffer, index, index) -> (index)
+    %key_base = func.call @flash_next_cache_origin(%rows, %row, %key_origin) : (buffer, index, offset) -> (offset)
+    %value_base = func.call @flash_next_cache_origin(%rows, %row, %value_origin) : (buffer, index, offset) -> (offset)
+    %pool = config.get @flash_next.pool_capacity : index
+    %c2 = index.constant 2 : index
+    %width = index.constant 256 : index
+    %input_head = index.madd %token, %c2, %head : index
+    %members = index.constant 4 : index
+    %physical_block = index.div %physical, %members : index
+    %physical_member = index.rem %physical, %members : index
+    %blocks = index.div %pool, %members : index
+    %output_block_head = index.madd %physical_block, %c2, %head : index
+    %block_head_bytes = index.constant 2048 : offset
+    %member_bytes = index.constant 32 : offset
+    %output_block_relative = index.scale %output_block_head, %block_head_bytes : index, offset -> offset
+    %member_relative = index.scale %physical_member, %member_bytes : index, offset -> offset
+    %output_group_stride = index.constant 64 : index
+    %head_bytes = index.constant 512 : offset
+    %input_origin = index.scale %input_head, %head_bytes : index, offset -> offset
+    %output_relative = index.add %output_block_relative, %member_relative : offset
+    %output_origin = index.add %key_base, %output_relative : offset
+    func.call @qsa_normalize_rotate(%width, %position, %keys, %input_origin, %weight, %arena, %output_origin, %output_group_stride) : (index, index, buffer, offset, buffer, buffer, offset, index)
+    %origin = index.constant 0 : offset
+    %input_view = buffer.view %values[%origin] : buffer -> view<[%tokens]x2x256xbf16>
+    %value_layout = encoding.layout.strided [2048, 1024, 1, 4] : encoding<layout>
+    %output_view = buffer.view %arena[%value_base] : buffer -> view<[%blocks]x2x4x256xbf16, %value_layout>
+    %lane = kernel.subgroup.lane.id : index
+    %c8 = index.constant 8 : index
+    %channel = index.mul %lane, %c8 : index
+    %packed = vector.load %input_view[%token, %head, %channel] : view<[%tokens]x2x256xbf16> -> vector<8xbf16>
+    vector.store %packed, %output_view[%physical_block, %head, %physical_member, %channel] : vector<8xbf16>, view<[%blocks]x2x4x256xbf16, %value_layout>
+  }
+  kernel.return
+}

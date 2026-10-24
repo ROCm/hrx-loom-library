@@ -71,8 +71,14 @@ Strix Halo NPU with source, bytecode, or mixed providers. Its pinned converter
 creates a standalone installation from the publisher checkpoint. The prepared
 bank is not hosted yet, so this model is not listed by the public picker.
 
+[Qwen3.8 Flash-Next](model/Qwen/Qwen3.8-Flash-Next/OVERVIEW.md) provides text
+generation on AMD RDNA with four ordered checkpoint shards and optional
+multi-token prediction. Its source, bytecode, and mixed providers share the
+same text service and retained-conversation checks. The source presets use
+the installed SDK directly, including when fetched from a library checkout.
+
 The [model map](model/README.md#map) also includes descriptions for image
-generation, text and vision, and sharded text models. Those descriptions
+generation and text with vision. Those descriptions
 identify compatible assets and intended programs; their executable ports are
 not yet included.
 

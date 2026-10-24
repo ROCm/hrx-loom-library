@@ -1,0 +1,167 @@
+// Sparse-attention cache append and query composition. Paged K/V and
+// compressed index blocks share physical page ownership, while partial-block
+// history publishes to the retained writer.
+
+command.program.decl @qsa_split_attention(%key_origin: offset, %value_origin: offset) launch(%span: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %query_gate: buffer, %arena: buffer, %selected_blocks: buffer, %output: buffer)
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+config.decl @flash_next.context_capacity : %value: index where [range(%value, 64, 262144), multiple_of(%value, 64)]
+
+config.decl @qsa.query_tile : %value: index where [range(%value, 1, 32768)]
+
+command.program.decl @flash_next_capture_inputs(%prefix_bytes: offset, %row_bytes: offset) launch(%epoch: buffer, %input: buffer, %capture: buffer)
+
+kernel.decl @qsa_linear_bf16(%output_capacity: index) launch(%width: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qsa_prepare_queries(%head_capacity: index) launch(%width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qsa_pool_blocks() launch(%tail_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %raw: buffer, %arena: buffer, %pooled: buffer)
+
+kernel.decl @qsa_prepare_blocks() launch(%index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer)
+
+kernel.decl @qsa_publish_tail() launch(%tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer)
+
+kernel.decl @qsa_append_kv() launch(%key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer)
+
+func.decl pure @qsa_cohort_capacity() -> (index)
+
+kernel.decl @qsa_merge_cohorts() launch(%epoch: buffer, %selected: buffer, %cohorts: buffer)
+
+kernel.decl @qsa_cohort_attention() launch(%key_origin: offset, %value_origin: offset, %rows: buffer, %queries: buffer, %gates: buffer, %arena: buffer, %cohorts: buffer, %output: buffer)
+
+kernel.decl @qsa_score_blocks() launch(%query_begin_arg: index, %index_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
+
+kernel.decl @qsa_score_tiled() launch(%query_begin_arg: index, %index_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
+
+kernel.decl @qsa_select_blocks() launch(%query_begin_arg: index, %span: buffer, %mapping: buffer, %scores: buffer, %selected: buffer)
+
+template.decl @flash_next.project_dense_q8(%inputs: index, %outputs: index, %blocks: index, %span: buffer, %input: buffer, %weight: view<[%outputs]x[%blocks]x34xi8>, %output: buffer)
+
+// Append publishes the same paged K/V, complete index blocks, and partial tail
+// for ordinary attention and predictor catch-up. No query or MoE work is needed
+// when target acceptance supplies the hidden rows being caught up.
+command.program.def public @flash_next_qsa_append(%layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %capture: buffer) {
+  %tokens = config.get @flash_next.token_count : index
+  %c4 = index.constant 4 : index
+  %index_width = index.constant 128 : index
+  %small_width = index.constant 512 : index
+  %hidden_width = index.constant 2560 : index
+  %index_key_bytes = index.constant 256 : offset
+  %small_row_bytes = index.constant 1024 : offset
+  %small_bytes = index.scale %tokens, %small_row_bytes : index, offset -> offset
+  %raw_bytes = index.scale %tokens, %index_key_bytes : index, offset -> offset
+  %index_key_raw = buffer.alloca<global> align(256) %raw_bytes : buffer
+  %pooled = buffer.alloca<global> align(256) %raw_bytes : buffer
+  %keys = buffer.alloca<global> align(256) %small_bytes : buffer
+  %values = buffer.alloca<global> align(256) %small_bytes : buffer
+  %index_key_weight = command.parameter %parameters, "blk.{}.indexer.k_proj.weight"[%layer] : view<128x2560xbf16>
+  %index_key_norm = command.parameter %parameters, "blk.{}.indexer.k_norm.weight"[%layer] : view<128xf32>
+  %key_weight = command.parameter %parameters, "blk.{}.attn_k.weight"[%layer] : view<512x80x34xi8>
+  %value_weight = command.parameter %parameters, "blk.{}.attn_v.weight"[%layer] : view<512x80x34xi8>
+  %key_norm = command.parameter %parameters, "blk.{}.attn_k_norm.weight"[%layer] : view<256xf32>
+  kernel.launch @qsa_linear_bf16[%index_width](%index_width, %span, %input, %index_key_weight, %index_key_raw) : [index](index, buffer, buffer, view<128x2560xbf16>, buffer)
+  %capture_base = index.constant 771584 : offset
+  %ordinal = index.div %layer, %c4 : index
+  %capture_relative = index.scale %ordinal, %index_key_bytes : index, offset -> offset
+  %capture_prefix = index.add %capture_base, %capture_relative : offset
+  command.program.launch @flash_next_capture_inputs[%capture_prefix, %index_key_bytes](%span, %index_key_raw, %capture) : [offset, offset](buffer, buffer, buffer)
+  kernel.launch @qsa_pool_blocks(%tail_origin, %span, %mapping, %rows, %index_key_raw, %arena, %pooled) : (offset, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @qsa_prepare_blocks(%index_origin, %span, %mapping, %rows, %pooled, %index_key_norm, %arena) : (offset, buffer, buffer, buffer, buffer, view<128xf32>, buffer)
+  kernel.launch @qsa_publish_tail(%tail_origin, %span, %rows, %index_key_raw, %arena) : (offset, buffer, buffer, buffer, buffer)
+  %key_weight_block_size = index.constant 32 : index
+  %key_weight_blocks = index.div %hidden_width, %key_weight_block_size : index
+  %key_weight_shaped = view.refine %key_weight : view<512x80x34xi8> -> view<[%small_width]x[%key_weight_blocks]x34xi8>
+  template.apply<@flash_next.project_dense_q8>(%hidden_width, %small_width, %key_weight_blocks, %span, %input, %key_weight_shaped, %keys) : (index, index, index, buffer, buffer, view<[%small_width]x[%key_weight_blocks]x34xi8>, buffer)
+  %value_weight_block_size = index.constant 32 : index
+  %value_weight_blocks = index.div %hidden_width, %value_weight_block_size : index
+  %value_weight_shaped = view.refine %value_weight : view<512x80x34xi8> -> view<[%small_width]x[%value_weight_blocks]x34xi8>
+  template.apply<@flash_next.project_dense_q8>(%hidden_width, %small_width, %value_weight_blocks, %span, %input, %value_weight_shaped, %values) : (index, index, index, buffer, buffer, view<[%small_width]x[%value_weight_blocks]x34xi8>, buffer)
+  kernel.launch @qsa_append_kv(%key_origin, %value_origin, %span, %mapping, %rows, %keys, %values, %key_norm, %arena) : (offset, offset, buffer, buffer, buffer, buffer, buffer, view<256xf32>, buffer)
+  command.return
+}
+
+command.program.def public @flash_next_qsa_attention(%layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %output: buffer, %capture: buffer) {
+  command.program.launch @flash_next_qsa_append[%layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %span, %mapping, %rows, %input, %arena, %capture) : [index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.program.launch @flash_next_qsa_queries[%layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %span, %mapping, %rows, %input, %arena, %output, %capture) : [index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @flash_next_qsa_queries(%layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %output: buffer, %capture: buffer) {
+  %tokens = config.get @flash_next.token_count : index
+  %capacity = config.get @flash_next.context_capacity : index
+  %c4 = index.constant 4 : index
+  %c24 = index.constant 24 : index
+  %index_width = index.constant 128 : index
+  %head_width = index.constant 256 : index
+  %small_width = index.constant 512 : index
+  %hidden_width = index.constant 2560 : index
+  %output_width = index.constant 6144 : index
+  %query_gate_width = index.constant 12288 : index
+  %small_row_bytes = index.constant 1024 : offset
+  %query_row_bytes = index.constant 24576 : offset
+  %output_row_bytes = index.constant 12288 : offset
+  %blocks = index.div %capacity, %c4 : index
+  %small_bytes = index.scale %tokens, %small_row_bytes : index, offset -> offset
+  %query_bytes = index.scale %tokens, %query_row_bytes : index, offset -> offset
+  %output_bytes = index.scale %tokens, %output_row_bytes : index, offset -> offset
+  %index_query_raw = buffer.alloca<global> align(256) %small_bytes : buffer
+  %index_query = buffer.alloca<global> align(256) %small_bytes : buffer
+  %query_gate = buffer.alloca<global> align(256) %query_bytes : buffer
+  %query = buffer.alloca<global> align(256) %output_bytes : buffer
+  %attended = buffer.alloca<global> align(256) %output_bytes : buffer
+  %tile_limit = config.get @qsa.query_tile : index
+  %short = index.cmp ult, %tokens, %tile_limit : index
+  %query_capacity = scf.select %short, %tokens, %tile_limit : index
+  %score_count = index.mul %blocks, %query_capacity : index
+  %score_element_bytes = index.constant 4 : offset
+  %score_bytes = index.scale %score_count, %score_element_bytes : index, offset -> offset
+  %scores = buffer.alloca<global> align(256) %score_bytes : buffer
+  %selection_row_bytes = index.constant 2048 : offset
+  %selection_bytes = index.scale %tokens, %selection_row_bytes : index, offset -> offset
+  %selected = buffer.alloca<global> align(256) %selection_bytes : buffer
+  %index_query_weight = command.parameter %parameters, "blk.{}.indexer.q_proj.weight"[%layer] : view<512x2560xbf16>
+  %index_query_norm = command.parameter %parameters, "blk.{}.indexer.q_norm.weight"[%layer] : view<128xf32>
+  %query_weight = command.parameter %parameters, "blk.{}.attn_q.weight"[%layer] : view<12288x80x34xi8>
+  %query_norm = command.parameter %parameters, "blk.{}.attn_q_norm.weight"[%layer] : view<256xf32>
+  %output_weight = command.parameter %parameters, "blk.{}.attn_output.weight"[%layer] : view<2560x192x34xi8>
+  kernel.launch @qsa_linear_bf16[%small_width](%small_width, %span, %input, %index_query_weight, %index_query_raw) : [index](index, buffer, buffer, view<512x2560xbf16>, buffer)
+  kernel.launch @qsa_prepare_queries[%c4](%index_width, %c4, %index_width, %span, %mapping, %index_query_raw, %index_query_norm, %index_query) : [index](index, index, index, buffer, buffer, buffer, view<128xf32>, buffer)
+  %query_weight_block_size = index.constant 32 : index
+  %query_weight_blocks = index.div %hidden_width, %query_weight_block_size : index
+  %query_weight_shaped = view.refine %query_weight : view<12288x80x34xi8> -> view<[%query_gate_width]x[%query_weight_blocks]x34xi8>
+  template.apply<@flash_next.project_dense_q8>(%hidden_width, %query_gate_width, %query_weight_blocks, %span, %input, %query_weight_shaped, %query_gate) : (index, index, index, buffer, buffer, view<[%query_gate_width]x[%query_weight_blocks]x34xi8>, buffer)
+  kernel.launch @qsa_prepare_queries[%c24](%head_width, %c24, %small_width, %span, %mapping, %query_gate, %query_norm, %query) : [index](index, index, index, buffer, buffer, buffer, view<256xf32>, buffer)
+  %query_zero = index.constant 0 : index
+  %matrix_threshold = index.constant 32 : index
+  %matrix_cohort = index.cmp uge, %tokens, %matrix_threshold : index
+  // Scoring shares one key panel across four queries, independently of the
+  // larger cohort needed to amortize the final attention union.
+  %matrix_score = index.cmp uge, %query_capacity, %c4 : index
+  scf.for %query_begin = [%query_zero to %tokens step %query_capacity] unroll {
+    scf.if %matrix_score {
+      kernel.launch @qsa_score_tiled(%query_begin, %index_origin, %span, %mapping, %rows, %index_query, %arena, %scores) : (index, offset, buffer, buffer, buffer, buffer, buffer, buffer)
+    } else {
+      kernel.launch @qsa_score_blocks(%query_begin, %index_origin, %span, %mapping, %rows, %index_query, %arena, %scores) : (index, offset, buffer, buffer, buffer, buffer, buffer, buffer)
+    }
+    kernel.launch @qsa_select_blocks(%query_begin, %span, %mapping, %scores, %selected) : (index, buffer, buffer, buffer, buffer)
+  }
+  // Four neighboring queries share selected K/V within an epoch span.
+  // The producer resolves ownership and visibility once; channel workers reuse
+  // the resulting union. Tiny capacities retain parallel key partitions.
+  scf.if %matrix_cohort {
+    %cohort_count = func.call pure @qsa_cohort_capacity() : () -> (index)
+    %cohort_record_bytes = index.constant 8224 : offset
+    %cohort_bytes = index.scale %cohort_count, %cohort_record_bytes : index, offset -> offset
+    %cohorts = buffer.alloca<global> align(16) %cohort_bytes : buffer
+    kernel.launch @qsa_merge_cohorts(%span, %selected, %cohorts) : (buffer, buffer, buffer)
+    kernel.launch @qsa_cohort_attention(%key_origin, %value_origin, %rows, %query, %query_gate, %arena, %cohorts, %attended) : (offset, offset, buffer, buffer, buffer, buffer, buffer, buffer)
+  } else {
+    command.program.launch @qsa_split_attention[%key_origin, %value_origin](%span, %mapping, %rows, %query, %query_gate, %arena, %selected, %attended) : [offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  %output_weight_block_size = index.constant 32 : index
+  %output_weight_blocks = index.div %output_width, %output_weight_block_size : index
+  %output_weight_shaped = view.refine %output_weight : view<2560x192x34xi8> -> view<[%hidden_width]x[%output_weight_blocks]x34xi8>
+  template.apply<@flash_next.project_dense_q8>(%output_width, %hidden_width, %output_weight_blocks, %span, %attended, %output_weight_shaped, %output) : (index, index, index, buffer, buffer, view<[%hidden_width]x[%output_weight_blocks]x34xi8>, buffer)
+  command.return
+}

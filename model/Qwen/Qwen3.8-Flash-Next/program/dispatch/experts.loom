@@ -1,0 +1,206 @@
+// Flash-Next experts command composition.
+// The prepared stage supplies capacities and parameter bindings; these
+// commands own intermediate buffers and ordered device launches.
+
+kernel.decl @expert_bucket_down_q51() launch(%input_arg: buffer, %tasks_arg: buffer, %weight_arg: buffer, %output_arg: buffer)
+
+kernel.decl @expert_bucket_down_q8() launch(%input_arg: buffer, %tasks_arg: buffer, %weight_arg: buffer, %output_arg: buffer)
+
+kernel.decl @expert_bucket_gate_up_q4k() launch(%input_arg: buffer, %tasks_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
+
+kernel.decl @expert_bucket_gate_up_q5k() launch(%input_arg: buffer, %tasks_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
+
+kernel.decl @expert_bucket_gate_up_q8() launch(%input_arg: buffer, %tasks_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
+
+kernel.decl @expert_down_q51() launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %weight_arg: buffer, %output_arg: buffer)
+
+kernel.decl @expert_down_q8() launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %weight_arg: buffer, %output_arg: buffer)
+
+func.decl pure @expert_gate_input_is_prepacked() -> (i1)
+
+kernel.decl @expert_gate_up_q4k() launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
+
+kernel.decl @expert_gate_up_q5k() launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
+
+kernel.decl @expert_gate_up_q8() launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
+
+kernel.decl @expert_input_half() launch(%input_arg: buffer, %epoch_arg: buffer, %output_arg: buffer)
+
+kernel.decl @expert_matrix() launch(%contraction: index, %format: index, %rows: index, %input: buffer, %tasks: buffer, %weight: buffer, %up_weight: buffer, %output: buffer)
+
+func.decl pure @expert_record_extent(%capacity: index, %record_rows: index) -> (index, index, offset)
+
+kernel.decl @expert_routes() launch(%record_rows_arg: index, %epoch_arg: buffer, %ids_arg: buffer, %ranks_arg: buffer, %tasks_arg: buffer)
+
+kernel.decl @experts_combine() launch(%span_arg: buffer, %experts_arg: buffer, %weights_arg: buffer, %shared_arg: buffer, %gate_arg: buffer, %output_arg: buffer)
+
+template.decl @flash_next.project_dense_q8(%inputs: index, %outputs: index, %blocks: index, %span: buffer, %input: buffer, %weight: view<[%outputs]x[%blocks]x34xi8>, %output: buffer)
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 8)]
+
+kernel.decl @shared_gate_up() launch(%span_arg: buffer, %input_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
+
+kernel.decl @shared_matrix() launch(%span: buffer, %input: buffer, %weight: buffer, %up_weight: buffer, %output: buffer)
+
+command.program.def public @flash_next_experts(%layer: index) launch(%parameters: buffer, %span: buffer, %input: buffer, %ids: buffer, %weights: buffer, %shared_gate: buffer, %output: buffer) {
+  %tokens = config.get @flash_next.token_count : index
+  %expert_hidden_row_bytes = index.constant 12800 : offset
+  %expert_output_row_bytes = index.constant 51200 : offset
+  %shared_hidden_row_bytes = index.constant 1280 : offset
+  %shared_output_row_bytes = index.constant 5120 : offset
+  %expert_hidden_bytes = index.scale %tokens, %expert_hidden_row_bytes : index, offset -> offset
+  %expert_output_bytes = index.scale %tokens, %expert_output_row_bytes : index, offset -> offset
+  %shared_hidden_bytes = index.scale %tokens, %shared_hidden_row_bytes : index, offset -> offset
+  %shared_output_bytes = index.scale %tokens, %shared_output_row_bytes : index, offset -> offset
+  %hidden = buffer.alloca<global> align(256) %expert_hidden_bytes : buffer
+  %down = buffer.alloca<global> align(256) %expert_output_bytes : buffer
+  %shared_hidden = buffer.alloca<global> align(256) %shared_hidden_bytes : buffer
+  %shared = buffer.alloca<global> align(256) %shared_output_bytes : buffer
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c30 = index.constant 30 : index
+  %c46 = index.constant 46 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  // Compact matrix tiles limit padded work for sparse expert populations.
+  // Larger epochs amortize each packed weight panel across wider records.
+  %matrix_threshold = index.constant 256 : index
+  %wide_threshold = index.constant 2048 : index
+  %compact_rows = index.constant 64 : index
+  %wide_rows = index.constant 128 : index
+  %wide = index.cmp uge, %tokens, %wide_threshold : index
+  %matrix_rows = scf.select %wide, %wide_rows, %compact_rows : index
+  %matrix = index.cmp uge, %tokens, %matrix_threshold : index
+  %record_rows = scf.select %matrix, %matrix_rows, %c4 : index
+  // Verification supplies a cohort of anchor and proposed tokens, even
+  // at capacity four. Share expert weights across those correlated rows.
+  // Ordinary one-token epochs retain the direct route path. One table feeds
+  // both contractions; rank scratch dies after table production.
+  %verification_width = config.get @flash_next.verification_width : index
+  %verification_cohort = index.cmp ugt, %verification_width, %c1 : index
+  %large_capacity = index.cmp ugt, %tokens, %c4 : index
+  %bucketed = scalar.ori %large_capacity, %verification_cohort : i1
+  %routing = scf.if %bucketed -> (buffer) {
+    %rank_row_bytes = index.constant 40 : offset
+    %rank_bytes = index.scale %tokens, %rank_row_bytes : index, offset -> offset
+    %record_capacity, %record_fields, %task_bytes = func.call pure @expert_record_extent(%tokens, %record_rows) : (index, index) -> (index, index, offset)
+    %ranks = buffer.alloca<global> align(16) %rank_bytes : buffer
+    %tasks = buffer.alloca<global> align(16) %task_bytes : buffer
+    kernel.launch @expert_routes(%record_rows, %span, %ids, %ranks, %tasks) : (index, buffer, buffer, buffer, buffer)
+    scf.yield %tasks : buffer
+  } else {
+    scf.yield %ids : buffer
+  }
+  %q5_encoding = index.cmp eq, %layer, %c2 : index
+  %q8_layer4 = index.cmp eq, %layer, %c4 : index
+  %q8_layer30 = index.cmp eq, %layer, %c30 : index
+  %q8_tail = index.cmp uge, %layer, %c46 : index
+  %q8_early = scalar.ori %q5_encoding, %q8_layer4 : i1
+  %q8_late = scalar.ori %q8_layer30, %q8_tail : i1
+  %q8_down = scalar.ori %q8_early, %q8_late : i1
+  %mtp_layer = index.constant 48 : index
+  %q8_gate_up = index.cmp eq, %layer, %mtp_layer : index
+  scf.if %q8_gate_up {
+    %gate_weight = command.parameter %parameters, "blk.{}.ffn_gate_exps.weight"[%layer] : view<512x640x80x34xi8>
+    %up_weight = command.parameter %parameters, "blk.{}.ffn_up_exps.weight"[%layer] : view<512x640x80x34xi8>
+    scf.if %bucketed {
+      scf.if %matrix {
+        kernel.launch @expert_matrix(%c0, %c0, %record_rows, %input, %routing, %gate_weight, %up_weight, %hidden) : (index, index, index, buffer, buffer, view<512x640x80x34xi8>, view<512x640x80x34xi8>, buffer)
+      } else {
+        kernel.launch @expert_bucket_gate_up_q8(%input, %routing, %gate_weight, %up_weight, %hidden) : (buffer, buffer, view<512x640x80x34xi8>, view<512x640x80x34xi8>, buffer)
+      }
+    } else {
+      kernel.launch @expert_gate_up_q8(%span, %input, %routing, %gate_weight, %up_weight, %hidden) : (buffer, buffer, buffer, view<512x640x80x34xi8>, view<512x640x80x34xi8>, buffer)
+    }
+  } else {
+    scf.if %q5_encoding {
+      %gate_weight = command.parameter %parameters, "blk.{}.ffn_gate_exps.weight"[%layer] : view<512x640x10x176xi8>
+      %up_weight = command.parameter %parameters, "blk.{}.ffn_up_exps.weight"[%layer] : view<512x640x10x176xi8>
+      scf.if %bucketed {
+        scf.if %matrix {
+          %prepacked = func.call pure @expert_gate_input_is_prepacked() : () -> (i1)
+          %operand = scf.if %prepacked -> (buffer) {
+            %row_bytes = index.constant 5120 : offset
+            %packed_bytes = index.scale %tokens, %row_bytes : index, offset -> offset
+            %packed_input = buffer.alloca<global> align(256) %packed_bytes : buffer
+            kernel.launch @expert_input_half(%input, %span, %packed_input) : (buffer, buffer, buffer)
+            scf.yield %packed_input : buffer
+          } else {
+            scf.yield %input : buffer
+          }
+          kernel.launch @expert_matrix(%c0, %c3, %record_rows, %operand, %routing, %gate_weight, %up_weight, %hidden) : (index, index, index, buffer, buffer, view<512x640x10x176xi8>, view<512x640x10x176xi8>, buffer)
+        } else {
+          kernel.launch @expert_bucket_gate_up_q5k(%input, %routing, %gate_weight, %up_weight, %hidden) : (buffer, buffer, view<512x640x10x176xi8>, view<512x640x10x176xi8>, buffer)
+        }
+      } else {
+        kernel.launch @expert_gate_up_q5k(%span, %input, %routing, %gate_weight, %up_weight, %hidden) : (buffer, buffer, buffer, view<512x640x10x176xi8>, view<512x640x10x176xi8>, buffer)
+      }
+    } else {
+      %gate_weight = command.parameter %parameters, "blk.{}.ffn_gate_exps.weight"[%layer] : view<512x640x10x144xi8>
+      %up_weight = command.parameter %parameters, "blk.{}.ffn_up_exps.weight"[%layer] : view<512x640x10x144xi8>
+      scf.if %bucketed {
+        scf.if %matrix {
+          %prepacked = func.call pure @expert_gate_input_is_prepacked() : () -> (i1)
+          %operand = scf.if %prepacked -> (buffer) {
+            %row_bytes = index.constant 5120 : offset
+            %packed_bytes = index.scale %tokens, %row_bytes : index, offset -> offset
+            %packed_input = buffer.alloca<global> align(256) %packed_bytes : buffer
+            kernel.launch @expert_input_half(%input, %span, %packed_input) : (buffer, buffer, buffer)
+            scf.yield %packed_input : buffer
+          } else {
+            scf.yield %input : buffer
+          }
+          kernel.launch @expert_matrix(%c0, %c2, %record_rows, %operand, %routing, %gate_weight, %up_weight, %hidden) : (index, index, index, buffer, buffer, view<512x640x10x144xi8>, view<512x640x10x144xi8>, buffer)
+        } else {
+          kernel.launch @expert_bucket_gate_up_q4k(%input, %routing, %gate_weight, %up_weight, %hidden) : (buffer, buffer, view<512x640x10x144xi8>, view<512x640x10x144xi8>, buffer)
+        }
+      } else {
+        kernel.launch @expert_gate_up_q4k(%span, %input, %routing, %gate_weight, %up_weight, %hidden) : (buffer, buffer, buffer, view<512x640x10x144xi8>, view<512x640x10x144xi8>, buffer)
+      }
+    }
+  }
+  scf.if %q8_down {
+    %down_weight = command.parameter %parameters, "blk.{}.ffn_down_exps.weight"[%layer] : view<512x2560x20x34xi8>
+    scf.if %bucketed {
+      scf.if %matrix {
+        kernel.launch @expert_matrix(%c1, %c0, %record_rows, %hidden, %routing, %down_weight, %down_weight, %down) : (index, index, index, buffer, buffer, view<512x2560x20x34xi8>, view<512x2560x20x34xi8>, buffer)
+      } else {
+        kernel.launch @expert_bucket_down_q8(%hidden, %routing, %down_weight, %down) : (buffer, buffer, view<512x2560x20x34xi8>, buffer)
+      }
+    } else {
+      kernel.launch @expert_down_q8(%span, %hidden, %routing, %down_weight, %down) : (buffer, buffer, buffer, view<512x2560x20x34xi8>, buffer)
+    }
+  } else {
+    %down_weight = command.parameter %parameters, "blk.{}.ffn_down_exps.weight"[%layer] : view<512x2560x20x24xi8>
+    scf.if %bucketed {
+      scf.if %matrix {
+        kernel.launch @expert_matrix(%c1, %c1, %record_rows, %hidden, %routing, %down_weight, %down_weight, %down) : (index, index, index, buffer, buffer, view<512x2560x20x24xi8>, view<512x2560x20x24xi8>, buffer)
+      } else {
+        kernel.launch @expert_bucket_down_q51(%hidden, %routing, %down_weight, %down) : (buffer, buffer, view<512x2560x20x24xi8>, buffer)
+      }
+    } else {
+      kernel.launch @expert_down_q51(%span, %hidden, %routing, %down_weight, %down) : (buffer, buffer, buffer, view<512x2560x20x24xi8>, buffer)
+    }
+  }
+  %shared_gate_weight = command.parameter %parameters, "blk.{}.ffn_gate_shexp.weight"[%layer] : view<640x80x34xi8>
+  %shared_up_weight = command.parameter %parameters, "blk.{}.ffn_up_shexp.weight"[%layer] : view<640x80x34xi8>
+  %shared_down_weight = command.parameter %parameters, "blk.{}.ffn_down_shexp.weight"[%layer] : view<2560x20x34xi8>
+  %hidden_width = index.constant 640 : index
+  %output_width = index.constant 2560 : index
+  %shared_threshold = index.constant 64 : index
+  %shared_matrix = index.cmp uge, %tokens, %shared_threshold : index
+  scf.if %shared_matrix {
+    kernel.launch @shared_matrix(%span, %input, %shared_gate_weight, %shared_up_weight, %shared_hidden) : (buffer, buffer, view<640x80x34xi8>, view<640x80x34xi8>, buffer)
+  } else {
+    kernel.launch @shared_gate_up(%span, %input, %shared_gate_weight, %shared_up_weight, %shared_hidden) : (buffer, buffer, view<640x80x34xi8>, view<640x80x34xi8>, buffer)
+  }
+  %shared_down_weight_block_size = index.constant 32 : index
+  %shared_down_weight_blocks = index.div %hidden_width, %shared_down_weight_block_size : index
+  %shared_down_weight_shaped = view.refine %shared_down_weight : view<2560x20x34xi8> -> view<[%output_width]x[%shared_down_weight_blocks]x34xi8>
+  template.apply<@flash_next.project_dense_q8>(%hidden_width, %output_width, %shared_down_weight_blocks, %span, %shared_hidden, %shared_down_weight_shaped, %shared) : (index, index, index, buffer, buffer, view<[%output_width]x[%shared_down_weight_blocks]x34xi8>, buffer)
+  kernel.launch @experts_combine(%span, %down, %weights, %shared, %shared_gate, %output) : (buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}

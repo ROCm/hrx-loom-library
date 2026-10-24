@@ -6,10 +6,23 @@ blocks select ten of 512 experts plus a shared expert. This card describes the
 48-layer text composition using the original packed Unsloth UD-Q4_K_XL files,
 with an optional Q8_0 multi-token predictor.
 
-**Execution status:** the native library providers are not included. The card
-and standalone reference describe the required inputs and qualification
-presets; they do not yet form a runnable Loom installation. The intended
-numerical implementation targets AMDGPU RDNA.
+The composition includes native AMD RDNA providers for Loom's text service,
+with source, bytecode, and mixed program representations. Its source preset
+can be fetched and served using the installed SDK, without building this
+repository. For example, after installing the `hrx-loom` SDK with its `hf` extra:
+
+```sh
+loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/Qwen/Qwen3.8-Flash-Next/model.json \
+  --preset chat --output "$HOME/models/qwen3.8-flash-next"
+loom-serve --model="$HOME/models/qwen3.8-flash-next/model.json" \
+  --device=amdgpu2://0
+```
+
+The source card and acquisition lock identify the exact providers, ordered
+checkpoint shards, and tokenizer. Fetching resolves the selected preset and
+reuses cached checkpoint files; serving loads the resulting local card.
+The source programs, numerical checks, and model service tests are available
+in the [library model package](https://github.com/ROCm/hrx-loom-library/tree/main/model/Qwen/Qwen3.8-Flash-Next).
 
 ## Ordered checkpoint shards
 

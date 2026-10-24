@@ -1,0 +1,125 @@
+config.decl @expert_test.tile_rows : %value: index where [range(%value, 64, 128), multiple_of(%value, 64)]
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+func.decl pure @expert_record_extent(%capacity: index, %record_rows: index) -> (index, index, offset)
+
+func.decl @quantized_finite_headers(%format: index, %width: index, %rows: index, %scale: f16, %minimum: f16, %weight: buffer)
+
+func.decl @quantized_sparse_input(%capacity: index, %count: index, %width: index, %input: buffer)
+
+func.decl @quantized_sparse_dot_arithmetic(%half_coefficients: i1, %format: index, %width: index, %input_row: index, %weight_row: index, %input: buffer, %weight: buffer) -> (f64)
+
+// One more active token than the record width gives each of ten distinct
+// experts a reversed full record and a one-route tail.
+// Both activation layouts retain NaNs in their inactive suffixes.
+func.def public @expert_matrix_fixture(%down: i1, %format: index, %input: buffer, %weight: buffer, %up_weight: buffer, %tasks: buffer) {
+  %record_rows = config.get @expert_test.tile_rows : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c10 = index.constant 10 : index
+  %active_tokens = index.add %record_rows, %c1 : index
+  %tokens = config.get @flash_next.token_count : index
+  %hidden = index.constant 640 : index
+  %model = index.constant 2560 : index
+  %width = scf.select %down, %hidden, %model : index
+  %features = scf.select %down, %model, %hidden : index
+  %route_count = index.mul %active_tokens, %c10 : index
+  %route_capacity = index.mul %tokens, %c10 : index
+  %count = scf.select %down, %route_count, %active_tokens : index
+  %capacity = scf.select %down, %route_capacity, %tokens : index
+  %weight_rows = index.mul %features, %c10 : index
+  // Non-power-of-two headers exercise original scale and affine-bias arithmetic.
+  %scale = scalar.constant 0.00125 : f16
+  %minimum = scalar.constant 0.00072999999999999996 : f16
+  func.call @quantized_finite_headers(%format, %width, %weight_rows, %scale, %minimum, %weight) : (index, index, index, f16, f16, buffer)
+  %is_gate = scalar.constant false : i1
+  %gate = scalar.cmpi eq, %down, %is_gate : i1
+  scf.if %gate {
+    func.call @quantized_finite_headers(%format, %width, %weight_rows, %scale, %minimum, %up_weight) : (index, index, index, f16, f16, buffer)
+  }
+  %origin = index.constant 0 : offset
+  %record_origin = index.constant 4 : offset
+  %header = buffer.view %tasks[%origin] : buffer -> view<1xi32>
+  %record_capacity, %record_fields, %record_bytes = func.call pure @expert_record_extent(%tokens, %record_rows) : (index, index) -> (index, index, offset)
+  %records = buffer.view %tasks[%record_origin] : buffer -> view<[%record_capacity]x[%record_fields]xi32>
+  %c20_i32 = scalar.constant 20 : i32
+  view.store %c20_i32, %header[0] : i32, view<1xi32>
+  %c2 = index.constant 2 : index
+  %last_full_row = index.sub %record_rows, %c1 : index
+  %full_count_word = index.cast %record_rows : index to i32
+  %c1_i32 = scalar.constant 1 : i32
+  %c0_i32 = scalar.constant 0 : i32
+  scf.for %expert = [%c0 to %c10 step %c1] {
+    %full = index.mul %expert, %c2 : index
+    %tail = index.add %full, %c1 : index
+    %expert_word = index.cast %expert : index to i32
+    view.store %expert_word, %records[%full, 0] : i32, view<[%record_capacity]x[%record_fields]xi32>
+    view.store %expert_word, %records[%tail, 0] : i32, view<[%record_capacity]x[%record_fields]xi32>
+    view.store %full_count_word, %records[%full, 1] : i32, view<[%record_capacity]x[%record_fields]xi32>
+    view.store %c1_i32, %records[%tail, 1] : i32, view<[%record_capacity]x[%record_fields]xi32>
+    scf.for %ordinal = [%c0 to %record_rows step %c1] {
+      %field = index.add %ordinal, %c2 : index
+      %token = index.sub %last_full_row, %ordinal : index
+      %route = index.madd %token, %c10, %expert : index
+      %route_word = index.cast %route : index to i32
+      view.store %route_word, %records[%full, %field] : i32, view<[%record_capacity]x[%record_fields]xi32>
+      view.store %c0_i32, %records[%tail, %field] : i32, view<[%record_capacity]x[%record_fields]xi32>
+    }
+    %tail_route = index.madd %record_rows, %c10, %expert : index
+    %tail_word = index.cast %tail_route : index to i32
+    view.store %tail_word, %records[%tail, 2] : i32, view<[%record_capacity]x[%record_fields]xi32>
+  }
+  func.call @quantized_sparse_input(%capacity, %count, %width, %input) : (index, index, index, buffer)
+  func.return
+}
+
+// Original route identity determines the expected expert and activation row;
+// the oracle never reads the GPU-produced record order or its live counts.
+// Wide consumers reconstruct F16 coefficients; narrow consumers retain original
+// scales. Both use independent scalar decoding and F64 accumulation here.
+func.def public inline @expert_matrix_reference(%down: i1, %format: index, %input: buffer, %tasks: buffer, %weight: buffer, %up_weight: buffer, %output: buffer) {
+  %record_rows = config.get @expert_test.tile_rows : index
+  %wide_rows = index.constant 128 : index
+  %half_coefficients = index.cmp eq, %record_rows, %wide_rows : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c10 = index.constant 10 : index
+  %tokens = config.get @flash_next.token_count : index
+  %active_tokens = index.add %record_rows, %c1 : index
+  %count = index.mul %active_tokens, %c10 : index
+  %route_capacity = index.mul %tokens, %c10 : index
+  %hidden = index.constant 640 : index
+  %model = index.constant 2560 : index
+  %width = scf.select %down, %hidden, %model : index
+  %features = scf.select %down, %model, %hidden : index
+  %origin = index.constant 0 : offset
+  %outputs = buffer.view %output[%origin] : buffer -> view<[%route_capacity]x[%features]xbf16>
+  %one_float = scalar.constant 1.0 : f32
+  scf.for %route = [%c0 to %count step %c1] {
+    %expert = index.rem %route, %c10 : index
+    %token = index.div %route, %c10 : index
+    %input_row = scf.select %down, %route, %token : index
+    scf.for %channel = [%c0 to %features step %c1] {
+      %weight_row = index.madd %expert, %features, %channel : index
+      %sum = func.call @quantized_sparse_dot_arithmetic(%half_coefficients, %format, %width, %input_row, %weight_row, %input, %weight) : (i1, index, index, index, index, buffer, buffer) -> (f64)
+      %value = scf.if %down -> (f32) {
+        %rounded = scalar.fptrunc %sum : f64 to f32
+        scf.yield %rounded : f32
+      } else {
+        %up_sum = func.call @quantized_sparse_dot_arithmetic(%half_coefficients, %format, %width, %input_row, %weight_row, %input, %up_weight) : (i1, index, index, index, index, buffer, buffer) -> (f64)
+        %gate = scalar.fptrunc %sum : f64 to f32
+        %up = scalar.fptrunc %up_sum : f64 to f32
+        %negative = scalar.negf %gate : f32
+        %exponential = scalar.expf<afn> %negative : f32
+        %denominator = scalar.addf %one_float, %exponential : f32
+        %silu = scalar.divf %gate, %denominator : f32
+        %product = scalar.mulf %silu, %up : f32
+        scf.yield %product : f32
+      }
+      %packed = scalar.fptrunc %value : f32 to bf16
+      view.store %packed, %outputs[%route, %channel] : bf16, view<[%route_capacity]x[%features]xbf16>
+    }
+  }
+  func.return
+}

@@ -1,0 +1,234 @@
+func.decl @quantized_qk_weight(%q5_encoding: i1, %table: buffer, %inputs: index, %row: index, %column: index) -> (f64)
+
+func.decl @quantized_small_weight(%q8: i1, %weight: buffer, %width: index, %row: index, %column: index) -> (f64)
+
+func.decl @quantized_finite_headers(%format: index, %width: index, %rows: index, %scale: f16, %minimum: f16, %weight: buffer)
+
+func.def @finite_headers(%format: index, %weight: buffer) {
+  %width = index.constant 768 : index
+  %rows = index.constant 4 : index
+  %scale = scalar.constant 0.015625 : f16
+  %minimum = scalar.constant 0.0078125 : f16
+  func.call @quantized_finite_headers(%format, %width, %rows, %scale, %minimum, %weight) : (index, index, index, f16, f16, buffer)
+  func.return
+}
+
+func.def @routed_reference(%live_value: index, %format: index, %input: buffer, %gate_weight: buffer, %up_weight: buffer, %output: buffer) {
+  %live = index.assume %live_value [range(%live_value, 0, 4)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %width = index.constant 768 : index
+  %origin = index.constant 0 : offset
+  %q8 = index.cmp eq, %format, %c0 : index
+  %c5 = index.cmp eq, %format, %c3 : index
+  %large = index.cmp uge, %format, %c2 : index
+  %inputs = buffer.view %input[%origin] : buffer -> view<4x768xbf16>
+  %outputs = buffer.view %output[%origin] : buffer -> view<4x4x2xf32>
+  %initial = scalar.constant 0.0 : f64
+  %first = index.sub %c4, %live : index
+  scf.for %token = [%first to %c4 step %c1] {
+    scf.for %row = [%c0 to %c4 step %c1] {
+      scf.for %projection = [%c0 to %c2 step %c1] {
+        %is_gate = index.cmp eq, %projection, %c0 : index
+        %weight = scf.select %is_gate, %gate_weight, %up_weight : buffer
+        %sum = scf.for %column = [%c0 to %width step %c1](%accumulator = %initial : f64) -> (f64) {
+          %w = scf.if %large -> (f64) {
+            %value = func.call @quantized_qk_weight(%c5, %weight, %width, %row, %column) : (i1, buffer, index, index, index) -> (f64)
+            scf.yield %value : f64
+          } else {
+            %value = func.call @quantized_small_weight(%q8, %weight, %width, %row, %column) : (i1, buffer, index, index, index) -> (f64)
+            scf.yield %value : f64
+          }
+          %packed = view.load %inputs[%token, %column] : view<4x768xbf16> -> bf16
+          %x = scalar.extf %packed : bf16 to f64
+          %product = scalar.mulf %w, %x : f64
+          %next = scalar.addf %accumulator, %product : f64
+          scf.yield %next : f64
+        }
+        %rounded = scalar.fptrunc %sum : f64 to f32
+        view.store %rounded, %outputs[%token, %row, %projection] : f32, view<4x4x2xf32>
+      }
+    }
+  }
+  func.return
+}
+
+func.def @reference(%format: index, %input: buffer, %gate_weight: buffer, %up_weight: buffer, %output: buffer) {
+  %live = index.constant 4 : index
+  func.call @routed_reference(%live, %format, %input, %gate_weight, %up_weight, %output) : (index, index, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+amdgpu.target<gfx11-generic> @wave32 {subgroup_size = 32}
+
+func.decl @flash_next_qk_pair_partial(%q5_encoding: i1, %width: index, %token: index, %row: index, %lane: index, %stride: index, %input: buffer, %gate_weight: buffer, %up_weight: buffer) -> (f32, f32)
+
+func.decl @flash_next_q51_partial(%width: index, %token: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (f32)
+
+func.decl @flash_next_q8_partial(%width: index, %token: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (f32)
+
+kernel.def target(@wave32) @quantized_dot(%format: index) {
+  %c4 = index.constant 4 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%c4, %c4, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%format: index, %input: buffer, %gate_weight: buffer, %up_weight: buffer, %output: buffer) {
+  %row = kernel.workgroup.id<x> : index
+  %token = kernel.workgroup.id<y> : index
+  %lane = kernel.subgroup.lane.id : index
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %width = index.constant 768 : index
+  %stride = index.constant 32 : index
+  %origin = index.constant 0 : offset
+  %large = index.cmp uge, %format, %c2 : index
+  %gate_partial, %up_partial = scf.if %large -> (f32, f32) {
+    %c5 = index.cmp eq, %format, %c3 : index
+    %gate, %up = func.call @flash_next_qk_pair_partial(%c5, %width, %token, %row, %lane, %stride, %input, %gate_weight, %up_weight) : (i1, index, index, index, index, index, buffer, buffer, buffer) -> (f32, f32)
+    scf.yield %gate, %up : f32, f32
+  } else {
+    %q8 = index.cmp eq, %format, %c0 : index
+    %gate, %up = scf.if %q8 -> (f32, f32) {
+      %gate = func.call @flash_next_q8_partial(%width, %token, %row, %lane, %stride, %input, %gate_weight) : (index, index, index, index, index, buffer, buffer) -> (f32)
+      %up = func.call @flash_next_q8_partial(%width, %token, %row, %lane, %stride, %input, %up_weight) : (index, index, index, index, index, buffer, buffer) -> (f32)
+      scf.yield %gate, %up : f32, f32
+    } else {
+      %gate = func.call @flash_next_q51_partial(%width, %token, %row, %lane, %stride, %input, %gate_weight) : (index, index, index, index, index, buffer, buffer) -> (f32)
+      %up = func.call @flash_next_q51_partial(%width, %token, %row, %lane, %stride, %input, %up_weight) : (index, index, index, index, index, buffer, buffer) -> (f32)
+      scf.yield %gate, %up : f32, f32
+    }
+    scf.yield %gate, %up : f32, f32
+  }
+  %gate = kernel.subgroup.reduce<addf> %gate_partial : f32
+  %up = kernel.subgroup.reduce<addf> %up_partial : f32
+  %leader = index.cmp eq, %lane, %c0 : index
+  scf.if %leader {
+    %view = buffer.view %output[%origin] : buffer -> view<4x4x2xf32>
+    view.store %gate, %view[%token, %row, 0] : f32, view<4x4x2xf32>
+    view.store %up, %view[%token, %row, 1] : f32, view<4x4x2xf32>
+  }
+  kernel.return
+}
+
+check.scenario public @original_quantization configure[4](%format: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %gate_seed = check.literal value(73419) : i64
+    %up_seed = check.literal value(84327) : i64
+    %input = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<4x768xbf16>
+    %gate_weight = check.generate.random.uniform seed(%gate_seed) range(-128 to 127) : tensor<3264xi8>
+    %up_weight = check.generate.random.uniform seed(%up_seed) range(-128 to 127) : tensor<3264xi8>
+    check.generate<@finite_headers>(%format, %gate_weight) : (index, tensor<3264xi8>) -> ()
+    check.generate<@finite_headers>(%format, %up_weight) : (index, tensor<3264xi8>) -> ()
+    %output = check.generate.fill value(-17.0) : tensor<4x4x2xf32>
+    check.compare<@quantized_dot, @reference>[%format](%format, %input, %gate_weight, %up_weight, %output) : [index](index, tensor<4x768xbf16>, tensor<3264xi8>, tensor<3264xi8>, tensor<4x4x2xf32>) -> () {
+      // F32 affine terms and a wave reduction; the F64 oracle never quantizes
+      // activations again or rounds decoded weights through BF16/F16.
+      check.expect.close actual(%output) expected(%output) atol(0.002) rtol(2.0000000000000002e-05) nan(different) : tensor<4x4x2xf32>
+    }
+  }
+  check.return
+}
+
+func.decl @flash_next_qk_pair_rows_partial(%q5: i1, %width: index, %rows: vector<4xi32>, %live: index, %row: index, %lane: index, %stride: index, %input: buffer, %gate_weight: buffer, %up_weight: buffer) -> (vector<4xf32>, vector<4xf32>)
+
+func.decl @flash_next_q51_output_pair_partial(%width: index, %rows: vector<4xi32>, %live: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (vector<4xf32>, vector<4xf32>)
+
+func.decl @flash_next_q8_rows_partial(%width: index, %rows: vector<4xi32>, %live: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (vector<4xf32>)
+
+kernel.def target(@wave32) @quantized_rows(%format: index) {
+  %c4 = index.constant 4 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%c4, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%live_value: index, %format: index, %input: buffer, %gate_weight: buffer, %up_weight: buffer, %output: buffer) {
+  %live = index.assume %live_value [range(%live_value, 0, 4)] : index
+  %row = kernel.workgroup.id<x> : index
+  %lane = kernel.subgroup.lane.id : index
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %width = index.constant 768 : index
+  %stride = index.constant 32 : index
+  %origin = index.constant 0 : offset
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %ordinals = vector.iota %c0_i32 step %c1_i32 : vector<4xi32>
+  %reverse = vector.constant 3 : vector<4xi32>
+  %permutation = vector.xori %ordinals, %reverse : vector<4xi32>
+  %live_word = index.cast %live : index to i32
+  %live_vector = vector.splat %live_word : vector<4xi32>
+  %valid = vector.cmpi ult, %ordinals, %live_vector : vector<4xi32> -> vector<4xi1>
+  // Invalid inactive identities prove that tails never read activation rows.
+  %invalid = vector.constant 327679 : vector<4xi32>
+  %rows = vector.select %valid, %permutation, %invalid : vector<4xi32>
+  %large = index.cmp uge, %format, %c2 : index
+  %gate_partial, %up_partial = scf.if %large -> (vector<4xf32>, vector<4xf32>) {
+    %c5 = index.cmp eq, %format, %c3 : index
+    %gate, %up = func.call @flash_next_qk_pair_rows_partial(%c5, %width, %rows, %live, %row, %lane, %stride, %input, %gate_weight, %up_weight) : (i1, index, vector<4xi32>, index, index, index, index, buffer, buffer, buffer) -> (vector<4xf32>, vector<4xf32>)
+    scf.yield %gate, %up : vector<4xf32>, vector<4xf32>
+  } else {
+    %q8 = index.cmp eq, %format, %c0 : index
+    %gate, %up = scf.if %q8 -> (vector<4xf32>, vector<4xf32>) {
+      %gate = func.call @flash_next_q8_rows_partial(%width, %rows, %live, %row, %lane, %stride, %input, %gate_weight) : (index, vector<4xi32>, index, index, index, index, buffer, buffer) -> (vector<4xf32>)
+      %up = func.call @flash_next_q8_rows_partial(%width, %rows, %live, %row, %lane, %stride, %input, %up_weight) : (index, vector<4xi32>, index, index, index, index, buffer, buffer) -> (vector<4xf32>)
+      scf.yield %gate, %up : vector<4xf32>, vector<4xf32>
+    } else {
+      // Exercise both adjacent outputs independently against the scalar oracle.
+      %pair = index.div %row, %c2 : index
+      %first = index.mul %pair, %c2 : index
+      %lower = index.cmp eq, %row, %first : index
+      %gate0, %gate1 = func.call @flash_next_q51_output_pair_partial(%width, %rows, %live, %first, %lane, %stride, %input, %gate_weight) : (index, vector<4xi32>, index, index, index, index, buffer, buffer) -> (vector<4xf32>, vector<4xf32>)
+      %up0, %up1 = func.call @flash_next_q51_output_pair_partial(%width, %rows, %live, %first, %lane, %stride, %input, %up_weight) : (index, vector<4xi32>, index, index, index, index, buffer, buffer) -> (vector<4xf32>, vector<4xf32>)
+      %gate = scf.select %lower, %gate0, %gate1 : vector<4xf32>
+      %up = scf.select %lower, %up0, %up1 : vector<4xf32>
+      scf.yield %gate, %up : vector<4xf32>, vector<4xf32>
+    }
+    scf.yield %gate, %up : vector<4xf32>, vector<4xf32>
+  }
+  %gate = kernel.subgroup.reduce<addf> %gate_partial : vector<4xf32>
+  %up = kernel.subgroup.reduce<addf> %up_partial : vector<4xf32>
+  %leader = index.cmp eq, %lane, %c0 : index
+  scf.if %leader {
+    %view = buffer.view %output[%origin] : buffer -> view<4x4x2xf32>
+    %c1_index = index.constant 1 : index
+    scf.for %ordinal = [%c0 to %live step %c1_index] {
+      %token = index.sub %c3, %ordinal : index
+      %gate_value = vector.extract %gate[%ordinal] : vector<4xf32> -> f32
+      %up_value = vector.extract %up[%ordinal] : vector<4xf32> -> f32
+      view.store %gate_value, %view[%token, %row, 0] : f32, view<4x4x2xf32>
+      view.store %up_value, %view[%token, %row, 1] : f32, view<4x4x2xf32>
+    }
+  }
+  kernel.return
+}
+
+check.scenario public @routed_quantization configure[4](%format: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[5](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %gate_seed = check.literal value(73419) : i64
+    %up_seed = check.literal value(84327) : i64
+    %input = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<4x768xbf16>
+    %gate_weight = check.generate.random.uniform seed(%gate_seed) range(-128 to 127) : tensor<3264xi8>
+    %up_weight = check.generate.random.uniform seed(%up_seed) range(-128 to 127) : tensor<3264xi8>
+    check.generate<@finite_headers>(%format, %gate_weight) : (index, tensor<3264xi8>) -> ()
+    check.generate<@finite_headers>(%format, %up_weight) : (index, tensor<3264xi8>) -> ()
+    %output = check.generate.fill value(-17.0) : tensor<4x4x2xf32>
+    check.compare<@quantized_rows, @routed_reference>[%format](%trial, %format, %input, %gate_weight, %up_weight, %output) : [index](index, index, tensor<4x768xbf16>, tensor<3264xi8>, tensor<3264xi8>, tensor<4x4x2xf32>) -> () {
+      // F32 affine terms and a wave reduction; the F64 oracle never quantizes
+      // activations again or rounds decoded weights through BF16/F16.
+      check.expect.close actual(%output) expected(%output) atol(0.002) rtol(2.0000000000000002e-05) nan(different) : tensor<4x4x2xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@original_quantization> @original_quantization_benchmark
+
+check.benchmark<@routed_quantization> @routed_quantization_benchmark

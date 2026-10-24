@@ -25,7 +25,7 @@ consume those projected facts and never parse the container directly.
 | [Krea 2 Turbo](krea/Krea-2-Turbo/OVERVIEW.md) | Image generation | BF16 and INT8 ConvRot | Description; native providers await porting |
 | [Pocket TTS](kyutai/pocket-tts/OVERVIEW.md) | Streaming speech synthesis | Three-voice default and four-voice noncommercial bank; source, bytecode, and mixed providers | Runnable on AMDGPU; independent numerical/text references and native PCM lifecycle checks |
 | [Qwen3.8 27B](Qwen/Qwen3.8-27B/OVERVIEW.md) | Text generation with optional image input | UD-Q5_K_XL, vision projector, and DFlash2 draft weights | Description; native providers await porting |
-| [Qwen3.8 Flash-Next](Qwen/Qwen3.8-Flash-Next/OVERVIEW.md) | Text generation | Four ordered UD-Q4_K_XL shards, with optional MTP weights | Description; native providers await porting |
+| [Qwen3.8 Flash-Next](Qwen/Qwen3.8-Flash-Next/OVERVIEW.md) | Text generation | Four ordered UD-Q4_K_XL shards, optional MTP weights; source, bytecode, and mixed providers | Runnable on AMD RDNA; independent recall, checkpoint forks, and parameter lifecycle checks |
 | [Qwen3 Embedding 0.6B](Qwen/Qwen3-Embedding-0.6B/OVERVIEW.md) | Text embeddings | Prepared BFP16EBS8 resident bank; source, bytecode, and mixed providers | Runnable on the Strix Halo NPU after conversion; independent publisher checks |
 
 Model namespaces can begin with a portable card and generated reference before
@@ -86,6 +86,7 @@ from its admitted cards with the SDK:
 
 ```sh
 python -m loom.model.catalog \
+  --card=model/Qwen/Qwen3.8-Flash-Next/model.json=model/Qwen/Qwen3.8-Flash-Next/model.json \
   --card=model/kyutai/pocket-tts/model.json=model/kyutai/pocket-tts/model.json \
   --card=model/moonshine-ai/moonshine-streaming-tiny/model.json=model/moonshine-ai/moonshine-streaming-tiny/model.json \
   --output=catalog.json
