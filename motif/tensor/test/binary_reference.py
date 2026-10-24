@@ -3,6 +3,7 @@
 
 """Exact significand rounding for finite numerical fixture generation."""
 
+import math
 import struct
 from fractions import Fraction
 
@@ -34,3 +35,25 @@ def round_binary(value: Fraction, precision: int) -> Fraction:
 
 def f32(value: float) -> float:
     return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def round_binary_sqrt(value: Fraction, precision: int) -> Fraction:
+    """Round a nonnegative rational's normal square root, ties to even.
+
+    Comparing squared midpoints keeps the rounding decision exact without
+    depending on a host square-root instruction or floating-point library.
+    """
+    if not value:
+        return value
+    exponent = value.numerator.bit_length() - value.denominator.bit_length()
+    if value < Fraction(2) ** exponent:
+        exponent -= 1
+    spacing = Fraction(2) ** (exponent // 2 - precision + 1)
+    scaled_square = value / (spacing * spacing)
+    lower = math.isqrt(scaled_square.numerator // scaled_square.denominator)
+    midpoint_square = Fraction((2 * lower + 1) ** 2, 4)
+    if scaled_square > midpoint_square or (
+        scaled_square == midpoint_square and lower % 2
+    ):
+        lower += 1
+    return lower * spacing

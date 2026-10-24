@@ -109,6 +109,23 @@ the composition owns tail masking, work distribution, and output placement.
 It reads each selected BF16 sample once and contains no target or launch
 configuration.
 
+`channel_norm.loom` normalizes one pixel across a channel-first F32 tensor.
+It accumulates channel squares in order with F32 fused multiply-add, takes
+the native approximate square root, and clamps that norm to a caller-supplied
+minimum. Each channel is divided by the bounded norm, multiplied by the square
+root of the channel count, and multiplied by its learned gamma, with separate F32
+rounding. Square roots carry explicit approximation permission; the operation
+does not promise correctly rounded normalization. An optional SiLU epilogue
+uses approximate exponential math.
+
+The caller owns pixel assignment and bounds. Geometry is positive, channel
+counts fit unsigned I32, the minimum norm is positive, and all operands and
+intermediates are finite. Buffers are naturally aligned. Input and output
+may be disjoint or identical; gamma is immutable and separate, and partial
+input/output overlap is unsupported. The complete reduction precedes output
+stores, so the in-place form preserves the same arithmetic. Input is read
+once for the reduction and once for output, without an intermediate tensor.
+
 `matrix.loom` contracts a caller-owned sixteen-row F16 panel against a
 sixteen-column window of another matrix. The left panel may use explicit
 physical strides, including a transposed and padded probability tile; the

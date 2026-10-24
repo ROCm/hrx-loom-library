@@ -104,6 +104,33 @@ rounding primitive in `binary_reference.py`.
 python3 -B motif/tensor/test/generate_image_unpack_oracle.py --check
 ```
 
+`channel_norm.loom` covers affine and SiLU epilogues with disjoint and exactly
+aliased output. Twelve cases include one and odd channel counts, the decoder's
+96/192/384-channel widths, complete workgroups, tails, multiple workgroups,
+signed zeros, and values on both sides of the norm clamp. A distinct minimum
+norm also checks that the caller owns that parameter.
+
+The reference uses exact rational F32 accumulation and arithmetic. Square
+roots use integer bounds and squared midpoint comparisons for ties-to-even
+rounding. The native implementation permits approximate roots: the
+[RDNA 3 ISA, section 16.8](https://gpuopen.com/download/rdna3-shader-instruction-set-architecture-feb-2023.pdf)
+specifies one-ULP F32 square-root accuracy. With `u = 2^-24`, each native root
+differs from the rounded reference by at most `3u / (1-u)` relatively.
+Propagating two roots and three rounded arithmetic steps gives less than
+`16u = 2^-20` relative error for the normal finite corpus. General affine
+checks use that bound with zero absolute tolerance; directed exact-root and
+clamp-dominated cases preserve bitwise results, including signed zeros.
+
+SiLU uses a binary64 expression with absolute tolerance `5e-7` and relative
+tolerance `2e-6` for approximate root and exponential math. Tensor views expose
+live values and their guards separately, so prefix/suffix guards and immutable
+inputs remain bitwise checks for every epilogue. Normal and access-instrumented
+executions share these scenarios and their benchmark declarations.
+
+```sh
+python3 -B motif/tensor/test/generate_channel_norm_oracle.py --check
+```
+
 `prefix_norm.loom` compares native NPU output with a serial binary64 sum of
 squares and reciprocal norm. Widths 32, 64, 96, and 1024 exercise prefix lengths
 on either side of 16- and 32-element boundaries, including single-element and

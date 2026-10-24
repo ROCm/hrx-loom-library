@@ -1,0 +1,50 @@
+// Normalize one pixel across a channel-first F32 tensor with learned gamma.
+// The caller supplies positive geometry, channels representable as unsigned
+// I32, a valid pixel, a positive minimum norm, and finite intermediates.
+// The norm is clamped after native approximate sqrt; ordered F32 FMA
+// accumulates its square. Square roots need not be correctly rounded.
+// Input/output may be disjoint or identical. Gamma is immutable and separate;
+// partial input/output overlap is unsupported. Reduction precedes all stores.
+// Optional SiLU retains approximate exp and needs no intermediate tensor.
+// Pixel distribution, bounds, target, and launch configuration belong to callers.
+
+template.decl @image.channel_norm_f32(%pixels: index, %channels: index, %pixel: index, %silu: i1, %minimum_norm: f32, %input: buffer, %weight: buffer, %output: buffer)
+
+template.def<@image.channel_norm_f32> device @image_channel_norm_f32(%pixels: index, %channels: index, %pixel: index, %silu: i1, %minimum_norm: f32, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c0_0 = scalar.constant 0.0 : f32
+  %c1_0 = scalar.constant 1.0 : f32
+  %channels_i32 = index.cast %channels : index to i32
+  %channels_f32 = scalar.uitofp %channels_i32 : i32 to f32
+  %scale = scalar.sqrtf<afn> %channels_f32 : f32
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%channels]x[%pixels]xf32>
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<[%channels]xf32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%channels]x[%pixels]xf32>
+  %squared = scf.for %channel = [%c0 to %channels step %c1](%acc = %c0_0 : f32) -> (f32) {
+    %value = view.load %input_view[%channel, %pixel] : view<[%channels]x[%pixels]xf32> -> f32
+    %next = scalar.fmaf %value, %value, %acc : f32
+    scf.yield %next : f32
+  }
+  %length = scalar.sqrtf<afn> %squared : f32
+  %denominator = scalar.maxnumf %length, %minimum_norm : f32
+  scf.for %channel = [%c0 to %channels step %c1] {
+    %value = view.load %input_view[%channel, %pixel] : view<[%channels]x[%pixels]xf32> -> f32
+    %gamma = view.load %weight_view[%channel] : view<[%channels]xf32> -> f32
+    %normalized = scalar.divf %value, %denominator : f32
+    %scaled = scalar.mulf %normalized, %scale : f32
+    %affine = scalar.mulf %scaled, %gamma : f32
+    %result = scf.if %silu -> (f32) {
+      %negative = scalar.negf %affine : f32
+      %exponential = scalar.expf<afn> %negative : f32
+      %divisor = scalar.addf %c1_0, %exponential : f32
+      %activated = scalar.divf %affine, %divisor : f32
+      scf.yield %activated : f32
+    } else {
+      scf.yield %affine : f32
+    }
+    view.store %result, %output_view[%channel, %pixel] : f32, view<[%channels]x[%pixels]xf32>
+  }
+  template.return
+}
