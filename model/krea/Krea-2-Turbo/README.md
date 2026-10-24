@@ -18,11 +18,13 @@ Build the description without acquiring checkpoints:
 bazel build //model/krea/Krea-2-Turbo:reference
 ```
 
-The executable port must implement `image_prepare_v1` and `image_control_v1`,
-load the declared parameter scopes, and retain request-specific geometry
-specialization. Its source providers use `loom_library`; its selected package
-uses `loom_model`. Qualification includes independent image comparisons for
-both checkpoint variants, exact tiled/untiled VAE agreement, request geometry
-rejection, and joined service shutdown. The acquisition lock is generated from
-that actual provider and asset closure. No lock or executable placeholder is
-substituted for the absent implementation.
+The image service's version 1 interface consists of `image_prepare_v1`,
+`image_prepare_request_v1`, `image_prepare_batch_v1`, and `image_generate_v1`.
+The executable port must implement these roles, load the declared parameter
+scopes, and retain request-specific geometry specialization. Its source
+providers use `loom_library`; its selected package uses `loom_model`.
+Qualification includes independent image comparisons for both checkpoint
+variants, exact tiled/untiled VAE agreement, request geometry rejection, and
+joined service shutdown. The acquisition lock is generated from that actual
+provider and asset closure. No lock or executable placeholder is substituted
+for the absent implementation.

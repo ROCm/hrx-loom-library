@@ -48,9 +48,10 @@ Text capacity is a positive multiple of 16. Image patches plus text tokens
 must fit within 65,536 positions. Unsupported geometry fails rather than
 silently resizing the image.
 
-The ordinary preset uses the untiled VAE decoder. `image-bounded-workspace`
-adds a 768 MiB workspace bound and selects exact overlapping tiles when needed.
-This preserves the untiled pixels; it does not blend tile boundaries.
+The ordinary presets use the untiled VAE decoder. `image-bounded-workspace`
+selects the INT8 ConvRot variant at 1024×1024 with a 512-token text stage and
+adds a 768 MiB workspace bound. Its decoder uses exact overlapping tiles when
+needed, preserving the untiled pixels without blending tile boundaries.
 Preparation still rejects a shape whose complete stage cannot satisfy the
 bound. This is a workspace policy, not an estimate of total model memory.
 
