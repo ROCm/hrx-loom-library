@@ -287,6 +287,26 @@ the composition owns tail masking, work distribution, and output placement.
 It reads each selected BF16 sample once and contains no target or launch
 configuration.
 
+`image_attention_matrix.loom` owns a 384-channel image-attention head with
+F32 global storage and BF16 matrix operands. Q/K occupy channel-first planes,
+followed by a token-first V plane; output is channel-first and disjoint.
+Sixteen queries share one 128-thread workgroup. Four wave32 subgroups split
+the score contraction into 96-channel partials, then each owns 96 output
+channels. The token count is a positive multiple of sixteen, and all threads
+participate in shared-memory publication and retirement.
+
+The query panel stays resident throughout the key scan. Each key tile reads
+24 KiB of K and 24 KiB of V once for the complete workgroup; padded operands
+and partial scores occupy 55,552 bytes of shared memory. Unnormalized
+probabilities round to BF16 for the value contraction, while their denominator
+retains unrounded F32 values. Online rescaling, accumulators, and output remain
+F32. The external `tensor_image_attention_rdna3` target qualifies the fragment
+layout, and the leaf supplies its concrete backend binding and wave32 launch.
+Operands, their conversions, contractions, and normalized values remain
+finite; native matrix intermediate precision follows the selected target
+contract. A negative-infinity initial maximum lets the first finite score
+tile establish normalization, including when every score is very negative.
+
 `channel_norm.loom` normalizes one pixel across a channel-first F32 tensor.
 It accumulates channel squares in order with F32 fused multiply-add, takes
 the native approximate square root, and clamps that norm to a caller-supplied

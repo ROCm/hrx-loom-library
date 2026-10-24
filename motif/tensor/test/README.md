@@ -270,6 +270,30 @@ rounding primitive in `binary_reference.py`.
 python3 -B motif/tensor/test/generate_image_unpack_oracle.py --check
 ```
 
+`image_attention_matrix.loom` compares complete image-attention heads with
+binary64 dense contractions and a whole softmax. Thirteen scenarios span one
+through nine query/key tiles, all 384 channels, zero and uniform scores,
+conversion midpoints, signed values, maxima that increase in later tiles,
+and finite scores below a conventional finite softmax sentinel.
+General accuracy cases round Q/K/V independently and include an absolute
+allowance for BF16 probability conversion, native matrix contraction, and
+F32 normalization; the generator states the input-scaled budget.
+
+Separate single-tile cases round unnormalized probabilities explicitly while
+leaving the denominator unrounded. Their probabilities stay away from BF16
+midpoints under the declared score/transcendental budget, making this boundary
+independently observable. Uniform and value-conversion cases require twenty
+significant binary bits relative to the largest input value, including means
+that require more precision than BF16; zero output compares bitwise. The
+generator verifies sensitivity to each Q/K/V/probability conversion, omitted
+score/value channels, and premature BF16 output. Complete immutable inputs
+and output guards are bitwise checks under native, access, and race profiles.
+Every scenario includes a benchmark declaration.
+
+```sh
+python3 -B motif/tensor/test/generate_image_attention_oracle.py --check
+```
+
 `channel_norm.loom` covers affine and SiLU epilogues with disjoint and exactly
 aliased output. Twelve cases include one and odd channel counts, the decoder's
 96/192/384-channel widths, complete workgroups, tails, multiple workgroups,
