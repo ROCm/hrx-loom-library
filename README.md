@@ -77,10 +77,17 @@ multi-token prediction. Its source, bytecode, and mixed providers share the
 same text service and retained-conversation checks. The source presets use
 the installed SDK directly, including when fetched from a library checkout.
 
-The [model map](model/README.md#map) also includes descriptions for image
-generation and text with vision. Those descriptions
-identify compatible assets and intended programs; their executable ports are
-not yet included.
+[Qwen3.8 27B](model/Qwen/Qwen3.8-27B/OVERVIEW.md) provides text generation,
+checkpoint multi-token prediction, and image-conditioned chat with the same
+source, bytecode, and mixed packaging. Its text service runs on RDNA and CDNA;
+the image projector uses RDNA. The separate DFlash2 draft composition has
+numerical coverage, while its full-checkpoint service gate awaits the native
+allocation repair described in the overview. This package remains outside
+the picker until that gate passes.
+
+The [model map](model/README.md#map) also describes Krea image generation,
+including compatible assets and service contracts. Its executable port is
+still gated on the shared adapter-collection contract.
 
 ## Library development quickstart
 

@@ -1,0 +1,978 @@
+# Copyright 2026 AMD ROCm™ Software
+# SPDX-License-Identifier: MIT
+
+load("@hrx//build_tools/bazel:python.bzl", "iree_py_test")
+load("@hrx//build_tools/bazel:requirements.bzl", "apply_test_requirements")
+load("@hrx//loom/src/loom/tooling/target/spirv:execution_profiles.bzl", "SPIRV_VULKAN_HARDWARE_PROFILE")
+load("@hrx//loom/target/amdgpu:execution_profiles.bzl", "AMD_GPU_HARDWARE_PROFILE", "amd_gpu_execution_profile")
+load("@hrx//loom/target/vm:execution_profiles.bzl", "VM_REFERENCE_PROFILE")
+load("//build_tools/bazel:defs.bzl", "loom_test")
+
+package(default_visibility = ["//visibility:private"])
+
+AMD_GPU_ACCESS_PROFILE = amd_gpu_execution_profile(
+    name = "amd_gpu_access",
+    runner_args = ["--sanitizer=access"],
+    tags = ["notsan"],
+)
+
+_MODEL_TARGETS = [
+    representation + suffix
+    for representation in [
+        "source",
+        "archive",
+        "mixed",
+    ]
+    for suffix in [
+        "",
+        "_vision",
+        "_target_only",
+        "_dflash2",
+        "_cdna_text",
+    ]
+]
+
+[
+    filegroup(
+        name = representation + "_card",
+        srcs = ["//model/Qwen/Qwen3.8-27B:" + representation],
+        output_group = "model_card",
+    )
+    for representation in _MODEL_TARGETS
+]
+
+_SERVICE_REQUIREMENTS = apply_test_requirements(
+    {},
+    build_requirements = AMD_GPU_HARDWARE_PROFILE.build_requirements,
+    resource_group = AMD_GPU_HARDWARE_PROFILE.resource_group,
+    run_requirements = AMD_GPU_HARDWARE_PROFILE.run_requirements,
+)
+
+# The acquisition lock identifies provisioned weights without introducing their
+# bytes into Bazel. Current providers and the frozen replies remain test inputs.
+[
+    iree_py_test(
+        name = "serve_" + representation + "_test",
+        size = "large",
+        srcs = ["serve_check.py"],
+        args = [
+            "--server=$(location @hrx//loom/src/loom/tools/loom-serve)",
+            "--model=$(location :" + representation + "_card)",
+            "--reference=$(location reference.json)",
+            "--device=amdgpu2://0",
+        ] + (["--images"] if representation.endswith("_vision") else []),
+        data = [
+            ":" + representation + "_card",
+            "reference.json",
+            "@hrx//loom/src/loom/tools/loom-serve",
+        ],
+        main = "serve_check.py",
+        resource_group = _SERVICE_REQUIREMENTS["resource_group"],
+        tags = ["manual"] + _SERVICE_REQUIREMENTS["tags"],
+        target_compatible_with = _SERVICE_REQUIREMENTS["target_compatible_with"],
+        deps = [
+            "@hrx//loom/src/loom/serve/testing:chat",
+            "@hrx//loom/src/loom/serve/testing:http",
+            "@hrx//loom/src/loom/serve/testing:model_staging",
+        ],
+    )
+    for representation in _MODEL_TARGETS
+]
+
+loom_test(
+    name = "vision_pixels",
+    srcs = [
+        "vision_pixels.loom",
+        "//model/Qwen/Qwen3.8-27B/program:vision_pixels.loom",
+    ],
+    execution_profiles = [VM_REFERENCE_PROFILE],
+)
+
+loom_test(
+    name = "vision_control",
+    srcs = [
+        "vision_control.loom",
+        "//model/Qwen/Qwen3.8-27B/program:vision_control.loom",
+    ],
+    execution_profiles = [VM_REFERENCE_PROFILE],
+    deps = ["//model/Qwen/Qwen3.8-27B/program:vision_pixels"],
+)
+
+loom_test(
+    name = "vision_resize",
+    srcs = ["vision_resize.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program:vision_pixels",
+        "//model/Qwen/Qwen3.8-27B/program/kernel:vision_resize",
+    ],
+)
+
+AMD_GPU_ACCESS_TRAP_PROFILE = amd_gpu_execution_profile(
+    name = "amd_gpu_access_trap",
+    runner_args = [
+        "--sanitizer=access",
+        "--sanitizer-reporting=trap",
+    ],
+    tags = ["notsan"],
+)
+
+loom_test(
+    name = "input_embedding",
+    srcs = [
+        "embedding_reference.loom",
+        "input_embedding.loom",
+        "token_embedding.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    variants = {
+        "mixed": {
+            "case": "@mixed_embedding_uses_device_rows",
+        },
+        "ordinary": {
+            "case": "@qwen38_token_embedding_q5k_f32_differential_case",
+        },
+    },
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "sampling",
+    srcs = ["sampling.loom"],
+    configs = {
+        "qwen38.greedy_argmax.output_capacity": "248320",
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/tensor:random",
+        "//motif/tensor:sampling",
+    ],
+)
+
+loom_test(
+    name = "selection_cdna",
+    srcs = ["selection_cdna.loom"],
+    configs = {
+        "qwen38.greedy_argmax.output_capacity": "248320",
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    variants = {
+        "normalization": {
+            "case": "@qwen38_rmsnorm_f32_decode_known_case_cdna",
+        },
+        "rows": {
+            "case": "@qwen38_greedy_argmax_rows_nontrivial_winner_case_cdna",
+        },
+        "tiled": {
+            "case": "@qwen38_greedy_argmax_cross_tile_tie_case_cdna",
+        },
+    },
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "rmsnorm",
+    srcs = ["rmsnorm.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+        SPIRV_VULKAN_HARDWARE_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/tensor:rmsnorm",
+    ],
+)
+
+loom_test(
+    name = "integer_projection",
+    srcs = [
+        "integer_projection.loom",
+        "linear_cohort_oracle.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    variants = {
+        "canonical": {
+            "case": "@integer_projection_canonical_check",
+        },
+        "channel8": {
+            "case": "@integer_projection_channel8_check",
+        },
+        "long": {
+            "case": "@integer_projection_long_check",
+        },
+    },
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "command_projection",
+    srcs = [
+        "command_projection.loom",
+        "linear_cohort_oracle.loom",
+        "matrix_projection.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    variants = {
+        "canonical": {
+            "case": "@command_projection_check",
+        },
+        "channel8": {
+            "case": "@command_channel8_projection_check",
+        },
+    },
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program:commands",
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+    ],
+)
+
+loom_test(
+    name = "matrix_projection",
+    srcs = [
+        "linear_cohort_oracle.loom",
+        "matrix_projection.loom",
+        "narrow_matrix_projection.loom",
+        "q6_fixture.loom",
+        "signed_matrix_projection.loom",
+        "split_matrix_projection.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "cohort_projection",
+    srcs = [
+        "linear_cohort.loom",
+        "linear_cohort_oracle.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    variants = {
+        "rows1": {
+            "configs": {
+                "runner.qwen38.prefill_token_count": "1",
+            },
+        },
+        "rows16": {
+            "configs": {
+                "runner.qwen38.prefill_token_count": "16",
+            },
+        },
+        "rows2": {
+            "configs": {
+                "runner.qwen38.prefill_token_count": "2",
+            },
+        },
+        "rows4": {
+            "configs": {
+                "runner.qwen38.prefill_token_count": "4",
+            },
+        },
+        "rows8": {
+            "configs": {
+                "runner.qwen38.prefill_token_count": "8",
+            },
+        },
+    },
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "vision_square",
+    srcs = ["vision_square.loom"],
+    configs = {
+        "qwen38.vision.image_height": "256",
+        "qwen38.vision.image_width": "256",
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "vision_minimum",
+    srcs = ["vision_minimum.loom"],
+    configs = {
+        "qwen38.vision.image_height": "32",
+        "qwen38.vision.image_width": "32",
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "vision_landscape",
+    srcs = ["vision_rectangle.loom"],
+    configs = {
+        "qwen38.vision.image_height": "224",
+        "qwen38.vision.image_width": "320",
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "vision_portrait",
+    srcs = ["vision_rectangle.loom"],
+    configs = {
+        "qwen38.vision.image_height": "320",
+        "qwen38.vision.image_width": "224",
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "ffn_gate_up",
+    srcs = ["ffn_gate_up.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "q4_matrix",
+    srcs = ["linear_q4k_f16_wmma.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "q6_metadata",
+    srcs = ["linear_q6k_f16_wmma_metadata.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/format/ggml:q4_k",
+    ],
+)
+
+loom_test(
+    name = "output_projection",
+    srcs = ["output_projection.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_TRAP_PROFILE,
+    ],
+    variants = {
+        "live_prefix": {
+            "case": "@output_projection_live_prefix_case",
+        },
+        "m32": {
+            "case": "@output_projection_m32_case",
+        },
+        "m8": {
+            "case": "@output_projection_m8_case",
+        },
+    },
+    deps = [
+        "//kernel/ggml/linear:q6_k_q8_1_x4_gfx11",
+        "//kernel/ggml/quantize:q8_1_x4_f32",
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+    ],
+)
+
+loom_test(
+    name = "dflash_attention",
+    srcs = ["dflash_attention.loom"],
+    configs = {
+        "qwen38.attention.cache_capacity": "4096",
+        "qwen38.attention.pool_capacity": "4224",
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "dflash_proposal",
+    srcs = ["dflash_proposal.loom"],
+    configs = {"runner.qwen38.mixed_inputs": "0"},
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "dflash_selection",
+    srcs = ["dflash_selection.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "feature_capture",
+    srcs = ["features.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+        SPIRV_VULKAN_HARDWARE_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "weights_prepare",
+    srcs = ["weights_prepare.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+        SPIRV_VULKAN_HARDWARE_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program:commands"],
+)
+
+loom_test(
+    name = "gdn_state",
+    srcs = [
+        "gdn_fork.loom",
+        "gdn_spans.loom",
+        "gdn_speculation.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "mtp_prepare",
+    srcs = ["mtp_prepare.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "attention_matrix",
+    srcs = [
+        "attention_matrix.loom",
+        "attention_reference.loom",
+    ],
+    configs = {
+        "qwen38.attention.cache_capacity": "81",
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "attention_state",
+    srcs = [
+        "attention_media.loom",
+        "attention_pages.loom",
+        "attention_spans.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    variants = {
+        "dense": {
+            "case": "@mixed_attention_spans",
+            "configs": {
+                "qwen38.attention.cache_capacity": "257",
+                "qwen38.attention.pool_capacity": "0",
+            },
+        },
+        "media": {
+            "case": "@media_query_uses_three_rotary_axes",
+            "configs": {
+                "qwen38.attention.cache_capacity": "257",
+                "qwen38.attention.pool_capacity": "0",
+            },
+        },
+        "paged": {
+            "case": "@scattered_attention_pages",
+            "configs": {
+                "qwen38.attention.cache_capacity": "192",
+                "qwen38.attention.pool_capacity": "256",
+            },
+        },
+        "paged_mfma": {
+            "case": "@scattered_attention_pages_mfma",
+            "configs": {
+                "qwen38.attention.cache_capacity": "192",
+                "qwen38.attention.pool_capacity": "256",
+            },
+        },
+    },
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "decode_attention_matrix",
+    srcs = [
+        "attention_decode_split.loom",
+        "attention_reference.loom",
+        "decode_attention_matrix.loom",
+    ],
+    configs = {
+        "qwen38.attention.cache_capacity": "13",
+        "qwen38.attention.decode_split_count": "10",
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    variants = {
+        "mfma": {"case": "@qwen38_attention_decode_split_mfma_differential_case"},
+        "mfma_m4": {"case": "@qwen38_attention_decode_split_m4_mfma_differential_case"},
+        "wmma": {
+            "case": "@qwen38_attention_decode_split_differential_case",
+            "configs": {"qwen38.attention.cache_capacity": "10"},
+        },
+        "wmma_m4": {"case": "@qwen38_attention_decode_split_m4_differential_case"},
+    },
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "attention_split",
+    srcs = ["attention_spans_split.loom"],
+    configs = {
+        "qwen38.attention.cache_capacity": "640",
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    variants = {
+        "dense": {
+            "configs": {
+                "qwen38.attention.pool_capacity": "0",
+            },
+        },
+        "paged": {
+            "configs": {
+                "qwen38.attention.pool_capacity": "768",
+            },
+        },
+    },
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "attention_specialization",
+    srcs = ["attention_specialization.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/sequence/qwen3_8:span",
+    ],
+)
+
+loom_test(
+    name = "ffn_gate_up_prefetch",
+    srcs = ["ffn_gate_up_prefetch.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "ffn_prefetch_specialization",
+    srcs = ["ffn_prefetch_specialization.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "gdn_convolution",
+    srcs = [
+        "gdn_convolution.loom",
+        "//model/Qwen/Qwen3.8-27B/program/kernel:gdn_common.loom",
+        "//model/Qwen/Qwen3.8-27B/program/kernel:gdn_prefill.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+)
+
+loom_test(
+    name = "linear_q5k_f16_wmma",
+    srcs = [
+        "linear_q5k_f16_wmma.loom",
+        "q5_reference.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//kernel/ggml/linear:affine_q8_1_x4",
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/format/ggml:q4_k",
+        "//motif/tensor:matrix",
+    ],
+)
+
+loom_test(
+    name = "linear_q5k_f16_wmma_wave32",
+    srcs = ["linear_q5k_f16_wmma_wave32.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/format/ggml:q4_k",
+    ],
+)
+
+loom_test(
+    name = "output_spans",
+    srcs = ["output_spans.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//kernel/ggml/linear:q6_k_q8_1_x4",
+        "//kernel/ggml/quantize:q8_1_x4_f32",
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+    ],
+)
+
+loom_test(
+    name = "prepared_q5",
+    srcs = ["prepared_q5.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//kernel/ggml/linear:affine_q8_1_x4",
+        "//kernel/ggml/quantize:q8_1_x4_f32",
+        "//model/Qwen/Qwen3.8-27B/program:commands",
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+    ],
+)
+
+loom_test(
+    name = "projection_capacity",
+    srcs = ["projection_capacity.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "attention_decode",
+    srcs = ["attention_decode.loom"],
+    configs = {"qwen38.attention.cache_capacity": "1"},
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "attention_decode_split",
+    srcs = [
+        "attention_decode_split.loom",
+        "attention_reference.loom",
+    ],
+    configs = {"qwen38.attention.decode_split_count": "10"},
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    variants = {
+        "differential": {
+            "case": "@qwen38_attention_decode_split_differential_case",
+            "configs": {"qwen38.attention.cache_capacity": "10"},
+        },
+        "differential_m4": {
+            "case": "@qwen38_attention_decode_split_m4_differential_case",
+            "configs": {"qwen38.attention.cache_capacity": "13"},
+        },
+        "context_10k": {
+            "case": "@qwen38_attention_decode_10k_baseline_case",
+            "configs": {"qwen38.attention.cache_capacity": "10240"},
+        },
+        "context_10k_split": {
+            "case": "@qwen38_attention_decode_10k_split_case",
+            "configs": {"qwen38.attention.cache_capacity": "10240"},
+        },
+        "context_10k_wmma": {
+            "case": "@qwen38_attention_decode_10k_split_wmma_case",
+            "configs": {"qwen38.attention.cache_capacity": "10240"},
+        },
+    },
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program:config",
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/tensor:matrix",
+    ],
+)
+
+loom_test(
+    name = "attention_prefill",
+    srcs = [
+        "attention_prefill.loom",
+        "attention_reference.loom",
+    ],
+    configs = {"qwen38.attention.cache_capacity": "3"},
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/sequence/qwen3_8:input",
+        "//motif/sequence/qwen3_8:span",
+    ],
+)
+
+loom_test(
+    name = "attention_prefill_wmma",
+    srcs = [
+        "attention_prefill_wmma.loom",
+        "attention_reference.loom",
+    ],
+    configs = {"qwen38.attention.cache_capacity": "81"},
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/sequence/qwen3_8:span",
+        "//motif/tensor:matrix",
+    ],
+)
+
+loom_test(
+    name = "decode_control",
+    srcs = [
+        "control_observation.loom",
+        "decode_control.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "ffn_gate_up_q5k_f16_wmma_wave32",
+    srcs = ["ffn_gate_up_q5k_f16_wmma_wave32.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/format/ggml:q4_k",
+    ],
+)
+
+loom_test(
+    name = "gdn_head_mapping",
+    srcs = ["gdn_head_mapping.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "gdn_decode",
+    srcs = ["gdn_decode.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "gdn_prefill",
+    srcs = ["gdn_prefill.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-27B/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "greedy_argmax",
+    srcs = ["greedy_argmax.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program:config",
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+    ],
+)
+
+loom_test(
+    name = "layer_decode",
+    srcs = ["layer_decode.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/tensor:rmsnorm",
+    ],
+)
+
+loom_test(
+    name = "layer_prefill",
+    srcs = ["layer_prefill.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/tensor:rmsnorm",
+    ],
+)
+
+loom_test(
+    name = "linear_q4k_f16_wmma_split_k",
+    srcs = [
+        "linear_q4k_f16_wmma_split_k.loom",
+        "q4_projection_reference.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/format/ggml:q4_k",
+    ],
+)
+
+loom_test(
+    name = "linear_q5k_f16_wmma_split_k",
+    srcs = ["linear_q5k_f16_wmma_split_k.loom"],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/format/ggml:q4_k",
+        "//motif/tensor:matrix",
+    ],
+)
+
+loom_test(
+    name = "linear_q6k_f16_wmma",
+    srcs = [
+        "linear_q6k_f16_wmma.loom",
+        "q6_fixture.loom",
+        "q8_projection_reference.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//kernel/ggml/linear:q6_k_q8_1_x4",
+        "//kernel/ggml/linear:q8_0_q8_1_x4",
+        "//kernel/ggml/quantize:q8_1_x4_f32",
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/format/ggml:q6_k",
+        "//motif/format/ggml:q8_0",
+        "//motif/tensor:matrix",
+    ],
+)
+
+loom_test(
+    name = "token_embedding",
+    srcs = [
+        "embedding_reference.loom",
+        "token_embedding.loom",
+    ],
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = [
+        "//model/Qwen/Qwen3.8-27B/program/kernel:numerics",
+        "//motif/format/ggml:q5_k",
+        "//motif/sequence/qwen3_8:input",
+    ],
+)

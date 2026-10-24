@@ -1,0 +1,78 @@
+config.decl @qwen38.attention.cache_capacity : %value: index where [range(%value, 1, 262144)]
+
+// Independent reference and observation kernels for model checks.
+// These kernels are owned by test roots and are not model providers.
+kernel.def export("qwen38_attention_prefill_reference") @qwen38_attention_prefill_reference(%token_count: index) {
+  %bounded_token_count = index.assume %token_count [range(%token_count, 1, 512)] : index
+  %unit = index.constant 1 : index
+  %head_count = index.constant 24 : index
+  %workgroup_size = index.constant 256 : index
+  kernel.launch.config workgroups(%head_count, %bounded_token_count, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%control: buffer, %query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer) {
+  %cache_capacity = config.get @qwen38.attention.cache_capacity : index
+  %head0 = kernel.workgroup.id<x> : index
+  %head = index.assume %head0 [range(%head0, 0, 23)] : index
+  %token0 = kernel.workgroup.id<y> : index
+  %lane0 = kernel.workitem.id<x> : index
+  %lane = index.assume %lane0 [range(%lane0, 0, 255)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c6 = index.constant 6 : index
+  %c256 = index.constant 256 : index
+  %c1024 = index.constant 1024 : index
+  %c0_offset = index.constant 0 : offset
+  %c0_f32 = scalar.constant 0.0 : f32
+  %negative_large = scalar.constant -3.4028234663852886e+38 : f32
+  %attention_scale = scalar.constant 0.0625 : f32
+  %control_view = buffer.view %control[%c0_offset] : buffer -> view<2xi32>
+  %token_count_i32 = view.load %control_view[%c0] : view<2xi32> -> i32
+  %token_count0 = index.cast %token_count_i32 : i32 to index
+  %token_count = index.assume %token_count0 [range(%token_count0, 1, 512)] : index
+  %token = index.assume %token0 [lt(%token0, %token_count)] : index
+  %position_base_i32 = view.load %control_view[%c1] : view<2xi32> -> i32
+  %position_base0 = index.cast %position_base_i32 : i32 to index
+  %position_base = index.assume %position_base0 [range(%position_base0, 0, 262143)] : index
+  %position0 = index.add %position_base, %token : index
+  %position = index.assume %position0 [lt(%position0, %cache_capacity)] : index
+  %context_count0 = index.add %position, %c1 : index
+  %context_count = index.assume %context_count0 [range(%context_count0, 1, 262144), le(%context_count0, %cache_capacity)] : index
+  %query_view = buffer.view %query[%c0_offset] : buffer -> view<[%token_count]x6144xf32>
+  %gate_view = buffer.view %gate[%c0_offset] : buffer -> view<[%token_count]x6144xf32>
+  %output_view = buffer.view %output[%c0_offset] : buffer -> view<[%token_count]x6144xf32>
+  %cache_element_count = index.mul %cache_capacity, %c1024 : index
+  %key_cache_view = buffer.view %key_cache[%c0_offset] : buffer -> view<[%cache_element_count]xf16>
+  %value_cache_view = buffer.view %value_cache[%c0_offset] : buffer -> view<[%cache_element_count]xf16>
+  %head_base = index.mul %head, %c256 : index
+  %element = index.add %head_base, %lane : index
+  %key_head = index.div %head, %c6 : index
+  %key_head_base = index.mul %key_head, %c256 : index
+  %query_value = view.load %query_view[%token, %element] : view<[%token_count]x6144xf32> -> f32
+  %final_max, %final_sum, %final_acc = scf.for %key_token = [%c0 to %context_count step %c1](%old_max = %negative_large : f32, %old_sum = %c0_f32 : f32, %old_acc = %c0_f32 : f32) -> (f32, f32, f32) {
+    %token_cache_base = index.mul %key_token, %c1024 : index
+    %cache_head_base = index.add %token_cache_base, %key_head_base : index
+    %cache_index = index.add %cache_head_base, %lane : index
+    %key_f16 = view.load %key_cache_view[%cache_index] : view<[%cache_element_count]xf16> -> f16
+    %value_f16 = view.load %value_cache_view[%cache_index] : view<[%cache_element_count]xf16> -> f16
+    %key = scalar.extf %key_f16 : f16 to f32
+    %value = scalar.extf %value_f16 : f16 to f32
+    %dot_part0 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %query_value, %key : f32
+    %dot_part = scalar.mulf<reassoc|nnan|ninf|nsz> %dot_part0, %attention_scale : f32
+    %score = kernel.workgroup.reduce<addf> %dot_part : f32
+    %new_max = scalar.maxnumf %old_max, %score : f32
+    %old_delta = scalar.subf %old_max, %new_max : f32
+    %score_delta = scalar.subf %score, %new_max : f32
+    %old_scale = scalar.expf<afn> %old_delta : f32
+    %new_scale = scalar.expf<afn> %score_delta : f32
+    %rescaled_sum = scalar.mulf<reassoc|nnan|ninf|nsz> %old_sum, %old_scale : f32
+    %new_sum = scalar.addf<reassoc|nnan|ninf|nsz> %rescaled_sum, %new_scale : f32
+    %rescaled_acc = scalar.mulf<reassoc|nnan|ninf|nsz> %old_acc, %old_scale : f32
+    %weighted_value = scalar.mulf<reassoc|nnan|ninf|nsz> %value, %new_scale : f32
+    %new_acc = scalar.addf<reassoc|nnan|ninf|nsz> %rescaled_acc, %weighted_value : f32
+    scf.yield %new_max, %new_sum, %new_acc : f32, f32, f32
+  }
+  %attention_value = scalar.divf<nnan|ninf|nsz|arcp> %final_acc, %final_sum : f32
+  %gate_value = view.load %gate_view[%token, %element] : view<[%token_count]x6144xf32> -> f32
+  %gated = scalar.mulf<nnan|ninf|nsz> %attention_value, %gate_value : f32
+  view.store %gated, %output_view[%token, %element] : f32, view<[%token_count]x6144xf32>
+  kernel.return
+}

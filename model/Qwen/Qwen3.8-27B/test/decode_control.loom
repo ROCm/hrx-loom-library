@@ -1,0 +1,78 @@
+kernel.decl @qwen38_decode_commit_token() launch(%control: buffer, %token_ids: buffer, %progress: buffer)
+
+kernel.decl @qwen38_decode_read_history_index3() launch(%token_ids: buffer, %result: buffer)
+
+kernel.decl @qwen38_prefill_finish_control() launch(%control: buffer, %token_ids: buffer, %progress: buffer)
+
+kernel.decl @qwen38_prefill_read_history_index1() launch(%token_ids: buffer, %result: buffer)
+
+// Numerical checks for decode control.
+// Production kernels come from the model library; independent reference
+// kernels and fixture data belong only to this test root.
+check.case public @qwen38_decode_commit_token_case {
+  %control = check.generate.iota offset(41) step(-39) : tensor<3xi32>
+  %token_ids = check.generate.iota offset(7) step(-1) : tensor<129xi32>
+  %progress = check.generate.fill value(0) : tensor<8xi32>
+  %committed_token = check.generate.fill value(-1) : tensor<1xi32>
+  %expected_control = check.generate.iota offset(42) step(-39) : tensor<2xi32>
+  %expected_token = check.generate.fill value(7) : tensor<1xi32>
+  kernel.launch @qwen38_decode_commit_token(%control, %token_ids, %progress) : (tensor<3xi32>, tensor<129xi32>, tensor<8xi32>)
+  kernel.launch @qwen38_decode_read_history_index3(%token_ids, %committed_token) : (tensor<129xi32>, tensor<1xi32>)
+  %control_pair = check.tensor.view %control offset(0) : tensor<3xi32> -> tensor<2xi32>
+  %progress_count = check.tensor.view %progress offset(0) : tensor<8xi32> -> tensor<1xi32>
+  %progress_done = check.tensor.view %progress offset(28) : tensor<8xi32> -> tensor<1xi32>
+  %expected_count = check.generate.fill value(3) : tensor<1xi32>
+  %expected_done = check.generate.fill value(0) : tensor<1xi32>
+  check.expect.equal actual(%control_pair) expected(%expected_control) : tensor<2xi32>
+  check.expect.equal actual(%committed_token) expected(%expected_token) : tensor<1xi32>
+  check.expect.equal actual(%progress_count) expected(%expected_count) : tensor<1xi32>
+  check.expect.equal actual(%progress_done) expected(%expected_done) : tensor<1xi32>
+  check.return
+}
+
+check.case public @qwen38_decode_history_wrap_case {
+  %control = check.generate.fill value(128) : tensor<3xi32>
+  %token_ids = check.generate.iota offset(1000) step(-1) : tensor<129xi32>
+  %progress = check.generate.fill value(0) : tensor<8xi32>
+  kernel.launch @qwen38_decode_commit_token(%control, %token_ids, %progress) : (tensor<3xi32>, tensor<129xi32>, tensor<8xi32>)
+  %wrapped = check.tensor.view %token_ids offset(4) : tensor<129xi32> -> tensor<1xi32>
+  %tail = check.tensor.view %token_ids offset(8) : tensor<129xi32> -> tensor<127xi32>
+  %expected = check.generate.fill value(1000) : tensor<1xi32>
+  %expected_tail = check.generate.iota offset(998) step(-1) : tensor<127xi32>
+  %control_pair = check.tensor.view %control offset(0) : tensor<3xi32> -> tensor<2xi32>
+  %expected_control = check.generate.fill value(129) : tensor<2xi32>
+  check.expect.equal actual(%wrapped) expected(%expected) : tensor<1xi32>
+  check.expect.equal actual(%tail) expected(%expected_tail) : tensor<127xi32>
+  check.expect.equal actual(%control_pair) expected(%expected_control) : tensor<2xi32>
+  check.return
+}
+
+// Converts the prefill control pair [token_count, position_base] in place to
+// the decode pair [next_position, generated_count] and preserves the first
+// selected token in the device-resident output history.
+check.case public @qwen38_prefill_finish_control_case {
+  %control = check.generate.iota offset(3) step(14) : tensor<3xi32>
+  %token_ids = check.generate.iota offset(7) step(-1) : tensor<129xi32>
+  %progress = check.generate.fill value(0) : tensor<8xi32>
+  %committed_token = check.generate.fill value(-1) : tensor<1xi32>
+  %expected = check.generate.iota offset(20) step(-19) : tensor<2xi32>
+  %expected_token = check.generate.fill value(7) : tensor<1xi32>
+  kernel.launch @qwen38_prefill_finish_control(%control, %token_ids, %progress) : (tensor<3xi32>, tensor<129xi32>, tensor<8xi32>)
+  kernel.launch @qwen38_prefill_read_history_index1(%token_ids, %committed_token) : (tensor<129xi32>, tensor<1xi32>)
+  %control_pair = check.tensor.view %control offset(0) : tensor<3xi32> -> tensor<2xi32>
+  %progress_count = check.tensor.view %progress offset(0) : tensor<8xi32> -> tensor<1xi32>
+  %progress_done = check.tensor.view %progress offset(28) : tensor<8xi32> -> tensor<1xi32>
+  %expected_count = check.generate.fill value(1) : tensor<1xi32>
+  %expected_done = check.generate.fill value(0) : tensor<1xi32>
+  check.expect.equal actual(%control_pair) expected(%expected) : tensor<2xi32>
+  check.expect.equal actual(%committed_token) expected(%expected_token) : tensor<1xi32>
+  check.expect.equal actual(%progress_count) expected(%expected_count) : tensor<1xi32>
+  check.expect.equal actual(%progress_done) expected(%expected_done) : tensor<1xi32>
+  check.return
+}
+
+check.benchmark<@qwen38_decode_commit_token_case> @qwen38_decode_commit_token_case_workload
+
+check.benchmark<@qwen38_decode_history_wrap_case> @qwen38_decode_history_wrap_case_workload
+
+check.benchmark<@qwen38_prefill_finish_control_case> @qwen38_prefill_finish_control_case_workload

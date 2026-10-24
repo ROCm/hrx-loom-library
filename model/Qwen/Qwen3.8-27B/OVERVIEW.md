@@ -6,29 +6,52 @@ uses Unsloth's mixed-format UD-Q5_K_XL checkpoint. Optional multi-token
 prediction uses the checkpoint's prediction block; DFlash2 instead adds a
 separate draft checkpoint. Drafting remains part of the text service.
 
-**Execution status:** this package contains a portable description and generated
-reference. Its native providers are not included, so it is not yet a runnable
-Loom model. The declared service ABIs, parameter scopes, and presets are the
-contract for the native port. Validation does not qualify model output.
+The composition contains native AMD text and image providers with source,
+relocatable-bytecode, and mixed representations. The source preset works with
+the installed SDK without building the library. After installing `hrx-loom`
+with its `hf` extra, select text chat or image-conditioned chat explicitly:
+
+```sh
+loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/Qwen/Qwen3.8-27B/model.json \
+  --preset vision --output "$HOME/models/qwen3.8-27b"
+loom-serve --model="$HOME/models/qwen3.8-27b/model.json" \
+  --device=amdgpu2://0
+```
+
+Use `--preset chat` for checkpoint MTP without the image projector, or
+`--preset target-only` for ordinary target decoding. Fetch resolves the exact
+asset and compiler-input closure and reuses cached weights; serving opens the
+resulting local card. The implementation and numerical checks are published
+in the [library model package](https://github.com/ROCm/hrx-loom-library/tree/main/model/Qwen/Qwen3.8-27B).
 
 ## Choose the asset closure
 
 All variants use the original
 [tokenizer](https://huggingface.co/Qwen/Qwen3.8-27B/resolve/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/tokenizer.json)
 and the exact
-[UD-Q5_K_XL file](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q5_K_XL.gguf).
-Renaming a different quantization does not make its tensor layout compatible.
+[UD-Q5_K_XL file](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/f1bfb127c64f7072bdd2cad55f258b9c8b2910fe/Qwen3.8-27B-UD-Q5_K_XL.gguf).
+The quantized source is pinned to the checkpoint revision used by this
+composition. Later files with the same upstream name have different bytes;
+the card and lock retain the exact compatible revision and identity.
 
 | Variant | Additional parameter scope | Additional file |
 | --- | --- | --- |
 | `ud-q5-k-xl` | None | Text-only, including the checkpoint's MTP block. |
-| `ud-q5-k-xl-vision` | `vision` | [Matching F16 projector](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/mmproj-F16.gguf). |
+| `ud-q5-k-xl-vision` | `vision` | [Matching F16 projector](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/f1bfb127c64f7072bdd2cad55f258b9c8b2910fe/mmproj-F16.gguf). |
 | `ud-q5-k-xl-dflash2` | `draft` | [DFlash2 Q4_K_M](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/resolve/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q4_K_M.gguf). |
 
 The text-only choices do not require the projector. Image conditioning is a
 versioned `image` component of the text service, with separate preparation and
 request control. It is not an image-generation service. The DFlash2 checkpoint
 is additional model storage, not a request adapter.
+
+Text, checkpoint MTP, and vision have complete service checks with all three
+program representations; CDNA text is checked on MI300. DFlash2 has source and
+numerical coverage, but its full-checkpoint service gate is blocked by native
+GPU host-memory registration returning `EAGAIN` before inference. The allocation
+operation's restart and cancellation contract needs repair before that preset
+can be qualified. Use `chat`, `target-only`, `vision`, or `cdna-text` for the
+qualified serving paths.
 
 The original model, selected quantization, and selected draft repository declare
 Apache-2.0. Their original cards are available from
@@ -40,7 +63,10 @@ Apache-2.0. Their original cards are available from
 
 `chat` and `vision` use eight execution rows, 32,768 positions per context,
 65,536 pooled positions, 512-token packed epochs, three MTP proposals, and
-two-epoch continuation. `target-only` disables drafting and continuation.
+two-epoch continuation. Every preset reserves four explicit checkpoint slots
+for conversation forks and reuse across parameter unloading. These retained
+endpoints are independent of the execution rows. `target-only` disables
+drafting and continuation.
 `dflash2` uses seven proposals and the separate draft parameter scope. The
 `qwen38.draft_kind` JIT setting distinguishes checkpoint MTP (`0`) from
 DFlash2 (`1`); a filename is not used to infer the drafting algorithm.
@@ -48,8 +74,8 @@ DFlash2 (`1`); a filename is not used to infer the drafting algorithm.
 The numerical provider set contains RDNA and CDNA text kernels. `cdna-text`
 records the text-only configuration of four rows, 4,096-position contexts,
 32,768 pooled positions, and 512-token epochs without drafting. The image
-projector requires the RDNA implementation. These are port qualification
-targets, not a claim that this package already runs on those devices.
+projector requires the RDNA implementation. The preset records model execution capacities; device selection remains
+part of the serving deployment.
 
 The canonical requests use greedy sampling and disable thinking. Requests may
 select temperature, top-p, top-k, and a signed 64-bit seed. Reasoning is returned

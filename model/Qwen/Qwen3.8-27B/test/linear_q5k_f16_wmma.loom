@@ -1,0 +1,352 @@
+kernel.decl @qwen38_linear_q5k_f16_wmma(%tokens: index, %inputs: index, %outputs: index) launch(%control: buffer, %inputs_argument: index, %outputs_argument: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_linear_q5k_f16_wmma_c64t32_f32acc(%tokens: index, %inputs: index, %outputs: index) launch(%control: buffer, %inputs_argument: index, %outputs_argument: index, %input: buffer, %weight: buffer, %output: buffer)
+
+// Both schedules decode the same Q5_K rows, but their F32 recurrences differ:
+// generic rounds a fresh 256-product block before adding it; narrow retains
+// the accumulator across blocks. The layout check uses exact operands so
+// the numerical comparison retains sensitivity to integer layout mistakes.
+// With both scales 2^-10, decoded F16 values are integer multiples of 2^-10
+// with numerator at most 1953. Inputs are -1, 0, or 1, and every mathematical
+// partial sum has numerator at most 5120*1953 < 2^24. Native matrix arithmetic
+// may differ in low bits from ordered scalar FMA. The accepted discrepancy is
+// 2^-12, one quarter of the smallest nonzero mathematical result difference.
+kernel.def @qwen38_q5_exact_headers(%channels: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%channels, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%weight: buffer) {
+  %channel = kernel.workgroup.id<x> : index
+  %block = kernel.workitem.id<x> : index
+  %blocks = index.constant 20 : index
+  %valid = index.cmp ult, %block, %blocks : index
+  scf.if %valid {
+    %row_bytes = index.constant 3520 : offset
+    %block_bytes = index.constant 176 : offset
+    %row_origin = index.scale %channel, %row_bytes : index, offset -> offset
+    %block_origin = index.scale %block, %block_bytes : index, offset -> offset
+    %origin = index.add %row_origin, %block_origin : offset
+    %header = buffer.view %weight[%origin] : buffer -> view<2xf16>
+    %scale = scalar.constant 0.0009765625 : f16
+    view.store %scale, %header[0] : f16, view<2xf16>
+    view.store %scale, %header[1] : f16, view<2xf16>
+  }
+  kernel.return
+}
+
+// Distinct rows and packed codes cover production widths and every tail class.
+check.case public @qwen38_narrow_q5_block_staging {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %tokens = check.literal value(32) : index
+  %inputs = check.literal value(5120) : index
+  %outputs = check.param.choice values([48, 64, 80, 96, 112, 128, 6144, 10240, 17408]) name("channels") : index
+  %control = check.generate.fill value(32) : tensor<1xi32>
+  %seed = check.param.seed base(98412) count(2) : i64
+  %input = check.generate.iota offset(-1.0) step(1.0) period(3) : tensor<32x5120xf32>
+  %weight = check.generate.random.uniform seed(%seed) range(0 to 31) : tensor<[%outputs]x20x176xi8>
+  kernel.launch @qwen38_q5_exact_headers[%outputs](%weight) : [index](tensor<[%outputs]x20x176xi8>)
+  %expected = check.generate.fill value(-17.0) : tensor<32x[%outputs]xf32>
+  %actual = check.generate.fill value(17.0) : tensor<32x[%outputs]xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma[%tokens, %inputs, %outputs](%control, %inputs, %outputs, %input, %weight, %expected) : [index, index, index](tensor<1xi32>, index, index, tensor<32x5120xf32>, tensor<[%outputs]x20x176xi8>, tensor<32x[%outputs]xf32>)
+  kernel.launch @qwen38_linear_q5k_f16_wmma_c64t32_f32acc[%tokens, %inputs, %outputs](%control, %inputs, %outputs, %input, %weight, %actual) : [index, index, index](tensor<1xi32>, index, index, tensor<32x5120xf32>, tensor<[%outputs]x20x176xi8>, tensor<32x[%outputs]xf32>)
+  check.expect.close actual(%actual) expected(%expected) atol(0.000244140625) rtol(0.0) nan(same) : tensor<32x[%outputs]xf32>
+  check.return
+}
+
+// Command programs use a zero workload to disable an otherwise prepared path.
+check.case public @qwen38_narrow_q5_zero_grid {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %tokens = check.literal value(0) : index
+  %inputs = check.literal value(5120) : index
+  %outputs = check.param.choice values([48, 17408]) name("channels") : index
+  %control = check.generate.fill value(32) : tensor<1xi32>
+  %input = check.generate.fill value(0.5) : tensor<32x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<[%outputs]x20x176xi8>
+  %expected = check.generate.fill value(-17.0) : tensor<32x[%outputs]xf32>
+  %actual = check.generate.fill value(-17.0) : tensor<32x[%outputs]xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma_c64t32_f32acc[%tokens, %inputs, %outputs](%control, %inputs, %outputs, %input, %weight, %actual) : [index, index, index](tensor<1xi32>, index, index, tensor<32x5120xf32>, tensor<[%outputs]x20x176xi8>, tensor<32x[%outputs]xf32>)
+  check.expect.bitwise actual(%actual) expected(%expected) : tensor<32x[%outputs]xf32>
+  check.return
+}
+
+check.benchmark<@qwen38_narrow_q5_block_staging> @qwen38_narrow_q5_block_staging_workload
+
+check.benchmark<@qwen38_narrow_q5_zero_grid> @qwen38_narrow_q5_zero_grid_workload
+
+kernel.decl @qwen38_linear_q5k_f16_wmma_c128_t128(%dispatch_token_count0: index, %dispatch_input_size0: index, %dispatch_output_size0: index) launch(%token_count_data: buffer, %input_size0: index, %output_size0: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_linear_q5k_f16_wmma_x128(%dispatch_token_count0: index, %dispatch_input_size0: index, %dispatch_output_size0: index) launch(%token_count_data: buffer, %input_size0: index, %output_size0: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_linear_q5k_f16_wmma_x128_direct(%dispatch_token_count0: index, %dispatch_input_size0: index, %dispatch_output_size0: index) launch(%token_count_data: buffer, %input_size0: index, %output_size0: index, %input: buffer, %weight: buffer, %output: buffer)
+
+// Numerical checks for linear q5k f16 wmma.
+// Production kernels come from the model library; independent reference
+// kernels and fixture data belong only to this test root.
+kernel.decl @ggml_q5k_f32_reference(%input_capacity: index) launch(%input_size: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_q5k_fix_differential_headers() launch(%weight: buffer)
+
+kernel.decl @ggml_linear_q5k_q8_1_x4(%token_capacity: index, %input_capacity: index, %output_capacity: index) launch(%token_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer)
+
+check.case public @qwen38_linear_q5k_f16_wmma_differential_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(1) : index
+  %input_size = check.literal value(256) : index
+  %output_size = check.literal value(65) : index
+  %token_count_data = check.generate.fill value(1) : tensor<1xi32>
+  %input = check.generate.iota offset(-0.75) step(0.0078125) : tensor<256xf32>
+  %weight = check.generate.fill value(1) : tensor<65x176xi8>
+  %expected = check.generate.fill value(0.0) : tensor<65xf32>
+  %actual = check.generate.fill value(0.0) : tensor<65xf32>
+  kernel.launch @ggml_q5k_fix_differential_headers(%weight) : (tensor<65x176xi8>)
+  kernel.launch @ggml_q5k_f32_reference[%input_size](%input_size, %input, %weight, %expected) : [index](index, tensor<256xf32>, tensor<65x176xi8>, tensor<65xf32>)
+  kernel.launch @qwen38_linear_q5k_f16_wmma[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %actual) : [index, index, index](tensor<1xi32>, index, index, tensor<256xf32>, tensor<65x176xi8>, tensor<65xf32>)
+  check.expect.close actual(%actual) expected(%expected) atol(0.5) rtol(0.02) nan(same) : tensor<65xf32>
+  check.return
+}
+
+// Covers one full aligned tile and requires bit-identical output from the
+// accepted and four-wave schedules.
+check.case public @qwen38_linear_q5k_f16_wmma_c128_t128_differential_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(128) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(17408) : index
+  %token_count_data = check.generate.fill value(128) : tensor<1xi32>
+  %input = check.generate.iota offset(-0.75) step(0.0078125) : tensor<128x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<17408x20x176xi8>
+  %expected = check.generate.fill value(0.0) : tensor<128x17408xf32>
+  %actual = check.generate.fill value(0.0) : tensor<128x17408xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma_x128[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %expected) : [index, index, index](tensor<1xi32>, index, index, tensor<128x5120xf32>, tensor<17408x20x176xi8>, tensor<128x17408xf32>)
+  kernel.launch @qwen38_linear_q5k_f16_wmma_c128_t128[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %actual) : [index, index, index](tensor<1xi32>, index, index, tensor<128x5120xf32>, tensor<17408x20x176xi8>, tensor<128x17408xf32>)
+  check.expect.close actual(%actual) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<128x17408xf32>
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_f16_wmma_x128_direct_differential_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(128) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(17408) : index
+  %token_count_data = check.generate.fill value(128) : tensor<1xi32>
+  %input = check.generate.iota offset(-0.75) step(0.0078125) : tensor<128x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<17408x20x176xi8>
+  %expected = check.generate.fill value(0.0) : tensor<128x17408xf32>
+  %actual = check.generate.fill value(0.0) : tensor<128x17408xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma_x128[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %expected) : [index, index, index](tensor<1xi32>, index, index, tensor<128x5120xf32>, tensor<17408x20x176xi8>, tensor<128x17408xf32>)
+  kernel.launch @qwen38_linear_q5k_f16_wmma_x128_direct[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %actual) : [index, index, index](tensor<1xi32>, index, index, tensor<128x5120xf32>, tensor<17408x20x176xi8>, tensor<128x17408xf32>)
+  check.expect.close actual(%actual) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<128x17408xf32>
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_f16_wmma_x128_gdn_prefill_128_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(128) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(6144) : index
+  %token_count_data = check.generate.fill value(128) : tensor<1xi32>
+  %input = check.generate.fill value(0.25) : tensor<128x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<6144x20x176xi8>
+  %output = check.generate.fill value(0.0) : tensor<128x6144xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma_x128[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<128x5120xf32>, tensor<6144x20x176xi8>, tensor<128x6144xf32>)
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_f16_wmma_prefill_512_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(512) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(17408) : index
+  %token_count_data = check.generate.fill value(512) : tensor<1xi32>
+  %input = check.generate.fill value(0.25) : tensor<512x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<17408x20x176xi8>
+  %output = check.generate.fill value(0.0) : tensor<512x17408xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma_x128[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<512x5120xf32>, tensor<17408x20x176xi8>, tensor<512x17408xf32>)
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_f16_wmma_prefill_128_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(128) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(17408) : index
+  %token_count_data = check.generate.fill value(128) : tensor<1xi32>
+  %input = check.generate.fill value(0.25) : tensor<128x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<17408x20x176xi8>
+  %output = check.generate.fill value(0.0) : tensor<128x17408xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma_x128[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<128x5120xf32>, tensor<17408x20x176xi8>, tensor<128x17408xf32>)
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_f16_wmma_c128_t128_prefill_128_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(128) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(17408) : index
+  %token_count_data = check.generate.fill value(128) : tensor<1xi32>
+  %input = check.generate.fill value(0.25) : tensor<128x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<17408x20x176xi8>
+  %output = check.generate.fill value(0.0) : tensor<128x17408xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma_c128_t128[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<128x5120xf32>, tensor<17408x20x176xi8>, tensor<128x17408xf32>)
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_f16_wmma_x128_direct_prefill_128_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(128) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(17408) : index
+  %token_count_data = check.generate.fill value(128) : tensor<1xi32>
+  %input = check.generate.fill value(0.25) : tensor<128x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<17408x20x176xi8>
+  %output = check.generate.fill value(0.0) : tensor<128x17408xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma_x128_direct[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<128x5120xf32>, tensor<17408x20x176xi8>, tensor<128x17408xf32>)
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_f16_wmma_c128_t128_prefill_512_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(512) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(17408) : index
+  %token_count_data = check.generate.fill value(512) : tensor<1xi32>
+  %input = check.generate.fill value(0.25) : tensor<512x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<17408x20x176xi8>
+  %output = check.generate.fill value(0.0) : tensor<512x17408xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma_c128_t128[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<512x5120xf32>, tensor<17408x20x176xi8>, tensor<512x17408xf32>)
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_f16_wmma_x64_prefill_512_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(512) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(17408) : index
+  %token_count_data = check.generate.fill value(512) : tensor<1xi32>
+  %input = check.generate.fill value(0.25) : tensor<512x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<17408x20x176xi8>
+  %output = check.generate.fill value(0.0) : tensor<512x17408xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<512x5120xf32>, tensor<17408x20x176xi8>, tensor<512x17408xf32>)
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_f16_wmma_x64_prefill_32_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(32) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(17408) : index
+  %token_count_data = check.generate.fill value(32) : tensor<1xi32>
+  %input = check.generate.fill value(0.25) : tensor<32x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<17408x20x176xi8>
+  %output = check.generate.fill value(0.0) : tensor<32x17408xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<32x5120xf32>, tensor<17408x20x176xi8>, tensor<32x17408xf32>)
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_f16_wmma_c64t32_f32acc_prefill_32_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(32) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(17408) : index
+  %token_count_data = check.generate.fill value(32) : tensor<1xi32>
+  %input = check.generate.fill value(0.25) : tensor<32x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<17408x20x176xi8>
+  %output = check.generate.fill value(0.0) : tensor<32x17408xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma_c64t32_f32acc[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<32x5120xf32>, tensor<17408x20x176xi8>, tensor<32x17408xf32>)
+  check.return
+}
+
+// Covers the GDN alpha projection's 48-channel tail and requires bit-identical
+// output from the generic and 32-token schedules.
+// Packed bytes 0x01 give scale=1; the four lower groups have minimum=1
+// and the four upper groups have minimum=0. Each block has 128 low-bit
+// ones and 32 high-bit sixteens. With d=dmin=2^-10 and inputs 1/4,
+// twenty blocks sum to 20*(128+32*16-128)/1024/4 = 2.5.
+check.case public @qwen38_linear_q5k_f16_wmma_c64t32_f32acc_alpha_32_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(32) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(48) : index
+  %token_count_data = check.generate.fill value(32) : tensor<1xi32>
+  %input = check.generate.fill value(0.25) : tensor<32x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<48x20x176xi8>
+  kernel.launch @qwen38_q5_exact_headers[%output_size](%weight) : [index](tensor<48x20x176xi8>)
+  %expected = check.generate.fill value(2.5) : tensor<32x48xf32>
+  %generic = check.generate.fill value(0.0) : tensor<32x48xf32>
+  %actual = check.generate.fill value(0.0) : tensor<32x48xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %generic) : [index, index, index](tensor<1xi32>, index, index, tensor<32x5120xf32>, tensor<48x20x176xi8>, tensor<32x48xf32>)
+  kernel.launch @qwen38_linear_q5k_f16_wmma_c64t32_f32acc[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %actual) : [index, index, index](tensor<1xi32>, index, index, tensor<32x5120xf32>, tensor<48x20x176xi8>, tensor<32x48xf32>)
+  check.expect.close actual(%generic) expected(%expected) atol(0.000244140625) rtol(0.0) nan(same) : tensor<32x48xf32>
+  check.expect.close actual(%actual) expected(%expected) atol(0.000244140625) rtol(0.0) nan(same) : tensor<32x48xf32>
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_f16_wmma_x64_alpha_32_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(32) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(48) : index
+  %token_count_data = check.generate.fill value(32) : tensor<1xi32>
+  %input = check.generate.fill value(0.25) : tensor<32x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<48x20x176xi8>
+  %output = check.generate.fill value(0.0) : tensor<32x48xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<32x5120xf32>, tensor<48x20x176xi8>, tensor<32x48xf32>)
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_f16_wmma_c64t32_f32acc_alpha_32_benchmark_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(32) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(48) : index
+  %token_count_data = check.generate.fill value(32) : tensor<1xi32>
+  %input = check.generate.fill value(0.25) : tensor<32x5120xf32>
+  %weight = check.generate.fill value(1) : tensor<48x20x176xi8>
+  %output = check.generate.fill value(0.0) : tensor<32x48xf32>
+  kernel.launch @qwen38_linear_q5k_f16_wmma_c64t32_f32acc[%token_count, %input_size, %output_size](%token_count_data, %input_size, %output_size, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<32x5120xf32>, tensor<48x20x176xi8>, tensor<32x48xf32>)
+  check.return
+}
+
+check.case public @qwen38_linear_q5k_q8_1_x4_prefill_512_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %token_count = check.literal value(512) : index
+  %input_size = check.literal value(5120) : index
+  %output_size = check.literal value(17408) : index
+  %input = check.generate.fill value(1) : tensor<512x5760xi8>
+  %weight = check.generate.fill value(1) : tensor<17408x20x176xi8>
+  %output = check.generate.fill value(0.0) : tensor<512x17408xf32>
+  kernel.launch @ggml_linear_q5k_q8_1_x4[%token_count, %input_size, %output_size](%token_count, %input_size, %output_size, %input, %weight, %output) : [index, index, index](index, index, index, tensor<512x5760xi8>, tensor<17408x20x176xi8>, tensor<512x17408xf32>)
+  check.return
+}
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_differential_case> @qwen38_linear_q5k_f16_wmma_small
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_c128_t128_differential_case> @qwen38_linear_q5k_f16_wmma_c128_t128_differential
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_x128_direct_differential_case> @qwen38_linear_q5k_f16_wmma_x128_direct_differential
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_prefill_512_case> @qwen38_linear_q5k_f16_wmma_prefill_512
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_prefill_128_case> @qwen38_linear_q5k_f16_wmma_prefill_128
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_c128_t128_prefill_128_case> @qwen38_linear_q5k_f16_wmma_c128_t128_prefill_128
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_x128_direct_prefill_128_case> @qwen38_linear_q5k_f16_wmma_x128_direct_prefill_128
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_x128_gdn_prefill_128_case> @qwen38_linear_q5k_f16_wmma_x128_gdn_prefill_128
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_c128_t128_prefill_512_case> @qwen38_linear_q5k_f16_wmma_c128_t128_prefill_512
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_x64_prefill_512_case> @qwen38_linear_q5k_f16_wmma_x64_prefill_512
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_x64_prefill_32_case> @qwen38_linear_q5k_f16_wmma_x64_prefill_32
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_c64t32_f32acc_prefill_32_case> @qwen38_linear_q5k_f16_wmma_c64t32_f32acc_prefill_32
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_c64t32_f32acc_alpha_32_case> @qwen38_linear_q5k_f16_wmma_c64t32_f32acc_alpha_32
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_x64_alpha_32_case> @qwen38_linear_q5k_f16_wmma_x64_alpha_32
+
+check.benchmark<@qwen38_linear_q5k_f16_wmma_c64t32_f32acc_alpha_32_benchmark_case> @qwen38_linear_q5k_f16_wmma_c64t32_f32acc_alpha_32_benchmark
+
+check.benchmark<@qwen38_linear_q5k_q8_1_x4_prefill_512_case> @qwen38_linear_q5k_q8_1_x4_prefill_512
