@@ -191,6 +191,27 @@ benchmark declarations.
 python3 -B motif/tensor/test/generate_linear_tiled_oracle.py --check
 ```
 
+`linear_temporal.loom` compares seventeen full-reduction contractions with
+independent dyadic whole-matrix products. All seven row-tail sizes and five
+column-tail sizes, simultaneous interior/tail tiles, complete and incomplete
+groups, and oversized groups exercise bank ownership and guarded publication.
+Both LDS acquisition schedules run with multiple K64 transitions and the final
+no-refill drain. Model reduction widths 6144/16384 and small positive terms
+distinguish full F32 accumulation from intermediate BF16 rounding. Every
+output, guard, and immutable input compares bitwise under native, access,
+and race instrumentation.
+
+`linear_temporal_coordinates.loom` checks twenty-five logical grids, including
+both rounding axes, every remainder of an eight-row group, the model's
+4224/4608-row selections, and the maximum 65536×16384 shape. The shared VM
+reference enumerates groups, columns, and rows without the production rounding
+or division formulas. Complete pairs and guards compare exactly under native
+and access instrumentation. Both corpora declare benchmarks.
+
+```sh
+python3 -B motif/tensor/test/generate_linear_temporal_oracle.py --check
+```
+
 `rmsnorm.loom` compares retained-row normalization with a sequential F64
 sum of squares and Newton-refined inverse square root. Widths 1024 and 5120,
 workgroups of 128 and 256 threads, and F32/F16 publication exercise distinct

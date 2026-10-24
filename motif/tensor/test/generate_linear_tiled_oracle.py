@@ -30,6 +30,35 @@ GRIDS = (
 )
 
 
+GROUP_REFERENCE = '''func.def @enumerate_groups(%rows: index, %columns: index, %group: index, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %count = index.mul %rows, %columns : index
+  %view = buffer.view %output[%origin] : buffer -> view<[%count]x2xi32>
+  %end = scf.for %first_row = [%c0 to %rows step %group](%group_position = %c0 : index) -> (index) {
+    %limit = index.add %first_row, %group : index
+    %last_row = index.min %limit, %rows : index
+    %next_group = scf.for %column = [%c0 to %columns step %c1](%column_position = %group_position : index) -> (index) {
+      %next_column = scf.for %row = [%first_row to %last_row step %c1](%position = %column_position : index) -> (index) {
+        // Group/column/row enumeration visits every pair exactly once.
+        %ordinal = index.assume %position [ge(%position, 0), lt(%position, %count)] : index
+        %row_value = index.cast %row : index to i32
+        %column_value = index.cast %column : index to i32
+        view.store %row_value, %view[%ordinal, 0] : i32, view<[%count]x2xi32>
+        view.store %column_value, %view[%ordinal, 1] : i32, view<[%count]x2xi32>
+        %next = index.add %position, %c1 : index
+        scf.yield %next : index
+      }
+      scf.yield %next_column : index
+    }
+    scf.yield %next_group : index
+  }
+  func.return
+}
+'''
+
+
 def render_matrix(shape, group):
     inputs, weights, _, output, _ = observations(shape)
     name = shape.name
@@ -167,33 +196,7 @@ amdgpu.target<gfx11-generic> @coordinates_wave32 {subgroup_size = 32}
 
 template.decl @projection.linear_tiled_coordinates(%row_tiles: index, %output_tiles: index, %group_size: index) -> (index, index)
 
-func.def @enumerate_groups(%rows: index, %columns: index, %group: index, %output: buffer) {
-  %origin = index.constant 0 : offset
-  %c0 = index.constant 0 : index
-  %c1 = index.constant 1 : index
-  %count = index.mul %rows, %columns : index
-  %view = buffer.view %output[%origin] : buffer -> view<[%count]x2xi32>
-  %end = scf.for %first_row = [%c0 to %rows step %group](%group_position = %c0 : index) -> (index) {
-    %limit = index.add %first_row, %group : index
-    %last_row = index.min %limit, %rows : index
-    %next_group = scf.for %column = [%c0 to %columns step %c1](%column_position = %group_position : index) -> (index) {
-      %next_column = scf.for %row = [%first_row to %last_row step %c1](%position = %column_position : index) -> (index) {
-        // Group/column/row enumeration visits every pair exactly once.
-        %ordinal = index.assume %position [ge(%position, 0), lt(%position, %count)] : index
-        %row_value = index.cast %row : index to i32
-        %column_value = index.cast %column : index to i32
-        view.store %row_value, %view[%ordinal, 0] : i32, view<[%count]x2xi32>
-        view.store %column_value, %view[%ordinal, 1] : i32, view<[%count]x2xi32>
-        %next = index.add %position, %c1 : index
-        scf.yield %next : index
-      }
-      scf.yield %next_column : index
-    }
-    scf.yield %next_group : index
-  }
-  func.return
-}
-'''
+''' + GROUP_REFERENCE
     return {
         "linear_tiled.loom": matrix_header + "".join(render_matrix(shape, group) for shape, group in SHAPES),
         "linear_coordinates.loom": coordinate_header + "".join(render_grid(*grid) for grid in GRIDS),

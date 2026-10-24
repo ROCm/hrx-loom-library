@@ -201,6 +201,34 @@ is target-neutral. The cooperative matrix provider uses the external
 `tensor_projection_tiled_rdna3` fragment-layout binding, and composition
 selects its wave32 launch target separately.
 
+`linear_temporal.loom` retains twelve F32 result fragments per wave across
+the complete reduction. Four wave32 subgroups own a 128×96 output tile and
+alternate between two workgroup-memory banks. Each K64 panel acquires at
+most 16 KiB of activations and 12 KiB of weights; padded 128×72 and 96×72
+views use 65,024 bytes across the two banks. Fourteen queued packets per
+lane hold the next panel. A transition barrier retires the consumed bank
+and publishes the other. The final panel publishes without a refill, then
+drains without further writes. A full output tile writes 24 KiB of BF16.
+
+The caller supplies positive row/output multiples of sixteen, reduction
+widths divisible by 256, a positive traversal group size, and separate
+naturally aligned input, weight, and dense output storage. Arithmetic stays
+finite. Launch geometry is `ceil(rows/128) × ceil(outputs/96)` with 128
+threads. Missing rows and columns zero-fill panel storage; complete valid
+16×16 fragments store, with every lane participating in bank transitions.
+The read-ahead operand chooses overlapping next-pair LDS loads or loading
+each pair at a time. Both choices specialize before execution and retain
+the same full-reduction accumulator lifetime.
+
+`projection.temporal_coordinates` rounds logical dimensions into tiles and
+maps them into bounded row groups, including incomplete final groups.
+Coordinates, packet acquisition, and packet refill are target-neutral.
+Fragment-shaped providers use the external
+`tensor_projection_temporal_rdna3` identity and require wave32; composition
+supplies the concrete binding. `projection.linear_temporal_at` also accepts
+explicit uniform tile origins and a caller-owned 65,024-byte workgroup
+allocation when composition already owns those facts.
+
 `rmsnorm.loom` computes `x * rsqrt(mean(x*x) + epsilon) * weight` for one
 F32 row per workgroup. A thread retains its four-element packets across the
 reduction, so normalization reads each input once. The caller specializes the
