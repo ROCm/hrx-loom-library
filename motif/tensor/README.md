@@ -101,6 +101,23 @@ strength returns the base bits without accessing factor storage. These scalar
 and gather providers are target-neutral, with finite active arithmetic and
 naturally aligned immutable inputs.
 
+`segmented_attention.loom` attends within independent packed segments of
+128-channel BF16 heads. One complete 32-lane subgroup owns a query/head, with
+four adjacent channels per lane. Positive row, segment, and head extents are
+explicit; rows contain complete segments, coordinates are subgroup-uniform
+and in bounds, and Q/K/V storage is eight-byte aligned. The inputs are
+immutable and may overlap. The caller owns launch bounds, subsequent gating,
+and publication into separate output storage.
+
+The subgroup retains its query and first key while streaming one key/value
+row at a time. Centering keys removes their common logit term. F32 online
+maximum, normalization, and value accumulation avoid a score tensor, shared
+memory, and additional dispatches. Per query/head, logical reads are 256 bytes
+each for the query and anchor, then 512 bytes per segment row. Approximate
+exponentials and reciprocal division remain explicit, and the final values
+round to BF16. The provider requires subgroup size 32 without embedding a
+concrete backend or model configuration; active arithmetic remains finite.
+
 `linear_tiled.loom` shares BF16 activation and weight panels across eight
 wave32 subgroups. A 256-thread workgroup owns a 64×64 output tile and acquires
 64 reduction elements at a time into two padded 64×72 workgroup-memory views.
