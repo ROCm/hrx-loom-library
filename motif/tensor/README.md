@@ -95,6 +95,25 @@ launch geometry. Neither module imposes a workgroup size or target. Operands
 and arithmetic intermediates are finite; approximate activation math does not
 promise bitwise agreement across devices.
 
+`matrix.loom` contracts a caller-owned sixteen-row F16 panel against a
+sixteen-column window of another matrix. The left panel may use explicit
+physical strides, including a transposed and padded probability tile; the
+right input and output are row-major with independent origins and column
+windows. A complete 64-lane subgroup owns one output tile. The reduction is a
+compile-time multiple of sixteen, while buffer origins may remain dynamic.
+Callers own staging, barriers, output placement, and non-overlapping storage.
+
+Composition binds the external `tensor_matrix_rdna3` and
+`tensor_matrix_cdna3` targets. RDNA uses replicated sixteen-element F16 operand
+payloads and an eight-element F16 accumulator payload; CDNA uses four-element
+F16 operands and four-element F32 accumulators. Both publish F16 directly.
+The operand-count query expresses this difference explicitly instead of
+inferring it from subgroup width. Native matrix arithmetic determines internal
+reduction order and precision, so F16 accumulation does not promise the result
+of a full F32 dot product rounded once. The
+[RDNA 3 ISA, section 7.9](https://gpuopen.com/download/rdna3-shader-instruction-set-architecture-feb-2023.pdf)
+describes the WMMA instruction and its replicated operand contract.
+
 The [checks](test/README.md) use published integer answers, independent
 double-precision random transforms, and serial order-statistic references.
 These motifs participate in native GPU model programs while their composition

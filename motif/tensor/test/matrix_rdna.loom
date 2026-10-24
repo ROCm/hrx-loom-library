@@ -1,0 +1,603 @@
+// RDNA F16 matrix contracts through native 64-lane fragments.
+// The leaf supplies both external target bindings; its launch selects gfx11-generic.
+// Random integer words become exact binary fractions before execution.
+// The precision workload distinguishes per-tile F16 rounding from final-only
+// F16 publication. Layout, guards, and inputs are exact; halfway results
+// retain a one-F16-step bound under the native matrix arithmetic contract.
+
+amdgpu.target<gfx11-generic> @tensor_matrix_rdna3
+
+amdgpu.target<gfx9-4-generic> @tensor_matrix_cdna3
+
+amdgpu.target<gfx11-generic> @matrix_launch {subgroup_size = 64}
+
+template.decl @tensor.matrix.f16_16x16x16.operand_elements() -> (index)
+
+template.decl @tensor.matrix.f16_16x16.product_to_f16(%reduction_size: index, %left_columns: index, %left_layout: encoding<layout>, %left: buffer, %right_rows: index, %right_columns: index, %right: buffer, %right_origin: offset, %right_row: index, %right_column: index, %output_columns: index, %output: buffer, %output_column: index)
+
+func.decl @initialize_fraction(%count: index, %storage: buffer)
+
+func.decl @initialize_precision(%left: buffer, %right: buffer)
+
+func.decl @initialize_rounding(%left: buffer, %right: buffer)
+
+func.decl @matrix_reference(%half_accumulator: i1, %operand_elements: index, %reduction: index, %left_columns: index, %left_row_stride: index, %left_column_stride: index, %right_rows: index, %right_columns: index, %right_origin: offset, %right_row: index, %right_column: index, %output_columns: index, %output_column: index, %waves: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer)
+
+// Fixed fragment geometry with runtime origins, as in attention composition.
+kernel.def target(@matrix_launch) @project_accumulator_rounding() {
+  %unit = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%right_origin: offset, %right_row_value: index, %right_column_value: index, %output_column_value: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %reduction = index.constant 16 : index
+  %left_columns = index.constant 16 : index
+  %left_row_stride = index.constant 16 : index
+  %left_column_stride = index.constant 1 : index
+  %right_rows = index.constant 16 : index
+  %right_columns = index.constant 16 : index
+  %output_columns = index.constant 16 : index
+  %waves = index.constant 1 : index
+  %right_row = index.assume %right_row_value [range(%right_row_value, 0, 0)] : index
+  %right_column = index.assume %right_column_value [range(%right_column_value, 0, 0), multiple_of(%right_column_value, 16)] : index
+  %output_column = index.assume %output_column_value [range(%output_column_value, 0, 0), multiple_of(%output_column_value, 16)] : index
+  %tile = index.constant 16 : index
+  %wave = kernel.subgroup.id : index
+  %column_delta = index.mul %wave, %tile : index
+  %right_selected_column = index.add %right_column, %column_delta : index
+  %output_selected_column = index.add %output_column, %column_delta : index
+  %layout = encoding.layout.strided [%left_row_stride, %left_column_stride] : encoding<layout>
+  template.apply<@tensor.matrix.f16_16x16.product_to_f16>(%reduction, %left_columns, %layout, %left, %right_rows, %right_columns, %right, %right_origin, %right_row, %right_selected_column, %output_columns, %output, %output_selected_column) : (index, index, encoding<layout>, buffer, index, index, buffer, offset, index, index, index, buffer, index)
+  %workitem = kernel.workitem.id<x> : index
+  %begin = index.constant 0 : index
+  %leader = index.cmp eq, %workitem, %begin : index
+  scf.if %leader {
+    %elements = template.apply<@tensor.matrix.f16_16x16x16.operand_elements>() : () -> (index)
+    %integer = index.cast %elements : index to i32
+    %origin = index.constant 0 : offset
+    %metadata_values = buffer.view %metadata[%origin] : buffer -> view<1xi32>
+    view.store %integer, %metadata_values[0] : i32, view<1xi32>
+  }
+  kernel.return
+}
+
+func.def @reference_accumulator_rounding(%right_origin: offset, %right_row_value: index, %right_column_value: index, %output_column_value: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %reduction = index.constant 16 : index
+  %left_columns = index.constant 16 : index
+  %left_row_stride = index.constant 16 : index
+  %left_column_stride = index.constant 1 : index
+  %right_rows = index.constant 16 : index
+  %right_columns = index.constant 16 : index
+  %output_columns = index.constant 16 : index
+  %waves = index.constant 1 : index
+  %right_row = index.assume %right_row_value [range(%right_row_value, 0, 0)] : index
+  %right_column = index.assume %right_column_value [range(%right_column_value, 0, 0), multiple_of(%right_column_value, 16)] : index
+  %output_column = index.assume %output_column_value [range(%output_column_value, 0, 0), multiple_of(%output_column_value, 16)] : index
+  %half_accumulator = scalar.constant true : i1
+  %operand_elements = index.constant 16 : index
+  func.call @matrix_reference(%half_accumulator, %operand_elements, %reduction, %left_columns, %left_row_stride, %left_column_stride, %right_rows, %right_columns, %right_origin, %right_row, %right_column, %output_columns, %output_column, %waves, %left, %right, %output, %metadata) : (i1, index, index, index, index, index, index, index, offset, index, index, index, index, index, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @accumulator_rounding_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %reduction = check.literal value(16) : index
+    %left_columns = check.literal value(16) : index
+    %left_row_stride = check.literal value(16) : index
+    %left_column_stride = check.literal value(1) : index
+    %right_rows = check.literal value(16) : index
+    %right_columns = check.literal value(16) : index
+    %right_origin = check.literal value(0) : offset
+    %right_row = check.literal value(0) : index
+    %right_column = check.literal value(0) : index
+    %output_columns = check.literal value(16) : index
+    %output_column = check.literal value(0) : index
+    %waves = check.literal value(1) : index
+    %left_count = check.literal value(264) : index
+    %right_count = check.literal value(264) : index
+    %left_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %right_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %left_words = check.generate.random.uniform seed(%left_seed) range(-3 to 3) : tensor<264xi16>
+    %right_words = check.generate.random.uniform seed(%right_seed) range(-3 to 3) : tensor<264xi16>
+    check.generate<@initialize_fraction>(%left_count, %left_words) : (index, tensor<264xi16>) -> ()
+    check.generate<@initialize_fraction>(%right_count, %right_words) : (index, tensor<264xi16>) -> ()
+    %left = check.tensor.view %left_words offset(0) : tensor<264xi16> -> tensor<264xf16>
+    %right = check.tensor.view %right_words offset(0) : tensor<264xi16> -> tensor<264xf16>
+    %storage = check.generate.fill value(-99.0) : tensor<272xf16>
+    %output = check.tensor.view %storage offset(16) : tensor<272xf16> -> tensor<16x16xf16>
+    %prefix = check.tensor.view %storage offset(0) : tensor<272xf16> -> tensor<8xf16>
+    %suffix = check.tensor.view %storage offset(528) : tensor<272xf16> -> tensor<8xf16>
+    %metadata = check.generate.fill value(-1) : tensor<1xi32>
+    check.generate<@initialize_rounding>(%left, %right) : (tensor<264xf16>, tensor<264xf16>) -> ()
+    check.compare<@project_accumulator_rounding, @reference_accumulator_rounding>(%right_origin, %right_row, %right_column, %output_column, %left, %right, %output, %metadata) : (offset, index, index, index, tensor<264xf16>, tensor<264xf16>, tensor<16x16xf16>, tensor<1xi32>) -> () {
+      // Native matrix rounding can select either neighbor at a midpoint.
+      // One F16 step at magnitude one bounds the live result independently
+      // of the target's tie choice; untouched storage remains exact.
+      check.expect.close actual(%output) expected(%output) atol(0.0009765625) rtol(0.0) nan(different) : tensor<16x16xf16>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<8xf16>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<8xf16>
+      check.expect.bitwise actual(%left) expected(%left) : tensor<264xf16>
+      check.expect.bitwise actual(%right) expected(%right) : tensor<264xf16>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@accumulator_rounding_case> @accumulator_rounding
+
+// Fixed fragment geometry with runtime origins, as in attention composition.
+kernel.def target(@matrix_launch) @project_dense_tile() {
+  %unit = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%right_origin: offset, %right_row_value: index, %right_column_value: index, %output_column_value: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %reduction = index.constant 16 : index
+  %left_columns = index.constant 16 : index
+  %left_row_stride = index.constant 16 : index
+  %left_column_stride = index.constant 1 : index
+  %right_rows = index.constant 16 : index
+  %right_columns = index.constant 16 : index
+  %output_columns = index.constant 16 : index
+  %waves = index.constant 1 : index
+  %right_row = index.assume %right_row_value [range(%right_row_value, 0, 0)] : index
+  %right_column = index.assume %right_column_value [range(%right_column_value, 0, 0), multiple_of(%right_column_value, 16)] : index
+  %output_column = index.assume %output_column_value [range(%output_column_value, 0, 0), multiple_of(%output_column_value, 16)] : index
+  %tile = index.constant 16 : index
+  %wave = kernel.subgroup.id : index
+  %column_delta = index.mul %wave, %tile : index
+  %right_selected_column = index.add %right_column, %column_delta : index
+  %output_selected_column = index.add %output_column, %column_delta : index
+  %layout = encoding.layout.strided [%left_row_stride, %left_column_stride] : encoding<layout>
+  template.apply<@tensor.matrix.f16_16x16.product_to_f16>(%reduction, %left_columns, %layout, %left, %right_rows, %right_columns, %right, %right_origin, %right_row, %right_selected_column, %output_columns, %output, %output_selected_column) : (index, index, encoding<layout>, buffer, index, index, buffer, offset, index, index, index, buffer, index)
+  %workitem = kernel.workitem.id<x> : index
+  %begin = index.constant 0 : index
+  %leader = index.cmp eq, %workitem, %begin : index
+  scf.if %leader {
+    %elements = template.apply<@tensor.matrix.f16_16x16x16.operand_elements>() : () -> (index)
+    %integer = index.cast %elements : index to i32
+    %origin = index.constant 0 : offset
+    %metadata_values = buffer.view %metadata[%origin] : buffer -> view<1xi32>
+    view.store %integer, %metadata_values[0] : i32, view<1xi32>
+  }
+  kernel.return
+}
+
+func.def @reference_dense_tile(%right_origin: offset, %right_row_value: index, %right_column_value: index, %output_column_value: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %reduction = index.constant 16 : index
+  %left_columns = index.constant 16 : index
+  %left_row_stride = index.constant 16 : index
+  %left_column_stride = index.constant 1 : index
+  %right_rows = index.constant 16 : index
+  %right_columns = index.constant 16 : index
+  %output_columns = index.constant 16 : index
+  %waves = index.constant 1 : index
+  %right_row = index.assume %right_row_value [range(%right_row_value, 0, 0)] : index
+  %right_column = index.assume %right_column_value [range(%right_column_value, 0, 0), multiple_of(%right_column_value, 16)] : index
+  %output_column = index.assume %output_column_value [range(%output_column_value, 0, 0), multiple_of(%output_column_value, 16)] : index
+  %half_accumulator = scalar.constant true : i1
+  %operand_elements = index.constant 16 : index
+  func.call @matrix_reference(%half_accumulator, %operand_elements, %reduction, %left_columns, %left_row_stride, %left_column_stride, %right_rows, %right_columns, %right_origin, %right_row, %right_column, %output_columns, %output_column, %waves, %left, %right, %output, %metadata) : (i1, index, index, index, index, index, index, index, offset, index, index, index, index, index, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @dense_tile_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %reduction = check.literal value(16) : index
+    %left_columns = check.literal value(16) : index
+    %left_row_stride = check.literal value(16) : index
+    %left_column_stride = check.literal value(1) : index
+    %right_rows = check.literal value(16) : index
+    %right_columns = check.literal value(16) : index
+    %right_origin = check.literal value(0) : offset
+    %right_row = check.literal value(0) : index
+    %right_column = check.literal value(0) : index
+    %output_columns = check.literal value(16) : index
+    %output_column = check.literal value(0) : index
+    %waves = check.literal value(1) : index
+    %left_count = check.literal value(264) : index
+    %right_count = check.literal value(264) : index
+    %left_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %right_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %left_words = check.generate.random.uniform seed(%left_seed) range(-3 to 3) : tensor<264xi16>
+    %right_words = check.generate.random.uniform seed(%right_seed) range(-3 to 3) : tensor<264xi16>
+    check.generate<@initialize_fraction>(%left_count, %left_words) : (index, tensor<264xi16>) -> ()
+    check.generate<@initialize_fraction>(%right_count, %right_words) : (index, tensor<264xi16>) -> ()
+    %left = check.tensor.view %left_words offset(0) : tensor<264xi16> -> tensor<264xf16>
+    %right = check.tensor.view %right_words offset(0) : tensor<264xi16> -> tensor<264xf16>
+    %storage = check.generate.fill value(-99.0) : tensor<272xf16>
+    %output = check.tensor.view %storage offset(16) : tensor<272xf16> -> tensor<16x16xf16>
+    %metadata = check.generate.fill value(-1) : tensor<1xi32>
+    check.compare<@project_dense_tile, @reference_dense_tile>(%right_origin, %right_row, %right_column, %output_column, %left, %right, %output, %metadata) : (offset, index, index, index, tensor<264xf16>, tensor<264xf16>, tensor<16x16xf16>, tensor<1xi32>) -> () {
+      check.expect.bitwise actual(%storage) expected(%storage) : tensor<272xf16>
+      check.expect.bitwise actual(%left) expected(%left) : tensor<264xf16>
+      check.expect.bitwise actual(%right) expected(%right) : tensor<264xf16>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@dense_tile_case> @dense_tile
+
+// Fixed fragment geometry with runtime origins, as in attention composition.
+kernel.def target(@matrix_launch) @project_dense_reduction() {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%right_origin: offset, %right_row_value: index, %right_column_value: index, %output_column_value: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %reduction = index.constant 64 : index
+  %left_columns = index.constant 80 : index
+  %left_row_stride = index.constant 88 : index
+  %left_column_stride = index.constant 1 : index
+  %right_rows = index.constant 96 : index
+  %right_columns = index.constant 80 : index
+  %output_columns = index.constant 80 : index
+  %waves = index.constant 4 : index
+  %right_row = index.assume %right_row_value [range(%right_row_value, 0, 32)] : index
+  %right_column = index.assume %right_column_value [range(%right_column_value, 0, 16), multiple_of(%right_column_value, 16)] : index
+  %output_column = index.assume %output_column_value [range(%output_column_value, 0, 16), multiple_of(%output_column_value, 16)] : index
+  %tile = index.constant 16 : index
+  %wave = kernel.subgroup.id : index
+  %column_delta = index.mul %wave, %tile : index
+  %right_selected_column = index.add %right_column, %column_delta : index
+  %output_selected_column = index.add %output_column, %column_delta : index
+  %layout = encoding.layout.strided [%left_row_stride, %left_column_stride] : encoding<layout>
+  template.apply<@tensor.matrix.f16_16x16.product_to_f16>(%reduction, %left_columns, %layout, %left, %right_rows, %right_columns, %right, %right_origin, %right_row, %right_selected_column, %output_columns, %output, %output_selected_column) : (index, index, encoding<layout>, buffer, index, index, buffer, offset, index, index, index, buffer, index)
+  %workitem = kernel.workitem.id<x> : index
+  %begin = index.constant 0 : index
+  %leader = index.cmp eq, %workitem, %begin : index
+  scf.if %leader {
+    %elements = template.apply<@tensor.matrix.f16_16x16x16.operand_elements>() : () -> (index)
+    %integer = index.cast %elements : index to i32
+    %origin = index.constant 0 : offset
+    %metadata_values = buffer.view %metadata[%origin] : buffer -> view<1xi32>
+    view.store %integer, %metadata_values[0] : i32, view<1xi32>
+  }
+  kernel.return
+}
+
+func.def @reference_dense_reduction(%right_origin: offset, %right_row_value: index, %right_column_value: index, %output_column_value: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %reduction = index.constant 64 : index
+  %left_columns = index.constant 80 : index
+  %left_row_stride = index.constant 88 : index
+  %left_column_stride = index.constant 1 : index
+  %right_rows = index.constant 96 : index
+  %right_columns = index.constant 80 : index
+  %output_columns = index.constant 80 : index
+  %waves = index.constant 4 : index
+  %right_row = index.assume %right_row_value [range(%right_row_value, 0, 32)] : index
+  %right_column = index.assume %right_column_value [range(%right_column_value, 0, 16), multiple_of(%right_column_value, 16)] : index
+  %output_column = index.assume %output_column_value [range(%output_column_value, 0, 16), multiple_of(%output_column_value, 16)] : index
+  %half_accumulator = scalar.constant true : i1
+  %operand_elements = index.constant 16 : index
+  func.call @matrix_reference(%half_accumulator, %operand_elements, %reduction, %left_columns, %left_row_stride, %left_column_stride, %right_rows, %right_columns, %right_origin, %right_row, %right_column, %output_columns, %output_column, %waves, %left, %right, %output, %metadata) : (i1, index, index, index, index, index, index, index, offset, index, index, index, index, index, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @dense_reduction_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %reduction = check.literal value(64) : index
+    %left_columns = check.literal value(80) : index
+    %left_row_stride = check.literal value(88) : index
+    %left_column_stride = check.literal value(1) : index
+    %right_rows = check.literal value(96) : index
+    %right_columns = check.literal value(80) : index
+    %right_origin = check.literal value(32) : offset
+    %right_row = check.literal value(16) : index
+    %right_column = check.literal value(16) : index
+    %output_columns = check.literal value(80) : index
+    %output_column = check.literal value(16) : index
+    %waves = check.literal value(4) : index
+    %left_count = check.literal value(1408) : index
+    %right_count = check.literal value(7704) : index
+    %left_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %right_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %left_words = check.generate.random.uniform seed(%left_seed) range(-3 to 3) : tensor<1408xi16>
+    %right_words = check.generate.random.uniform seed(%right_seed) range(-3 to 3) : tensor<7704xi16>
+    check.generate<@initialize_fraction>(%left_count, %left_words) : (index, tensor<1408xi16>) -> ()
+    check.generate<@initialize_fraction>(%right_count, %right_words) : (index, tensor<7704xi16>) -> ()
+    %left = check.tensor.view %left_words offset(0) : tensor<1408xi16> -> tensor<1408xf16>
+    %right = check.tensor.view %right_words offset(0) : tensor<7704xi16> -> tensor<7704xf16>
+    %storage = check.generate.fill value(-99.0) : tensor<1296xf16>
+    %output = check.tensor.view %storage offset(16) : tensor<1296xf16> -> tensor<16x80xf16>
+    %metadata = check.generate.fill value(-1) : tensor<1xi32>
+    check.compare<@project_dense_reduction, @reference_dense_reduction>(%right_origin, %right_row, %right_column, %output_column, %left, %right, %output, %metadata) : (offset, index, index, index, tensor<1408xf16>, tensor<7704xf16>, tensor<16x80xf16>, tensor<1xi32>) -> () {
+      check.expect.bitwise actual(%storage) expected(%storage) : tensor<1296xf16>
+      check.expect.bitwise actual(%left) expected(%left) : tensor<1408xf16>
+      check.expect.bitwise actual(%right) expected(%right) : tensor<7704xf16>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@dense_reduction_case> @dense_reduction
+
+// Fixed fragment geometry with runtime origins, as in attention composition.
+kernel.def target(@matrix_launch) @project_transposed_panel() {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%right_origin: offset, %right_row_value: index, %right_column_value: index, %output_column_value: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %reduction = index.constant 64 : index
+  %left_columns = index.constant 64 : index
+  %left_row_stride = index.constant 1 : index
+  %left_column_stride = index.constant 24 : index
+  %right_rows = index.constant 96 : index
+  %right_columns = index.constant 96 : index
+  %output_columns = index.constant 96 : index
+  %waves = index.constant 4 : index
+  %right_row = index.assume %right_row_value [range(%right_row_value, 0, 32)] : index
+  %right_column = index.assume %right_column_value [range(%right_column_value, 0, 32), multiple_of(%right_column_value, 16)] : index
+  %output_column = index.assume %output_column_value [range(%output_column_value, 0, 32), multiple_of(%output_column_value, 16)] : index
+  %tile = index.constant 16 : index
+  %wave = kernel.subgroup.id : index
+  %column_delta = index.mul %wave, %tile : index
+  %right_selected_column = index.add %right_column, %column_delta : index
+  %output_selected_column = index.add %output_column, %column_delta : index
+  %layout = encoding.layout.strided [%left_row_stride, %left_column_stride] : encoding<layout>
+  template.apply<@tensor.matrix.f16_16x16.product_to_f16>(%reduction, %left_columns, %layout, %left, %right_rows, %right_columns, %right, %right_origin, %right_row, %right_selected_column, %output_columns, %output, %output_selected_column) : (index, index, encoding<layout>, buffer, index, index, buffer, offset, index, index, index, buffer, index)
+  %workitem = kernel.workitem.id<x> : index
+  %begin = index.constant 0 : index
+  %leader = index.cmp eq, %workitem, %begin : index
+  scf.if %leader {
+    %elements = template.apply<@tensor.matrix.f16_16x16x16.operand_elements>() : () -> (index)
+    %integer = index.cast %elements : index to i32
+    %origin = index.constant 0 : offset
+    %metadata_values = buffer.view %metadata[%origin] : buffer -> view<1xi32>
+    view.store %integer, %metadata_values[0] : i32, view<1xi32>
+  }
+  kernel.return
+}
+
+func.def @reference_transposed_panel(%right_origin: offset, %right_row_value: index, %right_column_value: index, %output_column_value: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %reduction = index.constant 64 : index
+  %left_columns = index.constant 64 : index
+  %left_row_stride = index.constant 1 : index
+  %left_column_stride = index.constant 24 : index
+  %right_rows = index.constant 96 : index
+  %right_columns = index.constant 96 : index
+  %output_columns = index.constant 96 : index
+  %waves = index.constant 4 : index
+  %right_row = index.assume %right_row_value [range(%right_row_value, 0, 32)] : index
+  %right_column = index.assume %right_column_value [range(%right_column_value, 0, 32), multiple_of(%right_column_value, 16)] : index
+  %output_column = index.assume %output_column_value [range(%output_column_value, 0, 32), multiple_of(%output_column_value, 16)] : index
+  %half_accumulator = scalar.constant true : i1
+  %operand_elements = index.constant 16 : index
+  func.call @matrix_reference(%half_accumulator, %operand_elements, %reduction, %left_columns, %left_row_stride, %left_column_stride, %right_rows, %right_columns, %right_origin, %right_row, %right_column, %output_columns, %output_column, %waves, %left, %right, %output, %metadata) : (i1, index, index, index, index, index, index, index, offset, index, index, index, index, index, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @transposed_panel_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %reduction = check.literal value(64) : index
+    %left_columns = check.literal value(64) : index
+    %left_row_stride = check.literal value(1) : index
+    %left_column_stride = check.literal value(24) : index
+    %right_rows = check.literal value(96) : index
+    %right_columns = check.literal value(96) : index
+    %right_origin = check.literal value(32) : offset
+    %right_row = check.literal value(16) : index
+    %right_column = check.literal value(16) : index
+    %output_columns = check.literal value(96) : index
+    %output_column = check.literal value(16) : index
+    %waves = check.literal value(4) : index
+    %left_count = check.literal value(1536) : index
+    %right_count = check.literal value(9240) : index
+    %left_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %right_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %left_words = check.generate.random.uniform seed(%left_seed) range(-3 to 3) : tensor<1536xi16>
+    %right_words = check.generate.random.uniform seed(%right_seed) range(-3 to 3) : tensor<9240xi16>
+    check.generate<@initialize_fraction>(%left_count, %left_words) : (index, tensor<1536xi16>) -> ()
+    check.generate<@initialize_fraction>(%right_count, %right_words) : (index, tensor<9240xi16>) -> ()
+    %left = check.tensor.view %left_words offset(0) : tensor<1536xi16> -> tensor<1536xf16>
+    %right = check.tensor.view %right_words offset(0) : tensor<9240xi16> -> tensor<9240xf16>
+    %storage = check.generate.fill value(-99.0) : tensor<1552xf16>
+    %output = check.tensor.view %storage offset(16) : tensor<1552xf16> -> tensor<16x96xf16>
+    %metadata = check.generate.fill value(-1) : tensor<1xi32>
+    check.compare<@project_transposed_panel, @reference_transposed_panel>(%right_origin, %right_row, %right_column, %output_column, %left, %right, %output, %metadata) : (offset, index, index, index, tensor<1536xf16>, tensor<9240xf16>, tensor<16x96xf16>, tensor<1xi32>) -> () {
+      check.expect.bitwise actual(%storage) expected(%storage) : tensor<1552xf16>
+      check.expect.bitwise actual(%left) expected(%left) : tensor<1536xf16>
+      check.expect.bitwise actual(%right) expected(%right) : tensor<9240xf16>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@transposed_panel_case> @transposed_panel
+
+// Fixed fragment geometry with runtime origins, as in attention composition.
+kernel.def target(@matrix_launch) @project_short_strided() {
+  %unit = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%right_origin: offset, %right_row_value: index, %right_column_value: index, %output_column_value: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %reduction = index.constant 16 : index
+  %left_columns = index.constant 64 : index
+  %left_row_stride = index.constant 1 : index
+  %left_column_stride = index.constant 24 : index
+  %right_rows = index.constant 32 : index
+  %right_columns = index.constant 48 : index
+  %output_columns = index.constant 48 : index
+  %waves = index.constant 1 : index
+  %right_row = index.assume %right_row_value [range(%right_row_value, 0, 16)] : index
+  %right_column = index.assume %right_column_value [range(%right_column_value, 0, 32), multiple_of(%right_column_value, 16)] : index
+  %output_column = index.assume %output_column_value [range(%output_column_value, 0, 32), multiple_of(%output_column_value, 16)] : index
+  %tile = index.constant 16 : index
+  %wave = kernel.subgroup.id : index
+  %column_delta = index.mul %wave, %tile : index
+  %right_selected_column = index.add %right_column, %column_delta : index
+  %output_selected_column = index.add %output_column, %column_delta : index
+  %layout = encoding.layout.strided [%left_row_stride, %left_column_stride] : encoding<layout>
+  template.apply<@tensor.matrix.f16_16x16.product_to_f16>(%reduction, %left_columns, %layout, %left, %right_rows, %right_columns, %right, %right_origin, %right_row, %right_selected_column, %output_columns, %output, %output_selected_column) : (index, index, encoding<layout>, buffer, index, index, buffer, offset, index, index, index, buffer, index)
+  %workitem = kernel.workitem.id<x> : index
+  %begin = index.constant 0 : index
+  %leader = index.cmp eq, %workitem, %begin : index
+  scf.if %leader {
+    %elements = template.apply<@tensor.matrix.f16_16x16x16.operand_elements>() : () -> (index)
+    %integer = index.cast %elements : index to i32
+    %origin = index.constant 0 : offset
+    %metadata_values = buffer.view %metadata[%origin] : buffer -> view<1xi32>
+    view.store %integer, %metadata_values[0] : i32, view<1xi32>
+  }
+  kernel.return
+}
+
+func.def @reference_short_strided(%right_origin: offset, %right_row_value: index, %right_column_value: index, %output_column_value: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %reduction = index.constant 16 : index
+  %left_columns = index.constant 64 : index
+  %left_row_stride = index.constant 1 : index
+  %left_column_stride = index.constant 24 : index
+  %right_rows = index.constant 32 : index
+  %right_columns = index.constant 48 : index
+  %output_columns = index.constant 48 : index
+  %waves = index.constant 1 : index
+  %right_row = index.assume %right_row_value [range(%right_row_value, 0, 16)] : index
+  %right_column = index.assume %right_column_value [range(%right_column_value, 0, 32), multiple_of(%right_column_value, 16)] : index
+  %output_column = index.assume %output_column_value [range(%output_column_value, 0, 32), multiple_of(%output_column_value, 16)] : index
+  %half_accumulator = scalar.constant true : i1
+  %operand_elements = index.constant 16 : index
+  func.call @matrix_reference(%half_accumulator, %operand_elements, %reduction, %left_columns, %left_row_stride, %left_column_stride, %right_rows, %right_columns, %right_origin, %right_row, %right_column, %output_columns, %output_column, %waves, %left, %right, %output, %metadata) : (i1, index, index, index, index, index, index, index, offset, index, index, index, index, index, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @short_strided_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %reduction = check.literal value(16) : index
+    %left_columns = check.literal value(64) : index
+    %left_row_stride = check.literal value(1) : index
+    %left_column_stride = check.literal value(24) : index
+    %right_rows = check.literal value(32) : index
+    %right_columns = check.literal value(48) : index
+    %right_origin = check.literal value(16) : offset
+    %right_row = check.literal value(16) : index
+    %right_column = check.literal value(16) : index
+    %output_columns = check.literal value(48) : index
+    %output_column = check.literal value(16) : index
+    %waves = check.literal value(1) : index
+    %left_count = check.literal value(1536) : index
+    %right_count = check.literal value(1552) : index
+    %left_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %right_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %left_words = check.generate.random.uniform seed(%left_seed) range(-3 to 3) : tensor<1536xi16>
+    %right_words = check.generate.random.uniform seed(%right_seed) range(-3 to 3) : tensor<1552xi16>
+    check.generate<@initialize_fraction>(%left_count, %left_words) : (index, tensor<1536xi16>) -> ()
+    check.generate<@initialize_fraction>(%right_count, %right_words) : (index, tensor<1552xi16>) -> ()
+    %left = check.tensor.view %left_words offset(0) : tensor<1536xi16> -> tensor<1536xf16>
+    %right = check.tensor.view %right_words offset(0) : tensor<1552xi16> -> tensor<1552xf16>
+    %storage = check.generate.fill value(-99.0) : tensor<784xf16>
+    %output = check.tensor.view %storage offset(16) : tensor<784xf16> -> tensor<16x48xf16>
+    %metadata = check.generate.fill value(-1) : tensor<1xi32>
+    check.compare<@project_short_strided, @reference_short_strided>(%right_origin, %right_row, %right_column, %output_column, %left, %right, %output, %metadata) : (offset, index, index, index, tensor<1536xf16>, tensor<1552xf16>, tensor<16x48xf16>, tensor<1xi32>) -> () {
+      check.expect.bitwise actual(%storage) expected(%storage) : tensor<784xf16>
+      check.expect.bitwise actual(%left) expected(%left) : tensor<1536xf16>
+      check.expect.bitwise actual(%right) expected(%right) : tensor<1552xf16>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@short_strided_case> @short_strided
+
+// Fixed fragment geometry with runtime origins, as in attention composition.
+kernel.def target(@matrix_launch) @project_accumulator_precision() {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%right_origin: offset, %right_row_value: index, %right_column_value: index, %output_column_value: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %reduction = index.constant 64 : index
+  %left_columns = index.constant 64 : index
+  %left_row_stride = index.constant 1 : index
+  %left_column_stride = index.constant 24 : index
+  %right_rows = index.constant 80 : index
+  %right_columns = index.constant 80 : index
+  %output_columns = index.constant 96 : index
+  %waves = index.constant 4 : index
+  %right_row = index.assume %right_row_value [range(%right_row_value, 0, 16)] : index
+  %right_column = index.assume %right_column_value [range(%right_column_value, 0, 16), multiple_of(%right_column_value, 16)] : index
+  %output_column = index.assume %output_column_value [range(%output_column_value, 0, 32), multiple_of(%output_column_value, 16)] : index
+  %tile = index.constant 16 : index
+  %wave = kernel.subgroup.id : index
+  %column_delta = index.mul %wave, %tile : index
+  %right_selected_column = index.add %right_column, %column_delta : index
+  %output_selected_column = index.add %output_column, %column_delta : index
+  %layout = encoding.layout.strided [%left_row_stride, %left_column_stride] : encoding<layout>
+  template.apply<@tensor.matrix.f16_16x16.product_to_f16>(%reduction, %left_columns, %layout, %left, %right_rows, %right_columns, %right, %right_origin, %right_row, %right_selected_column, %output_columns, %output, %output_selected_column) : (index, index, encoding<layout>, buffer, index, index, buffer, offset, index, index, index, buffer, index)
+  %workitem = kernel.workitem.id<x> : index
+  %begin = index.constant 0 : index
+  %leader = index.cmp eq, %workitem, %begin : index
+  scf.if %leader {
+    %elements = template.apply<@tensor.matrix.f16_16x16x16.operand_elements>() : () -> (index)
+    %integer = index.cast %elements : index to i32
+    %origin = index.constant 0 : offset
+    %metadata_values = buffer.view %metadata[%origin] : buffer -> view<1xi32>
+    view.store %integer, %metadata_values[0] : i32, view<1xi32>
+  }
+  kernel.return
+}
+
+func.def @reference_accumulator_precision(%right_origin: offset, %right_row_value: index, %right_column_value: index, %output_column_value: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %reduction = index.constant 64 : index
+  %left_columns = index.constant 64 : index
+  %left_row_stride = index.constant 1 : index
+  %left_column_stride = index.constant 24 : index
+  %right_rows = index.constant 80 : index
+  %right_columns = index.constant 80 : index
+  %output_columns = index.constant 96 : index
+  %waves = index.constant 4 : index
+  %right_row = index.assume %right_row_value [range(%right_row_value, 0, 16)] : index
+  %right_column = index.assume %right_column_value [range(%right_column_value, 0, 16), multiple_of(%right_column_value, 16)] : index
+  %output_column = index.assume %output_column_value [range(%output_column_value, 0, 32), multiple_of(%output_column_value, 16)] : index
+  %half_accumulator = scalar.constant true : i1
+  %operand_elements = index.constant 16 : index
+  func.call @matrix_reference(%half_accumulator, %operand_elements, %reduction, %left_columns, %left_row_stride, %left_column_stride, %right_rows, %right_columns, %right_origin, %right_row, %right_column, %output_columns, %output_column, %waves, %left, %right, %output, %metadata) : (i1, index, index, index, index, index, index, index, offset, index, index, index, index, index, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @accumulator_precision_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %reduction = check.literal value(64) : index
+    %left_columns = check.literal value(64) : index
+    %left_row_stride = check.literal value(1) : index
+    %left_column_stride = check.literal value(24) : index
+    %right_rows = check.literal value(80) : index
+    %right_columns = check.literal value(80) : index
+    %right_origin = check.literal value(32) : offset
+    %right_row = check.literal value(16) : index
+    %right_column = check.literal value(16) : index
+    %output_columns = check.literal value(96) : index
+    %output_column = check.literal value(16) : index
+    %waves = check.literal value(4) : index
+    %left_count = check.literal value(1536) : index
+    %right_count = check.literal value(6424) : index
+    %left_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %right_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %left_words = check.generate.random.uniform seed(%left_seed) range(-3 to 3) : tensor<1536xi16>
+    %right_words = check.generate.random.uniform seed(%right_seed) range(-3 to 3) : tensor<6424xi16>
+    check.generate<@initialize_fraction>(%left_count, %left_words) : (index, tensor<1536xi16>) -> ()
+    check.generate<@initialize_fraction>(%right_count, %right_words) : (index, tensor<6424xi16>) -> ()
+    %left = check.tensor.view %left_words offset(0) : tensor<1536xi16> -> tensor<1536xf16>
+    %right = check.tensor.view %right_words offset(0) : tensor<6424xi16> -> tensor<6424xf16>
+    %storage = check.generate.fill value(-99.0) : tensor<1552xf16>
+    %output = check.tensor.view %storage offset(16) : tensor<1552xf16> -> tensor<16x96xf16>
+    %metadata = check.generate.fill value(-1) : tensor<1xi32>
+    check.generate<@initialize_precision>(%left, %right) : (tensor<1536xf16>, tensor<6424xf16>) -> ()
+    check.compare<@project_accumulator_precision, @reference_accumulator_precision>(%right_origin, %right_row, %right_column, %output_column, %left, %right, %output, %metadata) : (offset, index, index, index, tensor<1536xf16>, tensor<6424xf16>, tensor<16x96xf16>, tensor<1xi32>) -> () {
+      check.expect.bitwise actual(%storage) expected(%storage) : tensor<1552xf16>
+      check.expect.bitwise actual(%left) expected(%left) : tensor<1536xf16>
+      check.expect.bitwise actual(%right) expected(%right) : tensor<6424xf16>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@accumulator_precision_case> @accumulator_precision

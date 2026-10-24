@@ -1,0 +1,165 @@
+// Independent scalar references for native 16x16 F16 matrix products.
+// Integer fixture words become multiples of 1/16. The RDNA fixtures bound
+// every partial sum to exact F16; CDNA fixtures retain exact F32 sums. The
+// precision case has a known result independent of internal product order.
+// Halfway results retain a native-arithmetic error bound against scalar RNE. The scalar oracle uses no
+// matrix fragments, layouts, or production templates.
+// All helpers remain private to each test root.
+
+func.def @initialize_fraction(%count: index, %storage: buffer) {
+  %origin = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %step = scalar.constant 0.0625 : f32
+  %integers = buffer.view %storage[%origin] : buffer -> view<[%count]xi16>
+  %halves = buffer.view %storage[%origin] : buffer -> view<[%count]xf16>
+  scf.for %element = [%begin to %count step %unit] {
+    %integer = view.load %integers[%element] : view<[%count]xi16> -> i16
+    %wide = scalar.sitofp %integer : i16 to f32
+    %value = scalar.mulf %wide, %step : f32
+    %half = scalar.fptrunc %value : f32 to f16
+    view.store %half, %halves[%element] : f16, view<[%count]xf16>
+  }
+  func.return
+}
+
+func.def @initialize_precision(%left: buffer, %right: buffer) {
+  %reduction = index.constant 64 : index
+  %left_columns = index.constant 64 : index
+  %left_row_stride = index.constant 1 : index
+  %left_column_stride = index.constant 24 : index
+  %right_rows = index.constant 80 : index
+  %right_columns = index.constant 80 : index
+  %right_origin = index.constant 32 : offset
+  %right_row = index.constant 16 : index
+  %right_column = index.constant 16 : index
+  %waves = index.constant 4 : index
+  %origin = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %tile = index.constant 16 : index
+  %last_row = index.constant 15 : index
+  %last_column = index.sub %left_columns, %unit : index
+  %last_row_offset = index.mul %last_row, %left_row_stride : index
+  %last_column_offset = index.mul %last_column, %left_column_stride : index
+  %last_element = index.add %last_row_offset, %last_column_offset : index
+  %left_count = index.add %last_element, %unit : index
+  %left_values = buffer.view %left[%origin] : buffer -> view<[%left_count]xf16>
+  %right_values = buffer.view %right[%right_origin] : buffer -> view<[%right_rows]x[%right_columns]xf16>
+  %left_factor = scalar.constant 1.0 : f16
+  %leading_value = scalar.constant 4.0 : f16
+  %following_value = scalar.constant 0.0009765625 : f16
+  %column_count = index.mul %waves, %tile : index
+  scf.for %row = [%begin to %tile step %unit] {
+    scf.for %element = [%begin to %reduction step %unit] {
+      %row_base = index.mul %row, %left_row_stride : index
+      %position = index.madd %element, %left_column_stride, %row_base : index
+      view.store %left_factor, %left_values[%position] : f16, view<[%left_count]xf16>
+    }
+  }
+  scf.for %element = [%begin to %reduction step %unit] {
+    %first_tile = index.cmp ult, %element, %tile : index
+    %value = scf.select %first_tile, %leading_value, %following_value : f16
+    %row = index.add %right_row, %element : index
+    scf.for %column = [%begin to %column_count step %unit] {
+      %position = index.add %right_column, %column : index
+      view.store %value, %right_values[%row, %position] : f16, view<[%right_rows]x[%right_columns]xf16>
+    }
+  }
+  func.return
+}
+
+func.def inline @matrix_reference(%half_accumulator: i1, %operand_elements: index, %reduction: index, %left_columns: index, %left_row_stride: index, %left_column_stride: index, %right_rows: index, %right_columns: index, %right_origin: offset, %right_row: index, %right_column: index, %output_columns: index, %output_column: index, %waves: index, %left: buffer, %right: buffer, %output: buffer, %metadata: buffer) {
+  %origin = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %tile = index.constant 16 : index
+  %last_row = index.constant 15 : index
+  %last_column = index.sub %left_columns, %unit : index
+  %last_row_offset = index.mul %last_row, %left_row_stride : index
+  %last_column_offset = index.mul %last_column, %left_column_stride : index
+  %last_element = index.add %last_row_offset, %last_column_offset : index
+  %left_count = index.add %last_element, %unit : index
+  %left_values = buffer.view %left[%origin] : buffer -> view<[%left_count]xf16>
+  %right_values = buffer.view %right[%right_origin] : buffer -> view<[%right_rows]x[%right_columns]xf16>
+  %output_values = buffer.view %output[%origin] : buffer -> view<16x[%output_columns]xf16>
+  %metadata_values = buffer.view %metadata[%origin] : buffer -> view<1xi32>
+  %elements = index.cast %operand_elements : index to i32
+  view.store %elements, %metadata_values[0] : i32, view<1xi32>
+  %column_count = index.mul %waves, %tile : index
+  %initial = scalar.constant 0.0 : f64
+  scf.for %row = [%begin to %tile step %unit] {
+    scf.for %column = [%begin to %column_count step %unit] {
+      %right_selected_column = index.add %right_column, %column : index
+      %output_selected_column = index.add %output_column, %column : index
+      %sum = scf.for %block = [%begin to %reduction step %tile](%running = %initial : f64) -> (f64) {
+        %block_end = index.add %block, %tile : index
+        %partial = scf.for %element = [%block to %block_end step %unit](%value = %running : f64) -> (f64) {
+          %left_row_base = index.mul %row, %left_row_stride : index
+          %left_position = index.madd %element, %left_column_stride, %left_row_base : index
+          %right_selected_row = index.add %right_row, %element : index
+          %left_half = view.load %left_values[%left_position] : view<[%left_count]xf16> -> f16
+          %right_half = view.load %right_values[%right_selected_row, %right_selected_column] : view<[%right_rows]x[%right_columns]xf16> -> f16
+          %left_wide = scalar.extf %left_half : f16 to f64
+          %right_wide = scalar.extf %right_half : f16 to f64
+          %product = scalar.mulf %left_wide, %right_wide : f64
+          %next = scalar.addf %value, %product : f64
+          scf.yield %next : f64
+        }
+        %rounded = scf.if %half_accumulator -> (f64) {
+          %half = scalar.fptrunc %partial : f64 to f16
+          %wide = scalar.extf %half : f16 to f64
+          scf.yield %wide : f64
+        } else {
+          %single = scalar.fptrunc %partial : f64 to f32
+          %wide = scalar.extf %single : f32 to f64
+          scf.yield %wide : f64
+        }
+        scf.yield %rounded : f64
+      }
+      %half = scalar.fptrunc %sum : f64 to f16
+      view.store %half, %output_values[%row, %output_selected_column] : f16, view<16x[%output_columns]xf16>
+    }
+  }
+  func.return
+}
+
+// Exactly two nonzero terms reach both midpoint parities with both signs.
+// Their scalar reference rounds to nearest-even; native matrix arithmetic
+// is checked within one adjacent F16 value. Other terms and the sum start at zero.
+func.def @initialize_rounding(%left: buffer, %right: buffer) {
+  %origin = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %tile = index.constant 16 : index
+  %first_pair = index.constant 2 : index
+  %pair_mask = scalar.constant 1 : i32
+  %sign_mask = scalar.constant 2 : i32
+  %clear = scalar.constant 0 : i32
+  %neutral = scalar.constant 0.0 : f16
+  %left_factor = scalar.constant 1.0 : f16
+  %even_base = scalar.constant 1.0 : f16
+  %odd_base = scalar.constant 1.0009765625 : f16
+  %half_ulp = scalar.constant 0.00048828125 : f16
+  %left_values = buffer.view %left[%origin] : buffer -> view<16x16xf16>
+  %right_values = buffer.view %right[%origin] : buffer -> view<16x16xf16>
+  scf.for %row = [%begin to %tile step %unit] {
+    scf.for %column = [%begin to %tile step %unit] {
+      view.store %left_factor, %left_values[%row, %column] : f16, view<16x16xf16>
+      %column_integer = index.cast %column : index to i32
+      %parity = scalar.andi %column_integer, %pair_mask : i32
+      %odd = scalar.cmpi ne, %parity, %clear : i32
+      %base = scf.select %odd, %odd_base, %even_base : f16
+      %initial_row = index.cmp eq, %row, %begin : index
+      %term = scf.select %initial_row, %base, %half_ulp : f16
+      %live = index.cmp ult, %row, %first_pair : index
+      %magnitude = scf.select %live, %term, %neutral : f16
+      %sign = scalar.andi %column_integer, %sign_mask : i32
+      %negative = scalar.cmpi ne, %sign, %clear : i32
+      %negated = scalar.negf %magnitude : f16
+      %value = scf.select %negative, %negated, %magnitude : f16
+      view.store %value, %right_values[%row, %column] : f16, view<16x16xf16>
+    }
+  }
+  func.return
+}

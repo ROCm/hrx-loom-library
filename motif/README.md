@@ -12,7 +12,7 @@ and specialize them with the value facts available at their composition roots.
 | [`format/`](format/) | Physical tensor representations and their reusable operations. |
 | [`linear/`](linear/) | Packed-weight contractions and reusable row schedules. |
 | [`text/`](text/) | Unicode properties, full uppercase, UTF-8 traversal, and trimming. |
-| [`tensor/`](tensor/) | Sampling, ordered selection, normalization, convolution, BF16 activations, and diffusion updates. |
+| [`tensor/`](tensor/) | Sampling, ordered selection, normalization, matrix tiles, convolution, BF16 activations, and diffusion updates. |
 | [`sequence/`](sequence/) | Model-family sequence records and retained-state coordinates. |
 | `quantize/` | Representation-independent quantization algorithms once concrete formats establish a shared contract. |
 | `attention/` | Reusable attention algorithms and schedules. |

@@ -95,3 +95,31 @@ retain storage ownership; the complete output row checks that the selected
 prefix controls the scale without suppressing later lanes. The error bound is
 `2e-7 + 2e-6 * abs(expected)`. Benchmark declarations retain each row width;
 their execution is a workload smoke check, with no throughput claim.
+
+`matrix_rdna.loom` and `matrix_cdna.loom` bind the same external template
+contracts to their concrete target families. One- and four-subgroup launches
+cover reductions of sixteen and sixty-four, row-major and transposed left
+panels, padded rows, nonzero right byte and row origins, and independent
+right/output column windows. Full output arenas include prefix, suffix, and
+row-padding guards; inputs and the queried operand payload count are exact
+observations.
+
+The scalar F64 oracle indexes flat left storage directly, without production
+fragment operations or layout objects. RDNA random inputs are integer values
+from -3 to 3 divided by sixteen: each product is an integer multiple of
+1/256, and every partial sum has magnitude at most 576/256. All such sums fit
+exactly in F16, independently of the native dot-product order. CDNA uses the
+wider -31 to 31 range, whose sums fit exactly in F32 before final F16 rounding.
+Both comparisons are bitwise.
+
+Separate constructed cases exercise native rounding and accumulator precision.
+Two nonzero terms reach both midpoint parities with both signs. The live result
+may differ from scalar nearest-even by one F16 step, `2^-10` at these values
+near magnitude one. This bounds numerical accuracy without requiring native
+matrix instructions to share scalar tie-breaking. Prefix and suffix guards,
+input bytes, and operand metadata remain bitwise comparisons on both targets.
+
+A sixty-four-term case first produces 64, then adds three sixteen-term tiles
+of 1/1024. F16 accumulation retains 64, while F32 accumulation publishes
+64.0625 in F16. This precision distinction remains exact. Every shape has a
+benchmark workload; correctness timings do not establish a throughput claim.
