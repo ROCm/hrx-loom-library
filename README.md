@@ -67,9 +67,10 @@ publications. Both Moonshine and Pocket provide source, bytecode, and mixed
 packages with native service checks.
 
 [Qwen3 Embedding](model/Qwen/Qwen3-Embedding-0.6B/OVERVIEW.md) runs on the
-Strix Halo NPU with source, bytecode, or mixed providers. Its pinned converter
-creates a standalone installation from the publisher checkpoint. The prepared
-bank is not hosted yet, so this model is not listed by the public picker.
+Strix Halo NPU with source, bytecode, or mixed providers. Fetch acquires Qwen's
+original BF16 checkpoint. The server converts projection panels directly into
+device memory during loading, and requests reuse those resident parameters.
+No weight-preparation script or converted checkpoint is required.
 
 [Qwen3.8 Flash-Next](model/Qwen/Qwen3.8-Flash-Next/OVERVIEW.md) provides text
 generation on AMD RDNA with four ordered checkpoint shards and optional

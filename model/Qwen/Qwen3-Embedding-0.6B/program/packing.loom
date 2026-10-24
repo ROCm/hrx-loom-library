@@ -1,0 +1,175 @@
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+// Initialization-only conversion from original BF16 projection row ranges.
+// One output holds a column's 28 layers in the persistent inference schedule's
+// record order. Eight cores partition those records; every checkpoint byte is
+// read once. Each core needs one 32 KiB input tile and one 18,496-byte output.
+// The runtime owns the captured input staging and the final resident storage.
+target.decl @qwen3_embedding.array
+
+target.decl @bfp16ebs8.core
+
+func.decl inline @bfp16ebs8.pack_bf16_aie2p(%storage: buffer, %input: offset, %output: offset, %count: i32)
+
+// The policy captures 128-row strips in this order for each layer:
+// Q-low, K, Q-high, V, O, gate-0, up-0, gate-1, up-1, gate-2, up-2, down.
+// Return the byte origin and source row width for one scheduled 128x128 panel.
+func.def inline @qwen3_embedding.panel_source(%ordinal: index) -> (offset, index) {
+  %c2 = index.constant 2 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  %c96 = index.constant 96 : index
+  %c120 = index.constant 120 : index
+  %width1024 = index.constant 1024 : index
+  %width2048 = index.constant 2048 : index
+  %width3072 = index.constant 3072 : index
+  %layer_bytes = index.constant 3932160 : offset
+  %strip_bytes = index.constant 262144 : offset
+  %chunk_bytes = index.constant 256 : offset
+  %layer = index.div %ordinal, %c120 : index
+  %record = index.rem %ordinal, %c120 : index
+  %layer_origin = index.scale %layer, %layer_bytes : index, offset -> offset
+  %attention = index.cmp ult, %record, %c32 : index
+  %local_origin, %width = scf.if %attention -> (offset, index) {
+    %pair = index.div %record, %c16 : index
+    %role = index.rem %record, %c2 : index
+    %pair_base = index.mul %pair, %c2 : index
+    %strip = index.add %pair_base, %role : index
+    %within = index.rem %record, %c16 : index
+    %chunk = index.div %within, %c2 : index
+    %base = index.scale %strip, %strip_bytes : index, offset -> offset
+    %relative = index.scale %chunk, %chunk_bytes : index, offset -> offset
+    %position = index.add %base, %relative : offset
+    scf.yield %position, %width1024 : offset, index
+  } else {
+    %projection = index.cmp ult, %record, %c48 : index
+    %position, %width = scf.if %projection -> (offset, index) {
+      %base = index.constant 1048576 : offset
+      %chunk = index.sub %record, %c32 : index
+      %relative = index.scale %chunk, %chunk_bytes : index, offset -> offset
+      %position = index.add %base, %relative : offset
+      scf.yield %position, %width2048 : offset, index
+    } else {
+      %gate_up = index.cmp ult, %record, %c96 : index
+      %position, %width = scf.if %gate_up -> (offset, index) {
+        %base = index.constant 1572864 : offset
+        %local = index.sub %record, %c48 : index
+        %pair = index.div %local, %c16 : index
+        %role = index.rem %local, %c2 : index
+        %pair_base = index.mul %pair, %c2 : index
+        %strip = index.add %pair_base, %role : index
+        %within = index.rem %local, %c16 : index
+        %chunk = index.div %within, %c2 : index
+        %strip_origin = index.scale %strip, %strip_bytes : index, offset -> offset
+        %chunk_origin = index.scale %chunk, %chunk_bytes : index, offset -> offset
+        %relative = index.add %strip_origin, %chunk_origin : offset
+        %position = index.add %base, %relative : offset
+        scf.yield %position, %width1024 : offset, index
+      } else {
+        %base = index.constant 3145728 : offset
+        %chunk = index.sub %record, %c96 : index
+        %relative = index.scale %chunk, %chunk_bytes : index, offset -> offset
+        %position = index.add %base, %relative : offset
+        scf.yield %position, %width3072 : offset, index
+      }
+      scf.yield %position, %width : offset, index
+    }
+    scf.yield %position, %width : offset, index
+  }
+  %origin = index.add %layer_origin, %local_origin : offset
+  func.return %origin, %width : offset, index
+}
+
+// A row block uses all three DMA address dimensions. Iterating the 16 row
+// blocks avoids a fourth address dimension while preserving native N8/K8 order.
+func.def inline @qwen3_embedding.read_panel(%width: index, %input: buffer, %origin: offset, %target: view<16x16x8x8xbf16>) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %stride = index.mul %width, %c16 : index
+  %stride_bytes = index.cast %stride : index to offset
+  %layout = encoding.layout.strided [8, %width, 1] : encoding<layout>
+  scf.for %block = [%c0 to %c16 step %c1] {
+    %relative = index.scale %block, %stride_bytes : index, offset -> offset
+    %offset = index.add %origin, %relative : offset
+    %source = buffer.view %input[%offset] : buffer -> view<16x8x8xbf16, %layout>
+    %slice = view.subview %target[%block, 0, 0, 0] : view<16x16x8x8xbf16> -> view<1x16x8x8xbf16>
+    %destination = view.bitcast %slice : view<1x16x8x8xbf16> -> view<16x8x8xbf16>
+    %copy = kernel.async.copy %source to %destination {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<16x8x8xbf16, %layout> to view<16x8x8xbf16> -> kernel.async.token
+    %group = kernel.async.group %copy : kernel.async.token -> kernel.async.group
+    kernel.async.wait %group {newer_groups = 0} : kernel.async.group
+  }
+  func.return
+}
+
+pipeline.def<kernel> public retain target(@qwen3_embedding.array) @qwen3_embedding.pack_column() run(%output_arg: buffer, %input_arg: buffer) {
+  %input_unique, %output_unique = buffer.assume.noalias %input_arg, %output_arg : buffer, buffer
+  %input, %output = buffer.assume.alignment %input_unique, %output_unique {minimum_alignment = 64} : buffer, buffer
+  %origin = index.constant 0 : offset
+  %storage_bytes = index.constant 51264 : offset
+  %packed_origin = index.constant 32768 : offset
+  %record_bytes = index.constant 18496 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %columns = index.constant 8 : index
+  %records = index.constant 3360 : index
+  %width1024 = index.constant 1024 : index
+  %width2048 = index.constant 2048 : index
+  %width3072 = index.constant 3072 : index
+  scf.for %column = [%c0 to %columns step %c1] unroll {
+    %memory = pipeline.memory<workgroup>[%column, 3] : pool
+    %storage = buffer.alloca<workgroup> pool(%memory) align(64) %storage_bytes : buffer
+    %input_slots = buffer.view %storage[%origin] : buffer -> view<1x16x16x8x8xbf16>
+    %output_slots = buffer.view %storage[%packed_origin] : buffer -> view<1x18496xi8>
+    %inputs = channel.bind<fifo> %input_slots, %c1 : view<1x16x16x8x8xbf16>, index -> channel<tile<16x16x8x8xbf16>>
+    %outputs = channel.bind<fifo> %output_slots, %c1 : view<1x18496xi8>, index -> channel<tile<18496xi8>>
+    pipeline.strand workers([%column, 2], [1, 1], [1, 1]) {
+      scf.for %record = [%column to %records step %columns] {
+        %source_origin, %width = func.call @qwen3_embedding.panel_source(%record) : (index) -> (offset, index)
+        %write, %incoming = channel.reserve %inputs : channel<tile<16x16x8x8xbf16>> -> (write<tile<16x16x8x8xbf16>>, view<16x16x8x8xbf16>)
+        %narrow = index.cmp eq, %width, %width1024 : index
+        scf.if %narrow {
+          func.call @qwen3_embedding.read_panel(%width1024, %input, %source_origin, %incoming) : (index, buffer, offset, view<16x16x8x8xbf16>)
+        } else {
+          %attention_output = index.cmp eq, %width, %width2048 : index
+          scf.if %attention_output {
+            func.call @qwen3_embedding.read_panel(%width2048, %input, %source_origin, %incoming) : (index, buffer, offset, view<16x16x8x8xbf16>)
+          } else {
+            func.call @qwen3_embedding.read_panel(%width3072, %input, %source_origin, %incoming) : (index, buffer, offset, view<16x16x8x8xbf16>)
+          }
+        }
+        channel.publish %write : write<tile<16x16x8x8xbf16>>
+        %read, %outgoing = channel.acquire %outputs : channel<tile<18496xi8>> -> (read<tile<18496xi8>>, view<18496xi8>)
+        %offset = index.scale %record, %record_bytes : index, offset -> offset
+        %destination = buffer.view %output[%offset] : buffer -> view<18496xi8>
+        %copy = kernel.async.copy %outgoing to %destination {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<18496xi8> to view<18496xi8> -> kernel.async.token
+        %group = kernel.async.group %copy : kernel.async.token -> kernel.async.group
+        kernel.async.wait %group {newer_groups = 0} : kernel.async.group
+        channel.release %read : read<tile<18496xi8>>
+      }
+    }
+    pipeline.strand workers([%column, 3], [1, 1], [1, 1]) {
+      %tail = index.constant 18432 : index
+      %padding = vector.constant 0 : vector<64xi8>
+      %count = scalar.constant 256 : i32
+      scf.for %record = [%column to %records step %columns] {
+        %read, %incoming = channel.acquire %inputs : channel<tile<16x16x8x8xbf16>> -> (read<tile<16x16x8x8xbf16>>, view<16x16x8x8xbf16>)
+        %write, %outgoing = channel.reserve %outputs : channel<tile<18496xi8>> -> (write<tile<18496xi8>>, view<18496xi8>)
+        vector.store %padding, %outgoing[%tail] : vector<64xi8>, view<18496xi8>
+        func.call @bfp16ebs8.pack_bf16_aie2p(%storage, %origin, %packed_origin, %count) : (buffer, offset, offset, i32)
+        channel.publish %write : write<tile<18496xi8>>
+        channel.release %read : read<tile<16x16x8x8xbf16>>
+      }
+    }
+  }
+}
+
+command.program.def public @qwen3_embedding.prepare_projection_column() launch(%output: buffer, %input: buffer) {
+  kernel.launch @qwen3_embedding.pack_column(%output, %input) : (buffer, buffer)
+  command.return
+}

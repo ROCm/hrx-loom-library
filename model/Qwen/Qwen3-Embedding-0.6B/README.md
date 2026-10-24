@@ -1,46 +1,28 @@
 # Developing Qwen3 Embedding
 
-The [model overview](OVERVIEW.md) describes the installed workflow, original
-checkpoint, prepared representation, and embedding request contract. Serving
-uses the installed SDK. Preparing the NPU bank uses the pinned Python
-authoring environment; neither operation needs Bazel.
+The [standalone model overview](OVERVIEW.md) describes acquisition, serving,
+requests, and the supported NPU. The installed SDK fetches Qwen's original
+BF16 checkpoint and serves it directly. Running the model requires neither
+Bazel nor a weight-preparation script.
 
-## Prepare an installation
-
-From a library checkout, convert the pinned publisher checkpoint into a new
-model directory:
+From a library checkout, select the local providers and fetch the published
+checkpoint with the checked-in lock:
 
 ```sh
-uv run model/Qwen/Qwen3-Embedding-0.6B/prepare_assets.py \
-  --output=../qwen3-embedding
+loom-fetch model/Qwen/Qwen3-Embedding-0.6B/model.json \
+  --preset=embedding --origin=library="$PWD" \
+  --output=~/models/qwen3-embedding
 
-loom-serve --model=../qwen3-embedding/model.json \
-  --device='xdna://0?columns=8' --pool_backing=fixed \
-  --listen=127.0.0.1:8080
+loom-serve --model=~/models/qwen3-embedding/model.json \
+  --device='xdna://0?columns=8' --pool_backing=fixed
 ```
 
-The converter acquires the exact checkpoint, architecture configuration, and
-tokenizer through the Hugging Face cache. It checks the architecture, packs
-projection panels layer by layer, and writes one 808,069,248-byte Safetensors
-file, including its header. Its tensor payload must match the qualified bank's
-SHA-256 before publication succeeds. The output also contains the tokenizer,
-complete source and motif closure, a relative-path model card, and its lock.
-The model card is written last, after every referenced file exists.
-
-The original checkpoint remains in the HF cache; the converted bank is a
-different representation required by this composition. `--offline` forbids
-checkpoint downloads. `uv run --offline` separately requires the Python
-packages to be cached. The converter refuses an existing output directory.
-The pinned preparation functions preserve native panel ordering, exponent and
-rounding rules, 64-byte lookahead, and the publisher's BF16 rotary values.
-Safetensors alignment by itself cannot perform this conversion.
-
-The generated directory can be served immediately or hosted as a complete
-source publication. A recipient can then use `loom-fetch URL/model.json
---output=./qwen3-embedding` and the same serving command. The repository's
-unprepared card refers to `prepared/weights.safetensors`, which is not hosted
-here or supplied by the publisher. It is therefore excluded from the public
-picker until a prepared bank is published.
+The `model` parameter scope contains `parameter/model.safetensors` from the
+original Qwen repository. The weight policy validates tensor shapes and BF16
+data types, selects source row ranges, and asks the runtime to pack the
+projection columns into their final device allocations. The model owns that
+layout; the runtime owns asynchronous reads, bounded staging, and lifetime.
+No transformed checkpoint is produced or required.
 
 ## Build source, bytecode, and mixed programs
 
@@ -61,8 +43,8 @@ and JIT specialization.
 
 Each package contains a selected `model.json`, deployment `serve.json`, and
 its provider closure. Full parameters and the tokenizer retain their acquisition
-descriptors. Bazel neither fetches nor reads the prepared bank or original
-checkpoint. `reference.md` combines the standalone overview with card facts.
+descriptors. Bazel neither fetches nor reads the checkpoint. `reference.md`
+combines the standalone overview with card facts.
 
 The [program documentation](program/README.md) explains the fixed 32-core
 placement, shared-row ownership, and numerical boundaries. The public roots are
@@ -72,13 +54,13 @@ the `model` index scope and the tokenizer through the `text` identifier.
 
 ## Run learned regressions
 
-After preparing the installation above, run the current built providers on the
-NPU with externally provisioned assets:
+After fetching the model, run the current built providers on the NPU with
+that installation supplying the external assets:
 
 ```sh
 bazel test --config=asan --config=amdgpu \
   --strategy=TestRunner=standalone \
-  --test_env=LOOM_MODEL_ASSETS="$(realpath ../qwen3-embedding)" \
+  --test_env=LOOM_MODEL_ASSETS="$HOME/models/qwen3-embedding" \
   //model/Qwen/Qwen3-Embedding-0.6B/test:embedding_source_test \
   //model/Qwen/Qwen3-Embedding-0.6B/test:embedding_archive_test \
   //model/Qwen/Qwen3-Embedding-0.6B/test:embedding_mixed_test
@@ -86,8 +68,8 @@ bazel test --config=asan --config=amdgpu \
 
 The repository's `amdgpu` build configuration enables the native AMD HAL,
 including XDNA. These explicit `manual` targets select an eight-column NPU
-context and fixed resident backing. They check independent publisher vectors, exact native
-regressions, concurrent and reordered requests, tokenization, explicit token
+context and fixed resident backing. They check independent publisher vectors,
+exact native regressions, concurrent and reordered requests, tokenization, explicit token
 IDs, output encodings, normalized prefixes, cohort bounds, and joined shutdown.
 The [test documentation](test/README.md) records the numerical acceptance and
 reference provenance.

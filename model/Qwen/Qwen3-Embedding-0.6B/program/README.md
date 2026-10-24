@@ -2,9 +2,21 @@
 
 These providers implement embedding service ABI 1 over one fixed Strix Halo
 NPU composition. Preparation binds the card's `model` parameter scope and
-`text` tokenizer. The command consumes the aligned `resident` tensor described
-in the model card; it allocates mutable cohort state independently of that
-immutable bank. Parameter preparation leaves the already packed bytes intact.
+`text` tokenizer. The checkpoint is the original publisher BF16 Safetensors
+file. The weight policy validates its tensor metadata and captures the row
+ranges needed by each of eight projection columns. `packing.loom` uses eight
+cores to gather N8/K8 panels and encode them through the shared native BFP
+motif. The runtime schedules reads through four reusable 105 MiB staging lanes
+and releases those lanes after activation. Converted bytes go directly into
+resident device allocations, never an intermediate weight file.
+
+The command passes ten independently placed parameter views to the array:
+eight projection columns, normalization/constants, and original embedding rows.
+It allocates mutable cohort state separately. The compiler owns placement;
+worker code uses offsets only within its explicit parameter view.
+`constants.loom` copies learned normalization vectors and supplies mathematical
+SiLU/rotary lookup tables embedded in the program. `targets.loom` binds the
+same NPU target for initialization and inference.
 
 Request preparation accepts text or explicit token IDs and chooses an output
 dimension between one and 1,024. Batch preparation assigns each sequence a
@@ -24,10 +36,10 @@ normalization responsibility as a constant from the placed strand.
 
 Projection arithmetic uses N8/K8 BFP16EBS8 panels, compensated BF16 operands,
 and F32 accumulators. BF16 normalization, rotary transforms, sequence-masked
-softmax, and the prepared SiLU lookup table keep their defined rounding
+softmax, and the SiLU lookup table keep their defined rounding
 boundaries. Generic native packing and requested-prefix L2 normalization come
 from the format and tensor motifs. Model-specific panel shapes and the
-resident bank's offsets remain in these providers.
+offsets within each logical parameter remain in these providers.
 
 The declaration graph in `BUILD.bazel` mirrors these ownership boundaries.
 Each provider builds to relocatable bytecode independently; runtime linking

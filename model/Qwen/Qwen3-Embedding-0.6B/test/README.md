@@ -3,7 +3,9 @@
 The source, archive, and mixed tests run the built providers through the real
 HTTP embedding service on an eight-column Strix Halo NPU context with explicit
 fixed resident backing. The caller
-supplies a prepared installation through `LOOM_MODEL_ASSETS`. The small
+supplies a `loom-fetch` installation containing the original checkpoint through
+`LOOM_MODEL_ASSETS`. Each server run exercises native parameter conversion
+during loading before the HTTP checks begin. The small
 publisher reference, checker, card, acquisition lock, and providers are Bazel
 inputs; full model weights are not. External assets are trusted to match the
 lock. Changing that lock invalidates cached results without rescanning the

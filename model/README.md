@@ -26,7 +26,7 @@ consume those projected facts and never parse the container directly.
 | [Pocket TTS](kyutai/pocket-tts/OVERVIEW.md) | Streaming speech synthesis | Three-voice default and four-voice noncommercial bank; source, bytecode, and mixed providers | Runnable on AMDGPU; independent numerical/text references and native PCM lifecycle checks |
 | [Qwen3.8 27B](Qwen/Qwen3.8-27B/OVERVIEW.md) | Text generation with optional image input | UD-Q5_K_XL, vision projector, and DFlash2 draft weights; source, bytecode, and mixed providers | Runnable text on AMD RDNA/CDNA and vision on RDNA; separate DFlash2 service qualification is pending |
 | [Qwen3.8 Flash-Next](Qwen/Qwen3.8-Flash-Next/OVERVIEW.md) | Text generation | Four ordered UD-Q4_K_XL shards, optional MTP weights; source, bytecode, and mixed providers | Runnable on AMD RDNA; independent recall, checkpoint forks, and parameter lifecycle checks |
-| [Qwen3 Embedding 0.6B](Qwen/Qwen3-Embedding-0.6B/OVERVIEW.md) | Text embeddings | Prepared BFP16EBS8 resident bank; source, bytecode, and mixed providers | Runnable on the Strix Halo NPU after conversion; independent publisher checks |
+| [Qwen3 Embedding 0.6B](Qwen/Qwen3-Embedding-0.6B/OVERVIEW.md) | Text embeddings | Original BF16 checkpoint with runtime BFP16EBS8 conversion; source, bytecode, and mixed providers | Runnable on the Strix Halo NPU; independent publisher checks |
 
 Model namespaces can begin with a portable card and generated reference before
 their executable programs are ported. Such packages describe the required
@@ -63,9 +63,9 @@ resolves card-relative provider links in the generated page.
 
 The repository-root `catalog.json` lists packages with supplied providers and
 qualified execution. Packages enter this index when their executable ports are
-admitted and all selected assets have published acquisition sources. The embedding port has
-qualified providers and a local converter; its prepared bank is not hosted, so
-it remains outside this index. Qwen3.8-27B also remains outside the index until
+admitted and all selected assets have published acquisition sources. The embedding
+port loads the original Qwen BF16 checkpoint and performs its native representation
+conversion during model loading. Qwen3.8-27B remains outside the index until
 the full-checkpoint DFlash2 service gate passes. Its text, MTP, and vision
 presets can be fetched directly from the card. Installed SDK users can inspect
 a published snapshot without a clone:
