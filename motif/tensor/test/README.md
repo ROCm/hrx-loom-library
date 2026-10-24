@@ -93,6 +93,35 @@ access, and race instrumentation. Each scenario includes a benchmark.
 python3 -B motif/tensor/test/generate_layer_mix_oracle.py --check
 ```
 
+`attention_expanded.loom` compares nineteen causal/noncausal grouped-attention
+cases with whole binary64 QK contractions, a complete masked softmax, and
+weighted values. Cases span sixteen-row tails around sixty-four-key panels,
+176-row encoder geometry, the model's 32/8 and 20/20 head ratios, arbitrary
+nonzero masks, empty leading/interior/trailing tiles, single visible keys,
+and dense, transposed, and padded V storage. Full input allocations and output
+guards compare bitwise under native, access, and race instrumentation.
+
+The numerical budget uses centered operand magnitudes, twenty-bit native
+contraction accuracy, F32 recurrence bounds, and an allowance of `2^-16` per
+approximate exponential/reciprocal. Final BF16 rounding has an explicit
+relative allowance. Single-key, zero, very-negative-score, and dedicated
+probability cases compare bitwise; the latter remain away from output
+rounding boundaries under the fixed arithmetic budget. Mutation checks
+require sensitivity to causal visibility, masks, head grouping, centered-key
+residuals, F32 rounding of an uncentered common logit, and replacing expanded
+probabilities with one BF16 term. The reference never recreates the online
+GPU recurrence or its shared-memory exchanges.
+
+`attention_expanded_epilogue.loom` separately checks every returned row/channel
+coordinate and the BF16 sigmoid/product boundary using independent scalar
+expressions. Values include signed zero, and sigmoid conversions have a margin
+against the approximate-math allowance. Omitting sigmoid rounding changes
+expected bits. Every numerical and epilogue scenario has a benchmark.
+
+```sh
+python3 -B motif/tensor/test/generate_expanded_attention_oracle.py --check
+```
+
 `attention_shared.loom` checks both K16 and K32 against whole binary64
 contractions and a dense masked softmax. Twenty-six scenarios cover complete
 query/key tiles, multiple KV heads, the model's twelve-KV-head layout, arbitrary

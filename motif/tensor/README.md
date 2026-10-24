@@ -101,6 +101,35 @@ strength returns the base bits without accessing factor storage. These scalar
 and gather providers are target-neutral, with finite active arithmetic and
 naturally aligned immutable inputs.
 
+`attention_expanded.loom` provides causal or noncausal grouped attention with
+128-channel BF16 heads. Query heads divide into equal groups sharing a KV
+head. Q/K are row-major; V's token/channel layout is explicit. Tokens form
+complete sixteen-row query tiles, while a final sixty-four-key panel may
+contain fewer complete sixteen-key tiles. A nonzero byte enables each key.
+Every query has at least one visible key; causal callers enable key zero.
+Inputs and active arithmetic are finite, and output publication is separate.
+
+Four wave64 subgroups in a 256-thread workgroup share each query panel. Shared
+memory exchanges the row ownership used by softmax with the channel ownership
+used by the value contraction, occupying 25,600 bytes without a global score
+tensor. The returned eight BF16 values contain four consecutive query rows
+and two channels per lane. The store and gate providers consume this same
+subgroup layout; the gate rounds its sigmoid to BF16 before multiplication.
+
+A shared anchor key removes the common logit term before contraction. Centered
+keys use two BF16 terms, and probabilities use three independently contracted
+BF16 terms, retaining their small F32 corrections. The denominator still uses
+unrounded probabilities. Causal attention anchors at key zero; noncausal
+attention anchors at the last physical key, which may be masked. A
+negative-infinity maximum and neutral empty-prefix rescale support that case
+without constraining valid scores to a finite sentinel range.
+
+The external `tensor_expanded_attention_rdna3` target qualifies the matrix
+fragments; composition binds it and supplies the complete wave64 launch.
+Gate/store coordinate ownership requires subgroup size 64 independently of
+that matrix backend. Input storage remains immutable, and every thread
+participates in collective shared-memory publication and retirement.
+
 `attention_shared.loom` and `attention_shared_k32.loom` implement noncausal
 128-channel BF16 attention with four query heads sharing each KV head. A
 128-thread workgroup contains four wave32 subgroups, each owning sixteen
