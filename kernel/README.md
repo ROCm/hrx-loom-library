@@ -10,6 +10,7 @@ algorithm bodies live under `motif/` and are linked into these launch surfaces.
 | Path | Contents |
 | --- | --- |
 | [`ggml/`](ggml/) | Compatibility kernels matching GGML operation semantics and execution contracts. |
+| [`sequence/`](sequence/) | Model-family acceptance, proposal, and continuation control. |
 | `attention/` | Native launchable attention kernels. |
 | `gemm/` | Native launchable matrix kernels. |
 

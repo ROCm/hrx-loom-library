@@ -3,7 +3,8 @@
 The dense Qwen3.8 and Flash-Next programs share these sequence carriers while
 retaining their own numerical kernels, preparation, and scheduling. Functions
 consume validated, caller-owned storage and preserve the original public
-`qwen38_*` linking vocabulary. They allocate nothing and choose no target or
+`qwen38_*` linking vocabulary. Input and span accessors allocate nothing;
+continuation uses bounded private scratch. None chooses a target or
 configuration.
 
 `input.loom` reads and updates contiguous token IDs or the ID field of an
@@ -31,7 +32,16 @@ to physical pages. Logical capacity determines table stride, while physical
 capacity bounds the mapped pages. A zero physical capacity selects dense
 addressing without reading a map.
 
-Epoch metadata and retained origins stay immutable until queued work retires.
+Span consumers see immutable epoch metadata and retained origins until their
+queued work retires. Continuation then publishes the next live epoch.
 Page mappings must be published before their consumers; writers cannot
 overlap another live row's anchor or writer. These are producer contracts,
 not repeated runtime validation inside each accessor.
+
+`continuation.loom` constructs the next live epoch from a queued plan and the
+first epoch's accepted results. It preserves causal and source positions as
+separate facts, compacts ordinary or media input, rewrites selected outputs,
+and retains first-result identities. Mixed-media source frontiers are saved
+before overlapping input compaction. The caller owns disjoint epoch, token,
+and result allocations and their completion lifetime. Both the device launch
+and host-side service integration checks use this same public algorithm.

@@ -1,0 +1,140 @@
+// Qwen3.8 device-owned multi-token proposal preparation and publication.
+// Both launches take mixed_inputs first: 0 for contiguous target I32 IDs or
+// 1 for eight-word target records. Draft input always contains ordinary IDs.
+// Preparation consumes a validated 2320-byte epoch with at most 16 spans,
+// extracts generated spans in order, and writes a 1548-byte draft control,
+// 64-byte origin map, and draft_capacity IDs. draft_capacity holds every live
+// generated row; target_capacity bounds the full target token allocation.
+// Advance consumes 16 predictions, publishes round 0..6 into reserved target
+// slots, and advances draft causal/source positions. Target epoch frontiers
+// remain unchanged. Buffers are disjoint; queued completion owns reuse.
+
+func.decl @qwen38_input_token(%mixed: index, %capacity: index, %inputs: buffer, %input: index) -> (i32)
+
+func.decl @qwen38_input_store_token(%mixed: index, %capacity: index, %inputs: buffer, %input: index, %id: i32)
+
+func.decl @qwen38_descriptor_source_position(%word: i32) -> (i32)
+
+func.decl @qwen38_descriptor_pack(%source_position: i32, %selection: i32) -> (i32)
+
+// Option value two requests generated inputs; value one supplies candidates,
+// and zero supplies known input. Compaction preserves target-span order and
+// records the target token origin separately from ordinary draft descriptors.
+// No target frontier changes.
+kernel.def export("qwen38_mtp_proposal_prepare") @qwen38_mtp_proposal_prepare() {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%mixed_inputs_value: index, %target_capacity_value: index, %draft_capacity_value: index, %epoch: buffer, %target_tokens: buffer, %draft: buffer, %origins: buffer, %draft_tokens: buffer) {
+  %target_capacity = index.assume %target_capacity_value [range(%target_capacity_value, 1, 2147483647)] : index
+  %draft_capacity = index.assume %draft_capacity_value [range(%draft_capacity_value, 1, 2147483647)] : index
+  %mixed_inputs = index.assume %mixed_inputs_value [range(%mixed_inputs_value, 0, 1)] : index
+  %origin = index.constant 0 : offset
+  %descriptor_origin = index.constant 12 : offset
+  %options_origin = index.constant 1804 : offset
+  %input = buffer.assume.memory_space<constant> %epoch : buffer
+  %header = buffer.view %input[%origin] : buffer -> view<3xi32>
+  %spans = buffer.view %input[%descriptor_origin] : buffer -> view<64x5xi32>
+  %options = buffer.view %input[%options_origin] : buffer -> view<64x2xi32>
+  %draft_header = buffer.view %draft[%origin] : buffer -> view<3xi32>
+  %draft_spans = buffer.view %draft[%descriptor_origin] : buffer -> view<64x5xi32>
+  %mapping = buffer.view %origins[%origin] : buffer -> view<16xi32>
+  %inputs = buffer.view %draft_tokens[%origin] : buffer -> view<[%draft_capacity]xi32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c1_2 = scalar.constant 1 : i32
+  %generated_word = scalar.constant 2 : i32
+  %c0_2 = vector.constant 0 : vector<4xi32>
+  %packet_count = index.div %draft_capacity, %c4 : index
+  %packet_end = index.mul %packet_count, %c4 : index
+  %packets = buffer.view %draft_tokens[%origin] : buffer -> view<[%packet_count]x4xi32>
+  scf.for %packet = [%c0 to %packet_count step %c1] {
+    vector.store %c0_2, %packets[%packet, 0] : vector<4xi32>, view<[%packet_count]x4xi32>
+  }
+  %padding_token = scalar.constant 0 : i32
+  scf.for %token = [%packet_end to %draft_capacity step %c1] {
+    view.store %padding_token, %inputs[%token] : i32, view<[%draft_capacity]xi32>
+  }
+  %span_word = view.load %header[1] : view<3xi32> -> i32
+  %span_value = index.cast %span_word : i32 to index
+  %span_count = index.assume %span_value [range(%span_value, 0, 16)] : index
+  %count = scf.for %span = [%c0 to %span_count step %c1](%count = %c0 : index) -> (index) {
+    %flag = view.load %options[%span, 0] : view<64x2xi32> -> i32
+    %generated = scalar.cmpi eq, %flag, %generated_word : i32
+    %next = scf.if %generated -> (index) {
+      %slot = index.assume %count [range(%count, 0, 15), lt(%count, %draft_capacity)] : index
+      %position = view.load %spans[%span, 1] : view<64x5xi32> -> i32
+      %descriptor_word = view.load %spans[%span, 4] : view<64x5xi32> -> i32
+      %source_position = func.call @qwen38_descriptor_source_position(%descriptor_word) : (i32) -> (i32)
+      %begin_word = view.load %spans[%span, 2] : view<64x5xi32> -> i32
+      %row = view.load %spans[%span, 3] : view<64x5xi32> -> i32
+      %begin_value = index.cast %begin_word : i32 to index
+      %begin = index.assume %begin_value [ge(%begin_value, 0), lt(%begin_value, %target_capacity)] : index
+      %anchor = func.call @qwen38_input_token(%mixed_inputs, %target_capacity, %target_tokens, %begin) : (index, index, buffer, index) -> (i32)
+      %slot_word = index.cast %slot : index to i32
+      %draft_descriptor = func.call @qwen38_descriptor_pack(%source_position, %slot_word) : (i32, i32) -> (i32)
+      view.store %c1_2, %draft_spans[%slot, 0] : i32, view<64x5xi32>
+      view.store %position, %draft_spans[%slot, 1] : i32, view<64x5xi32>
+      view.store %slot_word, %draft_spans[%slot, 2] : i32, view<64x5xi32>
+      view.store %row, %draft_spans[%slot, 3] : i32, view<64x5xi32>
+      view.store %draft_descriptor, %draft_spans[%slot, 4] : i32, view<64x5xi32>
+      view.store %begin_word, %mapping[%slot] : i32, view<16xi32>
+      view.store %anchor, %inputs[%slot] : i32, view<[%draft_capacity]xi32>
+      %incremented = index.add %count, %c1 : index
+      scf.yield %incremented : index
+    } else {
+      scf.yield %count : index
+    }
+    scf.yield %next : index
+  }
+  %count_word = index.cast %count : index to i32
+  view.store %count_word, %draft_header[0] : i32, view<3xi32>
+  view.store %count_word, %draft_header[1] : i32, view<3xi32>
+  view.store %count_word, %draft_header[2] : i32, view<3xi32>
+  kernel.return
+}
+
+// Publish a sampled proposal both to the next draft input and to its reserved
+// target-verifier slot. The following command consumes these writes directly.
+kernel.def export("qwen38_mtp_proposal_advance") @qwen38_mtp_proposal_advance(%round: index) {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%mixed_inputs_value: index, %round_value: index, %target_capacity_value: index, %draft_capacity_value: index, %draft: buffer, %origins: buffer, %predictions: buffer, %draft_tokens: buffer, %target_tokens: buffer) {
+  %mixed_inputs = index.assume %mixed_inputs_value [range(%mixed_inputs_value, 0, 1)] : index
+  %round = index.assume %round_value [range(%round_value, 0, 6)] : index
+  %target_capacity = index.assume %target_capacity_value [range(%target_capacity_value, 1, 2147483647)] : index
+  %draft_capacity = index.assume %draft_capacity_value [range(%draft_capacity_value, 1, 2147483647)] : index
+  %origin = index.constant 0 : offset
+  %descriptor_origin = index.constant 12 : offset
+  %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
+  %spans = buffer.view %draft[%descriptor_origin] : buffer -> view<64x5xi32>
+  %mapping = buffer.view %origins[%origin] : buffer -> view<16xi32>
+  %outputs = buffer.view %predictions[%origin] : buffer -> view<16xi32>
+  %inputs = buffer.view %draft_tokens[%origin] : buffer -> view<[%draft_capacity]xi32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c1_2 = scalar.constant 1 : i32
+  %relative = index.add %round, %c1 : index
+  %count_word = view.load %header[1] : view<3xi32> -> i32
+  %count_value = index.cast %count_word : i32 to index
+  %count = index.assume %count_value [range(%count_value, 0, 16), le(%count_value, %draft_capacity)] : index
+  scf.for %slot_value = [%c0 to %count step %c1] {
+    %slot = index.assume %slot_value [range(%slot_value, 0, 15), lt(%slot_value, %draft_capacity)] : index
+    %prediction = view.load %outputs[%slot] : view<16xi32> -> i32
+    %begin_word = view.load %mapping[%slot] : view<16xi32> -> i32
+    %begin_value = index.cast %begin_word : i32 to index
+    %begin = index.assume %begin_value [ge(%begin_value, 0), lt(%begin_value, %target_capacity)] : index
+    %destination_value = index.add %begin, %relative : index
+    %destination = index.assume %destination_value [ge(%destination_value, 0), lt(%destination_value, %target_capacity)] : index
+    func.call @qwen38_input_store_token(%mixed_inputs, %target_capacity, %target_tokens, %destination, %prediction) : (index, index, buffer, index, i32)
+    view.store %prediction, %inputs[%slot] : i32, view<[%draft_capacity]xi32>
+    %position = view.load %spans[%slot, 1] : view<64x5xi32> -> i32
+    %next_position = scalar.addi %position, %c1_2 : i32
+    view.store %next_position, %spans[%slot, 1] : i32, view<64x5xi32>
+    %descriptor_word = view.load %spans[%slot, 4] : view<64x5xi32> -> i32
+    %source_step = scalar.constant 1024 : i32
+    %next_descriptor = scalar.addi %descriptor_word, %source_step : i32
+    view.store %next_descriptor, %spans[%slot, 4] : i32, view<64x5xi32>
+  }
+  kernel.return
+}

@@ -12,6 +12,9 @@ output. No checkpoint or network access is needed.
 VM cases check exact output-span boundaries, integer-grid resize coordinates,
 complete ordinary token planes, live upload descriptors, ordinary versus
 verified continuation progress, and image frontiers across every epoch split.
+Mixed-image checks also run the real continuation algorithm and compare its
+entire compacted active plane, including splits with overlapping source and
+destination records.
 Ownership-event checks compare every resident row, including untouched KV
 origins. The epoch fixture retains sentinel padding so
 writes beyond the submitted prefix are visible. The benchmark declarations

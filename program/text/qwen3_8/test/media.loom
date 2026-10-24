@@ -3,6 +3,8 @@
 // explicit maxima, not the encoder's compressed-prefix formula. Publication
 // consumes known feedback and must preserve the same source frontier.
 
+func.decl @qwen38_continue_spans(%mixed_inputs: index, %context: index, %capacity: index, %epoch: buffer, %tokens: buffer, %results: buffer)
+
 func.decl @text_encode_epoch_v1(%control_state: buffer, %plan: buffer, %inputs: buffer, %media_plan: buffer, %first_count: i32, %next_count: i32, %input_count: i32, %first_media_count: i32, %next_media_count: i32, %first_packet_capacity: i32, %next_packet_capacity: i32, %eos: i32, %metadata: buffer, %tokens: buffer) -> (i32, buffer, i64, i64)
 
 func.decl @text_publish_epoch_v1(%plan: buffer, %media_plan: buffer, %count: i32, %first_media_count: i32, %next_media_count: i32, %verified: i32, %continues: i32, %next_speculative_mask: i32, %ordinary: buffer, %first_results: buffer, %next_results: buffer, %progress: buffer)
@@ -157,7 +159,26 @@ func.def @mixed_split_observation(%split: i32, %grid_width: i32) -> (i32) {
   %published_ok = scalar.andi %consumed_ok, %source_ok : i1
   %failure = scf.select %published_ok, %c0_i32, %c1_i32 : i32
   %published_failures = scalar.addi %failures, %failure : i32
-  func.return %published_failures : i32
+  // The production continuation compacts queued records in place. For small
+  // first banks the destination overlaps the source, so retain the exact
+  // expected records before calling it.
+  %expected = buffer.alloca<private> align(4) %token_bytes : buffer
+  buffer.fill %c0_i32, %expected[%origin], %token_bytes : i32
+  %first_capacity_index = index.cast %first_capacity : i32 to index
+  %next_capacity_index = index.cast %next_capacity : i32 to index
+  %remaining_index = index.cast %remaining : i32 to index
+  %record_bytes = index.constant 32 : offset
+  %queued_origin = index.scale %first_capacity_index, %record_bytes : index, offset -> offset
+  %queued_bytes = index.scale %remaining_index, %record_bytes : index, offset -> offset
+  %active_bytes = index.scale %next_capacity_index, %record_bytes : index, offset -> offset
+  buffer.copy %tokens[%queued_origin], %expected[%origin], %queued_bytes
+  %context = index.constant 512 : index
+  func.call @qwen38_continue_spans(%c1, %context, %next_capacity_index, %metadata, %tokens, %first_results) : (index, index, index, buffer, buffer, buffer)
+  %difference = buffer.compare %tokens[%origin], %expected[%origin], %active_bytes
+  %records_ok = scalar.cmpi eq, %difference, %c0_i32 : i32
+  %record_failure = scf.select %records_ok, %c0_i32, %c1_i32 : i32
+  %all_failures = scalar.addi %published_failures, %record_failure : i32
+  func.return %all_failures : i32
 }
 
 func.def @all_mixed_splits(%grid_width: i32) -> (i32) {
