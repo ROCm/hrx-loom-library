@@ -95,6 +95,20 @@ launch geometry. Neither module imposes a workgroup size or target. Operands
 and arithmetic intermediates are finite; approximate activation math does not
 promise bitwise agreement across devices.
 
+`image_unpack.loom` decodes one F32 pixel from a tensor of packed 2×2 BF16
+patches. Patches are ordered by spatial row and column, then channel, then the
+four pixels within the patch. The affine table contains one positive inverse
+standard deviation per channel followed by the channel means. Decoding divides
+by the inverse standard deviation and then adds the mean, rounding each F32
+operation separately.
+
+The caller supplies positive even image geometry and a valid channel and pixel
+index. Input buffers are immutable and naturally aligned for their element
+types; operands and intermediates are finite. The motif returns a scalar, so
+the composition owns tail masking, work distribution, and output placement.
+It reads each selected BF16 sample once and contains no target or launch
+configuration.
+
 `matrix.loom` contracts a caller-owned sixteen-row F16 panel against a
 sixteen-column window of another matrix. The left panel may use explicit
 physical strides, including a transposed and padded probability tile; the

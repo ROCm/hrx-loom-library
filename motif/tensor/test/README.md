@@ -86,6 +86,24 @@ by the wrapper kernel. Regenerate the authored answers with:
 python3 -B motif/tensor/test/generate_pointwise_oracle.py
 ```
 
+`image_unpack.loom` starts from independently authored channel-first pixels
+and packs its BF16 input by traversing complete 2×2 patches. Its expected
+outputs never reconstruct coordinates from a packed index. Minimum, portrait,
+landscape, exact-group, tail, and multiple-group shapes exercise one, odd, and
+sixteen channel counts with 32-, 64-, 128-, and 256-thread leaf launches.
+
+Division and mean addition use exact rational ties-to-even references for
+their separate F32 roundings. Two cancellation cases distinguish that result
+from dividing and adding before rounding. Every output bit, prefix and suffix
+guard, input sample, and affine coefficient is compared. Both ordinary native
+execution and access instrumentation use the same scenarios; each shape also
+has a benchmark declaration. The authoring generators share the exact binary
+rounding primitive in `binary_reference.py`.
+
+```sh
+python3 -B motif/tensor/test/generate_image_unpack_oracle.py --check
+```
+
 `prefix_norm.loom` compares native NPU output with a serial binary64 sum of
 squares and reciprocal norm. Widths 32, 64, 96, and 1024 exercise prefix lengths
 on either side of 16- and 32-element boundaries, including single-element and
