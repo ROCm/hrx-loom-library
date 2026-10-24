@@ -1,7 +1,7 @@
 # Pocket numerical and state checks
 
 These workloads use synthetic tensors and the public Loom case/benchmark
-runner. They need no checkpoint, prepared voice bank, or network access.
+runner. They need no checkpoint, reference recordings, or network access.
 Each test leaf declares its exact geometry and direct provider dependencies.
 
 Projection, convolution, and normalization checks use independent numerical
@@ -31,14 +31,14 @@ bazel test --config=asan --config=amdgpu \
   //model/kyutai/pocket-tts/test/...
 ```
 
-Each case has a benchmark declaration for the same bounded workload. Normal
-test execution also runs one benchmark iteration. These checks establish
-correctness and executable workload coverage; performance measurements use
-the optimized profile and a qualified measurement host.
+Numerical kernel cases include benchmark declarations for the same bounded
+workload. Normal test execution also runs one benchmark iteration. These checks
+establish correctness and executable workload coverage; performance measurements
+use the optimized profile and a qualified measurement host.
 
 ## Full learned speech
 
-The explicit `speech_*_test` targets exercise both voice banks in source,
+The explicit `speech_*_test` targets exercise both voice variants in source,
 archive, and mixed form. Each test starts the real native server with built
 providers and a separately provisioned installation. Sequential requests
 establish each voice's PCM; concurrent requests must reproduce those bytes
@@ -68,3 +68,11 @@ python dev.py format model/kyutai/pocket-tts/test/text_normalization.loom
 
 The generator requires Pocket TTS 3.3.0 and Unicode 15.0.0, imports only prompt
 preparation, and does not load model weights.
+
+The audio oracle checks every output sample, block count, trimming, and padding
+for 31 upstream cases spanning eight rates and one, two, or six channels. The
+expected arrays come from Pocket revision ec569b2, SciPy 1.18.1 `resample_poly`,
+and Torch 2.9.1 `end_on_pause`, with a 2e-6 absolute sample tolerance. Rotary
+initialization checks both planes and all 32 frequencies at 24 positions across
+the default 4096-position capacity against an independent F32-rounding/libm
+oracle, within 1.2e-7 absolute error. These fixtures contain synthetic data only.

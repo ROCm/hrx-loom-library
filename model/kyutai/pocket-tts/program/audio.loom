@@ -1,0 +1,325 @@
+// One-time voice prompt processing on the host. Original interleaved PCM is
+// mixed once, polyphase-filtered to 24 kHz, ended on a short pause, and padded
+// to Mimi's 1920-sample blocks. Synthesis retains only learned conditioning.
+
+func.def @pocket.audio_mono(%samples: buffer, %channels: i64) -> (buffer) {
+  %c1_i64 = scalar.constant 1 : i64
+  %mono = scalar.cmpi eq, %channels, %c1_i64 : i64
+  %result = scf.if %mono -> (buffer) {
+    scf.yield %samples : buffer
+  } else {
+    %origin = index.constant 0 : offset
+    %bytes = buffer.length %samples
+    %bytes64 = index.cast %bytes : offset to i64
+    %word64 = scalar.constant 4 : i64
+    %frame_bytes = scalar.muli %channels, %word64 : i64
+    %frames64 = scalar.divui %bytes64, %frame_bytes : i64
+    %frames = index.cast %frames64 : i64 to index
+    %channel_count = index.cast %channels : i64 to index
+    %word = index.constant 4 : offset
+    %length = index.scale %frames, %word : index, offset -> offset
+    %output = buffer.alloca<private> align(16) %length : buffer
+    %input = buffer.view %samples[%origin] : buffer -> view<[%frames]x[%channel_count]xf32>
+    %mixed = buffer.view %output[%origin] : buffer -> view<[%frames]xf32>
+    %c0 = index.constant 0 : index
+    %c1 = index.constant 1 : index
+    %initial = scalar.constant 0.0 : f32
+    %divisor = scalar.uitofp %channels : i64 to f32
+    scf.for %frame = [%c0 to %frames step %c1] {
+      %sum = scf.for %channel = [%c0 to %channel_count step %c1](%sum = %initial : f32) -> (f32) {
+        %sample = view.load %input[%frame, %channel] : view<[%frames]x[%channel_count]xf32> -> f32
+        %next = scalar.addf %sum, %sample : f32
+        scf.yield %next : f32
+      }
+      %sample = scalar.divf %sum, %divisor : f32
+      view.store %sample, %mixed[%frame] : f32, view<[%frames]xf32>
+    }
+    scf.yield %output : buffer
+  }
+  func.return %result : buffer
+}
+
+// Kaiser beta=5: I0(5*sqrt(1-x*x)) is evaluated directly from its squared
+// argument. Twenty terms cover x in [-1,1] to double precision without a
+// square root. The constant I0(5) cancels in the filter's DC normalization.
+func.def @pocket.audio_kaiser(%position: f64) -> (f64) {
+  %c1_f64 = scalar.constant 1.0 : f64
+  %scale = scalar.constant 6.25 : f64
+  %squared = scalar.mulf %position, %position : f64
+  %remaining = scalar.subf %c1_f64, %squared : f64
+  %argument = scalar.mulf %scale, %remaining : f64
+  %c1 = index.constant 1 : index
+  %end = index.constant 21 : index
+  %term, %sum = scf.for %i = [%c1 to %end step %c1](%term = %c1_f64 : f64, %sum = %c1_f64 : f64) -> (f64, f64) {
+    %i64 = index.cast %i : index to i64
+    %value = scalar.uitofp %i64 : i64 to f64
+    %denominator = scalar.mulf %value, %value : f64
+    %product = scalar.mulf %term, %argument : f64
+    %next_term = scalar.divf %product, %denominator : f64
+    %next_sum = scalar.addf %sum, %next_term : f64
+    scf.yield %next_term, %next_sum : f64, f64
+  }
+  func.return %sum : f64
+}
+
+// The pinned upstream resample_poly uses a 20*max(up,down)+1 tap symmetric
+// FIR, DC-normalized in F64, rounded to F32, and then multiplied by up.
+// Only the selected polyphase taps participate in each output sample.
+func.def @pocket.audio_filter(%up: i64, %down: i64) -> (buffer) {
+  %rate = scalar.maxui %up, %down : i64
+  %c10 = scalar.constant 10 : i64
+  %c2_i64 = scalar.constant 2 : i64
+  %c1_i64 = scalar.constant 1 : i64
+  %half = scalar.muli %rate, %c10 : i64
+  %extent = scalar.muli %half, %c2_i64 : i64
+  %taps64 = scalar.addi %extent, %c1_i64 : i64
+  %taps = index.cast %taps64 : i64 to index
+  %word64 = index.constant 8 : offset
+  %length64 = index.scale %taps, %word64 : index, offset -> offset
+  %coefficients = buffer.alloca<private> align(16) %length64 : buffer
+  %origin = index.constant 0 : offset
+  %raw = buffer.view %coefficients[%origin] : buffer -> view<[%taps]xf64>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %initial = scalar.constant 0.0 : f64
+  %rate_f64 = scalar.uitofp %rate : i64 to f64
+  %half_f64 = scalar.uitofp %half : i64 to f64
+  %pi = scalar.constant 3.1415926535897931 : f64
+  %c0_i64 = scalar.constant 0 : i64
+  %c1_f64 = scalar.constant 1.0 : f64
+  %sum = scf.for %i = [%c0 to %taps step %c1](%sum = %initial : f64) -> (f64) {
+    %ordinal = index.cast %i : index to i64
+    %relative = scalar.subi %ordinal, %half : i64
+    %position = scalar.sitofp %relative : i64 to f64
+    %center = scalar.cmpi eq, %relative, %c0_i64 : i64
+    %sinc = scf.if %center -> (f64) {
+      scf.yield %c1_f64 : f64
+    } else {
+      %cycles = scalar.divf %position, %rate_f64 : f64
+      %nearest = scalar.roundevenf %cycles : f64
+      %remainder = scalar.subf %cycles, %nearest : f64
+      %angle = scalar.mulf %remainder, %pi : f64
+      %angle32 = scalar.fptrunc %angle : f64 to f32
+      %sine32 = scalar.sinf<afn> %angle32 : f32
+      %sine = scalar.extf %sine32 : f32 to f64
+      %nearest64 = scalar.fptosi %nearest : f64 to i64
+      %parity = scalar.andi %nearest64, %c1_i64 : i64
+      %even = scalar.cmpi eq, %parity, %c0_i64 : i64
+      %negative = scalar.negf %sine : f64
+      %numerator = scf.select %even, %sine, %negative : f64
+      %denominator = scalar.mulf %pi, %cycles : f64
+      %value = scalar.divf %numerator, %denominator : f64
+      scf.yield %value : f64
+    }
+    %normalized = scalar.divf %position, %half_f64 : f64
+    %window = func.call @pocket.audio_kaiser(%normalized) : (f64) -> (f64)
+    %value = scalar.mulf %sinc, %window : f64
+    view.store %value, %raw[%i] : f64, view<[%taps]xf64>
+    %next_sum = scalar.addf %sum, %value : f64
+    scf.yield %next_sum : f64
+  }
+  %word = index.constant 4 : offset
+  %length = index.scale %taps, %word : index, offset -> offset
+  %output = buffer.alloca<private> align(16) %length : buffer
+  %filter = buffer.view %output[%origin] : buffer -> view<[%taps]xf32>
+  %scale = scalar.uitofp %up : i64 to f32
+  scf.for %i = [%c0 to %taps step %c1] {
+    %raw_value = view.load %raw[%i] : view<[%taps]xf64> -> f64
+    %normalized = scalar.divf %raw_value, %sum : f64
+    %rounded = scalar.fptrunc %normalized : f64 to f32
+    %value = scalar.mulf %rounded, %scale : f32
+    view.store %value, %filter[%i] : f32, view<[%taps]xf32>
+  }
+  func.return %output : buffer
+}
+
+// Reduced polyphase geometry is independent of waveform content.
+func.def public @pocket.audio_ratio(%rate: i64) -> (i64, i64) {
+  %target = scalar.constant 24000 : i64
+  %c0_i64 = scalar.constant 0 : i64
+  %gcd, %unused = scf.while(%a = %rate : i64, %b = %target : i64) -> (i64, i64) {
+    %active = scalar.cmpi ne, %b, %c0_i64 : i64
+    scf.condition %active, %a, %b : i1, i64, i64
+  } do(%a: i64, %b: i64) {
+    %remainder = scalar.remui %a, %b : i64
+    scf.yield %b, %remainder : i64, i64
+  }
+  %up = scalar.divui %target, %gcd : i64
+  %down = scalar.divui %rate, %gcd : i64
+  func.return %up, %down : i64, i64
+}
+
+func.def @pocket.audio_resample(%mono: buffer, %rate: i64) -> (buffer) {
+  %target = scalar.constant 24000 : i64
+  %identity = scalar.cmpi eq, %rate, %target : i64
+  %result = scf.if %identity -> (buffer) {
+    scf.yield %mono : buffer
+  } else {
+    %c0_i64 = scalar.constant 0 : i64
+    %c1_i64 = scalar.constant 1 : i64
+    %up, %down = func.call @pocket.audio_ratio(%rate) : (i64) -> (i64, i64)
+    %coefficients = func.call @pocket.audio_filter(%up, %down) : (i64, i64) -> (buffer)
+    %origin = index.constant 0 : offset
+    %bytes = buffer.length %mono
+    %bytes64 = index.cast %bytes : offset to i64
+    %word64 = scalar.constant 4 : i64
+    %count64 = scalar.divui %bytes64, %word64 : i64
+    %count = index.cast %count64 : i64 to index
+    %scaled = scalar.muli %count64, %up : i64
+    %tail = scalar.subi %down, %c1_i64 : i64
+    %rounded = scalar.addi %scaled, %tail : i64
+    %output_count64 = scalar.divui %rounded, %down : i64
+    %output_count = index.cast %output_count64 : i64 to index
+    %word = index.constant 4 : offset
+    %output_bytes = index.scale %output_count, %word : index, offset -> offset
+    %output = buffer.alloca<private> align(16) %output_bytes : buffer
+    %source = buffer.view %mono[%origin] : buffer -> view<[%count]xf32>
+    %samples = buffer.view %output[%origin] : buffer -> view<[%output_count]xf32>
+    %maximum = scalar.maxui %up, %down : i64
+    %c10 = scalar.constant 10 : i64
+    %c2_i64 = scalar.constant 2 : i64
+    %half = scalar.muli %maximum, %c10 : i64
+    %extent = scalar.muli %half, %c2_i64 : i64
+    %tap_count64 = scalar.addi %extent, %c1_i64 : i64
+    %tap_count = index.cast %tap_count64 : i64 to index
+    %filter = buffer.view %coefficients[%origin] : buffer -> view<[%tap_count]xf32>
+    %up_tail = scalar.subi %up, %c1_i64 : i64
+    %c0 = index.constant 0 : index
+    %c1 = index.constant 1 : index
+    %initial = scalar.constant 0.0 : f32
+    scf.for %i = [%c0 to %output_count step %c1] {
+      %i64 = index.cast %i : index to i64
+      %advance = scalar.muli %i64, %down : i64
+      %center = scalar.addi %half, %advance : i64
+      %left = scalar.subi %center, %extent : i64
+      %bounded_left = scalar.maxsi %left, %c0_i64 : i64
+      %rounded_left = scalar.addi %bounded_left, %up_tail : i64
+      %first64 = scalar.divui %rounded_left, %up : i64
+      %right = scalar.divui %center, %up : i64
+      %right_end = scalar.addi %right, %c1_i64 : i64
+      %last64 = scalar.minui %right_end, %count64 : i64
+      %first = index.cast %first64 : i64 to index
+      %last = index.cast %last64 : i64 to index
+      %value = scf.for %j = [%first to %last step %c1](%sum = %initial : f32) -> (f32) {
+        %j64 = index.cast %j : index to i64
+        %phase = scalar.muli %j64, %up : i64
+        %tap64 = scalar.subi %center, %phase : i64
+        %tap_value = index.cast %tap64 : i64 to index
+        // The intersected polyphase interval contains only source samples
+        // whose centered taps are in the finite FIR support.
+        %tap = index.assume %tap_value [ge(%tap_value, 0), lt(%tap_value, %tap_count)] : index
+        %source_position = index.assume %j [ge(%j, 0), lt(%j, %count)] : index
+        %coefficient = view.load %filter[%tap] : view<[%tap_count]xf32> -> f32
+        %sample = view.load %source[%source_position] : view<[%count]xf32> -> f32
+        %weighted = scalar.mulf %coefficient, %sample : f32
+        %next = scalar.addf %sum, %weighted : f32
+        scf.yield %next : f32
+      }
+      view.store %value, %samples[%i] : f32, view<[%output_count]xf32>
+    }
+    scf.yield %output : buffer
+  }
+  func.return %result : buffer
+}
+
+// The reference keeps the final 20ms window within 35dB of peak RMS, fades
+// that window, appends 80ms silence, and pads to a complete codec block.
+// Recordings shorter than one analysis window retain their samples unchanged.
+func.def @pocket.audio_end_on_pause(%samples: buffer) -> (buffer, i32) {
+  %origin = index.constant 0 : offset
+  %bytes = buffer.length %samples
+  %bytes64 = index.cast %bytes : offset to i64
+  %word64 = scalar.constant 4 : i64
+  %count64 = scalar.divui %bytes64, %word64 : i64
+  %count = index.cast %count64 : i64 to index
+  %source = buffer.view %samples[%origin] : buffer -> view<[%count]xf32>
+  %window = index.constant 480 : index
+  %windows = index.div %count, %window : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %has_windows = index.cmp ne, %windows, %c0 : index
+  %end = scf.if %has_windows -> (index) {
+    %word = index.constant 4 : offset
+    %level_bytes = index.scale %windows, %word : index, offset -> offset
+    %level_storage = buffer.alloca<private> align(16) %level_bytes : buffer
+    %levels = buffer.view %level_storage[%origin] : buffer -> view<[%windows]xf32>
+    %initial = scalar.constant 0.0 : f32
+    %minimum = scalar.constant 0.0 : f32
+    %divisor = scalar.constant 480.0 : f32
+    %epsilon = scalar.constant 9.9999999999999998e-13 : f32
+    %peak = scf.for %i = [%c0 to %windows step %c1](%peak = %minimum : f32) -> (f32) {
+      %begin = index.mul %i, %window : index
+      %limit = index.add %begin, %window : index
+      %sum = scf.for %j = [%begin to %limit step %c1](%sum = %initial : f32) -> (f32) {
+        // Only complete analysis windows enter this loop.
+        %position = index.assume %j [ge(%j, 0), lt(%j, %count)] : index
+        %sample = view.load %source[%position] : view<[%count]xf32> -> f32
+        %square = scalar.mulf %sample, %sample : f32
+        %next = scalar.addf %sum, %square : f32
+        scf.yield %next : f32
+      }
+      %mean = scalar.divf %sum, %divisor : f32
+      %rms = scalar.sqrtf %mean : f32
+      %level = scalar.addf %rms, %epsilon : f32
+      view.store %level, %levels[%i] : f32, view<[%windows]xf32>
+      %next_peak = scalar.maximumf %peak, %level : f32
+      scf.yield %next_peak : f32
+    }
+    // log10 is monotone: a 35 dB window is the RMS ratio 10^(-35/20).
+    %ratio = scalar.constant 0.017782794100389229 : f32
+    %threshold = scalar.mulf %peak, %ratio : f32
+    %last = scf.for %i = [%c0 to %windows step %c1](%last = %c1 : index) -> (index) {
+      %level = view.load %levels[%i] : view<[%windows]xf32> -> f32
+      %loud = scalar.cmpf ogt, %level, %threshold : f32
+      %next = index.add %i, %c1 : index
+      %selected = scf.select %loud, %next, %last : index
+      scf.yield %selected : index
+    }
+    %end = index.mul %last, %window : index
+    scf.yield %end : index
+  } else {
+    scf.yield %count : index
+  }
+  %block = index.constant 1920 : index
+  %paused = index.add %end, %block : index
+  %length = scf.select %has_windows, %paused, %end : index
+  %tail = index.constant 1919 : index
+  %rounded = index.add %length, %tail : index
+  %blocks = index.div %rounded, %block : index
+  %padded = index.mul %blocks, %block : index
+  %word = index.constant 4 : offset
+  %output_bytes = index.scale %padded, %word : index, offset -> offset
+  %output = buffer.alloca<private> align(16) %output_bytes : buffer
+  %c0_i32 = scalar.constant 0 : i32
+  buffer.fill %c0_i32, %output[%origin], %output_bytes : i32
+  %retained_bytes = index.scale %end, %word : index, offset -> offset
+  buffer.copy %samples[%origin], %output[%origin], %retained_bytes
+  scf.if %has_windows {
+    %fade_begin = index.sub %end, %window : index
+    %values = buffer.view %output[%origin] : buffer -> view<[%padded]xf32>
+    %denominator = scalar.constant 479.0 : f32
+    %c1_f32 = scalar.constant 1.0 : f32
+    scf.for %i = [%c0 to %window step %c1] {
+      %i64 = index.cast %i : index to i64
+      %i_f32 = scalar.uitofp %i64 : i64 to f32
+      %fraction = scalar.divf %i_f32, %denominator : f32
+      %scale = scalar.subf %c1_f32, %fraction : f32
+      %position_value = index.add %fade_begin, %i : index
+      // The peak window always exceeds peak minus 35 dB, so at least one
+      // complete window survives and the fade stays within that prefix.
+      %position = index.assume %position_value [ge(%position_value, 0), lt(%position_value, %padded)] : index
+      %sample = view.load %values[%position] : view<[%padded]xf32> -> f32
+      %faded = scalar.mulf %sample, %scale : f32
+      view.store %faded, %values[%position] : f32, view<[%padded]xf32>
+    }
+  }
+  %blocks32 = index.cast %blocks : index to i32
+  func.return %output, %blocks32 : buffer, i32
+}
+
+func.def public @pocket.prepare_audio(%samples: buffer, %sample_rate: i64, %channels: i64) -> (buffer, i32) {
+  %mono = func.call @pocket.audio_mono(%samples, %channels) : (buffer, i64) -> (buffer)
+  %resampled = func.call @pocket.audio_resample(%mono, %sample_rate) : (buffer, i64) -> (buffer)
+  %output, %blocks = func.call @pocket.audio_end_on_pause(%resampled) : (buffer) -> (buffer, i32)
+  func.return %output, %blocks : buffer, i32
+}

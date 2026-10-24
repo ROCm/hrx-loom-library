@@ -1,0 +1,70 @@
+// The model generates its rotary tables once during CPU preparation. Frequencies
+// use Pocket's F32-rounded exp(i * F32(-log(10000)/32)) convention. They are
+// fixed architectural coefficients, independent of weights or voice recordings.
+
+global.rodata.def @pocket.rotary_frequencies = align(16) bytes("0000803f11f93f3f9af50f3f9ae8d73e9be8a13e22d4723e8718363e778d083ecccccc3d0d94993dc155663d15ba2c3de286013d4e43c23c39ad913cf17b5a3c0ad7233cadb9f53b9a44b83b752e8a3b333e4f3b0d691b3b2815e93a8ec9ae3a6e12833a8a94443a146a133a2117dd3961cba5390da8783953773a396dd40b39")
+
+// Both planes form the immutable prefix of the shared conditioning buffer.
+template.decl pure @pocket.rotary_size(%capacity: index) -> (offset)
+
+template.def<@pocket.rotary_size> pure @pocket_rotary_size(%capacity: index) -> (offset) {
+  %stride = index.constant 256 : offset
+  %bytes = index.scale %capacity, %stride : index, offset -> offset
+  template.return %bytes : offset
+}
+
+func.def public @pocket.prepare_rotary(%capacity32: i32) -> (buffer) {
+  %capacity = index.cast %capacity32 : i32 to index
+  %bytes = template.apply<@pocket.rotary_size>(%capacity) pure : (index) -> (offset)
+  %output = buffer.alloca<private> align(16) %bytes : buffer
+  %origin = index.constant 0 : offset
+  %row_bytes = index.constant 128 : offset
+  %sine_origin = index.scale %capacity, %row_bytes : index, offset -> offset
+  %cosine = buffer.view %output[%origin] : buffer -> view<[%capacity]x32xf32>
+  %sine = buffer.view %output[%sine_origin] : buffer -> view<[%capacity]x32xf32>
+  %frequency_storage = global.load @pocket.rotary_frequencies : buffer
+  %frequencies = buffer.view %frequency_storage[%origin] : buffer -> view<32xf32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %columns = index.constant 32 : index
+  scf.for %i = [%c0 to %capacity step %c1] {
+    %position64 = index.cast %i : index to i64
+    %position = scalar.uitofp %position64 : i64 to f32
+    scf.for %j = [%c0 to %columns step %c1] {
+      %frequency = view.load %frequencies[%j] : view<32xf32> -> f32
+      %angle = scalar.mulf %position, %frequency : f32
+      // Reduce the F32-rounded angle in F64 before native approximation;
+      // converting a large angle to F32 turns discards its low phase bits.
+      %angle64 = scalar.extf %angle : f32 to f64
+      %inverse_half_pi = scalar.constant 0.63661977236758138 : f64
+      %half_pi = scalar.constant 1.5707963267948966 : f64
+      %quarter_turns = scalar.mulf %angle64, %inverse_half_pi : f64
+      %rounded = scalar.roundevenf %quarter_turns : f64
+      %whole = scalar.mulf %rounded, %half_pi : f64
+      %residual64 = scalar.subf %angle64, %whole : f64
+      %residual = scalar.fptrunc %residual64 : f64 to f32
+      %cosine_residual = scalar.cosf<afn> %residual : f32
+      %sine_residual = scalar.sinf<afn> %residual : f32
+      %quadrant = scalar.fptoui %rounded : f64 to i32
+      %c1_i32 = scalar.constant 1 : i32
+      %c2_i32 = scalar.constant 2 : i32
+      %c0_i32 = scalar.constant 0 : i32
+      %odd_bit = scalar.andi %quadrant, %c1_i32 : i32
+      %odd = scalar.cmpi ne, %odd_bit, %c0_i32 : i32
+      %cosine_magnitude = scf.select %odd, %sine_residual, %cosine_residual : f32
+      %sine_magnitude = scf.select %odd, %cosine_residual, %sine_residual : f32
+      %next_quadrant = scalar.addi %quadrant, %c1_i32 : i32
+      %cosine_bit = scalar.andi %next_quadrant, %c2_i32 : i32
+      %sine_bit = scalar.andi %quadrant, %c2_i32 : i32
+      %negate_cosine = scalar.cmpi ne, %cosine_bit, %c0_i32 : i32
+      %negate_sine = scalar.cmpi ne, %sine_bit, %c0_i32 : i32
+      %negative_cosine = scalar.negf %cosine_magnitude : f32
+      %negative_sine = scalar.negf %sine_magnitude : f32
+      %cosine_value = scf.select %negate_cosine, %negative_cosine, %cosine_magnitude : f32
+      %sine_value = scf.select %negate_sine, %negative_sine, %sine_magnitude : f32
+      view.store %cosine_value, %cosine[%i, %j] : f32, view<[%capacity]x32xf32>
+      view.store %sine_value, %sine[%i, %j] : f32, view<[%capacity]x32xf32>
+    }
+  }
+  func.return %output : buffer
+}

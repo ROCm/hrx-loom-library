@@ -1,0 +1,72 @@
+// One-time upload preparation. The native service supplies decoded finite
+// interleaved F32 PCM and a reserved slot. Only this request retains the
+// processed waveform; the published voice contains slot and prefix geometry.
+
+func.decl @pocket.check(%condition: i1, %diagnostic: buffer)
+
+func.decl @pocket.audio_ratio(%rate: i64) -> (i64, i64)
+
+func.decl @pocket.prepare_audio(%samples: buffer, %sample_rate: i64, %channels: i64) -> (buffer, i32)
+
+// Pocket voice processing exceeds voice_audio_capacity
+global.rodata.def @pocket.audio_capacity_error = bytes("506f636b657420766f6963652070726f63657373696e67206578636565647320766f6963655f617564696f5f6361706163697479")
+
+// Pocket processed voice must contain 1..voice_frame_capacity blocks
+global.rodata.def @pocket.voice_frames_error = bytes("506f636b65742070726f63657373656420766f696365206d75737420636f6e7461696e20312e2e766f6963655f6672616d655f636170616369747920626c6f636b73")
+
+func.def public @speech_prepare_voice_v2(%model: buffer, %slot: i64, %samples: buffer, %sample_rate: i64, %channels: i64) -> (buffer, buffer, buffer) {
+  %origin = index.constant 0 : offset
+  %model_header = buffer.view %model[%origin] : buffer -> view<12xi32>
+  %audio_capacity32 = view.load %model_header[9] : view<12xi32> -> i32
+  %audio_capacity = scalar.extui %audio_capacity32 : i32 to i64
+  %bytes = buffer.length %samples
+  %bytes64 = index.cast %bytes : offset to i64
+  %c4_i64 = scalar.constant 4 : i64
+  %frame_bytes = scalar.muli %channels, %c4_i64 : i64
+  %frames = scalar.divui %bytes64, %frame_bytes : i64
+  %up, %down = func.call @pocket.audio_ratio(%sample_rate) : (i64) -> (i64, i64)
+  %c1_i64 = scalar.constant 1 : i64
+  %tail = scalar.subi %down, %c1_i64 : i64
+  %scaled = scalar.muli %frames, %up : i64
+  %rounded = scalar.addi %scaled, %tail : i64
+  %resampled = scalar.divui %rounded, %down : i64
+  %sample_bytes = scalar.muli %resampled, %c4_i64 : i64
+  %ratio = scalar.maxui %up, %down : i64
+  %taps_per_ratio = scalar.constant 20 : i64
+  %extent = scalar.muli %ratio, %taps_per_ratio : i64
+  %taps = scalar.addi %extent, %c1_i64 : i64
+  %coefficient_bytes = scalar.constant 12 : i64
+  %filter_bytes = scalar.muli %taps, %coefficient_bytes : i64
+  %samples_fit = scalar.cmpi ule, %sample_bytes, %audio_capacity : i64
+  %filter_fits = scalar.cmpi ule, %filter_bytes, %audio_capacity : i64
+  %fits = scalar.andi %samples_fit, %filter_fits : i1
+  %capacity_error = global.load @pocket.audio_capacity_error : buffer
+  func.call @pocket.check(%fits, %capacity_error) : (i1, buffer)
+  %processed, %blocks = func.call @pocket.prepare_audio(%samples, %sample_rate, %channels) : (buffer, i64, i64) -> (buffer, i32)
+  %maximum = view.load %model_header[8] : view<12xi32> -> i32
+  %c0 = scalar.constant 0 : i32
+  %nonempty = scalar.cmpi ugt, %blocks, %c0 : i32
+  %bounded = scalar.cmpi ule, %blocks, %maximum : i32
+  %valid = scalar.andi %nonempty, %bounded : i1
+  %frames_error = global.load @pocket.voice_frames_error : buffer
+  func.call @pocket.check(%valid, %frames_error) : (i1, buffer)
+  %voice_bytes = index.constant 8 : offset
+  %voice = buffer.alloca<private> align(8) %voice_bytes : buffer
+  %voice_header = buffer.view %voice[%origin] : buffer -> view<2xi32>
+  %slot32 = scalar.trunci %slot : i64 to i32
+  view.store %slot32, %voice_header[0] : i32, view<2xi32>
+  view.store %blocks, %voice_header[1] : i32, view<2xi32>
+  %header_bytes = index.constant 48 : offset
+  %processed_bytes = buffer.length %processed
+  %state_bytes = index.add %header_bytes, %processed_bytes : offset
+  %state = buffer.alloca<private> align(8) %state_bytes : buffer
+  buffer.fill %c0, %state[%origin], %header_bytes : i32
+  buffer.copy %processed[%origin], %state[%header_bytes], %processed_bytes
+  %header = buffer.view %state[%origin] : buffer -> view<8xi32>
+  view.store %slot32, %header[2] : i32, view<8xi32>
+  view.store %blocks, %header[3] : i32, view<8xi32>
+  %payload_bytes = index.constant 16 : offset
+  %payload = buffer.alloca<private> align(8) %payload_bytes : buffer
+  buffer.fill %c0, %payload[%origin], %payload_bytes : i32
+  func.return %voice, %state, %payload : buffer, buffer, buffer
+}

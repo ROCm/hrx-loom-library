@@ -61,7 +61,7 @@ def check(address, model, voices, output):
         "seed": 42,
         "response_format": "pcm",
     }
-    # First requests independently populate the immutable voice prefixes.
+    # Startup has already registered originals through the native upload path.
     reference = {
         voice: speech(address, {**request, "voice": voice}) for voice in voices
     }
@@ -100,8 +100,10 @@ def check(address, model, voices, output):
         raise AssertionError(f"disconnect did not retire as cancellation: {counters}")
     replay(voices[0])
 
+    result = speech(address, {**request, "voice": "unregistered-voice"}, status=404)
+    if "error" not in result:
+        raise AssertionError(f"missing voice has no diagnostic: {result}")
     for override in (
-        {"voice": "unregistered-voice"},
         {"input": ""},
         {"speed": 1.25},
         {"instructions": "whisper"},
@@ -152,7 +154,8 @@ def main():
     model = args.model.absolute()
     document = json.loads(model.read_text(encoding="utf-8"))
     (preset,) = document["presets"].values()
-    voices = [voice["id"] for voice in preset["options"]["voices"]]
+    service = document["variants"][preset["variant"]]["services"][preset["service"]]
+    voices = list(service["voices"])
     model_id = document["model"]["id"]
     log = output / "pocket.log"
     with tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR")) as temporary:

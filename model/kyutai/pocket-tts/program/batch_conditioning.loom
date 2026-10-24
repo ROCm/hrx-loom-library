@@ -1,6 +1,6 @@
 // Pocket resident request initialization and shared voice conditioning. A work
-// record names the voice, valid prefix, and designated cache writer. Only
-// completed conditioning copies are published by the CPU control program;
+// record names the reserved voice slot and valid prefix. Only
+// completed conditioning copies are published by the native speech service;
 // restore resets the destination stream before copying the prefix.
 
 target.decl @pocket
@@ -11,7 +11,9 @@ config.decl @pocket.batch_capacity : %value: index where [range(%value, 1, 65536
 
 config.decl @pocket.context_capacity : %value: index where [range(%value, 1, 65536)]
 
-config.decl @pocket.voice_count : %value: index where [range(%value, 1, 256)]
+config.decl @pocket.rotary_capacity : %value: index where [range(%value, 16, 1048576)]
+
+config.decl @pocket.voice_capacity : %value: index where [range(%value, 1, 256)]
 
 config.decl @pocket.voice_frame_capacity : %value: index where [range(%value, 1, 65535)]
 
@@ -24,6 +26,8 @@ template.decl pure @pocket.state_words(%capacity: index) -> (index)
 template.decl pure @pocket.flow_state_words(%capacity: index) -> (index)
 
 template.decl pure @pocket.request_state_size(%capacity: index) -> (offset)
+
+template.decl pure @pocket.rotary_size(%capacity: index) -> (offset)
 
 template.decl pure @pocket.conditioning_size(%voice_frames: index) -> (offset)
 
@@ -60,9 +64,9 @@ kernel.def target(@pocket) @pocket.batch.initialize_request() {
   kernel.return
 }
 
-// A cohort has one writer for each unpublished voice. Publication is a CPU
-// completion action after this command retires; duplicate readers never write
-// the same cache row. Only populated prefix positions enter retained storage.
+// Each upload owns an exclusive reserved slot until retirement. The native
+// service publishes it after this command completes; readers never write it.
+// Only populated prefix positions enter retained storage.
 kernel.def target(@pocket) @pocket.batch.save_conditioning() {
   %frames = config.get @pocket.voice_frame_capacity : index
   %c1 = index.constant 1 : index
@@ -79,9 +83,6 @@ kernel.def target(@pocket) @pocket.batch.save_conditioning() {
   %active, %packed, %resident = template.apply<@pocket.batch.member>(%work) : (buffer) -> (i1, index, index)
   scf.if %active {
     %record = template.apply<@pocket.batch.work_record>(%work, %packed) : (buffer, index) -> (view<8xi32>)
-    %writer = view.load %record[5] : view<8xi32> -> i32
-    %c0 = scalar.constant 0 : i32
-    %writes = scalar.cmpi ne, %writer, %c0 : i32
     %frames = config.get @pocket.voice_frame_capacity : index
     %c1 = index.constant 1 : index
     %positions = index.add %frames, %c1 : index
@@ -89,8 +90,7 @@ kernel.def target(@pocket) @pocket.batch.save_conditioning() {
     %elements = index.mul %positions, %position_words : index
     %element = template.apply<@pocket.element>() : () -> (index)
     %live = index.cmp ult, %element, %elements : index
-    %enabled = scalar.andi %writes, %live : i1
-    scf.if %enabled {
+    scf.if %live {
       %context = config.get @pocket.context_capacity : index
       %channels = index.constant 1024 : index
       %plane_words = index.mul %positions, %channels : index
@@ -104,7 +104,7 @@ kernel.def target(@pocket) @pocket.batch.save_conditioning() {
       %prefix = index.assume %prefix_value [ge(%prefix_value, 1), le(%prefix_value, %positions), le(%prefix_value, %context)] : index
       %populated = index.cmp ult, %position, %prefix : index
       scf.if %populated {
-        %voice_count = config.get @pocket.voice_count : index
+        %voice_count = config.get @pocket.voice_capacity : index
         %voice32 = view.load %record[1] : view<8xi32> -> i32
         %voice_value = index.cast %voice32 : i32 to index
         %voice = index.assume %voice_value [ge(%voice_value, 0), lt(%voice_value, %voice_count)] : index
@@ -113,7 +113,10 @@ kernel.def target(@pocket) @pocket.batch.save_conditioning() {
         %header = index.constant 144 : offset
         %state_origin = index.add %state_row, %header : offset
         %cache_stride = template.apply<@pocket.conditioning_size>(%frames) pure : (index) -> (offset)
-        %cache_origin = index.scale %voice, %cache_stride : index, offset -> offset
+        %relative_cache = index.scale %voice, %cache_stride : index, offset -> offset
+        %rotary = config.get @pocket.rotary_capacity : index
+        %rotary_bytes = template.apply<@pocket.rotary_size>(%rotary) pure : (index) -> (offset)
+        %cache_origin = index.add %rotary_bytes, %relative_cache : offset
         %source = buffer.view %state[%state_origin] : buffer -> view<12x[%context]x1024xi32>
         %target = buffer.view %conditioning[%cache_origin] : buffer -> view<12x[%positions]x1024xi32>
         %value = view.load %source[%plane, %position, %channel] : view<12x[%context]x1024xi32> -> i32
@@ -174,12 +177,15 @@ kernel.def target(@pocket) @pocket.batch.restore_conditioning() {
       %channel = index.rem %in_plane, %channels : index
       %populated = index.cmp ult, %position, %prefix : index
       %cached = scf.if %populated -> (i32) {
-        %voice_count = config.get @pocket.voice_count : index
+        %voice_count = config.get @pocket.voice_capacity : index
         %voice32 = view.load %record[1] : view<8xi32> -> i32
         %voice_value = index.cast %voice32 : i32 to index
         %voice = index.assume %voice_value [ge(%voice_value, 0), lt(%voice_value, %voice_count)] : index
         %stride = template.apply<@pocket.conditioning_size>(%frames) pure : (index) -> (offset)
-        %origin = index.scale %voice, %stride : index, offset -> offset
+        %relative_cache = index.scale %voice, %stride : index, offset -> offset
+        %rotary = config.get @pocket.rotary_capacity : index
+        %rotary_bytes = template.apply<@pocket.rotary_size>(%rotary) pure : (index) -> (offset)
+        %origin = index.add %rotary_bytes, %relative_cache : offset
         %source = buffer.view %conditioning[%origin] : buffer -> view<12x[%positions]x1024xi32>
         %word = view.load %source[%plane, %position, %channel] : view<12x[%positions]x1024xi32> -> i32
         scf.yield %word : i32
