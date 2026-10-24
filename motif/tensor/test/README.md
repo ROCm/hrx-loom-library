@@ -47,6 +47,37 @@ two-dispatch case expects the sixteen lowest IDs among equal winners from
 separate tiles. Its benchmark declarations retain these different input and
 merge shapes rather than reporting one synthetic size.
 
+`linear.loom` checks eleven BF16 projection shapes against independently
+authored whole-matrix products. Both checkpoint storage formats, short and
+partial 256-input blocks, multiple blocks, and the 2560/6144-column model
+reductions are covered. Reversed grid traversal checks that logical tile
+origins reach contraction and publication unchanged. BF16 output in dense,
+column-major, and padded layouts compares bitwise, including untouched holes.
+
+Native F32 matrix results have an input-scaled accuracy requirement:
+`atol = max(sum(abs(BF16 products))) / 2^20`, with zero relative tolerance.
+The generator verifies this budget is below half the smallest nonzero product
+in each case. This measures contraction accuracy without assuming native matrix
+instructions reproduce ordered scalar accumulation bits. Two positive-term
+constructions separately require exact F32 results that BF16 cannot represent.
+Input conversion midpoints distinguish rounded weights from their F32 originals.
+All immutable allocations and output guards compare bitwise.
+
+`linear_epilogue.loom` supplies twelve independent store, bias, and adapter
+scenarios without performing matrix contraction. Rational scalar arithmetic
+authors each F32 and BF16 boundary, including conversion midpoint parities,
+cancellation, signed zeros, and subnormals. Omission checks prove the corpus
+distinguishes bias conversion, delta rounding, scaled-delta rounding, and the
+zero-strength bypass. Both bias formats, nonzero tile origins, three physical
+layouts, and exact base/output aliasing are exercised. Every observed bit is
+exact, including the F32 result before final publication. Both corpora run with
+native, access, and race instrumentation and retain benchmark declarations.
+
+```sh
+python3 -B motif/tensor/test/generate_linear_oracle.py --check
+python3 -B motif/tensor/test/generate_linear_epilogue_oracle.py --check
+```
+
 `rmsnorm.loom` compares retained-row normalization with a sequential F64
 sum of squares and Newton-refined inverse square root. Widths 1024 and 5120,
 workgroups of 128 and 256 threads, and F32/F16 publication exercise distinct

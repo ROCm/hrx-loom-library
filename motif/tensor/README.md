@@ -53,6 +53,38 @@ winners with negative infinity and `INT_MAX`; valid input logits are finite.
 Inputs and outputs are separate, and the composition owns both launch geometry
 and temporary partial-list storage.
 
+`linear.loom` separates BF16 projection tiles from their publication. The
+storage-selected contraction reads BF16 activations and either BF16 weights
+or F32 weights rounded to BF16, with checkpoint rows indexed by output channel.
+It accumulates sixteen-input matrix operations within 256-input partials and
+adds the completed partials in F32. The native-BF16 provider instead uses four
+independent chains within each partial. These recurrences remain distinct;
+matrix operations follow the selected target's native arithmetic contract.
+
+Composition supplies each tile's row and output-column origins, independently
+of launch-grid traversal. One complete 32-thread workgroup owns a 16×16 tile.
+Rows, output columns, and tile origins are multiples of sixteen; reduction
+widths are multiples of sixteen for storage-selected contraction or sixty-four
+for the four-chain form. Operands, their conversions, and intermediates remain
+finite. The external `tensor_projection_rdna3` target binds the RDNA3 fragment
+layout in a composition leaf; the motif contains no concrete target or global
+configuration. Launch targets separately select wave32 execution.
+
+`projection.store_bf16` rounds the result into a caller-supplied injective
+layout, including dense, column-major, or padded storage. The bias epilogue
+reads native BF16 bias or rounds F32 bias to BF16 before adding in F32.
+`projection.adapter_epilogue_bf16` rounds the projected delta to BF16,
+multiplies by the runtime F32 strength, rounds that product to BF16, and adds
+the BF16 base in F32. Publication performs the final BF16 rounding. Either
+signed zero strength returns the base directly, preserving its signed zeros.
+
+Activations and weights are immutable, naturally aligned, and disjoint from
+output. Bias and strength are also separate from output. An adapter update
+may reuse its exact base allocation with the same layout because each tile
+owns every value it reads and writes. Partial overlap is unsupported. These
+helpers allocate no scratch, publish no global partials, and add no dispatch
+or synchronization boundary.
+
 `rmsnorm.loom` computes `x * rsqrt(mean(x*x) + epsilon) * weight` for one
 F32 row per workgroup. A thread retains its four-element packets across the
 reduction, so normalization reads each input once. The caller specializes the
