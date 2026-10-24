@@ -25,8 +25,8 @@ before the first PyPI release. A published SDK uses
 With the SDK installed, fetch this model directly from its publication URL:
 
 ```sh
-loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/21637a18079d1f1dd9b8e20d26f700a62e60db4f/model/moonshine-ai/moonshine-streaming-tiny/model.json --list
-loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/21637a18079d1f1dd9b8e20d26f700a62e60db4f/model/moonshine-ai/moonshine-streaming-tiny/model.json --preset=streaming --output=./moonshine
+loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/bedb7bbf149066c7979f45ce753da3b9b8875842/model/moonshine-ai/moonshine-streaming-tiny/model.json --list
+loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/bedb7bbf149066c7979f45ce753da3b9b8875842/model/moonshine-ai/moonshine-streaming-tiny/model.json --preset=streaming --output=./moonshine
 ```
 
 These URLs pin one library revision. Fetch checks its adjacent acquisition
@@ -61,7 +61,7 @@ Send 16 kHz mono signed little-endian PCM16 audio. For a first check, download
 the small reference recording:
 
 ```sh
-curl --fail --location https://raw.githubusercontent.com/ROCm/hrx-loom-library/21637a18079d1f1dd9b8e20d26f700a62e60db4f/model/moonshine-ai/moonshine-streaming-tiny/test/short.pcm --output=recording.pcm
+curl --fail --location https://raw.githubusercontent.com/ROCm/hrx-loom-library/bedb7bbf149066c7979f45ce753da3b9b8875842/model/moonshine-ai/moonshine-streaming-tiny/test/short.pcm --output=recording.pcm
 curl --fail-with-body -H 'Expect:' \
   http://127.0.0.1:8080/v1/audio/transcriptions \
   -F model=moonshine-ai/moonshine-streaming-tiny \

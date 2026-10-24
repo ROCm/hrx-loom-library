@@ -71,8 +71,10 @@ presets can be fetched directly from the card. Installed SDK users can inspect
 a published snapshot without a clone:
 
 ```sh
-loom-fetch --catalog=github:ROCm/hrx-loom-library@21637a18079d1f1dd9b8e20d26f700a62e60db4f --list --json
+loom-fetch --catalog=github:ROCm/hrx-loom-library@bedb7bbf149066c7979f45ce753da3b9b8875842 --list --json
 ```
+
+This snapshot lists Moonshine Streaming Tiny, Pocket TTS, and Qwen3.8 Flash-Next.
 
 A local checkout supports the same discovery and selection:
 
