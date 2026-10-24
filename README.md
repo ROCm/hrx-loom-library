@@ -83,10 +83,11 @@ the installed SDK directly, including when fetched from a library checkout.
 [Qwen3.8 27B](model/Qwen/Qwen3.8-27B/OVERVIEW.md) provides text generation,
 checkpoint multi-token prediction, and image-conditioned chat with the same
 source, bytecode, and mixed packaging. Its text service runs on RDNA and CDNA;
-the image projector uses RDNA. Native allocation failures currently prevent
-complete qualification of concurrent vision requests and the separate DFlash2
-draft composition. The overview describes the remaining runtime repair and
-service checks. This package remains outside the picker until those gates pass.
+the image projector uses RDNA. The `vision` preset adds image input, while
+`dflash2` fetches a separate draft checkpoint for speculative text generation.
+Concurrent requests, conversation forks, parameter unload/reload, and joined
+shutdown are checked through the native service. All five presets are listed
+in the checkout's model catalog.
 
 The [model map](model/README.md#map) also describes Krea image generation,
 including compatible assets and service contracts. Its executable port is

@@ -24,7 +24,7 @@ consume those projected facts and never parse the container directly.
 | [Moonshine Streaming Tiny](moonshine-ai/moonshine-streaming-tiny/OVERVIEW.md) | Streaming speech recognition | Original F32; source, bytecode, and mixed providers | Runnable on AMDGPU; independent transcript checks |
 | [Krea 2 Turbo](krea/Krea-2-Turbo/OVERVIEW.md) | Image generation | BF16 and INT8 ConvRot | Description; native providers await porting |
 | [Pocket TTS](kyutai/pocket-tts/OVERVIEW.md) | Streaming speech synthesis | Three-voice default, four-voice noncommercial variant, and native custom uploads; source, bytecode, and mixed providers | Runnable on AMDGPU; original-recording preparation, independent numerics, and native PCM lifecycle checks |
-| [Qwen3.8 27B](Qwen/Qwen3.8-27B/OVERVIEW.md) | Text generation with optional image input | UD-Q5_K_XL, vision projector, and DFlash2 draft weights; source, bytecode, and mixed providers | Runnable text on AMD RDNA/CDNA; native allocation repair precedes complete vision and DFlash2 qualification |
+| [Qwen3.8 27B](Qwen/Qwen3.8-27B/OVERVIEW.md) | Text generation with optional image input | UD-Q5_K_XL, vision projector, and DFlash2 draft weights; source, bytecode, and mixed providers | Runnable text on AMD RDNA/CDNA; vision and DFlash2 on RDNA with concurrent requests, checkpoint forks, and parameter lifecycle checks |
 | [Qwen3.8 Flash-Next](Qwen/Qwen3.8-Flash-Next/OVERVIEW.md) | Text generation | Four ordered UD-Q4_K_XL shards, optional MTP weights; source, bytecode, and mixed providers | Runnable on AMD RDNA; independent recall, checkpoint forks, and parameter lifecycle checks |
 | [Qwen3 Embedding 0.6B](Qwen/Qwen3-Embedding-0.6B/OVERVIEW.md) | Text embeddings | Original BF16 checkpoint with runtime BFP16EBS8 conversion; source, bytecode, and mixed providers | Runnable on the Strix Halo NPU; independent publisher checks |
 
@@ -65,9 +65,8 @@ The repository-root `catalog.json` lists packages with supplied providers and
 qualified execution. Packages enter this index when their executable ports are
 admitted and all selected assets have published acquisition sources. The embedding
 port loads the original Qwen BF16 checkpoint and performs its native representation
-conversion during model loading. Qwen3.8-27B remains outside the index until
-the complete vision and DFlash2 service gates pass. Its presets can be fetched
-directly from the card, with execution status documented in the overview.
+conversion during model loading. Qwen3.8-27B includes text, image-conditioned
+chat, and DFlash2 drafting with the complete native service checks.
 Installed SDK users can inspect a published snapshot without a clone:
 
 ```sh
@@ -76,7 +75,8 @@ loom-fetch --catalog=github:ROCm/hrx-loom-library@bedb7bbf149066c7979f45ce753da3
 
 This snapshot lists Moonshine Streaming Tiny, Pocket TTS, and Qwen3.8 Flash-Next.
 The checkout's catalog additionally includes Qwen3 Embedding for the Strix Halo
-NPU, acquired directly from the original publisher checkpoint.
+NPU and Qwen3.8-27B with its text, vision, and drafting presets. Their original
+checkpoint files are acquired directly from the named publishers.
 
 A local checkout supports the same discovery and selection:
 
@@ -95,6 +95,7 @@ from its admitted cards with the SDK:
 ```sh
 python -m loom.model.catalog \
   --card=model/Qwen/Qwen3-Embedding-0.6B/model.json=model/Qwen/Qwen3-Embedding-0.6B/model.json \
+  --card=model/Qwen/Qwen3.8-27B/model.json=model/Qwen/Qwen3.8-27B/model.json \
   --card=model/Qwen/Qwen3.8-Flash-Next/model.json=model/Qwen/Qwen3.8-Flash-Next/model.json \
   --card=model/kyutai/pocket-tts/model.json=model/kyutai/pocket-tts/model.json \
   --card=model/moonshine-ai/moonshine-streaming-tiny/model.json=model/moonshine-ai/moonshine-streaming-tiny/model.json \

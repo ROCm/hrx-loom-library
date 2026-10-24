@@ -19,11 +19,19 @@ loom-serve --model="$HOME/models/qwen3.8-27b/model.json" \
 ```
 
 The `chat` preset uses checkpoint MTP without the image projector;
-`target-only` selects ordinary target decoding. The `vision` and `dflash2`
-presets retain the native allocation qualification gate described below.
+`target-only` selects ordinary target decoding. Select `vision` to fetch the
+image projector, or `dflash2` to fetch the separate draft checkpoint. For example:
+
+```sh
+loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/Qwen/Qwen3.8-27B/model.json \
+  --preset dflash2 --output "$HOME/models/qwen3.8-27b-dflash2"
+loom-serve --model="$HOME/models/qwen3.8-27b-dflash2/model.json" \
+  --device=amdgpu2://0
+```
+
 Fetch resolves the exact asset and compiler-input closure and reuses cached
-weights; serving opens the
-resulting local card. The implementation and numerical checks are published
+weights across these installations; serving opens the resulting local card.
+The implementation and numerical checks are published
 in the [library model package](https://github.com/ROCm/hrx-loom-library/tree/main/model/Qwen/Qwen3.8-27B).
 
 ## Choose the asset closure
@@ -47,15 +55,12 @@ versioned `image` component of the text service, with separate preparation and
 request control. It is not an image-generation service. The DFlash2 checkpoint
 is additional model storage, not a request adapter.
 
-Text, checkpoint MTP, and vision have service checks for all three program
-representations; CDNA text is checked on MI300. Current SDK verification passes
-text and CDNA execution but reproduces a native allocation failure during the
-concurrent vision cohort. DFlash2's full-checkpoint run also remains blocked by
-GPU host-memory registration returning `EAGAIN` before inference. The allocation
-operation's restart and cancellation contract needs repair, followed by the
-complete vision and DFlash2 checks. Earlier successful vision results do not
-qualify this failing SDK execution. The package remains outside model discovery
-until those runtime gates pass.
+Text, checkpoint MTP, vision, and DFlash2 have native service checks for source,
+relocatable-bytecode, and mixed programs. The checks exercise concurrent
+requests, exact responses, checkpoint forks and continuation, parameter
+unload/reload, disconnected clients, and joined shutdown. Vision also checks
+independent projector residency. DFlash2 retains the eight-row preset and its
+seven-proposal depth. CDNA text is checked on MI300 with the `cdna-text` preset.
 
 The original model, selected quantization, and selected draft repository declare
 Apache-2.0. Their original cards are available from
@@ -78,8 +83,8 @@ DFlash2 (`1`); a filename is not used to infer the drafting algorithm.
 The numerical provider set contains RDNA and CDNA text kernels. `cdna-text`
 records the text-only configuration of four rows, 4,096-position contexts,
 32,768 pooled positions, and 512-token epochs without drafting. The image
-projector requires the RDNA implementation. The preset records model execution capacities; device selection remains
-part of the serving deployment.
+projector requires the RDNA implementation. Presets record model execution
+capacities; device selection remains part of the serving deployment.
 
 The canonical requests use greedy sampling and disable thinking. Requests may
 select temperature, top-p, top-k, and a signed 64-bit seed. Reasoning is returned
