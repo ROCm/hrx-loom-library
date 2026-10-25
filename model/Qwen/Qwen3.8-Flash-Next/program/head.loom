@@ -22,9 +22,9 @@ func.decl @flash_next_q8_partial(%width: index, %token: index, %row: index, %lan
 
 func.decl @flash_next_q8_batch_partial(%width: index, %group_size: index, %batch_size: index, %first: index, %end: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (vector<[%group_size]xf32>)
 
-kernel.decl @hc_normalize() launch(%span: buffer, %residual: buffer, %gamma: buffer, %normalized: buffer)
+kernel.decl @hc_normalize(%neural_enabled: i1) launch(%span: buffer, %residual: buffer, %gamma: buffer, %normalized: buffer)
 
-kernel.decl @hc_up_mix() launch(%span: buffer, %normalized: buffer, %lowrank: buffer, %weight: buffer, %mixed: buffer)
+kernel.decl @hc_up_mix(%neural_enabled: i1) launch(%span: buffer, %normalized: buffer, %lowrank: buffer, %weight: buffer, %mixed: buffer)
 
 template.decl @sampling.categorical_excluding_f32(%columns: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64) -> (i32)
 
@@ -75,12 +75,14 @@ kernel.def @flash_next_select_output_rows() {
 
 // The output mixer has no injection branch: it contracts the normalized four
 // streams into a low-rank SiLU publication, then reuses the stream mixer.
-kernel.def target(@flash_next_head_wave32) @flash_next_head_down() {
+kernel.def target(@flash_next_head_wave32) @flash_next_head_down(%neural_enabled: i1) {
   %groups = index.constant 80 : index
   %rows = func.call pure @flash_next_output_capacity() : () -> (index)
   %c1 = index.constant 1 : index
   %threads = index.constant 128 : index
-  kernel.launch.config workgroups(%groups, %rows, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %rows, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%epoch: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %token = kernel.workgroup.id<y> : index
@@ -232,7 +234,7 @@ kernel.def @flash_next_sample() {
   kernel.return
 }
 
-command.program.def @flash_next_head_mix(%predictor: index) launch(%parameters: buffer, %epoch: buffer, %residual: buffer, %hidden: buffer) {
+command.program.def @flash_next_head_mix(%neural_enabled: i1, %predictor: index) launch(%parameters: buffer, %epoch: buffer, %residual: buffer, %hidden: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %residual_stride = index.constant 20480 : offset
   %rank_stride = index.constant 640 : offset
@@ -253,37 +255,38 @@ command.program.def @flash_next_head_mix(%predictor: index) launch(%parameters: 
     %up = command.parameter %parameters, "output_hc_up.weight" : view<3481600xi8>
     scf.yield %gamma, %down, %up : view<4x2560xf32>, view<3481600xi8>, view<3481600xi8>
   }
-  kernel.launch @hc_normalize(%epoch, %residual, %gamma, %normalized) : (buffer, buffer, view<4x2560xf32>, buffer)
-  kernel.launch @flash_next_head_down(%epoch, %normalized, %down, %lowrank) : (buffer, buffer, view<3481600xi8>, buffer)
-  kernel.launch @hc_up_mix(%epoch, %normalized, %lowrank, %up, %hidden) : (buffer, buffer, buffer, view<3481600xi8>, buffer)
+  kernel.launch @hc_normalize[%neural_enabled](%epoch, %residual, %gamma, %normalized) : [i1](buffer, buffer, view<4x2560xf32>, buffer)
+  kernel.launch @flash_next_head_down[%neural_enabled](%epoch, %normalized, %down, %lowrank) : [i1](buffer, buffer, view<3481600xi8>, buffer)
+  kernel.launch @hc_up_mix[%neural_enabled](%epoch, %normalized, %lowrank, %up, %hidden) : [i1](buffer, buffer, buffer, view<3481600xi8>, buffer)
   command.return
 }
 
 command.program.def public @flash_next_head_logits(%predictor: index) launch(%parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %residual: buffer, %logits: buffer) {
+  %neural_enabled = scalar.constant true : i1
   %tokens = config.get @flash_next.token_count : index
   %hidden_stride = index.constant 5120 : offset
   %hidden_bytes = index.scale %tokens, %hidden_stride : index, offset -> offset
   %hidden = buffer.alloca<global> align(256) %hidden_bytes : buffer
-  command.program.launch @flash_next_head_mix[%predictor](%parameters, %epoch, %residual, %hidden) : [index](buffer, buffer, buffer, buffer)
+  command.program.launch @flash_next_head_mix[%neural_enabled, %predictor](%parameters, %epoch, %residual, %hidden) : [i1, index](buffer, buffer, buffer, buffer)
   %head = command.parameter %vocabulary_parameters, "output.weight" : view<675430400xi8>
   kernel.launch @flash_next_vocabulary(%epoch, %hidden, %head, %logits) : (buffer, buffer, view<675430400xi8>, buffer)
   command.return
 }
 
-kernel.decl @flash_next_draft_common_head() launch(%epoch: buffer, %plan: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @flash_next_draft_common_head(%neural_enabled: i1) launch(%epoch: buffer, %plan: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
-kernel.decl @flash_next_draft_rare_head() launch(%epoch: buffer, %plan: buffer, %carry: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @flash_next_draft_rare_head(%neural_enabled: i1) launch(%epoch: buffer, %plan: buffer, %carry: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
-command.program.def public @flash_next_draft_head() launch(%parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %plan: buffer, %carry: buffer, %residual: buffer, %logits: buffer) {
+command.program.def public @flash_next_draft_head(%neural_enabled: i1) launch(%parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %plan: buffer, %carry: buffer, %residual: buffer, %logits: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %hidden_stride = index.constant 5120 : offset
   %hidden_bytes = index.scale %tokens, %hidden_stride : index, offset -> offset
   %hidden = buffer.alloca<global> align(256) %hidden_bytes : buffer
   %predictor = index.constant 1 : index
-  command.program.launch @flash_next_head_mix[%predictor](%parameters, %epoch, %residual, %hidden) : [index](buffer, buffer, buffer, buffer)
+  command.program.launch @flash_next_head_mix[%neural_enabled, %predictor](%parameters, %epoch, %residual, %hidden) : [i1, index](buffer, buffer, buffer, buffer)
   %head = command.parameter %vocabulary_parameters, "output.weight" : view<675430400xi8>
-  kernel.launch @flash_next_draft_common_head(%epoch, %plan, %hidden, %head, %logits) : (buffer, buffer, buffer, view<675430400xi8>, buffer)
-  kernel.launch @flash_next_draft_rare_head(%epoch, %plan, %carry, %hidden, %head, %logits) : (buffer, buffer, buffer, buffer, view<675430400xi8>, buffer)
+  kernel.launch @flash_next_draft_common_head[%neural_enabled](%epoch, %plan, %hidden, %head, %logits) : [i1](buffer, buffer, buffer, view<675430400xi8>, buffer)
+  kernel.launch @flash_next_draft_rare_head[%neural_enabled](%epoch, %plan, %carry, %hidden, %head, %logits) : [i1](buffer, buffer, buffer, buffer, view<675430400xi8>, buffer)
   command.return
 }
 

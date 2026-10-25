@@ -15,6 +15,12 @@ workload can be planned, executed, and measured through the ordinary Loom tools.
 | Experts and mixed quantization | Scalar decoding of each admitted block format, independent matrix references, route grouping, padded tasks, and routed/shared output composition. |
 | MTP, output, and vocabulary | Independent projection references and explicit expected state for accepted history, compact vocabularies, fallback selection, proposal rejection, and retained carry. |
 
+`proposal_launch` exercises the real Q8 projection template at its wave and
+two matrix entry shapes. GPU-published conditions alternate between active
+and skipped rounds, including an observed false value followed by an overwrite.
+Complete output comparisons distinguish preserved sentinels from the exact
+unit-input contraction. The ordinary constant-true call uses the same source.
+
 Run the package through the repository's normal build environment:
 
 ```sh

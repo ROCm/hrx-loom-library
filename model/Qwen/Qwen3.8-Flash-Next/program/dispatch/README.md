@@ -20,6 +20,12 @@ combines routed and shared outputs. Projection dispatch supplies exact
 dimensions to the Q8 launch policy. Weight preparation is a separate command
 whose only mutation is the selected parameter allocation.
 
+Commands in the neural proposal path forward the caller's `neural_enabled`
+value through their nested commands and projection templates. It controls
+launch geometry and does not become a parameter of the device algorithm.
+Callers outside that path supply a constant true value. The proposal owner
+can therefore reuse the same source with a device-sampled condition.
+
 `dispatch.loombc` depends on configuration and numerical providers. Model-wide
 layer ordering, accepted-prefix replay, and service policy belong to its
 callers. The explicit declarations in each source file are its linking

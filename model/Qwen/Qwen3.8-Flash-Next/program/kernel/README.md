@@ -11,6 +11,12 @@ their storage, and partial tiles mask their loads and publications. Parameter
 views carry exact checkpoint shapes and encodings; kernels consume those
 prepared contracts rather than discovering a format from bytes or filenames.
 
+Kernels shared with recursive drafting take `neural_enabled` as a staged
+launch argument. A false value selects zero workgroups; the numerical body
+and its runtime bindings remain identical. Ordinary callers supply a constant
+true value, allowing specialization to retain the direct launch geometry.
+The projection template forwards this argument to every shape-selected entry.
+
 | Family | Storage and numerical contract |
 | --- | --- |
 | Q8 projection | Original 32-code GGML blocks, BF16 activations, and F32 block-scaled reductions. Long reductions use paired K64 stages from capacity 256, with F16 operands and F32 accumulators. Prepared K2560 QKV weights use four-channel code/scale planes in the original allocation. |

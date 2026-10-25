@@ -137,7 +137,7 @@ func.def inline @qsa_bf16_matrix(%capacity: index, %end: index, %outputs: index,
 // Packed BF16 parameters and activations accumulate in F32. Large cohorts
 // share panels across 128 tokens; tiny cohorts keep independent wave dots.
 // Capacity specializes the launch, while the epoch supplies the live prefix.
-kernel.def target(@qsa_wave32) @qsa_linear_bf16(%width: index) {
+kernel.def target(@qsa_wave32) @qsa_linear_bf16(%neural_enabled: i1, %width: index) {
   %rows = index.assume %width [range(%width, 128, 512), multiple_of(%width, 4)] : index
   %tokens = config.get @flash_next.token_count : index
   %c1 = index.constant 1 : index
@@ -154,7 +154,9 @@ kernel.def target(@qsa_wave32) @qsa_linear_bf16(%width: index) {
   %groups = scf.select %matrix, %matrix_groups, %dot_groups : index
   %batches = scf.select %matrix, %matrix_batches, %tokens : index
   %threads = scf.select %matrix, %matrix_threads, %tile : index
-  kernel.launch.config workgroups(%groups, %batches, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %batches, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%width: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %rows = index.assume %width [range(%width, 128, 512), multiple_of(%width, 4)] : index
   %tokens = config.get @flash_next.token_count : index
@@ -286,12 +288,14 @@ func.def public inline @qsa_normalize_rotate(%width_arg: index, %position: index
 }
 
 // Both indexer and main queries have compact append rows and absolute RoPE.
-kernel.def target(@qsa_wave32) @qsa_prepare_queries(%heads: index) {
+kernel.def target(@qsa_wave32) @qsa_prepare_queries(%neural_enabled: i1, %heads: index) {
   %count = index.assume %heads [range(%heads, 4, 24)] : index
   %tokens = config.get @flash_next.token_count : index
   %threads = index.constant 32 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%count, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %count, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
@@ -314,11 +318,13 @@ kernel.def target(@qsa_wave32) @qsa_prepare_queries(%heads: index) {
 
 // Completed four-token blocks are published once. An append that crosses a
 // block boundary reads its old raw prefix from the immutable recurrent anchor.
-kernel.def target(@qsa_wave32) @qsa_pool_blocks() {
+kernel.def target(@qsa_wave32) @qsa_pool_blocks(%neural_enabled: i1) {
   %tokens = config.get @flash_next.token_count : index
   %threads = index.constant 32 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %tokens, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%tail_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %raw: buffer, %arena: buffer, %pooled: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%epoch, %tokens) : (buffer, index) -> (index)
@@ -369,11 +375,13 @@ kernel.def target(@qsa_wave32) @qsa_pool_blocks() {
   kernel.return
 }
 
-kernel.def target(@qsa_wave32) @qsa_prepare_blocks() {
+kernel.def target(@qsa_wave32) @qsa_prepare_blocks(%neural_enabled: i1) {
   %tokens = config.get @flash_next.token_count : index
   %threads = index.constant 32 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %tokens, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%epoch, %tokens) : (buffer, index) -> (index)
@@ -461,11 +469,13 @@ template.def<@flash_next.qsa_publish_tail.body> device @qsa_publish_tail_body(%c
   template.return
 }
 
-kernel.def target(@qsa_wave32) @qsa_publish_tail() {
+kernel.def target(@qsa_wave32) @qsa_publish_tail(%neural_enabled: i1) {
   %spans = config.get @flash_next.span_capacity : index
   %threads = index.constant 32 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%spans, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %spans, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %verification = config.get @flash_next.verification_width : index
