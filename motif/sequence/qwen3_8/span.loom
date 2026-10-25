@@ -1,13 +1,13 @@
 // Qwen3.8 packed sequence and retained-state carriers. The header contains
 // three I32 words: active token count, span count, and selected output count.
-// Each following span contains five I32 words: token count, absolute position,
-// packed token begin, resident row, and a packed source position plus
-// selected-output code. Input epochs partition the packed token prefix and
-// refer to distinct resident rows.
+// Each following span contains six I32 words: token count, causal position,
+// packed token begin, resident row, source position, and selected output.
+// A selected output of -1 means that no vocabulary result is requested. Input
+// epochs partition the packed token prefix and refer to distinct resident rows.
 // Accepted/replay controls retain original activation offsets with gaps; their
 // counts describe only the accepted subspans inside the header's token extent.
-// Full-model epochs reserve 64 descriptors, followed at byte 1292 by 128 I32
-// selected packed-row indices. The producer fills this direct output mapping
+// Full-model epochs size descriptors and selected packed-row indices from
+// their prepared workload capacity. The producer fills this direct mapping
 // with selected token positions (all inputs for speculative spans, otherwise the
 // span's last token); unused entries are never consumed.
 // These helpers consume the caller's validated model plan, not external input.
@@ -69,52 +69,16 @@ func.def public inline @qwen38_span_active(%epoch: buffer, %span: index) -> (i1)
   func.return %active : i1
 }
 
-// The final descriptor word packs the source-coordinate base above a ten-bit
-// selected-output code. Code zero means no output; nonzero codes carry the
-// selected row plus one. Source positions fit 22 bits; selected IDs are
-// -1 for no output or 0..1022. This covers the target's 128 rows and DFlash's
-// 448 compact rows while keeping the causal cache position and compressed
-// M-RoPE position adjacent without enlarging the hot span table.
-func.def public inline @qwen38_descriptor_pack(%source_position: i32, %selection: i32) -> (i32) {
-  %shift = scalar.constant 10 : i32
-  %c1 = scalar.constant 1 : i32
-  %source_bits = scalar.shli %source_position, %shift : i32
-  %selection_code = scalar.addi %selection, %c1 : i32
-  %word = scalar.ori %source_bits, %selection_code : i32
-  func.return %word : i32
-}
-
-func.def public inline @qwen38_descriptor_source_position(%word: i32) -> (i32) {
-  %shift = scalar.constant 10 : i32
-  %position = scalar.shrui %word, %shift : i32
-  func.return %position : i32
-}
-
-func.def public inline @qwen38_descriptor_selection(%word: i32) -> (i32) {
-  %mask = scalar.constant 1023 : i32
-  %c1 = scalar.constant 1 : i32
-  %code = scalar.andi %word, %mask : i32
-  %selection = scalar.subi %code, %c1 : i32
-  func.return %selection : i32
-}
-
-func.def public inline @qwen38_descriptor_without_selection(%word: i32) -> (i32) {
-  %source_mask = scalar.constant -1024 : i32
-  %source_bits = scalar.andi %word, %source_mask : i32
-  func.return %source_bits : i32
-}
-
 func.def public inline @qwen38_span_source_position(%epoch: buffer, %span: index) -> (i32) {
   %header_bytes = index.constant 12 : offset
-  %span_bytes = index.constant 20 : offset
+  %span_bytes = index.constant 24 : offset
   %source_index = index.constant 4 : index
   %relative_origin = index.scale %span, %span_bytes : index, offset -> offset
   %control_origin = index.add %header_bytes, %relative_origin : offset
   %metadata = buffer.assume.memory_space<constant> %epoch : buffer
-  %descriptor = buffer.view %metadata[%control_origin] : buffer -> view<5xi32>
-  %word = view.load %descriptor[%source_index] : view<5xi32> -> i32
-  %position = func.call @qwen38_descriptor_source_position(%word) : (i32) -> (i32)
-  func.return %position : i32
+  %descriptor = buffer.view %metadata[%control_origin] : buffer -> view<6xi32>
+  %word = view.load %descriptor[%source_index] : view<6xi32> -> i32
+  func.return %word : i32
 }
 
 // The returned control origin addresses the count/position pair used by the
@@ -124,15 +88,15 @@ func.def public inline @qwen38_span_source_position(%epoch: buffer, %span: index
 // callers carry their actual activation and retained-storage extents.
 func.def public inline @qwen38_span_binding(%epoch: buffer, %span: index) -> (offset, index, index) {
   %header_bytes = index.constant 12 : offset
-  %span_bytes = index.constant 20 : offset
+  %span_bytes = index.constant 24 : offset
   %relative_origin = index.scale %span, %span_bytes : index, offset -> offset
   %control_origin = index.add %header_bytes, %relative_origin : offset
   %metadata = buffer.assume.memory_space<constant> %epoch : buffer
-  %descriptor = buffer.view %metadata[%control_origin] : buffer -> view<5xi32>
+  %descriptor = buffer.view %metadata[%control_origin] : buffer -> view<6xi32>
   %begin_index = index.constant 2 : index
   %row_index = index.constant 3 : index
-  %begin_word = view.load %descriptor[%begin_index] : view<5xi32> -> i32
-  %row_word = view.load %descriptor[%row_index] : view<5xi32> -> i32
+  %begin_word = view.load %descriptor[%begin_index] : view<6xi32> -> i32
+  %row_word = view.load %descriptor[%row_index] : view<6xi32> -> i32
   %begin_value = index.cast %begin_word : i32 to index
   %row_value = index.cast %row_word : i32 to index
   %begin = index.assume %begin_value [range(%begin_value, 0, 2147483647)] : index
@@ -160,8 +124,8 @@ func.def public inline @qwen38_row_gdn_binding(%epoch: buffer, %control_origin: 
   %write_word = view.load %entry[%write_index] : view<5xi64> -> i64
   %frontier = view.load %entry[%frontier_index] : view<5xi64> -> i64
   %controls = buffer.assume.memory_space<constant> %epoch : buffer
-  %control = buffer.view %controls[%control_origin] : buffer -> view<5xi32>
-  %position_word = view.load %control[%write_index] : view<5xi32> -> i32
+  %control = buffer.view %controls[%control_origin] : buffer -> view<6xi32>
+  %position_word = view.load %control[%write_index] : view<6xi32> -> i32
   %position = scalar.extui %position_word : i32 to i64
   %first_advance = scalar.cmpi eq, %position, %frontier : i64
   %read_value = scalar.assume %anchor_word [range(%anchor_word, 0, 9223372036854775807)] : i64

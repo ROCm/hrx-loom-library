@@ -6,9 +6,11 @@ config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
-config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 16)]
+config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
 
 config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 8)]
+
+config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]
 
 command.program.decl @flash_next_body() launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer)
 
@@ -18,7 +20,7 @@ command.program.decl @flash_next_capture_inputs(%prefix_bytes: offset, %row_byte
 
 command.program.decl @flash_next_commit_state() launch(%parameters: buffer, %capture: buffer, %replay: buffer, %rows: buffer, %state: buffer)
 
-kernel.decl @qwen38_accept_spans() launch(%mixed_inputs: index, %width: index, %token_capacity: index, %epoch: buffer, %inputs: buffer, %predictions: buffer, %committed: buffer, %replay: buffer, %results: buffer)
+kernel.decl @qwen38_accept_spans() launch(%mixed_inputs: index, %width: index, %token_capacity: index, %packet_capacity: index, %epoch: buffer, %inputs: buffer, %predictions: buffer, %committed: buffer, %replay: buffer, %results: buffer)
 
 // Target sampling remains authoritative. Speculative cache writes become
 // visible only through the accepted frontier; all non-page state commits from
@@ -34,7 +36,11 @@ command.program.def public @flash_next_verify() launch(%parameters: buffer, %res
   %word_bytes = index.constant 4 : offset
   %capture_bytes = index.scale %capacity, %capture_stride : index, offset -> offset
   %prediction_bytes = index.scale %capacity, %word_bytes : index, offset -> offset
-  %replay_bytes = index.constant 1548 : offset
+  %packet_capacity = config.get @qwen38.packet_capacity : index
+  %header_bytes = index.constant 12 : offset
+  %descriptor_stride = index.constant 24 : offset
+  %descriptor_bytes = index.scale %packet_capacity, %descriptor_stride : index, offset -> offset
+  %replay_bytes = index.add %header_bytes, %descriptor_bytes : offset
   %capture = buffer.alloca<global> align(256) %capture_bytes : buffer
   %predictions = buffer.alloca<global> align(256) %prediction_bytes : buffer
   %replay = buffer.alloca<global> align(256) %replay_bytes : buffer
@@ -42,7 +48,7 @@ command.program.def public @flash_next_verify() launch(%parameters: buffer, %res
   command.program.launch @flash_next_capture_inputs[%ids_prefix, %word_bytes](%epoch, %input_tokens, %capture) : [offset, offset](buffer, buffer, buffer)
   command.program.launch @flash_next_body(%parameters, %residual, %epoch, %rows, %state, %input_tokens, %capture) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   command.program.launch @flash_next_output_head(%parameters, %epoch, %residual, %predictions) : (buffer, buffer, buffer, buffer)
-  kernel.launch @qwen38_accept_spans(%mixed_inputs, %width, %tokens, %epoch, %input_tokens, %predictions, %committed, %replay, %results) : (index, index, index, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @qwen38_accept_spans(%mixed_inputs, %width, %tokens, %packet_capacity, %epoch, %input_tokens, %predictions, %committed, %replay, %results) : (index, index, index, index, buffer, buffer, buffer, buffer, buffer, buffer)
   command.program.launch @flash_next_commit_state(%parameters, %capture, %replay, %rows, %state) : (buffer, buffer, buffer, buffer, buffer)
   command.return
 }

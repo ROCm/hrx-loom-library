@@ -3,6 +3,10 @@
 // limits, and EOS. Known spans publish directly; speculative spans wait for
 // the target acceptance frontier.
 
+config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]
+
+func.decl @qwen38_packet_options_origin(%capacity: index) -> (offset)
+
 func.decl @qwen38_span_active(%epoch: buffer, %span: index) -> (i1)
 
 func.decl @qwen38_span_binding(%epoch: buffer, %span: index) -> (offset, index, index)
@@ -13,22 +17,22 @@ template.decl @qwen38.gdn_conv_prepare_prefill.body(%publish: i1, %head: index, 
 
 template.decl @qwen38.gdn_recurrent_prefill_x4.body(%publish: i1, %head: index, %column: index, %lane: index, %epoch: buffer, %qkv: buffer, %inverse_norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer, %control_origin: offset, %token_begin: index, %state_origin: offset, %next_state_origin: offset)
 
-// Verification extends the immutable epoch after its 128 selected-row slots:
-// 64 pairs of {speculative, output_limit}, followed by the EOS token. Known
-// spans publish in the traversal; speculative spans publish only
-// after acceptance. The ordinary five-word span and cold row layouts match.
-func.def public inline @qwen38_span_speculative(%epoch: buffer, %span: index) -> (i1) {
-  %origin = index.constant 1804 : offset
+// Known spans publish during traversal; speculative spans publish only after
+// acceptance. The prepared packet capacity locates their option records.
+func.def public inline @qwen38_span_speculative(%epoch: buffer, %span_value: index) -> (i1) {
+  %capacity = config.get @qwen38.packet_capacity : index
+  %span = index.assume %span_value [ge(%span_value, 0), lt(%span_value, %capacity)] : index
+  %origin = func.call @qwen38_packet_options_origin(%capacity) : (index) -> (offset)
   %c0 = scalar.constant 0 : i32
   %metadata = buffer.assume.memory_space<constant> %epoch : buffer
-  %options = buffer.view %metadata[%origin] : buffer -> view<64x2xi32>
-  %flag = view.load %options[%span, 0] : view<64x2xi32> -> i32
+  %options = buffer.view %metadata[%origin] : buffer -> view<[%capacity]x2xi32>
+  %flag = view.load %options[%span, 0] : view<[%capacity]x2xi32> -> i32
   %speculative = scalar.cmpi ne, %flag, %c0 : i32
   func.return %speculative : i1
 }
 
 kernel.def export("qwen38_gdn_conv_verify_spans") @qwen38_gdn_conv_verify_spans(%span_capacity: index) {
-  %spans = index.assume %span_capacity [range(%span_capacity, 1, 16)] : index
+  %spans = index.assume %span_capacity [range(%span_capacity, 1, 2147483647)] : index
   %heads = index.constant 16 : index
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
@@ -56,7 +60,7 @@ kernel.def export("qwen38_gdn_conv_verify_spans") @qwen38_gdn_conv_verify_spans(
 }
 
 kernel.def export("qwen38_gdn_recurrent_verify_spans") @qwen38_gdn_recurrent_verify_spans(%span_capacity: index) {
-  %spans = index.assume %span_capacity [range(%span_capacity, 1, 16)] : index
+  %spans = index.assume %span_capacity [range(%span_capacity, 1, 2147483647)] : index
   %heads = index.constant 48 : index
   %columns = index.constant 32 : index
   %threads = index.constant 32 : index
@@ -91,7 +95,7 @@ kernel.def export("qwen38_gdn_recurrent_verify_spans") @qwen38_gdn_recurrent_ver
 // placement even when acceptance compacts the replay descriptors.
 // Known prompt/decode spans leave their slots untouched and are never replayed.
 kernel.def export("qwen38_gdn_capture_spans") @qwen38_gdn_capture_spans(%span_capacity: index, %verification_width: index) {
-  %spans = index.assume %span_capacity [range(%span_capacity, 1, 16)] : index
+  %spans = index.assume %span_capacity [range(%span_capacity, 1, 2147483647)] : index
   %width = index.assume %verification_width [range(%verification_width, 1, 8)] : index
   %tiles_per_row = index.constant 10 : index
   %qkv_tiles = index.mul %width, %tiles_per_row : index

@@ -1,15 +1,7 @@
-// Qwen sequence fields against arithmetic packing and explicit state coordinates.
+// Qwen sequence fields and explicit retained-state coordinates.
 // Metadata storage is compared completely, including unused records and guards.
 
 amdgpu.target<gfx11-generic> @native
-
-func.decl @qwen38_descriptor_pack(%source: i32, %selection: i32) -> (i32)
-
-func.decl @qwen38_descriptor_source_position(%word: i32) -> (i32)
-
-func.decl @qwen38_descriptor_selection(%word: i32) -> (i32)
-
-func.decl @qwen38_descriptor_without_selection(%word: i32) -> (i32)
 
 func.decl @qwen38_span_active(%epoch: buffer, %span: index) -> (i1)
 
@@ -25,88 +17,10 @@ func.decl @qwen38_row_kv_map_origin(%rows: buffer, %row: index) -> (offset)
 
 func.decl @qwen38_kv_position(%capacity: index, %map: buffer, %origin: offset, %position: index, %pool: index) -> (index)
 
-// Cartesian product: sources 0, 1, 2^21, 2^22-1 and selections -1, 0, 127,
-// 447, 1022. This includes absent selection, both consumers' row limits,
-// the packed word's sign bit, and both field maxima.
-global.rodata.def @descriptor_records = bytes("00000000ffffffff0000000000000000000000007f00000000000000bf01000000000000fe03000001000000ffffffff0100000000000000010000007f00000001000000bf01000001000000fe03000000002000ffffffff0000200000000000000020007f00000000002000bf01000000002000fe030000ffff3f00ffffffffffff3f0000000000ffff3f007f000000ffff3f00bf010000ffff3f00fe030000")
-
-func.def @initialize_descriptors(%input: buffer) {
-  %source = global.load @descriptor_records : buffer
-  %source_origin = index.constant 0 : offset
-  %input_origin = index.constant 16 : offset
-  %bytes = index.constant 160 : offset
-  buffer.copy %source[%source_origin], %input[%input_origin], %bytes
-  func.return
-}
-
-kernel.def target(@native) @exercise_descriptors() {
-  %unit = index.constant 1 : index
-  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%unit, %unit, %unit) : index
-} launch(%input: buffer, %output: buffer) {
-  %origin = index.constant 16 : offset
-  %begin = index.constant 0 : index
-  %unit = index.constant 1 : index
-  %count = index.constant 20 : index
-  %records = buffer.view %input[%origin] : buffer -> view<20x2xi32>
-  %results = buffer.view %output[%origin] : buffer -> view<20x4xi32>
-  scf.for %record = [%begin to %count step %unit] {
-    %source = view.load %records[%record, 0] : view<20x2xi32> -> i32
-    %selection = view.load %records[%record, 1] : view<20x2xi32> -> i32
-    %word = func.call @qwen38_descriptor_pack(%source, %selection) : (i32, i32) -> (i32)
-    %decoded_source = func.call @qwen38_descriptor_source_position(%word) : (i32) -> (i32)
-    %decoded_selection = func.call @qwen38_descriptor_selection(%word) : (i32) -> (i32)
-    %without_selection = func.call @qwen38_descriptor_without_selection(%word) : (i32) -> (i32)
-    view.store %word, %results[%record, 0] : i32, view<20x4xi32>
-    view.store %decoded_source, %results[%record, 1] : i32, view<20x4xi32>
-    view.store %decoded_selection, %results[%record, 2] : i32, view<20x4xi32>
-    view.store %without_selection, %results[%record, 3] : i32, view<20x4xi32>
-  }
-  kernel.return
-}
-
-func.def @reference_descriptors(%input: buffer, %output: buffer) {
-  %origin = index.constant 16 : offset
-  %begin = index.constant 0 : index
-  %unit = index.constant 1 : index
-  %count = index.constant 20 : index
-  %scale = scalar.constant 1024 : i32
-  %bias = scalar.constant 1 : i32
-  %records = buffer.view %input[%origin] : buffer -> view<20x2xi32>
-  %results = buffer.view %output[%origin] : buffer -> view<20x4xi32>
-  scf.for %record = [%begin to %count step %unit] {
-    %source = view.load %records[%record, 0] : view<20x2xi32> -> i32
-    %selection = view.load %records[%record, 1] : view<20x2xi32> -> i32
-    %upper = scalar.muli %source, %scale : i32
-    %code = scalar.addi %selection, %bias : i32
-    %word = scalar.addi %upper, %code : i32
-    view.store %word, %results[%record, 0] : i32, view<20x4xi32>
-    view.store %source, %results[%record, 1] : i32, view<20x4xi32>
-    view.store %selection, %results[%record, 2] : i32, view<20x4xi32>
-    view.store %upper, %results[%record, 3] : i32, view<20x4xi32>
-  }
-  func.return
-}
-
-check.scenario public @descriptors {
-  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
-  check.trial[1](%trial: index, %entropy: check.entropy) {
-    %input = check.generate.fill value(-77) : tensor<48xi32>
-    check.generate<@initialize_descriptors>(%input) : (tensor<48xi32>) -> ()
-    %output = check.generate.fill value(-99) : tensor<88xi32>
-    check.compare<@exercise_descriptors, @reference_descriptors>(%input, %output) : (tensor<48xi32>, tensor<88xi32>) -> () {
-      check.expect.bitwise actual(%input) expected(%input) : tensor<48xi32>
-      check.expect.bitwise actual(%output) expected(%output) : tensor<88xi32>
-    }
-  }
-  check.return
-}
-
-check.benchmark<@descriptors> @descriptor_fields
-
 // Epoch: five packed tokens, two spans, two selected outputs. Span 0 starts
 // at the row-1 fork (position 100), span 1 follows the row-256 fork (101).
-// Descriptor words are count, position, packed begin, row, source/selection.
-global.rodata.def @epoch_records = bytes("05000000020000000200000003000000640000000000000001000000015c00000200000065000000030000000001000080fcffff")
+// Descriptor words are count, position, packed begin, row, source, selection.
+global.rodata.def @epoch_records = bytes("05000000020000000200000003000000640000000000000001000000170000000000000002000000650000000300000000010000ffffff7f01000000")
 
 // The first four words contain anchor, writer, K/V origin, and fork position.
 // Initialization appends the independently placed page-map origin.
@@ -125,7 +39,7 @@ func.def @initialize_state(%epoch: buffer, %rows: buffer) {
   %source_origin = index.constant 0 : offset
   %epoch_records_data = global.load @epoch_records : buffer
   %epoch_records_origin = index.constant 0 : offset
-  %epoch_records_bytes = index.constant 52 : offset
+  %epoch_records_bytes = index.constant 60 : offset
   buffer.copy %epoch_records_data[%source_origin], %epoch[%epoch_records_origin], %epoch_records_bytes
   %row_fork_data = global.load @row_fork : buffer
   %row_fork_origin = index.constant 40 : offset
@@ -218,7 +132,7 @@ kernel.def target(@native) @exercise_state() {
 // Per span: active, descriptor byte origin, begin, row, source, anchor+layer,
 // writer+layer, at-fork, K/V+layer, map byte origin, six paged positions,
 // and six dense positions. The inactive span changes only its active flag.
-global.rodata.def @expected_state = bytes("01000000000000000c0000000000000000000000000000000100000000000000170000000000000000020000000000000003000000000000010000000000000000040000000000003428000000000000c000000000000000ff0000000000000000000000000000003f000000000000008000000000000000810000000000000000000000000000003f0000000000000040000000000000007f00000000000000800000000000000081000000000000000100000000000000200000000000000003000000000000000001000000000000ffff3f0000000000000500000000000000090000000000000000000000000000000d000000000000283400000000000040000000000000007f00000000000000c000000000000000ff000000000000000000000000000000010000000000000000000000000000003f0000000000000040000000000000007f000000000000008000000000000000810000000000000000000000000000009dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff")
+global.rodata.def @expected_state = bytes("01000000000000000c0000000000000000000000000000000100000000000000170000000000000000020000000000000003000000000000010000000000000000040000000000003428000000000000c000000000000000ff0000000000000000000000000000003f000000000000008000000000000000810000000000000000000000000000003f0000000000000040000000000000007f00000000000000800000000000000081000000000000000100000000000000240000000000000003000000000000000001000000000000ffffff7f00000000000500000000000000090000000000000000000000000000000d000000000000283400000000000040000000000000007f00000000000000c000000000000000ff000000000000000000000000000000010000000000000000000000000000003f0000000000000040000000000000007f000000000000008000000000000000810000000000000000000000000000009dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff")
 
 func.def @reference_state(%epoch: buffer, %rows: buffer, %output: buffer) {
   %source = global.load @expected_state : buffer

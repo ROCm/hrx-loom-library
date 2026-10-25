@@ -3,9 +3,13 @@
 // descriptors select stable capture slots without copying the captured
 // payload.
 
-config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 16)]
+config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
 
 config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 8)]
+
+config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]
+
+func.decl @qwen38_packet_options_origin(%capacity: index) -> (offset)
 
 func.decl @flash_next_span_active(%epoch: buffer, %span: index) -> (i1)
 
@@ -21,9 +25,11 @@ func.def public inline @flash_next_span_publishes(%verification: index, %epoch: 
     %yes = scalar.constant true : i1
     scf.yield %yes : i1
   } else {
-    %origin = index.constant 1804 : offset
-    %options = buffer.view %epoch[%origin] : buffer -> view<64x2xi32>
-    %flag = view.load %options[%span, 0] : view<64x2xi32> -> i32
+    %packet_capacity = config.get @qwen38.packet_capacity : index
+    %origin = func.call @qwen38_packet_options_origin(%packet_capacity) : (index) -> (offset)
+    %options = buffer.view %epoch[%origin] : buffer -> view<[%packet_capacity]x2xi32>
+    %slot = index.assume %span [ge(%span, 0), lt(%span, %packet_capacity)] : index
+    %flag = view.load %options[%slot, 0] : view<[%packet_capacity]x2xi32> -> i32
     %known = scalar.constant 0 : i32
     %publish = scalar.cmpi eq, %flag, %known : i32
     scf.yield %publish : i1
@@ -35,7 +41,7 @@ func.def public inline @flash_next_span_publishes(%verification: index, %epoch: 
 // span has a stable width-sized slot, including gaps occupied by known spans.
 // Acceptance emits replay descriptors into these slots without copying data.
 kernel.def @flash_next_capture_rows(%span_capacity: index, %row_bytes: offset) {
-  %spans = index.assume %span_capacity [range(%span_capacity, 1, 16)] : index
+  %spans = index.assume %span_capacity [range(%span_capacity, 1, 2147483647)] : index
   %bytes = index.cast %row_bytes : offset to index
   %rounding = index.constant 511 : index
   %group_bytes = index.constant 512 : index
@@ -49,7 +55,7 @@ kernel.def @flash_next_capture_rows(%span_capacity: index, %row_bytes: offset) {
   %width = index.assume %width_value [range(%width_value, 1, 8)] : index
   %row_bytes = index.assume %row_bytes_value [range(%row_bytes_value, 4, 20480), multiple_of(%row_bytes_value, 4)] : offset
   %span_value = kernel.workgroup.id<y> : index
-  %span = index.assume %span_value [range(%span_value, 0, 15)] : index
+  %span = index.assume %span_value [range(%span_value, 0, 2147483647)] : index
   %active = func.call @flash_next_span_active(%epoch, %span) : (buffer, index) -> (i1)
   scf.if %active {
     %known = func.call @flash_next_span_publishes(%width, %epoch, %span) : (index, buffer, index) -> (i1)
@@ -57,9 +63,11 @@ kernel.def @flash_next_capture_rows(%span_capacity: index, %row_bytes: offset) {
     %speculative = scalar.cmpi eq, %known, %no : i1
     scf.if %speculative {
       %origin = index.constant 12 : offset
-      %descriptors = buffer.view %epoch[%origin] : buffer -> view<64x5xi32>
-      %count_word = view.load %descriptors[%span, 0] : view<64x5xi32> -> i32
-      %begin_word = view.load %descriptors[%span, 2] : view<64x5xi32> -> i32
+      %packet_capacity = config.get @qwen38.packet_capacity : index
+      %slot = index.assume %span [ge(%span, 0), lt(%span, %packet_capacity)] : index
+      %descriptors = buffer.view %epoch[%origin] : buffer -> view<[%packet_capacity]x6xi32>
+      %count_word = view.load %descriptors[%slot, 0] : view<[%packet_capacity]x6xi32> -> i32
+      %begin_word = view.load %descriptors[%slot, 2] : view<[%packet_capacity]x6xi32> -> i32
       %count_value = index.cast %count_word : i32 to index
       %count = index.assume %count_value [range(%count_value, 1, %width)] : index
       %begin = index.cast %begin_word : i32 to index
@@ -101,7 +109,7 @@ kernel.def @flash_next_capture_rows(%span_capacity: index, %row_bytes: offset) {
 kernel.def @flash_next_commit_ple_history() {
   %groups = index.constant 20 : index
   %threads = index.constant 128 : index
-  %spans = index.constant 16 : index
+  %spans = config.get @flash_next.span_capacity : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %spans, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%history_origin: offset, %epoch: buffer, %rows: buffer, %input: buffer, %arena: buffer) {
@@ -109,7 +117,7 @@ kernel.def @flash_next_commit_ple_history() {
   %width = config.get @flash_next.verification_width : index
   %capacity = index.mul %spans, %width : index
   %span_value = kernel.workgroup.id<y> : index
-  %span = index.assume %span_value [range(%span_value, 0, 15)] : index
+  %span = index.assume %span_value [range(%span_value, 0, 2147483647)] : index
   %active = func.call @flash_next_span_active(%epoch, %span) : (buffer, index) -> (i1)
   scf.if %active {
     %begin, %end, %fresh, %reader, %writer = func.call @flash_next_span_state(%epoch, %rows, %span, %history_origin, %capacity) : (buffer, buffer, index, offset, index) -> (index, index, i1, offset, offset)

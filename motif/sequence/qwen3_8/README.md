@@ -3,9 +3,9 @@
 The dense Qwen3.8 and Flash-Next programs share these sequence carriers while
 retaining their own numerical kernels, preparation, and scheduling. Functions
 consume validated, caller-owned storage and preserve the original public
-`qwen38_*` linking vocabulary. Input and span accessors allocate nothing;
-continuation uses bounded private scratch. None chooses a target or
-configuration.
+`qwen38_*` linking vocabulary. Accessors and continuation allocate nothing;
+continuation reuses scratch inside the caller's packet storage. None chooses
+a target or configuration.
 
 `input.loom` reads and updates contiguous token IDs or the ID field of an
 eight-word media record. The composition supplies the layout choice. Media
@@ -15,13 +15,19 @@ halves use the same coordinate. Position lookup accepts records 0–511 and
 lanes 0–63. Token lookup and mutation instead use the caller's positive
 capacity and preserve every other record field.
 
-`span.loom` interprets the three-word epoch header and five-word descriptors,
-including a 22-bit source position and 10-bit selected-output code. The code
-is zero for no selection and otherwise holds the selected ID plus one, so
-the supplied selection is `-1` or 0–1022. Causal positions and source
-coordinates remain distinct. Packed token positions and resident identities
-are independent positive I32 values. Their actual extents belong to the
-caller rather than to a fixed binding-helper capacity.
+`span.loom` interprets the three-word epoch header and six-word descriptors:
+length, causal position, packed-token begin, resident identity, source position,
+and selected-output index. Source positions and output indices have independent
+I32 fields; `-1` denotes no selection. Causal positions and source coordinates
+remain distinct. Packed token positions and resident identities are independent
+nonnegative I32 values. Their actual extents belong to the caller rather than
+to a fixed binding-helper capacity.
+
+`packet.loom` defines storage geometry from a caller-supplied token capacity.
+The packet holds two epoch banks, cohort-local sampling policies and identities,
+continuation indices, and compaction scratch. Device feedback uses the same
+capacity. Resident count does not determine packet geometry: a compact cohort
+can reference any resident in the model's state directory.
 
 Each retained row contains five I64 words: immutable anchor origin, private
 writer origin, K/V origin, fork position, and page-map origin. The recurrent

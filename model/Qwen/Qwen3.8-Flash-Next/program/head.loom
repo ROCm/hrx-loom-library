@@ -4,6 +4,14 @@
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
+config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]
+
+func.decl @qwen38_packet_selection_origin(%capacity: index) -> (offset)
+
+func.decl @qwen38_packet_identity_origin(%capacity: index) -> (offset)
+
+func.decl @qwen38_packet_policy_origin(%capacity: index) -> (offset)
+
 func.decl pure @flash_next_output_capacity() -> (index)
 
 amdgpu.target<gfx11-generic> @flash_next_head_wave32 {subgroup_size = 32}
@@ -47,9 +55,10 @@ kernel.def @flash_next_select_output_rows() {
   %active = index.cmp ult, %row, %count : index
   scf.if %active {
     %tokens = config.get @flash_next.token_count : index
-    %selection_origin = index.constant 1292 : offset
-    %selections = buffer.view %epoch[%selection_origin] : buffer -> view<128xi32>
-    %source_word = view.load %selections[%row] : view<128xi32> -> i32
+    %packet_capacity = config.get @qwen38.packet_capacity : index
+    %selection_origin = func.call @qwen38_packet_selection_origin(%packet_capacity) : (index) -> (offset)
+    %selections = buffer.view %epoch[%selection_origin] : buffer -> view<[%packet_capacity]xi32>
+    %source_word = view.load %selections[%row] : view<[%packet_capacity]xi32> -> i32
     %source_value = index.cast %source_word : i32 to index
     %source = index.assume %source_value [range(%source_value, 0, 32767), lt(%source_value, %tokens)] : index
     %input = buffer.view %residual[%origin] : buffer -> view<[%tokens]x1280x8xbf16>
@@ -169,14 +178,15 @@ kernel.def @flash_next_sample() {
   %count = index.cast %count_word : i32 to index
   %active = index.cmp ult, %row, %count : index
   scf.if %active {
-    %identity_origin = index.constant 5088 : offset
-    %identities = buffer.view %epoch[%identity_origin] : buffer -> view<128x2xi32>
-    %owner_word = view.load %identities[%row, 0] : view<128x2xi32> -> i32
-    %position_word = view.load %identities[%row, 1] : view<128x2xi32> -> i32
+    %packet_capacity = config.get @qwen38.packet_capacity : index
+    %identity_origin = func.call @qwen38_packet_identity_origin(%packet_capacity) : (index) -> (offset)
+    %identities = buffer.view %epoch[%identity_origin] : buffer -> view<[%packet_capacity]x2xi32>
+    %owner_word = view.load %identities[%row, 0] : view<[%packet_capacity]x2xi32> -> i32
+    %position_word = view.load %identities[%row, 1] : view<[%packet_capacity]x2xi32> -> i32
     %owner_value = index.cast %owner_word : i32 to index
-    %owner = index.assume %owner_value [range(%owner_value, 0, 15)] : index
+    %owner = index.assume %owner_value [ge(%owner_value, 0), lt(%owner_value, %packet_capacity)] : index
     %position = scalar.extui %position_word : i32 to i64
-    %policy_begin = index.constant 4704 : offset
+    %policy_begin = func.call @qwen38_packet_policy_origin(%packet_capacity) : (index) -> (offset)
     %policy_stride = index.constant 24 : offset
     %policy_relative = index.scale %owner, %policy_stride : index, offset -> offset
     %policy_origin = index.add %policy_begin, %policy_relative : offset
@@ -207,7 +217,7 @@ kernel.def @flash_next_sample() {
     %publishes = index.cmp eq, %thread, %c0 : index
     scf.if %publishes {
       %rows = func.call pure @flash_next_output_capacity() : () -> (index)
-      %output_row = index.assume %row [range(%row, 0, 127), lt(%row, %rows)] : index
+      %output_row = index.assume %row [ge(%row, 0), lt(%row, %rows)] : index
       %ids = buffer.view %output[%origin] : buffer -> view<[%rows]xi32>
       view.store %selected, %ids[%output_row] : i32, view<[%rows]xi32>
     }

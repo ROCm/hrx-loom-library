@@ -5,6 +5,10 @@
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
+func.decl pure @flash_next_draft_cohorts(%capacity: index) -> (index)
+
+func.decl pure @flash_next_draft_mode_origin(%capacity: index) -> (offset)
+
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
 func.decl @flash_next_mtp_span(%epoch: buffer, %span: index) -> (index, index, index, index)
@@ -152,8 +156,8 @@ template.def<@flash_next.draft_update> device @flash_next_draft_update(%position
   template.return
 }
 
-// The plan is immutable for a recursive proposal chain. Four cohort flags
-// precede sixteen row flags. A cohort shares the union of its requested weight
+// The plan is immutable for a recursive proposal chain. Cohort flags
+// precede token flags. A cohort shares the union of its requested weight
 // rows; a full-head peer therefore needs only one shared full weight pass.
 kernel.def @flash_next_draft_plan() {
   %c1_index = index.constant 1 : index
@@ -161,11 +165,12 @@ kernel.def @flash_next_draft_plan() {
 } launch(%epoch: buffer, %ids: buffer, %carry: buffer, %plan: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %count_value = func.call @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
-  %count = index.assume %count_value [range(%count_value, 0, 16), le(%count_value, %capacity)] : index
+  %count = index.assume %count_value [range(%count_value, 0, %capacity)] : index
   %origin = index.constant 0 : offset
-  %row_origin = index.constant 16 : offset
-  %cohorts = buffer.view %plan[%origin] : buffer -> view<4xi32>
-  %modes = buffer.view %plan[%row_origin] : buffer -> view<16xi32>
+  %row_origin = func.call pure @flash_next_draft_mode_origin(%capacity) : (index) -> (offset)
+  %cohort_count = func.call pure @flash_next_draft_cohorts(%capacity) : (index) -> (index)
+  %cohorts = buffer.view %plan[%origin] : buffer -> view<[%cohort_count]xi32>
+  %modes = buffer.view %plan[%row_origin] : buffer -> view<[%capacity]xi32>
   %tokens = buffer.view %ids[%origin] : buffer -> view<[%capacity]xi32>
   %c0_index = index.constant 0 : index
   %c1_index = index.constant 1 : index
@@ -173,8 +178,8 @@ kernel.def @flash_next_draft_plan() {
   %c0_i32 = scalar.constant 0 : i32
   %window = index.constant 32 : index
   %yes = scalar.constant true : i1
-  scf.for %cohort = [%c0_index to %c4_index step %c1_index] {
-    view.store %c0_i32, %cohorts[%cohort] : i32, view<4xi32>
+  scf.for %cohort = [%c0_index to %cohort_count step %c1_index] {
+    view.store %c0_i32, %cohorts[%cohort] : i32, view<[%cohort_count]xi32>
   }
   scf.for %span = [%c0_index to %count step %c1_index] {
     %length, %position, %begin, %owner = func.call @flash_next_mtp_span(%epoch, %span) : (buffer, index) -> (index, index, index, index)
@@ -193,12 +198,12 @@ kernel.def @flash_next_draft_plan() {
     %subset = scalar.andi %known, %quiet : i1
     %full = scalar.xori %subset, %yes : i1
     %mode = scalar.extui %full : i1 to i32
-    %row = index.assume %begin [range(%begin, 0, 15)] : index
-    view.store %mode, %modes[%row] : i32, view<16xi32>
+    %row = index.assume %begin [ge(%begin, 0), lt(%begin, %capacity)] : index
+    view.store %mode, %modes[%row] : i32, view<[%capacity]xi32>
     %cohort = index.div %row, %c4_index : index
-    %prior_mode = view.load %cohorts[%cohort] : view<4xi32> -> i32
+    %prior_mode = view.load %cohorts[%cohort] : view<[%cohort_count]xi32> -> i32
     %combined = scalar.ori %prior_mode, %mode : i32
-    view.store %combined, %cohorts[%cohort] : i32, view<4xi32>
+    view.store %combined, %cohorts[%cohort] : i32, view<[%cohort_count]xi32>
   }
   kernel.return
 }
@@ -248,15 +253,16 @@ kernel.def target(@flash_next_draft_wave32) @flash_next_draft_common_head() {
 } launch(%epoch: buffer, %plan: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %count_value = func.call @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
-  %count = index.assume %count_value [range(%count_value, 0, 16), le(%count_value, %capacity)] : index
+  %count = index.assume %count_value [range(%count_value, 0, %capacity)] : index
   %batch = kernel.workgroup.id<y> : index
   %c4_index = index.constant 4 : index
   %first = index.mul %batch, %c4_index : index
   %active = index.cmp ult, %first, %count : index
   scf.if %active {
     %origin = index.constant 0 : offset
-    %cohorts = buffer.view %plan[%origin] : buffer -> view<4xi32>
-    %mode = view.load %cohorts[%batch] : view<4xi32> -> i32
+    %cohort_count = func.call pure @flash_next_draft_cohorts(%capacity) : (index) -> (index)
+    %cohorts = buffer.view %plan[%origin] : buffer -> view<[%cohort_count]xi32>
+    %mode = view.load %cohorts[%batch] : view<[%cohort_count]xi32> -> i32
     %c0_i32 = scalar.constant 0 : i32
     %full = scalar.cmpi ne, %mode, %c0_i32 : i32
     %full_rows = index.constant 248077 : index
@@ -320,15 +326,16 @@ kernel.def target(@flash_next_draft_wave32) @flash_next_draft_rare_head() {
 } launch(%epoch: buffer, %plan: buffer, %carry: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %count_value = func.call @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
-  %count = index.assume %count_value [range(%count_value, 0, 16), le(%count_value, %capacity)] : index
+  %count = index.assume %count_value [range(%count_value, 0, %capacity)] : index
   %token = kernel.workgroup.id<y> : index
   %active = index.cmp ult, %token, %count : index
   scf.if %active {
     %origin = index.constant 0 : offset
     %c4_index = index.constant 4 : index
     %batch = index.div %token, %c4_index : index
-    %cohorts = buffer.view %plan[%origin] : buffer -> view<4xi32>
-    %mode = view.load %cohorts[%batch] : view<4xi32> -> i32
+    %cohort_count = func.call pure @flash_next_draft_cohorts(%capacity) : (index) -> (index)
+    %cohorts = buffer.view %plan[%origin] : buffer -> view<[%cohort_count]xi32>
+    %mode = view.load %cohorts[%batch] : view<[%cohort_count]xi32> -> i32
     %c0_i32 = scalar.constant 0 : i32
     %subset = scalar.cmpi eq, %mode, %c0_i32 : i32
     scf.if %subset {
@@ -375,7 +382,7 @@ kernel.def @flash_next_draft_sample() {
 } launch(%epoch: buffer, %plan: buffer, %carry: buffer, %logits: buffer, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %count_value = func.call @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
-  %count = index.assume %count_value [range(%count_value, 0, 16), le(%count_value, %capacity)] : index
+  %count = index.assume %count_value [range(%count_value, 0, %capacity)] : index
   %token = kernel.workgroup.id<x> : index
   %active = index.cmp ult, %token, %count : index
   scf.if %active {
@@ -384,9 +391,9 @@ kernel.def @flash_next_draft_sample() {
     %header = buffer.view %carry[%record] : buffer -> view<3xi32>
     %rare_word = view.load %header[0] : view<3xi32> -> i32
     %rare = index.cast %rare_word : i32 to index
-    %row_origin = index.constant 16 : offset
-    %modes = buffer.view %plan[%row_origin] : buffer -> view<16xi32>
-    %mode = view.load %modes[%token] : view<16xi32> -> i32
+    %row_origin = func.call pure @flash_next_draft_mode_origin(%capacity) : (index) -> (offset)
+    %modes = buffer.view %plan[%row_origin] : buffer -> view<[%capacity]xi32>
+    %mode = view.load %modes[%token] : view<[%capacity]xi32> -> i32
     %c0_i32 = scalar.constant 0 : i32
     %full = scalar.cmpi ne, %mode, %c0_i32 : i32
     %common = index.constant 98337 : index
