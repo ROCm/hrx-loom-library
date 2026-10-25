@@ -89,9 +89,12 @@ Concurrent requests, conversation forks, parameter unload/reload, and joined
 shutdown are checked through the native service. All five presets are listed
 in the checkout's model catalog.
 
-The [model map](model/README.md#map) also describes Krea image generation,
-including compatible assets and service contracts. Its executable port is
-still gated on the shared adapter-collection contract.
+[Krea 2 Turbo](model/krea/Krea-2-Turbo/OVERVIEW.md) generates images from the
+original BF16 or compatible INT8 ConvRot checkpoint. Source, bytecode, and mixed
+packages support request-selected adapters prepared from original files at
+runtime. A finite shared arena retains their factors across requests; a
+bounded-workspace preset tiles VAE decoding while preserving the full image.
+The overview includes complete fetch, deployment, and image-request examples.
 
 ## Library development quickstart
 

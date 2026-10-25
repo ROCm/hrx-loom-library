@@ -22,7 +22,7 @@ consume those projected facts and never parse the container directly.
 | Model | Service | Described variants | Execution status |
 | --- | --- | --- | --- |
 | [Moonshine Streaming Tiny](moonshine-ai/moonshine-streaming-tiny/OVERVIEW.md) | Streaming speech recognition | Original F32; source, bytecode, and mixed providers | Runnable on AMDGPU; independent transcript checks |
-| [Krea 2 Turbo](krea/Krea-2-Turbo/OVERVIEW.md) | Image generation | BF16 and INT8 ConvRot | Description; native providers await porting |
+| [Krea 2 Turbo](krea/Krea-2-Turbo/OVERVIEW.md) | Image generation | BF16 and INT8 ConvRot; source, bytecode, and mixed providers | Runnable on AMDGPU; shared runtime adapters, exact image regressions, and bounded VAE workspace |
 | [Pocket TTS](kyutai/pocket-tts/OVERVIEW.md) | Streaming speech synthesis | Three-voice default, four-voice noncommercial variant, and native custom uploads; source, bytecode, and mixed providers | Runnable on AMDGPU; original-recording preparation, independent numerics, and native PCM lifecycle checks |
 | [Qwen3.8 27B](Qwen/Qwen3.8-27B/OVERVIEW.md) | Text generation with optional image input | UD-Q5_K_XL, vision projector, and DFlash2 draft weights; source, bytecode, and mixed providers | Runnable text on AMD RDNA/CDNA; vision and DFlash2 on RDNA with concurrent requests, checkpoint forks, and parameter lifecycle checks |
 | [Qwen3.8 Flash-Next](Qwen/Qwen3.8-Flash-Next/OVERVIEW.md) | Text generation | Four ordered UD-Q4_K_XL shards, optional MTP weights; source, bytecode, and mixed providers | Runnable on AMD RDNA; independent recall, checkpoint forks, and parameter lifecycle checks |
