@@ -19,18 +19,19 @@ capacity and preserve every other record field.
 including a 22-bit source position and 10-bit selected-output code. The code
 is zero for no selection and otherwise holds the selected ID plus one, so
 the supplied selection is `-1` or 0–1022. Causal positions and source
-coordinates remain distinct. The ordinary span-binding helper serves the
-dense model's 512-token packet; Flash's larger packets use their own binding
-while sharing the descriptor encoding.
+coordinates remain distinct. Packed token positions and resident identities
+are independent positive I32 values. Their actual extents belong to the
+caller rather than to a fixed binding-helper capacity.
 
-Each retained row contains four I64 words: immutable anchor origin, private
-writer origin, K/V origin, and fork position. The recurrent binding reports
-whether a span begins at the fork; its caller chooses the corresponding
+Each retained row contains five I64 words: immutable anchor origin, private
+writer origin, K/V origin, fork position, and page-map origin. The recurrent
+binding reports whether a span begins at the fork; its caller chooses the corresponding
 state and owns the aliasing contract. K/V layer origins are 256-byte aligned.
-Optional page tables follow the 64-row header and map 64-token logical pages
-to physical pages. Logical capacity determines table stride, while physical
-capacity bounds the mapped pages. A zero physical capacity selects dense
-addressing without reading a map.
+Preparation publishes each optional page table's byte origin in its resident
+record. Tables map 64-token logical pages to physical pages; neither resident
+count nor epoch width participates in lookup. Physical capacity bounds the
+mapped pages. A zero physical capacity selects dense addressing without reading
+a map.
 
 Span consumers see immutable epoch metadata and retained origins until their
 queued work retires. Continuation then publishes the next live epoch.

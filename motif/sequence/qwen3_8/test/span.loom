@@ -21,7 +21,7 @@ func.decl @qwen38_row_gdn_binding(%epoch: buffer, %control: offset, %rows: buffe
 
 func.decl @qwen38_row_kv_origin(%rows: buffer, %row: index, %layer: offset) -> (offset)
 
-func.decl @qwen38_row_kv_map_origin(%capacity: index, %row: index) -> (offset)
+func.decl @qwen38_row_kv_map_origin(%rows: buffer, %row: index) -> (offset)
 
 func.decl @qwen38_kv_position(%capacity: index, %map: buffer, %origin: offset, %position: index, %pool: index) -> (index)
 
@@ -104,11 +104,12 @@ check.scenario public @descriptors {
 check.benchmark<@descriptors> @descriptor_fields
 
 // Epoch: five packed tokens, two spans, two selected outputs. Span 0 starts
-// at the row-1 fork (position 100), span 1 follows the row-63 fork (101).
+// at the row-1 fork (position 100), span 1 follows the row-256 fork (101).
 // Descriptor words are count, position, packed begin, row, source/selection.
-global.rodata.def @epoch_records = bytes("05000000020000000200000003000000640000000000000001000000015c00000200000065000000030000003f00000080fcffff")
+global.rodata.def @epoch_records = bytes("05000000020000000200000003000000640000000000000001000000015c00000200000065000000030000000001000080fcffff")
 
-// Rows contain anchor, writer, K/V origin, and fork position in I64 words.
+// The first four words contain anchor, writer, K/V origin, and fork position.
+// Initialization appends the independently placed page-map origin.
 global.rodata.def @row_fork = bytes("0001000000000000000200000000000000030000000000006400000000000000")
 
 global.rodata.def @row_last = bytes("00040000000000000008000000000000000c0000000000006400000000000000")
@@ -120,10 +121,6 @@ global.rodata.def @page_last = bytes("010000000300000000000000")
 
 global.rodata.def @positions = bytes("000000003f000000400000007f0000008000000081000000")
 
-global.rodata.def @capacities = bytes("400000004100000082000000")
-
-global.rodata.def @rows = bytes("00000000010000003f000000")
-
 func.def @initialize_state(%epoch: buffer, %rows: buffer) {
   %source_origin = index.constant 0 : offset
   %epoch_records_data = global.load @epoch_records : buffer
@@ -131,21 +128,26 @@ func.def @initialize_state(%epoch: buffer, %rows: buffer) {
   %epoch_records_bytes = index.constant 52 : offset
   buffer.copy %epoch_records_data[%source_origin], %epoch[%epoch_records_origin], %epoch_records_bytes
   %row_fork_data = global.load @row_fork : buffer
-  %row_fork_origin = index.constant 32 : offset
+  %row_fork_origin = index.constant 40 : offset
   %row_fork_bytes = index.constant 32 : offset
   buffer.copy %row_fork_data[%source_origin], %rows[%row_fork_origin], %row_fork_bytes
   %row_last_data = global.load @row_last : buffer
-  %row_last_origin = index.constant 2016 : offset
+  %row_last_origin = index.constant 10240 : offset
   %row_last_bytes = index.constant 32 : offset
   buffer.copy %row_last_data[%source_origin], %rows[%row_last_origin], %row_last_bytes
   %page_fork_data = global.load @page_fork : buffer
-  %page_fork_origin = index.constant 2060 : offset
+  %page_fork_origin = index.constant 10292 : offset
   %page_fork_bytes = index.constant 12 : offset
   buffer.copy %page_fork_data[%source_origin], %rows[%page_fork_origin], %page_fork_bytes
   %page_last_data = global.load @page_last : buffer
-  %page_last_origin = index.constant 2804 : offset
+  %page_last_origin = index.constant 13352 : offset
   %page_last_bytes = index.constant 12 : offset
   buffer.copy %page_last_data[%source_origin], %rows[%page_last_origin], %page_last_bytes
+  %origins = buffer.view %rows[%source_origin] : buffer -> view<257x5xi64>
+  %first_map = index.cast %page_fork_origin : offset to i64
+  %last_map = index.cast %page_last_origin : offset to i64
+  view.store %first_map, %origins[1, 4] : i64, view<257x5xi64>
+  view.store %last_map, %origins[256, 4] : i64, view<257x5xi64>
   func.return
 }
 
@@ -159,7 +161,6 @@ kernel.def target(@native) @exercise_state() {
   %position_count = index.constant 6 : index
   %origin = index.constant 0 : offset
   %output_origin = index.constant 16 : offset
-  %geometry_origin = index.constant 544 : offset
   %logical_capacity = index.constant 130 : index
   %pool_capacity = index.constant 256 : index
   %layer_origin = index.constant 256 : offset
@@ -177,7 +178,7 @@ kernel.def target(@native) @exercise_state() {
       %source = func.call @qwen38_span_source_position(%epoch, %span) : (buffer, index) -> (i32)
       %anchor, %writer, %fork = func.call @qwen38_row_gdn_binding(%epoch, %control, %rows, %row, %layer_origin) : (buffer, offset, buffer, index, offset) -> (offset, offset, i1)
       %kv = func.call @qwen38_row_kv_origin(%rows, %row, %layer_origin) : (buffer, index, offset) -> (offset)
-      %map = func.call @qwen38_row_kv_map_origin(%logical_capacity, %row) : (index, index) -> (offset)
+      %map = func.call @qwen38_row_kv_map_origin(%rows, %row) : (buffer, index) -> (offset)
       %control_word = index.cast %control : offset to i64
       view.store %control_word, %results[%span, 1] : i64, view<3x22xi64>
       %token_begin_word = index.cast %token_begin : index to i64
@@ -211,38 +212,19 @@ kernel.def target(@native) @exercise_state() {
       }
     }
   }
-  %capacity_data = global.load @capacities : buffer
-  %row_data = global.load @rows : buffer
-  %capacities = buffer.view %capacity_data[%origin] : buffer -> view<3xi32>
-  %selected_rows = buffer.view %row_data[%origin] : buffer -> view<3xi32>
-  %geometry = buffer.view %output[%geometry_origin] : buffer -> view<3x3xi64>
-  scf.for %capacity_index = [%begin to %span_count step %unit] {
-    %capacity_word = view.load %capacities[%capacity_index] : view<3xi32> -> i32
-    %capacity_value = index.cast %capacity_word : i32 to index
-    %capacity = index.assume %capacity_value [range(%capacity_value, 64, 130)] : index
-    scf.for %row_index = [%begin to %span_count step %unit] {
-      %row_word = view.load %selected_rows[%row_index] : view<3xi32> -> i32
-      %row_value = index.cast %row_word : i32 to index
-      %row = index.assume %row_value [range(%row_value, 0, 63)] : index
-      %map = func.call @qwen38_row_kv_map_origin(%capacity, %row) : (index, index) -> (offset)
-      %map_word = index.cast %map : offset to i64
-      view.store %map_word, %geometry[%capacity_index, %row_index] : i64, view<3x3xi64>
-    }
-  }
   kernel.return
 }
 
 // Per span: active, descriptor byte origin, begin, row, source, anchor+layer,
 // writer+layer, at-fork, K/V+layer, map byte origin, six paged positions,
 // and six dense positions. The inactive span changes only its active flag.
-// Following geometry is capacity [64,65,130] x row [0,1,63].
-global.rodata.def @expected_state = bytes("01000000000000000c0000000000000000000000000000000100000000000000170000000000000000020000000000000003000000000000010000000000000000040000000000000c08000000000000c000000000000000ff0000000000000000000000000000003f000000000000008000000000000000810000000000000000000000000000003f0000000000000040000000000000007f00000000000000800000000000000081000000000000000100000000000000200000000000000003000000000000003f00000000000000ffff3f0000000000000500000000000000090000000000000000000000000000000d000000000000f40a00000000000040000000000000007f00000000000000c000000000000000ff000000000000000000000000000000010000000000000000000000000000003f0000000000000040000000000000007f000000000000008000000000000000810000000000000000000000000000009dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff00080000000000000408000000000000fc0800000000000000080000000000000808000000000000f80900000000000000080000000000000c08000000000000f40a000000000000")
+global.rodata.def @expected_state = bytes("01000000000000000c0000000000000000000000000000000100000000000000170000000000000000020000000000000003000000000000010000000000000000040000000000003428000000000000c000000000000000ff0000000000000000000000000000003f000000000000008000000000000000810000000000000000000000000000003f0000000000000040000000000000007f00000000000000800000000000000081000000000000000100000000000000200000000000000003000000000000000001000000000000ffff3f0000000000000500000000000000090000000000000000000000000000000d000000000000283400000000000040000000000000007f00000000000000c000000000000000ff000000000000000000000000000000010000000000000000000000000000003f0000000000000040000000000000007f000000000000008000000000000000810000000000000000000000000000009dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff9dffffffffffffff")
 
 func.def @reference_state(%epoch: buffer, %rows: buffer, %output: buffer) {
   %source = global.load @expected_state : buffer
   %source_origin = index.constant 0 : offset
   %output_origin = index.constant 16 : offset
-  %bytes = index.constant 600 : offset
+  %bytes = index.constant 528 : offset
   buffer.copy %source[%source_origin], %output[%output_origin], %bytes
   func.return
 }
@@ -251,13 +233,13 @@ check.scenario public @retained_state {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   check.trial[1](%trial: index, %entropy: check.entropy) {
     %epoch = check.generate.fill value(-77) : tensor<24xi32>
-    %rows = check.generate.fill value(-77) : tensor<354xi64>
-    check.generate<@initialize_state>(%epoch, %rows) : (tensor<24xi32>, tensor<354xi64>) -> ()
-    %output = check.generate.fill value(-99) : tensor<79xi64>
-    check.compare<@exercise_state, @reference_state>(%epoch, %rows, %output) : (tensor<24xi32>, tensor<354xi64>, tensor<79xi64>) -> () {
+    %rows = check.generate.fill value(-77) : tensor<3341xi32>
+    check.generate<@initialize_state>(%epoch, %rows) : (tensor<24xi32>, tensor<3341xi32>) -> ()
+    %output = check.generate.fill value(-99) : tensor<70xi64>
+    check.compare<@exercise_state, @reference_state>(%epoch, %rows, %output) : (tensor<24xi32>, tensor<3341xi32>, tensor<70xi64>) -> () {
       check.expect.bitwise actual(%epoch) expected(%epoch) : tensor<24xi32>
-      check.expect.bitwise actual(%rows) expected(%rows) : tensor<354xi64>
-      check.expect.bitwise actual(%output) expected(%output) : tensor<79xi64>
+      check.expect.bitwise actual(%rows) expected(%rows) : tensor<3341xi32>
+      check.expect.bitwise actual(%output) expected(%output) : tensor<70xi64>
     }
   }
   check.return

@@ -118,7 +118,7 @@ func.def @allocation(%records: buffer, %slot: index, %bytes: i64, %private_bytes
 // input/progress order. Recurrent slots have an independent geometry record.
 func.def @row_view(%records: buffer, %row_count: index, %row: index, %slot: index, %offset: i64, %length: i64) {
   %origin = index.constant 0 : offset
-  %bounded_row = index.assume %row [range(%row, 0, 15), lt(%row, %row_count)] : index
+  %bounded_row = index.assume %row [range(%row, 0, 2147483647), lt(%row, %row_count)] : index
   %bounded_slot = index.assume %slot [range(%slot, 0, 3)] : index
   %view = buffer.view %records[%origin] : buffer -> view<[%row_count]x4x2xi64>
   view.store %offset, %view[%bounded_row, %bounded_slot, 0] : i64, view<[%row_count]x4x2xi64>
@@ -131,7 +131,8 @@ func.def @row_view(%records: buffer, %row_count: index, %row: index, %slot: inde
 // cache-page payloads and the remaining allocations need no initial fill.
 // One recurrent slot contains 36 GDN states, PLE token/convolution history, and
 // twelve QSA incomplete-block tails. KV and index pages share physical page IDs.
-func.def @storage(%tokens: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %enabled: i1) -> (buffer, buffer, buffer, buffer, buffer) {
+func.def @storage(%tokens: i64, %context: i64, %pool: i64, %rows_arg: i64, %pins: i64, %enabled: i1) -> (buffer, buffer, buffer, buffer, buffer) {
+  %rows = scalar.assume %rows_arg [range(%rows_arg, 1, 2147483647)] : i64
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -150,7 +151,8 @@ func.def @storage(%tokens: i64, %context: i64, %pool: i64, %rows: i64, %pins: i6
   %c0_i32 = scalar.constant 0 : i32
   %block_tokens = scalar.constant 64 : i64
   %word_bytes = scalar.constant 4 : i64
-  %map_origin = scalar.constant 2048 : i64
+  %origin_stride = scalar.constant 40 : i64
+  %map_origin = scalar.muli %rows, %origin_stride : i64
   %recurrent_origin = scalar.constant 256 : i64
   %recurrent_bytes = scalar.constant 115651840 : i64
   %control_bytes = scalar.constant 12 : i64
@@ -206,18 +208,17 @@ func.def @storage(%tokens: i64, %context: i64, %pool: i64, %rows: i64, %pins: i6
     func.call @allocation(%allocations, %c9, %draft_bytes, %tail_bytes) : (buffer, index, i64, i64)
     func.call @allocation(%allocations, %c10, %table_bytes, %c0_i64) : (buffer, index, i64, i64)
   }
-  %bounded_rows = scalar.assume %rows [range(%rows, 1, 16)] : i64
-  %row_count = index.cast %bounded_rows : i64 to index
+  %row_count = index.cast %rows : i64 to index
   %view_stride = index.constant 64 : offset
   %view_bytes = index.scale %row_count, %view_stride : index, offset -> offset
   %views = buffer.alloca<private> align(8) %view_bytes : buffer
-  %origin_bytes = index.constant 512 : offset
+  %origin_bytes = index.cast %map_origin : i64 to offset
   %target_origins = buffer.alloca<private> align(8) %origin_bytes : buffer
   %draft_origins = buffer.alloca<private> align(8) %origin_bytes : buffer
   buffer.fill %c0_i32, %target_origins[%origin], %origin_bytes : i32
   buffer.fill %c0_i32, %draft_origins[%origin], %origin_bytes : i32
-  %target = buffer.view %target_origins[%origin] : buffer -> view<16x4xi64>
-  %draft = buffer.view %draft_origins[%origin] : buffer -> view<16x4xi64>
+  %target = buffer.view %target_origins[%origin] : buffer -> view<[%row_count]x5xi64>
+  %draft = buffer.view %draft_origins[%origin] : buffer -> view<[%row_count]x5xi64>
   scf.for %i = [%c0 to %row_count step %c1] {
     %row = index.cast %i : index to i64
     %base = scalar.muli %row, %slot_stride : i64
@@ -228,13 +229,18 @@ func.def @storage(%tokens: i64, %context: i64, %pool: i64, %rows: i64, %pins: i6
     func.call @row_view(%views, %row_count, %i, %c1, %input_base, %c0_i64) : (buffer, index, index, index, i64, i64)
     func.call @row_view(%views, %row_count, %i, %c2, %input_base, %input_bytes) : (buffer, index, index, index, i64, i64)
     func.call @row_view(%views, %row_count, %i, %c3, %progress_base, %progress_bytes) : (buffer, index, index, index, i64, i64)
-    view.store %recurrent_base, %target[%i, 0] : i64, view<16x4xi64>
-    view.store %recurrent_base, %target[%i, 1] : i64, view<16x4xi64>
-    view.store %private_bytes, %target[%i, 2] : i64, view<16x4xi64>
+    view.store %recurrent_base, %target[%i, 0] : i64, view<[%row_count]x5xi64>
+    view.store %recurrent_base, %target[%i, 1] : i64, view<[%row_count]x5xi64>
+    view.store %private_bytes, %target[%i, 2] : i64, view<[%row_count]x5xi64>
     %tail_base = scalar.muli %row, %tail_stride : i64
-    view.store %tail_base, %draft[%i, 0] : i64, view<16x4xi64>
-    view.store %tail_base, %draft[%i, 1] : i64, view<16x4xi64>
-    view.store %tail_bytes, %draft[%i, 2] : i64, view<16x4xi64>
+    view.store %tail_base, %draft[%i, 0] : i64, view<[%row_count]x5xi64>
+    view.store %tail_base, %draft[%i, 1] : i64, view<[%row_count]x5xi64>
+    view.store %tail_bytes, %draft[%i, 2] : i64, view<[%row_count]x5xi64>
+    %map_stride = scalar.muli %blocks_per_row, %word_bytes : i64
+    %map_relative = scalar.muli %row, %map_stride : i64
+    %map_base = scalar.addi %map_origin, %map_relative : i64
+    view.store %map_base, %target[%i, 4] : i64, view<[%row_count]x5xi64>
+    view.store %map_base, %draft[%i, 4] : i64, view<[%row_count]x5xi64>
   }
   // Geometry header: page tokens, map origin, carry stride, feedback split,
   // recurrent origin, slot stride, slot length, and slot count.

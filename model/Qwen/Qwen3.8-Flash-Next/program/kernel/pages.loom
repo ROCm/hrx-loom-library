@@ -10,6 +10,8 @@ config.decl @flash_next.pool_capacity : %value: index where [range(%value, 64, 4
 
 func.decl @flash_next_span_active(%epoch: buffer, %span: index) -> (i1)
 
+func.decl @qwen38_row_kv_map_origin(%rows: buffer, %row: index) -> (offset)
+
 // A single producer publishes direct token ownership for every packed row.
 // QSA kernels share this immutable map throughout the layer stack.
 kernel.def @flash_next_map_tokens() {
@@ -66,7 +68,7 @@ func.def public inline @flash_next_token_binding(%mapping: buffer, %token_arg: i
   %position_value = index.cast %position_word : i32 to index
   %position = index.assume %position_value [range(%position_value, 0, 262143), lt(%position_value, %capacity)] : index
   %row_value = index.cast %row_word : i32 to index
-  %row = index.assume %row_value [range(%row_value, 0, 15)] : index
+  %row = index.assume %row_value [range(%row_value, 0, 2147483647)] : index
   %begin_value = index.cast %begin_word : i32 to index
   %first_value = index.cast %first_word : i32 to index
   %begin = index.assume %begin_value [range(%begin_value, 0, 32767), lt(%begin_value, %tokens)] : index
@@ -85,11 +87,7 @@ func.def public inline @flash_next_physical_token(%rows: buffer, %row: index, %p
   %position = index.assume %position_arg [range(%position_arg, 0, 262143), lt(%position_arg, %capacity)] : index
   %page = index.div %position, %page_tokens : index
   %within = index.rem %position, %page_tokens : index
-  %map_origin = index.constant 2048 : offset
-  %word_bytes = index.constant 4 : offset
-  %row_bytes = index.scale %pages, %word_bytes : index, offset -> offset
-  %row_relative = index.scale %row, %row_bytes : index, offset -> offset
-  %row_origin = index.add %map_origin, %row_relative : offset
+  %row_origin = func.call @qwen38_row_kv_map_origin(%rows, %row) : (buffer, index) -> (offset)
   %maps = buffer.view %rows[%row_origin] : buffer -> view<[%pages]xi32>
   %id_word = view.load %maps[%page] : view<[%pages]xi32> -> i32
   %id_value = index.cast %id_word : i32 to index
@@ -99,9 +97,10 @@ func.def public inline @flash_next_physical_token(%rows: buffer, %row: index, %p
 }
 
 func.def public inline @flash_next_cache_origin(%rows: buffer, %row: index, %plane_origin: offset) -> (offset) {
-  %origin = index.constant 0 : offset
-  %table = buffer.view %rows[%origin] : buffer -> view<16x4xi64>
-  %base_word = view.load %table[%row, 2] : view<16x4xi64> -> i64
+  %stride = index.constant 40 : offset
+  %origin = index.scale %row, %stride : index, offset -> offset
+  %table = buffer.view %rows[%origin] : buffer -> view<5xi64>
+  %base_word = view.load %table[2] : view<5xi64> -> i64
   %base_value = scalar.assume %base_word [range(%base_word, 0, 9223372036854775807)] : i64
   %base = index.cast %base_value : i64 to offset
   %result = index.add %base, %plane_origin : offset
@@ -109,11 +108,12 @@ func.def public inline @flash_next_cache_origin(%rows: buffer, %row: index, %pla
 }
 
 func.def public inline @flash_next_row_state(%rows: buffer, %row: index, %position: index, %layer_origin: offset) -> (offset, offset) {
-  %origin = index.constant 0 : offset
-  %table = buffer.view %rows[%origin] : buffer -> view<16x4xi64>
-  %anchor_word = view.load %table[%row, 0] : view<16x4xi64> -> i64
-  %writer_word = view.load %table[%row, 1] : view<16x4xi64> -> i64
-  %frontier = view.load %table[%row, 3] : view<16x4xi64> -> i64
+  %stride = index.constant 40 : offset
+  %origin = index.scale %row, %stride : index, offset -> offset
+  %table = buffer.view %rows[%origin] : buffer -> view<5xi64>
+  %anchor_word = view.load %table[0] : view<5xi64> -> i64
+  %writer_word = view.load %table[1] : view<5xi64> -> i64
+  %frontier = view.load %table[3] : view<5xi64> -> i64
   %position_word = index.cast %position : index to i64
   %first = scalar.cmpi eq, %position_word, %frontier : i64
   %reader_word = scf.select %first, %anchor_word, %writer_word : i64

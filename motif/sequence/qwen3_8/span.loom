@@ -1,8 +1,9 @@
 // Qwen3.8 packed sequence and retained-state carriers. The header contains
-// three I32 words: active token count, span count, and selected output count. Each following span contains
-// five I32 words: token count, absolute position, packed token begin, resident
-// row, and a packed source position plus selected-output code. Input epochs
-// partition the packed token prefix and refer to distinct resident rows.
+// three I32 words: active token count, span count, and selected output count.
+// Each following span contains five I32 words: token count, absolute position,
+// packed token begin, resident row, and a packed source position plus
+// selected-output code. Input epochs partition the packed token prefix and
+// refer to distinct resident rows.
 // Accepted/replay controls retain original activation offsets with gaps; their
 // counts describe only the accepted subspans inside the header's token extent.
 // Full-model epochs reserve 64 descriptors, followed at byte 1292 by 128 I32
@@ -14,19 +15,17 @@
 // permission to refill epoch storage. Resident origins remain cold data;
 // optional page maps are published before the work that first consumes them.
 
-// Packed cache page maps follow room for 64 eight-word row records. A mapping
-// covers only the resident logical prefix; entries beyond it are not read.
-// Its row stride uses the caller's logical capacity, not the physical pool.
-func.def public inline @qwen38_row_kv_map_origin(%logical_capacity: index, %row: index) -> (offset) {
-  %c63 = index.constant 63 : index
-  %c64 = index.constant 64 : index
-  %padded_capacity = index.add %logical_capacity, %c63 : index
-  %block_count = index.div %padded_capacity, %c64 : index
-  %word_bytes = index.constant 4 : offset
-  %row_bytes = index.scale %block_count, %word_bytes : index, offset -> offset
-  %relative_origin = index.scale %row, %row_bytes : index, offset -> offset
-  %header_bytes = index.constant 2048 : offset
-  %origin = index.add %header_bytes, %relative_origin : offset
+// Preparation publishes the page-map origin with the resident's state origins.
+// Neither the epoch width nor a compiled resident count participates in lookup.
+// A mapping covers only the resident logical prefix; later entries are not read.
+func.def public inline @qwen38_row_kv_map_origin(%rows: buffer, %row: index) -> (offset) {
+  %record_bytes = index.constant 40 : offset
+  %record_origin = index.scale %row, %record_bytes : index, offset -> offset
+  %metadata = buffer.assume.memory_space<constant> %rows : buffer
+  %entry = buffer.view %metadata[%record_origin] : buffer -> view<5xi64>
+  %origin_word = view.load %entry[4] : view<5xi64> -> i64
+  %nonnegative = scalar.assume %origin_word [range(%origin_word, 0, 9223372036854775807), multiple_of(%origin_word, 4)] : i64
+  %origin = index.cast %nonnegative : i64 to offset
   func.return %origin : offset
 }
 
@@ -121,8 +120,8 @@ func.def public inline @qwen38_span_source_position(%epoch: buffer, %span: index
 // The returned control origin addresses the count/position pair used by the
 // ordinary single-span kernels. Token begin indexes the compact activations;
 // resident row indexes stable state and is independent of that placement.
-// This binding serves the 512-token Qwen packet: begin is 0..511 and row 0..63.
-// Larger Flash packets use their own binding, sharing only descriptor fields.
+// Packed positions and resident identities are independent positive I32 values;
+// callers carry their actual activation and retained-storage extents.
 func.def public inline @qwen38_span_binding(%epoch: buffer, %span: index) -> (offset, index, index) {
   %header_bytes = index.constant 12 : offset
   %span_bytes = index.constant 20 : offset
@@ -136,30 +135,30 @@ func.def public inline @qwen38_span_binding(%epoch: buffer, %span: index) -> (of
   %row_word = view.load %descriptor[%row_index] : view<5xi32> -> i32
   %begin_value = index.cast %begin_word : i32 to index
   %row_value = index.cast %row_word : i32 to index
-  %begin = index.assume %begin_value [range(%begin_value, 0, 511)] : index
-  %row = index.assume %row_value [range(%row_value, 0, 63)] : index
+  %begin = index.assume %begin_value [range(%begin_value, 0, 2147483647)] : index
+  %row = index.assume %row_value [range(%row_value, 0, 2147483647)] : index
   func.return %control_origin, %begin, %row : offset, index, index
 }
 
-// Each row holds four I64 words: recurrent read origin, write origin, K/V
-// origin, and fork position. At the fork position both verification and accepted
-// replay read the immutable anchor. Later queued epochs read the private writer
-// using their advanced position, without changing this table. An exclusive row
+// Each row holds five I64 words: recurrent read origin, write origin, K/V
+// origin, fork position, and page-map origin. At the fork position verification
+// and accepted replay read the immutable anchor. Later epochs read the private
+// writer using their advanced position, without changing this table. An exclusive row
 // has equal read/write origins. A destination cannot overlap any other cohort
 // member's read or write state; the table remains immutable until retirement.
 // Returns the anchor, writer, and whether this span starts at the fork. Keeping
 // that choice outside the math body preserves its explicit address/alias facts.
 func.def public inline @qwen38_row_gdn_binding(%epoch: buffer, %control_origin: offset, %rows: buffer, %row: index, %layer_origin: offset) -> (offset, offset, i1) {
-  %row_bytes = index.constant 32 : offset
+  %row_bytes = index.constant 40 : offset
   %table_origin = index.scale %row, %row_bytes : index, offset -> offset
   %metadata = buffer.assume.memory_space<constant> %rows : buffer
-  %entry = buffer.view %metadata[%table_origin] : buffer -> view<4xi64>
+  %entry = buffer.view %metadata[%table_origin] : buffer -> view<5xi64>
   %anchor_index = index.constant 0 : index
   %write_index = index.constant 1 : index
   %frontier_index = index.constant 3 : index
-  %anchor_word = view.load %entry[%anchor_index] : view<4xi64> -> i64
-  %write_word = view.load %entry[%write_index] : view<4xi64> -> i64
-  %frontier = view.load %entry[%frontier_index] : view<4xi64> -> i64
+  %anchor_word = view.load %entry[%anchor_index] : view<5xi64> -> i64
+  %write_word = view.load %entry[%write_index] : view<5xi64> -> i64
+  %frontier = view.load %entry[%frontier_index] : view<5xi64> -> i64
   %controls = buffer.assume.memory_space<constant> %epoch : buffer
   %control = buffer.view %controls[%control_origin] : buffer -> view<5xi32>
   %position_word = view.load %control[%write_index] : view<5xi32> -> i32
@@ -179,12 +178,12 @@ func.def public inline @qwen38_row_gdn_binding(%epoch: buffer, %control_origin: 
 // independently of the currently consumed prefix in the span descriptor.
 // State origins and layer planes both begin on 256-byte boundaries.
 func.def public inline @qwen38_row_kv_origin(%rows: buffer, %row: index, %layer_origin: offset) -> (offset) {
-  %row_bytes = index.constant 32 : offset
+  %row_bytes = index.constant 40 : offset
   %table_origin = index.scale %row, %row_bytes : index, offset -> offset
   %metadata = buffer.assume.memory_space<constant> %rows : buffer
-  %entry = buffer.view %metadata[%table_origin] : buffer -> view<4xi64>
+  %entry = buffer.view %metadata[%table_origin] : buffer -> view<5xi64>
   %kv_index = index.constant 2 : index
-  %origin_word = view.load %entry[%kv_index] : view<4xi64> -> i64
+  %origin_word = view.load %entry[%kv_index] : view<5xi64> -> i64
   %nonnegative_origin = scalar.assume %origin_word [range(%origin_word, 0, 9223372036854775807), multiple_of(%origin_word, 256)] : i64
   %row_origin = index.cast %nonnegative_origin : i64 to offset
   %aligned_layer_origin = index.assume %layer_origin [multiple_of(%layer_origin, 256)] : offset
