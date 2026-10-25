@@ -140,7 +140,8 @@ func.def @encode_plan(%plan: buffer, %inputs: buffer, %count: index, %first: ind
         %relative = scalar.subi %token, %cursor : i32
         %input_position = scalar.addi %position, %relative : i32
         %target_position = scalar.addi %input_position, %one32 : i32
-        view.store %row, %identities[%slot, 0] : i32, view<128x2xi32>
+        %owner = index.cast %i : index to i32
+        view.store %owner, %identities[%slot, 0] : i32, view<128x2xi32>
         view.store %target_position, %identities[%slot, 1] : i32, view<128x2xi32>
       }
     }
@@ -165,10 +166,21 @@ func.def public @text_encode_epoch_v1(%control_state: buffer, %plan: buffer, %in
   %token_bytes = buffer.length %tokens
   %policy_source = index.constant 32 : offset
   %policy_target = index.constant 4704 : offset
-  %policy_bytes = index.constant 384 : offset
-  buffer.copy %control_state[%policy_source], %metadata[%policy_target], %policy_bytes
+  %policy_stride = index.constant 24 : offset
   %first_bounded = scalar.assume %first_count [range(%first_count, 1, 16)] : i32
   %first = index.cast %first_bounded : i32 to index
+  %requests = buffer.view %plan[%origin] : buffer -> view<[%first]x9xi32>
+  // Sampling follows the compact first cohort, not the resident directory.
+  // A queued continuation retains its first-plan policy index after compaction.
+  scf.for %i = [%c0 to %first step %c1] {
+    %row_word = view.load %requests[%i, 3] : view<[%first]x9xi32> -> i32
+    %row = index.cast %row_word : i32 to index
+    %source_relative = index.scale %row, %policy_stride : index, offset -> offset
+    %source_offset = index.add %policy_source, %source_relative : offset
+    %target_relative = index.scale %i, %policy_stride : index, offset -> offset
+    %target_offset = index.add %policy_target, %target_relative : offset
+    buffer.copy %control_state[%source_offset], %metadata[%target_offset], %policy_stride
+  }
   %media_count = scalar.addi %first_media_count, %next_media_count : i32
   %ordinary = scalar.cmpi eq, %media_count, %zero32 : i32
   %outputs, %first_tokens = func.call @encode_plan(%plan, %inputs, %first, %c0, %metadata, %origin, %tokens, %origin, %ordinary) : (buffer, buffer, index, index, buffer, offset, buffer, offset, i1) -> (i32, i32)
@@ -218,7 +230,10 @@ func.def public @text_encode_epoch_v1(%control_state: buffer, %plan: buffer, %in
     }
   }
   func.call @qwen38.epoch_transfers(%control_state, %first_count, %next_count, %outputs, %next_output_count, %first_tokens, %next_token_count, %first_packet_capacity, %tokens, %mixed) : (buffer, i32, i32, i32, i32, i32, i32, i32, buffer, i1)
-  %transfer_begin = scalar.constant 416 : i64
+  %state_bytes = buffer.length %control_state
+  %transfer_bytes = index.constant 560 : offset
+  %transfer_offset = index.sub %state_bytes, %transfer_bytes : offset
+  %transfer_begin = index.cast %transfer_offset : offset to i64
   %transfer_length = scalar.constant 560 : i64
   func.return %outputs, %control_state, %transfer_begin, %transfer_length : i32, buffer, i64, i64
 }
@@ -472,10 +487,12 @@ func.def public @text_epoch_v1(%control_state: buffer, %shape: i32, %proposes: i
 }
 
 // Fourteen ordered, disjoint placements describe the live packet fields.
-// The retained table follows the 32-byte control header and 384-byte row
-// sampling table. Empty placements carry zero length; they upload no bytes.
+// The retained table follows the 32-byte control header and resident sampling
+// directory. Empty placements carry zero length; they upload no bytes.
 func.def @qwen38.epoch_transfer(%state: buffer, %slot: index, %binding: i64, %begin: i64, %length: i64) {
-  %origin = index.constant 416 : offset
+  %state_bytes = buffer.length %state
+  %table_bytes = index.constant 560 : offset
+  %origin = index.sub %state_bytes, %table_bytes : offset
   %entry = index.assume %slot [range(%slot, 0, 13)] : index
   %table = buffer.view %state[%origin] : buffer -> view<14x5xi64>
   view.store %binding, %table[%entry, 0] : i64, view<14x5xi64>
@@ -511,7 +528,8 @@ func.def @qwen38.epoch_transfers(%state: buffer, %first_count: i32, %next_count:
   %next_options = scalar.muli %next, %pair : i64
   %next_eos = scf.select %has_next, %word, %metadata : i64
   %indices = scalar.muli %next, %word : i64
-  %policies = scalar.constant 384 : i64
+  %policy_stride = scalar.constant 24 : i64
+  %policies = scalar.muli %first, %policy_stride : i64
   %identities = scalar.muli %outputs, %pair : i64
   %shape = scf.select %mixed, %pair, %metadata : i64
   %stride = scf.select %mixed, %record, %word : i64

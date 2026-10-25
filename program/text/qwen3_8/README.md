@@ -20,9 +20,12 @@ carries length, causal and source positions, resident row, known-input range,
 flags, output credit, and continuation owner.
 Encoding builds the source's packed descriptors and selected-row mapping.
 It returns fourteen explicit upload ranges; unused capacity remains untouched
-and is not uploaded. The retained 976-byte control allocation contains an
-8-word stage header, sixteen 24-byte sampling records, and fourteen 40-byte
+and is not uploaded. The retained control allocation contains an 8-word stage
+header, one 24-byte sampling record per resident identity, and fourteen 40-byte
 transfer records. The composition's preparation provider owns this allocation.
+Encoding gathers the current cohort's sampling records; output identities name
+their first-cohort policy ordinal, not their resident state ID. Reordered
+continuations preserve that policy ordinal through their first-result tags.
 
 Runner imports enqueue target, proposal, verification, catch-up, and feedback
 work. The returned completion edge covers work using mutable state; feedback
