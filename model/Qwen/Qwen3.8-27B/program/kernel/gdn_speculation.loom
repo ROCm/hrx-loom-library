@@ -90,10 +90,10 @@ kernel.def export("qwen38_gdn_recurrent_verify_spans") @qwen38_gdn_recurrent_ver
   kernel.return
 }
 
-// Each layer retains verification_width transitions per compiled span,
-// independently of its padded token capacity. Capture slots keep original span
-// placement even when acceptance compacts the replay descriptors.
-// Known prompt/decode spans leave their slots untouched and are never replayed.
+// Each capture plane retains the target stage's packed token capacity.
+// Speculative transitions keep their original token offsets when acceptance
+// compacts replay descriptors. Known spans remain untouched and are not replayed.
+// Width selects the work per speculative span; capacity sets plane origins.
 kernel.def export("qwen38_gdn_capture_spans") @qwen38_gdn_capture_spans(%span_capacity: index, %verification_width: index) {
   %spans = index.assume %span_capacity [range(%span_capacity, 1, 2147483647)] : index
   %width = index.assume %verification_width [range(%verification_width, 1, 8)] : index
@@ -103,7 +103,8 @@ kernel.def export("qwen38_gdn_capture_spans") @qwen38_gdn_capture_spans(%span_ca
   %c1 = index.constant 1 : index
   %tiles = index.add %qkv_tiles, %c1 : index
   kernel.launch.config workgroups(%tiles, %spans, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%verification_width: index, %epoch: buffer, %qkv: buffer, %alpha: buffer, %beta: buffer, %capture: buffer, %layer_origin: offset) {
+} launch(%token_capacity_value: index, %verification_width: index, %epoch: buffer, %qkv: buffer, %alpha: buffer, %beta: buffer, %capture: buffer, %layer_origin: offset) {
+  %token_capacity = index.assume %token_capacity_value [range(%token_capacity_value, 1, 2147483647)] : index
   %width = index.assume %verification_width [range(%verification_width, 1, 8)] : index
   %span = kernel.workgroup.id<y> : index
   %active = func.call @qwen38_span_active(%epoch, %span) : (buffer, index) -> (i1)
@@ -118,9 +119,7 @@ kernel.def export("qwen38_gdn_capture_spans") @qwen38_gdn_capture_spans(%span_ca
       %qkv_tiles = index.mul %width, %tiles_per_row : index
       %threads = index.constant 256 : index
       %qkv_row_bytes = index.constant 40960 : offset
-      %qkv_span_bytes = index.scale %width, %qkv_row_bytes : index, offset -> offset
       %gate_row_bytes = index.constant 192 : offset
-      %gate_span_bytes = index.scale %width, %gate_row_bytes : index, offset -> offset
       %qkv_channels = index.constant 10240 : index
       %gate_channels = index.constant 48 : index
       %qkv_elements = index.mul %width, %qkv_channels : index
@@ -128,8 +127,7 @@ kernel.def export("qwen38_gdn_capture_spans") @qwen38_gdn_capture_spans(%span_ca
       %is_qkv = index.cmp ult, %tile, %qkv_tiles : index
       scf.if %is_qkv {
         %source_origin = index.scale %begin, %qkv_row_bytes : index, offset -> offset
-        %span_origin = index.scale %span, %qkv_span_bytes : index, offset -> offset
-        %target_origin = index.add %layer_origin, %span_origin : offset
+        %target_origin = index.add %layer_origin, %source_origin : offset
         %input = buffer.view %qkv[%source_origin] : buffer -> view<[%qkv_elements]xf32>
         %output = buffer.view %capture[%target_origin] : buffer -> view<[%qkv_elements]xf32>
         %tile_begin = index.mul %tile, %threads : index
@@ -142,11 +140,9 @@ kernel.def export("qwen38_gdn_capture_spans") @qwen38_gdn_capture_spans(%span_ca
         %active_packet = index.cmp ult, %thread, %packets : index
         scf.if %active_packet {
           %source_origin = index.scale %begin, %gate_row_bytes : index, offset -> offset
-          %span_origin = index.scale %span, %gate_span_bytes : index, offset -> offset
-          %target_origin = index.add %layer_origin, %span_origin : offset
-          %span_capacity = kernel.workgroup.count<y> : index
-          %alpha_offset = index.scale %span_capacity, %qkv_span_bytes : index, offset -> offset
-          %gate_bytes = index.scale %span_capacity, %gate_span_bytes : index, offset -> offset
+          %target_origin = index.add %layer_origin, %source_origin : offset
+          %alpha_offset = index.scale %token_capacity, %qkv_row_bytes : index, offset -> offset
+          %gate_bytes = index.scale %token_capacity, %gate_row_bytes : index, offset -> offset
           %beta_offset = index.add %alpha_offset, %gate_bytes : offset
           %alpha_origin = index.add %target_origin, %alpha_offset : offset
           %beta_origin = index.add %target_origin, %beta_offset : offset

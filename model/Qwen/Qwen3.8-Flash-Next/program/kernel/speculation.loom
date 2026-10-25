@@ -3,9 +3,9 @@
 // descriptors select stable capture slots without copying the captured
 // payload.
 
-config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
-config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 8)]
+config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
 
 config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]
 
@@ -38,8 +38,8 @@ func.def public inline @flash_next_span_publishes(%verification: index, %epoch: 
 }
 
 // Capture preserves transition inputs, not recurrent endpoints. Every source
-// span has a stable width-sized slot, including gaps occupied by known spans.
-// Acceptance emits replay descriptors into these slots without copying data.
+// token keeps its original packed offset. Known spans leave their tokens
+// untouched; acceptance compacts replay descriptors without copying payloads.
 kernel.def @flash_next_capture_rows(%neural_enabled: i1, %span_capacity: index, %row_bytes: offset) {
   %spans = index.assume %span_capacity [range(%span_capacity, 1, 2147483647)] : index
   %bytes = index.cast %row_bytes : offset to index
@@ -83,16 +83,12 @@ kernel.def @flash_next_capture_rows(%neural_enabled: i1, %span_capacity: index, 
       %byte = index.scale %packet, %packet_bytes : index, offset -> offset
       %inside = index.cmp ult, %byte, %row_bytes : offset
       scf.if %inside {
-        %first = index.mul %span, %width : index
         scf.for %token = [%c0 to %count step %c1] {
           %source_value = index.add %begin, %token : index
           %source = index.assume %source_value [range(%source_value, 0, 32767), lt(%source_value, %source_capacity)] : index
-          %destination = index.add %first, %token : index
           %source_row = index.scale %source, %row_bytes : index, offset -> offset
           %source_origin = index.add %source_row, %byte : offset
-          %destination_row = index.scale %destination, %row_bytes : index, offset -> offset
-          %destination_base = index.add %capture_origin, %destination_row : offset
-          %destination_origin = index.add %destination_base, %byte : offset
+          %destination_origin = index.add %capture_origin, %source_origin : offset
           %input_view = buffer.view %input[%source_origin] : buffer -> view<4xi8>
           %output_view = buffer.view %capture[%destination_origin] : buffer -> view<4xi8>
           %value = vector.load %input_view[%c0] : view<4xi8> -> vector<4xi8>
@@ -115,9 +111,7 @@ kernel.def @flash_next_commit_ple_history() {
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %spans, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%history_origin: offset, %epoch: buffer, %rows: buffer, %input: buffer, %arena: buffer) {
-  %spans = config.get @flash_next.span_capacity : index
-  %width = config.get @flash_next.verification_width : index
-  %capacity = index.mul %spans, %width : index
+  %capacity = config.get @flash_next.token_count : index
   %span_value = kernel.workgroup.id<y> : index
   %span = index.assume %span_value [range(%span_value, 0, 2147483647)] : index
   %active = func.call @flash_next_span_active(%epoch, %span) : (buffer, index) -> (i1)
