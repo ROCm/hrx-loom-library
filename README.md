@@ -36,7 +36,7 @@ Fetch Moonshine Streaming Tiny directly from its published card, then serve it
 on an AMD GPU:
 
 ```sh
-loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/bedb7bbf149066c7979f45ce753da3b9b8875842/model/moonshine-ai/moonshine-streaming-tiny/model.json --preset=streaming --output=./moonshine
+loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/4317508bf5adb251a284ea8dc4e5a24a11bd1c17/model/moonshine-ai/moonshine-streaming-tiny/model.json --preset=streaming --output=./moonshine
 loom-serve --device=amdgpu2 --workers=4 --listen=127.0.0.1:8080 --model=./moonshine/model.json
 ```
 

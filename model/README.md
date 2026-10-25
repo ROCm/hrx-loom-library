@@ -70,14 +70,13 @@ chat, and DFlash2 drafting with the complete native service checks.
 Installed SDK users can inspect a published snapshot without a clone:
 
 ```sh
-loom-fetch --catalog=github:ROCm/hrx-loom-library@bedb7bbf149066c7979f45ce753da3b9b8875842 --list --json
+loom-fetch --catalog=github:ROCm/hrx-loom-library@4317508bf5adb251a284ea8dc4e5a24a11bd1c17 --list --json
 ```
 
-This snapshot lists Moonshine Streaming Tiny, Pocket TTS, and Qwen3.8 Flash-Next.
-The checkout's catalog additionally includes Qwen3 Embedding for the Strix Halo
-NPU, Qwen3.8-27B with its text, vision, and drafting presets, and Krea 2 Turbo
-with BF16, INT8, and bounded-workspace image presets. Their checkpoint files
-are acquired directly from the named publishers.
+This snapshot lists all six packages above: recognition, speech synthesis,
+text generation, image-conditioned chat, NPU embeddings, and image generation.
+The same variants and presets are available through the checkout's catalog.
+Checkpoint files are acquired directly from the named publishers.
 
 A local checkout supports the same discovery and selection:
 
