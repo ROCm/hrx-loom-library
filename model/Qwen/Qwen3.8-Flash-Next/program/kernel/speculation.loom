@@ -11,7 +11,9 @@ config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147
 
 func.decl @qwen38_packet_options_origin(%capacity: index) -> (offset)
 
-func.decl @flash_next_span_active(%epoch: buffer, %span: index) -> (i1)
+func.decl @flash_next_span_count(%epoch: buffer) -> (index)
+
+func.decl pure @flash_next_span_workers(%capacity: index) -> (index)
 
 func.decl @flash_next_span_state(%epoch: buffer, %rows: buffer, %span: index, %layer_origin: offset, %capacity: index) -> (index, index, i1, offset, offset)
 
@@ -41,7 +43,8 @@ func.def public inline @flash_next_span_publishes(%verification: index, %epoch: 
 // token keeps its original packed offset. Known spans leave their tokens
 // untouched; acceptance compacts replay descriptors without copying payloads.
 kernel.def @flash_next_capture_rows(%neural_enabled: i1, %span_capacity: index, %row_bytes: offset) {
-  %spans = index.assume %span_capacity [range(%span_capacity, 1, 2147483647)] : index
+  %capacity = index.assume %span_capacity [range(%span_capacity, 1, 2147483647)] : index
+  %spans = func.call pure @flash_next_span_workers(%capacity) : (index) -> (index)
   %bytes = index.cast %row_bytes : offset to index
   %rounding = index.constant 511 : index
   %group_bytes = index.constant 512 : index
@@ -56,10 +59,10 @@ kernel.def @flash_next_capture_rows(%neural_enabled: i1, %span_capacity: index, 
   %source_capacity = index.assume %source_capacity_value [range(%source_capacity_value, 1, 32768)] : index
   %width = index.assume %width_value [range(%width_value, 1, 8)] : index
   %row_bytes = index.assume %row_bytes_value [range(%row_bytes_value, 4, 20480), multiple_of(%row_bytes_value, 4)] : offset
-  %span_value = kernel.workgroup.id<y> : index
-  %span = index.assume %span_value [range(%span_value, 0, 2147483647)] : index
-  %active = func.call @flash_next_span_active(%epoch, %span) : (buffer, index) -> (i1)
-  scf.if %active {
+  %first_span = kernel.workgroup.id<y> : index
+  %span_stride = kernel.workgroup.count<y> : index
+  %span_count = func.call @flash_next_span_count(%epoch) : (buffer) -> (index)
+  scf.for %span = [%first_span to %span_count step %span_stride] {
     %known = func.call @flash_next_span_publishes(%width, %epoch, %span) : (index, buffer, index) -> (i1)
     %no = scalar.constant false : i1
     %speculative = scalar.cmpi eq, %known, %no : i1
@@ -107,15 +110,16 @@ kernel.def @flash_next_capture_rows(%neural_enabled: i1, %span_capacity: index, 
 kernel.def @flash_next_commit_ple_history() {
   %groups = index.constant 20 : index
   %threads = index.constant 128 : index
-  %spans = config.get @flash_next.span_capacity : index
+  %span_capacity = config.get @flash_next.span_capacity : index
+  %spans = func.call pure @flash_next_span_workers(%span_capacity) : (index) -> (index)
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %spans, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%history_origin: offset, %epoch: buffer, %rows: buffer, %input: buffer, %arena: buffer) {
   %capacity = config.get @flash_next.token_count : index
-  %span_value = kernel.workgroup.id<y> : index
-  %span = index.assume %span_value [range(%span_value, 0, 2147483647)] : index
-  %active = func.call @flash_next_span_active(%epoch, %span) : (buffer, index) -> (i1)
-  scf.if %active {
+  %first_span = kernel.workgroup.id<y> : index
+  %span_stride = kernel.workgroup.count<y> : index
+  %span_count = func.call @flash_next_span_count(%epoch) : (buffer) -> (index)
+  scf.for %span = [%first_span to %span_count step %span_stride] {
     %begin, %end, %fresh, %reader, %writer = func.call @flash_next_span_state(%epoch, %rows, %span, %history_origin, %capacity) : (buffer, buffer, index, offset, index) -> (index, index, i1, offset, offset)
     %c0 = index.constant 0 : index
     %c1 = index.constant 1 : index

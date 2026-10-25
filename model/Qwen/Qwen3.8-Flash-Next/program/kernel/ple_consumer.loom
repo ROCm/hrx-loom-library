@@ -2,6 +2,8 @@
 // publications feed the residual composition, and reader/writer origins
 // preserve independent fork history.
 
+config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
+
 config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 8)]
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
@@ -10,7 +12,9 @@ func.decl @flash_next_span_publishes(%verification: index, %epoch: buffer, %span
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
-func.decl @flash_next_span_active(%epoch: buffer, %span: index) -> (i1)
+func.decl @flash_next_span_count(%epoch: buffer) -> (index)
+
+func.decl pure @flash_next_span_workers(%capacity: index) -> (index)
 
 func.decl @flash_next_span_state(%epoch: buffer, %rows: buffer, %span: index, %layer_origin: offset, %capacity: index) -> (index, index, i1, offset, offset)
 
@@ -129,9 +133,10 @@ template.decl @flash_next.ple_convolve.body(%capacity: index, %verification: ind
 
 template.def<@flash_next.ple_convolve.body> device @flash_next_ple_convolve_body(%capacity: index, %verification: index, %history_origin: offset, %origins: buffer, %span_arg: buffer, %gated_arg: buffer, %normalized_arg: buffer, %weight_arg: buffer, %history_arg: buffer, %residual_arg: buffer, %output_arg: buffer) {
   %span, %gated, %normalized, %weight, %history, %residual, %output = buffer.assume.noalias %span_arg, %gated_arg, %normalized_arg, %weight_arg, %history_arg, %residual_arg, %output_arg : buffer, buffer, buffer, buffer, buffer, buffer, buffer
-  %slot = kernel.workgroup.id<y> : index
-  %active = func.call @flash_next_span_active(%span, %slot) : (buffer, index) -> (i1)
-  scf.if %active {
+  %first_span = kernel.workgroup.id<y> : index
+  %span_stride = kernel.workgroup.count<y> : index
+  %span_count = func.call @flash_next_span_count(%span) : (buffer) -> (index)
+  scf.for %slot = [%first_span to %span_count step %span_stride] {
     %begin, %end, %fresh, %reader, %writer = func.call @flash_next_span_state(%span, %origins, %slot, %history_origin, %capacity) : (buffer, buffer, index, offset, index) -> (index, index, i1, offset, offset)
     %origin = index.constant 0 : offset
     %c0 = index.constant 0 : index
@@ -263,7 +268,8 @@ kernel.def @flash_next_ple_convolve() {
   %groups = index.constant 20 : index
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
-  %spans = index.constant 16 : index
+  %span_capacity = config.get @flash_next.span_capacity : index
+  %spans = func.call pure @flash_next_span_workers(%span_capacity) : (index) -> (index)
   kernel.launch.config workgroups(%groups, %spans, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%history_origin: offset, %origins: buffer, %span_arg: buffer, %gated_arg: buffer, %normalized_arg: buffer, %weight_arg: buffer, %history_arg: buffer, %residual_arg: buffer, %output_arg: buffer) {
   %capacity = config.get @flash_next.token_count : index

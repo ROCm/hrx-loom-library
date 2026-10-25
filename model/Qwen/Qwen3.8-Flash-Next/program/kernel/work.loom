@@ -2,8 +2,9 @@
 // {length, absolute_position, packed_begin, resident_row, source, selection}.
 // Source and selection are independent signed 32-bit coordinates. The
 // host owns distinct rows and immutable read/write origins through completion.
-// Stateless kernels visit the active packed prefix. Recurrent kernels advance
-// one span and publish only its private writer, including at a retained fork.
+// Stateless kernels visit the active packed prefix. Recurrent workers visit
+// independent spans and publish only their private writers, including at a
+// retained fork.
 func.def public inline @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index) {
   %origin = index.constant 0 : offset
   %view = buffer.view %epoch[%origin] : buffer -> view<3xi32>
@@ -13,13 +14,28 @@ func.def public inline @flash_next_token_count(%epoch: buffer, %capacity: index)
   func.return %count : index
 }
 
-func.def public inline @flash_next_span_active(%epoch: buffer, %span: index) -> (i1) {
+func.def public inline @flash_next_span_count(%epoch: buffer) -> (index) {
   %origin = index.constant 0 : offset
   %view = buffer.view %epoch[%origin] : buffer -> view<3xi32>
   %word = view.load %view[1] : view<3xi32> -> i32
-  %count = index.cast %word : i32 to index
+  %value = index.cast %word : i32 to index
+  %count = index.assume %value [range(%value, 0, 2147483647)] : index
+  func.return %count : index
+}
+
+func.def public inline @flash_next_span_active(%epoch: buffer, %span: index) -> (i1) {
+  %count = func.call @flash_next_span_count(%epoch) : (buffer) -> (index)
   %active = index.cmp ult, %span, %count : index
   func.return %active : i1
+}
+
+// Each head/channel tile has a bounded set of span workers. Their grid-stride
+// traversal covers the live header count without launching one workgroup per
+// capacity slot when a large stage contains only a few spans.
+func.def public pure inline @flash_next_span_workers(%capacity: index) -> (index) {
+  %parallel_spans = index.constant 16 : index
+  %workers = index.min %capacity, %parallel_spans : index
+  func.return %workers : index
 }
 
 // A fresh span has no readable history. Otherwise the fork frontier selects
