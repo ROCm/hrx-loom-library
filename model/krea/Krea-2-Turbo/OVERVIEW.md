@@ -58,8 +58,15 @@ BF16 transformer. Multiple installations can share those cached files.
 The bounded-workspace preset uses exact overlapping VAE tiles when required,
 without blending tile boundaries. Global VAE attention runs before tiling;
 only the spatial decoder is partitioned. Preparation rejects a geometry whose
-complete stage cannot satisfy the bound. The bound controls invocation
+complete stage cannot satisfy the bound. The bound controls compiled command
 workspace, not total model memory or checkpoint storage.
+
+Physical backing also follows the server's slab geometry. Smaller
+`--weight_slab_bytes` values reduce rounding and idle retention, with more
+allocation and mapping work. `--memory_bytes` caps the shared physical budget;
+idle backing can be reclaimed by the idle policy or explicit trim. The
+[server memory controls](https://rocm.github.io/hrx-system/loom/serving/workflows/operate-model-server/#trim-without-changing-the-budget)
+explain those controls separately from the model's workspace bound.
 
 Short prompts use a retained 128-token text stage; longer prompts use the
 512-token stage. The tokenizer preserves the encoder's framing and selects

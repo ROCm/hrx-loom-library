@@ -75,8 +75,9 @@ loom-fetch --catalog=github:ROCm/hrx-loom-library@bedb7bbf149066c7979f45ce753da3
 
 This snapshot lists Moonshine Streaming Tiny, Pocket TTS, and Qwen3.8 Flash-Next.
 The checkout's catalog additionally includes Qwen3 Embedding for the Strix Halo
-NPU and Qwen3.8-27B with its text, vision, and drafting presets. Their original
-checkpoint files are acquired directly from the named publishers.
+NPU, Qwen3.8-27B with its text, vision, and drafting presets, and Krea 2 Turbo
+with BF16, INT8, and bounded-workspace image presets. Their checkpoint files
+are acquired directly from the named publishers.
 
 A local checkout supports the same discovery and selection:
 
@@ -97,6 +98,7 @@ python -m loom.model.catalog \
   --card=model/Qwen/Qwen3-Embedding-0.6B/model.json=model/Qwen/Qwen3-Embedding-0.6B/model.json \
   --card=model/Qwen/Qwen3.8-27B/model.json=model/Qwen/Qwen3.8-27B/model.json \
   --card=model/Qwen/Qwen3.8-Flash-Next/model.json=model/Qwen/Qwen3.8-Flash-Next/model.json \
+  --card=model/krea/Krea-2-Turbo/model.json=model/krea/Krea-2-Turbo/model.json \
   --card=model/kyutai/pocket-tts/model.json=model/kyutai/pocket-tts/model.json \
   --card=model/moonshine-ai/moonshine-streaming-tiny/model.json=model/moonshine-ai/moonshine-streaming-tiny/model.json \
   --output=catalog.json
