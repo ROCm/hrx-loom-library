@@ -8,6 +8,8 @@ config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 21
 
 func.decl @flash_next_span_active(%epoch: buffer, %span: index) -> (i1)
 
+func.decl @flash_next_row_state(%rows: buffer, %row: index, %position: index, %layer_origin: offset) -> (offset, offset)
+
 // Accepted descriptors retain original packed starts, including rejected holes.
 // Publish a dense predictor batch and origins keyed by compact token starts.
 // The token map preserves those starts through downstream normalization.
@@ -85,14 +87,15 @@ func.def public inline @flash_next_mtp_span(%epoch: buffer, %span: index) -> (in
 // Carry begins with 1280 raw-hidden packets and 48 partial-index packets,
 // each sixteen bytes, followed by request-owned draft vocabulary. Only
 // position%4 index rows are live. Restore them to the working cache before
-// proposing or replacing rejected speculative entries.
+// proposing or replacing rejected speculative entries. The row directory
+// supplies the writable tail address independently of the KV plane layout.
 // A fresh span synthesizes hidden zero and never reads its uninitialized carry.
 kernel.def @flash_next_mtp_restore() {
   %spans = config.get @flash_next.span_capacity : index
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%spans, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%epoch: buffer, %carry: buffer, %cache: buffer, %hidden: buffer) {
+} launch(%epoch: buffer, %rows: buffer, %carry: buffer, %cache: buffer, %hidden: buffer) {
   %span = kernel.workgroup.id<x> : index
   %active = func.call @flash_next_span_active(%epoch, %span) : (buffer, index) -> (i1)
   scf.if %active {
@@ -100,10 +103,7 @@ kernel.def @flash_next_mtp_restore() {
     %tokens = config.get @flash_next.token_count : index
     %origin = index.constant 0 : offset
     %carry_stride = index.constant 44032 : offset
-    %cache_stride = index.constant 768 : offset
     %carry_origin = index.scale %row, %carry_stride : index, offset -> offset
-    %cache_origin = index.scale %row, %cache_stride : index, offset -> offset
-    %working = buffer.view %cache[%cache_origin] : buffer -> view<48x4xi32>
     %source = buffer.view %carry[%carry_origin] : buffer -> view<2752x4xi32>
     %output = buffer.view %hidden[%origin] : buffer -> view<[%tokens]x1280x4xi32>
     %thread = kernel.workitem.id<x> : index
@@ -127,6 +127,8 @@ kernel.def @flash_next_mtp_restore() {
     %tail_packets = index.mul %tail_rows, %c16 : index
     %copies_tail = index.cmp ult, %thread, %tail_packets : index
     scf.if %copies_tail {
+      %reader, %writer = func.call @flash_next_row_state(%rows, %row, %position, %origin) : (buffer, index, index, offset) -> (offset, offset)
+      %working = buffer.view %cache[%writer] : buffer -> view<48x4xi32>
       %packet = index.add %hidden_packets, %thread : index
       %value = vector.load %source[%packet, %c0] : view<2752x4xi32> -> vector<4xi32>
       vector.store %value, %working[%thread, %c0] : vector<4xi32>, view<48x4xi32>
@@ -177,7 +179,7 @@ kernel.def @flash_next_mtp_commit() {
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%spans, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%epoch: buffer, %origins: buffer, %target: buffer, %cache: buffer, %ids: buffer, %carry: buffer) {
+} launch(%epoch: buffer, %rows: buffer, %origins: buffer, %target: buffer, %cache: buffer, %ids: buffer, %carry: buffer) {
   %span = kernel.workgroup.id<x> : index
   %active = func.call @flash_next_span_active(%epoch, %span) : (buffer, index) -> (i1)
   scf.if %active {
@@ -189,10 +191,7 @@ kernel.def @flash_next_mtp_commit() {
     %source_begin = index.cast %source_begin_word : i32 to index
     %source = buffer.view %target[%origin] : buffer -> view<[%capacity]x1280x4xi32>
     %carry_stride = index.constant 44032 : offset
-    %cache_stride = index.constant 768 : offset
     %carry_origin = index.scale %row, %carry_stride : index, offset -> offset
-    %cache_origin = index.scale %row, %cache_stride : index, offset -> offset
-    %working = buffer.view %cache[%cache_origin] : buffer -> view<48x4xi32>
     %output = buffer.view %carry[%carry_origin] : buffer -> view<2752x4xi32>
     %thread = kernel.workitem.id<x> : index
     %stride = index.constant 128 : index
@@ -213,6 +212,8 @@ kernel.def @flash_next_mtp_commit() {
     %tail_packets = index.mul %tail_rows, %c16 : index
     %copies_tail = index.cmp ult, %thread, %tail_packets : index
     scf.if %copies_tail {
+      %reader, %writer = func.call @flash_next_row_state(%rows, %row, %position, %origin) : (buffer, index, index, offset) -> (offset, offset)
+      %working = buffer.view %cache[%writer] : buffer -> view<48x4xi32>
       %packet = index.add %hidden_packets, %thread : index
       %value = vector.load %working[%thread, %c0] : view<48x4xi32> -> vector<4xi32>
       vector.store %value, %output[%packet, %c0] : vector<4xi32>, view<2752x4xi32>

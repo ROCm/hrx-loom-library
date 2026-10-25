@@ -1,20 +1,22 @@
 kernel.decl @flash_next_mtp_compact() launch(%accepted: buffer, %compact: buffer, %origins: buffer)
 
-kernel.decl @flash_next_mtp_restore() launch(%epoch: buffer, %carry: buffer, %cache: buffer, %hidden: buffer)
+kernel.decl @flash_next_mtp_restore() launch(%epoch: buffer, %rows: buffer, %carry: buffer, %cache: buffer, %hidden: buffer)
 
 kernel.decl @flash_next_mtp_ids() launch(%epoch: buffer, %origins: buffer, %target_tokens: buffer, %tokens: buffer)
 
-kernel.decl @flash_next_mtp_commit() launch(%epoch: buffer, %origins: buffer, %target: buffer, %cache: buffer, %ids: buffer, %carry: buffer)
+kernel.decl @flash_next_mtp_commit() launch(%epoch: buffer, %rows: buffer, %origins: buffer, %target: buffer, %cache: buffer, %ids: buffer, %carry: buffer)
 
 kernel.decl @qsa_publish_tail(%neural_enabled: i1) launch(%tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer)
 
 // Four original spans leave holes, one is empty, and physical owner order
 // differs from packed order. Positions cross both page and index boundaries;
 // source coordinates deliberately differ from those causal positions.
+// Tail writers follow a protected cache prefix in reversed resident order.
+// Continued rows are past their anchor frontier and use the directory writer.
 kernel.def @fixture() {
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
-} launch(%epoch: buffer, %expected_epoch: buffer, %expected_origins: buffer, %rows: buffer, %expected_hidden: buffer, %source_ids: buffer, %expected_ids: buffer, %actual_carry: buffer, %expected_carry: buffer) {
+} launch(%epoch: buffer, %expected_epoch: buffer, %expected_origins: buffer, %rows: buffer, %expected_hidden: buffer, %source_ids: buffer, %expected_ids: buffer, %actual_carry: buffer, %expected_carry: buffer, %expected_cache: buffer) {
   %origin = index.constant 0 : offset
   %input = buffer.view %epoch[%origin] : buffer -> view<99xi32>
   %compact = buffer.view %expected_epoch[%origin] : buffer -> view<99xi32>
@@ -25,6 +27,7 @@ kernel.def @fixture() {
   %ids = buffer.view %expected_ids[%origin] : buffer -> view<16xi32>
   %carry = buffer.view %expected_carry[%origin] : buffer -> view<16x11008xi32>
   %actual_state = buffer.view %actual_carry[%origin] : buffer -> view<16x11008xi32>
+  %published = buffer.view %expected_cache[%origin] : buffer -> view<17x192xi32>
   %c0_word = scalar.constant 0 : i32
   %c1_word = scalar.constant 1 : i32
   %c2_word = scalar.constant 2 : i32
@@ -119,12 +122,30 @@ kernel.def @fixture() {
   %tail_origin = index.constant 5120 : index
   %c64 = index.constant 64 : index
   %c128 = index.constant 128 : index
+  %c192 = index.constant 192 : index
   %tail_bytes = scalar.constant 768 : i64
   scf.for %row = [%c0 to %c16 step %c1] {
     %row_word = index.cast %row : index to i64
     %base = scalar.muli %row_word, %tail_bytes : i64
+    %writer_slot = index.sub %c16, %row : index
+    %writer_word = index.cast %writer_slot : index to i64
+    %writer_base = scalar.muli %writer_word, %tail_bytes : i64
     view.store %base, %row_table[%row, 0] : i64, view<16x5xi64>
-    view.store %base, %row_table[%row, 1] : i64, view<16x5xi64>
+    view.store %writer_base, %row_table[%row, 1] : i64, view<16x5xi64>
+  }
+  // The continued spans restore three and two committed index rows. Their
+  // carry inputs are independent iotas; fresh owner seven restores no tail.
+  scf.for %column = [%c0 to %c192 step %c1] {
+    %word = index.cast %column : index to i32
+    %base = scalar.constant 127136 : i32
+    %value = scalar.addi %word, %base : i32
+    view.store %value, %published[14, %column] : i32, view<17x192xi32>
+  }
+  scf.for %column = [%c0 to %c128 step %c1] {
+    %word = index.cast %column : index to i32
+    %base = scalar.constant 204192 : i32
+    %value = scalar.addi %word, %base : i32
+    view.store %value, %published[7, %column] : i32, view<17x192xi32>
   }
   scf.for %column = [%c0 to %width step %c1] {
     %word = index.cast %column : index to i32
@@ -153,6 +174,8 @@ kernel.def @fixture() {
     %continued = scalar.addi %word, %continued_base : i32
     view.store %fresh, %carry[7, %destination] : i32, view<16x11008xi32>
     view.store %continued, %carry[2, %destination] : i32, view<16x11008xi32>
+    view.store %fresh, %published[9, %column] : i32, view<17x192xi32>
+    view.store %continued, %published[14, %column] : i32, view<17x192xi32>
   }
   scf.for %column = [%c0 to %c64 step %c1] {
     %word = index.cast %column : index to i32
@@ -161,6 +184,7 @@ kernel.def @fixture() {
     %base = scalar.constant 150320 : i32
     %value = scalar.addi %word, %base : i32
     view.store %value, %carry[9, %destination] : i32, view<16x11008xi32>
+    view.store %value, %published[7, %slot] : i32, view<17x192xi32>
   }
   // Continued owners have valid empty vocabulary state. Fresh owner seven
   // will reset its live header and bitmap again at the publication boundary.
@@ -213,19 +237,21 @@ check.case public @accepted_carry_with_holes {
   %expected_ids = check.generate.fill value(-7) : tensor<16xi32>
   %carry = check.generate.iota offset(100000) step(1) : tensor<16x11008xi32>
   %expected_carry = check.generate.iota offset(100000) step(1) : tensor<16x11008xi32>
-  %cache = check.generate.fill value(-7) : tensor<16x192xi32>
+  %cache = check.generate.fill value(-7) : tensor<17x192xi32>
+  %expected_cache = check.generate.fill value(-7) : tensor<17x192xi32>
   %raw = check.generate.iota offset(150000) step(1) : tensor<16x64xi32>
   %origin = check.literal value(0) : offset
-  kernel.launch @fixture(%epoch, %expected_epoch, %expected_origins, %rows, %expected_hidden, %source_ids, %expected_ids, %carry, %expected_carry) : (tensor<99xi32>, tensor<99xi32>, tensor<16xi32>, tensor<16x5xi64>, tensor<16x5120xi32>, tensor<16xi32>, tensor<16xi32>, tensor<16x11008xi32>, tensor<16x11008xi32>)
+  kernel.launch @fixture(%epoch, %expected_epoch, %expected_origins, %rows, %expected_hidden, %source_ids, %expected_ids, %carry, %expected_carry, %expected_cache) : (tensor<99xi32>, tensor<99xi32>, tensor<16xi32>, tensor<16x5xi64>, tensor<16x5120xi32>, tensor<16xi32>, tensor<16xi32>, tensor<16x11008xi32>, tensor<16x11008xi32>, tensor<17x192xi32>)
   kernel.launch @flash_next_mtp_compact(%epoch, %compact, %origins) : (tensor<99xi32>, tensor<99xi32>, tensor<16xi32>)
   check.expect.bitwise actual(%compact) expected(%expected_epoch) : tensor<99xi32>
   check.expect.bitwise actual(%origins) expected(%expected_origins) : tensor<16xi32>
-  kernel.launch @flash_next_mtp_restore(%compact, %carry, %cache, %hidden) : (tensor<99xi32>, tensor<16x11008xi32>, tensor<16x192xi32>, tensor<16x5120xi32>)
+  kernel.launch @flash_next_mtp_restore(%compact, %rows, %carry, %cache, %hidden) : (tensor<99xi32>, tensor<16x5xi64>, tensor<16x11008xi32>, tensor<17x192xi32>, tensor<16x5120xi32>)
   kernel.launch @flash_next_mtp_ids(%compact, %origins, %source_ids, %ids) : (tensor<99xi32>, tensor<16xi32>, tensor<16xi32>, tensor<16xi32>)
   check.expect.bitwise actual(%hidden) expected(%expected_hidden) : tensor<16x5120xi32>
   check.expect.bitwise actual(%ids) expected(%expected_ids) : tensor<16xi32>
-  kernel.launch @qsa_publish_tail[%neural_enabled](%origin, %compact, %rows, %raw, %cache) : [i1](offset, tensor<99xi32>, tensor<16x5xi64>, tensor<16x64xi32>, tensor<16x192xi32>)
-  kernel.launch @flash_next_mtp_commit(%compact, %origins, %source, %cache, %ids, %carry) : (tensor<99xi32>, tensor<16xi32>, tensor<16x5120xi32>, tensor<16x192xi32>, tensor<16xi32>, tensor<16x11008xi32>)
+  kernel.launch @qsa_publish_tail[%neural_enabled](%origin, %compact, %rows, %raw, %cache) : [i1](offset, tensor<99xi32>, tensor<16x5xi64>, tensor<16x64xi32>, tensor<17x192xi32>)
+  kernel.launch @flash_next_mtp_commit(%compact, %rows, %origins, %source, %cache, %ids, %carry) : (tensor<99xi32>, tensor<16x5xi64>, tensor<16xi32>, tensor<16x5120xi32>, tensor<17x192xi32>, tensor<16xi32>, tensor<16x11008xi32>)
+  check.expect.bitwise actual(%cache) expected(%expected_cache) : tensor<17x192xi32>
   check.expect.bitwise actual(%carry) expected(%expected_carry) : tensor<16x11008xi32>
   check.return
 }
