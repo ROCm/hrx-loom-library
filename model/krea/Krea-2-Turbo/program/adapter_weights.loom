@@ -1,0 +1,205 @@
+// Validate original rank-32 F32 factors and prepare BF16 banks at runtime.
+// Ordered checkpoint shards share one native parameter index. No converted
+// checkpoint or request-private factor copy is required.
+
+func.decl import("weights") @count() -> (i32)
+
+func.decl import("weights") @parameter(%source: i32, %key: buffer) -> (buffer, i64)
+
+func.decl import("weights") @input(%source: i32, %key: buffer, %offset: i64, %length: i64, %alignment: i64) -> (i64)
+
+func.decl import("prepare") @stage(%root: buffer, %tag: i64) -> (i32)
+
+func.decl import("prepare") @config_i64(%stage: i32, %key: buffer, %value: i64)
+
+func.decl import("input") @require(%condition: i32, %diagnostic: buffer)
+
+func.decl import("json") @members(%json: buffer) -> (buffer, i32, i64)
+
+func.decl import("json") @unescape(%source: buffer, %offset: i64, %length: i64, %target: buffer, %target_offset: i64) -> (i64)
+
+func.decl import("json") @parse_i64(%source: buffer, %offset: i64, %length: i64) -> (i64)
+
+// adapter.pack / adapter.elements / adapter.input_offset
+global.rodata.def @root = bytes("616461707465722e7061636b")
+
+global.rodata.def @elements = bytes("616461707465722e656c656d656e7473")
+
+global.rodata.def @input_offset = bytes("616461707465722e696e7075745f6f6666736574")
+
+// dtype / shape / F32 / .lora_A.weight / .lora_B.weight
+global.rodata.def @dtype = bytes("6474797065")
+
+global.rodata.def @shape = bytes("7368617065")
+
+global.rodata.def @f32 = bytes("463332")
+
+global.rodata.def @down = bytes("2e6c6f72615f412e776569676874")
+
+global.rodata.def @up = bytes("2e6c6f72615f422e776569676874")
+
+// expected one rank-32 F32 LoRA factor checkpoint
+global.rodata.def @error = bytes("6578706563746564206f6e652072616e6b2d333220463332204c6f524120666163746f7220636865636b706f696e74")
+
+func.def @check(%valid: i1) {
+  %condition = scalar.extui %valid : i1 to i32
+  %error = global.load @error : buffer
+  func.call @require(%condition, %error) : (i32, buffer)
+  func.return
+}
+
+func.def @equal(%decoded: buffer, %length: i64, %expected: buffer) -> (i1) {
+  %bytes = buffer.length %expected
+  %size = index.cast %bytes : offset to i64
+  %sized = scalar.cmpi eq, %length, %size : i64
+  %result = scf.if %sized -> (i1) {
+    %origin = index.constant 0 : offset
+    %c0_i32 = scalar.constant 0 : i32
+    %order = buffer.compare %decoded[%origin], %expected[%origin], %bytes
+    %same = scalar.cmpi eq, %order, %c0_i32 : i32
+    scf.yield %same : i1
+  } else {
+    %false = scalar.constant false : i1
+    scf.yield %false : i1
+  }
+  func.return %result : i1
+}
+
+func.def @matrix_shape(%metadata: buffer, %begin: i64, %length: i64) -> (i64, i64) {
+  %bounded_begin = scalar.assume %begin [range(%begin, 0, 9223372036854775807)] : i64
+  %bounded_length = scalar.assume %length [range(%length, 0, 9223372036854775807)] : i64
+  %start = index.cast %bounded_begin : i64 to offset
+  %bytes = index.cast %bounded_length : i64 to offset
+  %origin = index.constant 0 : offset
+  %array = buffer.alloca<private> align(1) %bytes : buffer
+  buffer.copy %metadata[%start], %array[%origin], %bytes
+  %fields, %type, %count = func.call @members(%array) : (buffer) -> (buffer, i32, i64)
+  %array_type = scalar.constant 3 : i32
+  %c2_i64 = scalar.constant 2 : i64
+  %c1_i64 = scalar.constant 1 : i64
+  %is_array = scalar.cmpi eq, %type, %array_type : i32
+  %pair = scalar.cmpi eq, %count, %c2_i64 : i64
+  %valid = scalar.andi %is_array, %pair : i1
+  func.call @check(%valid) : (i1)
+  %records = buffer.view %fields[%origin] : buffer -> view<2x5xi64>
+  %first_type = view.load %records[0, 4] : view<2x5xi64> -> i64
+  %second_type = view.load %records[1, 4] : view<2x5xi64> -> i64
+  %first_number = scalar.cmpi eq, %first_type, %c1_i64 : i64
+  %second_number = scalar.cmpi eq, %second_type, %c1_i64 : i64
+  %numbers = scalar.andi %first_number, %second_number : i1
+  func.call @check(%numbers) : (i1)
+  %first_begin = view.load %records[0, 2] : view<2x5xi64> -> i64
+  %first_length = view.load %records[0, 3] : view<2x5xi64> -> i64
+  %second_begin = view.load %records[1, 2] : view<2x5xi64> -> i64
+  %second_length = view.load %records[1, 3] : view<2x5xi64> -> i64
+  %rows = func.call @parse_i64(%array, %first_begin, %first_length) : (buffer, i64, i64) -> (i64)
+  %columns = func.call @parse_i64(%array, %second_begin, %second_length) : (buffer, i64, i64) -> (i64)
+  func.return %rows, %columns : i64, i64
+}
+
+func.def @check_metadata(%metadata: buffer) -> (i64, i64) {
+  %fields, %type, %count = func.call @members(%metadata) : (buffer) -> (buffer, i32, i64)
+  %object = scalar.constant 2 : i32
+  %is_object = scalar.cmpi eq, %type, %object : i32
+  func.call @check(%is_object) : (i1)
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %origin = index.constant 0 : offset
+  %extent = index.cast %count : i64 to index
+  %records = buffer.view %fields[%origin] : buffer -> view<[%extent]x5xi64>
+  %metadata_bytes = buffer.length %metadata
+  %decoded = buffer.alloca<private> align(1) %metadata_bytes : buffer
+  %c0_i64 = scalar.constant 0 : i64
+  %array_type = scalar.constant 3 : i64
+  %false = scalar.constant false : i1
+  %true = scalar.constant true : i1
+  %expected_dtype = global.load @dtype : buffer
+  %expected_shape = global.load @shape : buffer
+  %expected_f32 = global.load @f32 : buffer
+  %rows, %columns, %dtype_seen, %shape_seen = scf.for %i = [%begin to %extent step %step](%rows = %c0_i64 : i64, %columns = %c0_i64 : i64, %dtype_seen = %false : i1, %shape_seen = %false : i1) -> (i64, i64, i1, i1) {
+    %key_begin = view.load %records[%i, 0] : view<[%extent]x5xi64> -> i64
+    %key_length = view.load %records[%i, 1] : view<[%extent]x5xi64> -> i64
+    %value_begin = view.load %records[%i, 2] : view<[%extent]x5xi64> -> i64
+    %value_length = view.load %records[%i, 3] : view<[%extent]x5xi64> -> i64
+    %value_type = view.load %records[%i, 4] : view<[%extent]x5xi64> -> i64
+    %decoded_length = func.call @unescape(%metadata, %key_begin, %key_length, %decoded, %c0_i64) : (buffer, i64, i64, buffer, i64) -> (i64)
+    %is_dtype = func.call @equal(%decoded, %decoded_length, %expected_dtype) : (buffer, i64, buffer) -> (i1)
+    %is_shape = func.call @equal(%decoded, %decoded_length, %expected_shape) : (buffer, i64, buffer) -> (i1)
+    scf.if %is_dtype {
+      %not_seen = scalar.cmpi eq, %dtype_seen, %false : i1
+      %string = scalar.cmpi eq, %value_type, %c0_i64 : i64
+      %typed = scalar.andi %not_seen, %string : i1
+      func.call @check(%typed) : (i1)
+      %decoded_value_length = func.call @unescape(%metadata, %value_begin, %value_length, %decoded, %c0_i64) : (buffer, i64, i64, buffer, i64) -> (i64)
+      %is_f32 = func.call @equal(%decoded, %decoded_value_length, %expected_f32) : (buffer, i64, buffer) -> (i1)
+      func.call @check(%is_f32) : (i1)
+    }
+    %next_rows, %next_columns = scf.if %is_shape -> (i64, i64) {
+      %not_seen = scalar.cmpi eq, %shape_seen, %false : i1
+      %array = scalar.cmpi eq, %value_type, %array_type : i64
+      %typed = scalar.andi %not_seen, %array : i1
+      func.call @check(%typed) : (i1)
+      %shape_rows, %shape_columns = func.call @matrix_shape(%metadata, %value_begin, %value_length) : (buffer, i64, i64) -> (i64, i64)
+      scf.yield %shape_rows, %shape_columns : i64, i64
+    } else {
+      scf.yield %rows, %columns : i64, i64
+    }
+    %next_dtype = scalar.ori %dtype_seen, %is_dtype : i1
+    %next_shape = scalar.ori %shape_seen, %is_shape : i1
+    scf.yield %next_rows, %next_columns, %next_dtype, %next_shape : i64, i64, i1, i1
+  }
+  %complete = scalar.andi %dtype_seen, %shape_seen : i1
+  func.call @check(%complete) : (i1)
+  func.return %rows, %columns : i64, i64
+}
+
+func.def public @prepare_weight(%key: buffer) -> (i64) {
+  %c0_i64 = scalar.constant 0 : i64
+  %zero32 = scalar.constant 0 : i32
+  %one32 = scalar.constant 1 : i32
+  %count = func.call @count() : () -> (i32)
+  %pair = scalar.cmpi eq, %count, %one32 : i32
+  func.call @check(%pair) : (i1)
+  %first_metadata, %first_length = func.call @parameter(%zero32, %key) : (i32, buffer) -> (buffer, i64)
+  %first_rows, %first_columns = func.call @check_metadata(%first_metadata) : (buffer) -> (i64, i64)
+  %suffix = global.load @down : buffer
+  %suffix_bytes = buffer.length %suffix
+  %key_bytes = buffer.length %key
+  %key_sized = index.cmp uge, %key_bytes, %suffix_bytes : offset
+  func.call @check(%key_sized) : (i1)
+  %start = index.sub %key_bytes, %suffix_bytes : offset
+  %origin = index.constant 0 : offset
+  %down_order = buffer.compare %key[%start], %suffix[%origin], %suffix_bytes
+  %up_suffix = global.load @up : buffer
+  %up_order = buffer.compare %key[%start], %up_suffix[%origin], %suffix_bytes
+  %down = scalar.cmpi eq, %down_order, %zero32 : i32
+  %up = scalar.cmpi eq, %up_order, %zero32 : i32
+  %known = scalar.ori %down, %up : i1
+  func.call @check(%known) : (i1)
+  %rank = scf.select %down, %first_rows, %first_columns : i64
+  %width = scf.select %down, %first_columns, %first_rows : i64
+  %rank32 = scalar.constant 32 : i64
+  %rank_valid = scalar.cmpi eq, %rank, %rank32 : i64
+  %positive = scalar.cmpi sgt, %width, %c0_i64 : i64
+  %maximum = scalar.constant 72057594037927935 : i64
+  %bounded = scalar.cmpi sle, %width, %maximum : i64
+  %addressable = scalar.andi %positive, %bounded : i1
+  %shape_valid = scalar.andi %rank_valid, %addressable : i1
+  func.call @check(%shape_valid) : (i1)
+  %bytes_per_width = scalar.constant 128 : i64
+  %expected_length = scalar.muli %width, %bytes_per_width : i64
+  %sized = scalar.cmpi eq, %first_length, %expected_length : i64
+  func.call @check(%sized) : (i1)
+  %alignment = scalar.constant 256 : i64
+  %first = func.call @input(%zero32, %key, %c0_i64, %first_length, %alignment) : (i32, buffer, i64, i64, i64) -> (i64)
+  %elements = scalar.muli %width, %rank32 : i64
+  %root = global.load @root : buffer
+  %stage = func.call @stage(%root, %c0_i64) : (buffer, i64) -> (i32)
+  %elements_key = global.load @elements : buffer
+  %input_key = global.load @input_offset : buffer
+  func.call @config_i64(%stage, %elements_key, %elements) : (i32, buffer, i64)
+  func.call @config_i64(%stage, %input_key, %first) : (i32, buffer, i64)
+  %c2_i64 = scalar.constant 2 : i64
+  %packed_bytes = scalar.divui %first_length, %c2_i64 : i64
+  func.return %packed_bytes : i64
+}

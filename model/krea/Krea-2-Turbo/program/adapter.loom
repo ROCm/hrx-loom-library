@@ -1,0 +1,56 @@
+// Fixed-ABI adapter launches over compiler-located shared parameter banks.
+// Only this model leaf interprets the source-owned selection records. The
+// count and offsets are device data; the maximum only sizes reusable rank
+// scratch in the command workspace.
+
+config.decl @krea2.adapter_capacity : %value: index where [range(%value, 0, 2147483647)]
+
+amdgpu.target<gfx11-generic> @tensor_adapter_rdna3
+
+template.decl @projection.adapter_down_bf16(%rows: index, %inputs: index, %count: index, %offset_layout: encoding<layout>, %strength_layout: encoding<layout>, %offsets: view<[%count]xi64, %offset_layout>, %strengths: view<[%count]xf32, %strength_layout>, %input: buffer, %factors: buffer, %low: buffer)
+
+template.decl @projection.adapter_up_bf16(%rows: index, %outputs: index, %count: index, %output_layout: encoding<layout>, %offset_layout: encoding<layout>, %offsets: view<[%count]xi64, %offset_layout>, %low: buffer, %factors: buffer, %base: buffer, %output: buffer)
+
+template.decl @krea2.adapter_scratch(%rows: index) -> (buffer)
+
+template.def<@krea2.adapter_scratch> @krea2_adapter_scratch(%rows: index) -> (buffer) {
+  %capacity = config.get @krea2.adapter_capacity : index
+  %rank_bytes = index.constant 64 : offset
+  %bank_bytes = index.scale %rows, %rank_bytes : index, offset -> offset
+  %bytes = index.scale %capacity, %bank_bytes : index, offset -> offset
+  %scratch = buffer.alloca<global> align(256) %bytes : buffer
+  template.return %scratch : buffer
+}
+
+template.decl @krea2.adapter_down(%rows: index, %inputs: index, %input: buffer, %factors: buffer, %selection: buffer, %output: buffer)
+
+template.def<@krea2.adapter_down> @krea2_adapter_down(%rows: index, %inputs: index, %input: buffer, %factors: buffer, %selection: buffer, %output: buffer) {
+  %selection_origin = index.constant 0 : offset
+  %selection_header = buffer.view %selection[%selection_origin] : buffer -> view<1xi32>
+  %selection_count32 = view.load %selection_header[0] : view<1xi32> -> i32
+  %selection_count_nonnegative = scalar.assume %selection_count32 [range(%selection_count32, 0, 2147483647)] : i32
+  %count = index.cast %selection_count_nonnegative : i32 to index
+  %offset_begin = index.constant 16 : offset
+  %offset_layout = encoding.layout.strided [2] : encoding<layout>
+  %offsets = buffer.view %selection[%offset_begin] : buffer -> view<[%count]xi64, %offset_layout>
+  %strength_begin = index.constant 24 : offset
+  %strength_layout = encoding.layout.strided [4] : encoding<layout>
+  %strengths = buffer.view %selection[%strength_begin] : buffer -> view<[%count]xf32, %strength_layout>
+  template.apply<@projection.adapter_down_bf16>(%rows, %inputs, %count, %offset_layout, %strength_layout, %offsets, %strengths, %input, %factors, %output) : (index, index, index, encoding<layout>, encoding<layout>, view<[%count]xi64, %offset_layout>, view<[%count]xf32, %strength_layout>, buffer, buffer, buffer)
+  template.return
+}
+
+template.decl @krea2.adapter_up(%rows: index, %outputs: index, %layout: encoding<layout>, %low: buffer, %factors: buffer, %selection: buffer, %base: buffer, %output: buffer)
+
+template.def<@krea2.adapter_up> @krea2_adapter_up(%rows: index, %outputs: index, %layout: encoding<layout>, %low: buffer, %factors: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %selection_origin = index.constant 0 : offset
+  %selection_header = buffer.view %selection[%selection_origin] : buffer -> view<1xi32>
+  %selection_count32 = view.load %selection_header[0] : view<1xi32> -> i32
+  %selection_count_nonnegative = scalar.assume %selection_count32 [range(%selection_count32, 0, 2147483647)] : i32
+  %count = index.cast %selection_count_nonnegative : i32 to index
+  %offset_begin = index.constant 16 : offset
+  %offset_layout = encoding.layout.strided [2] : encoding<layout>
+  %offsets = buffer.view %selection[%offset_begin] : buffer -> view<[%count]xi64, %offset_layout>
+  template.apply<@projection.adapter_up_bf16>(%rows, %outputs, %count, %layout, %offset_layout, %offsets, %low, %factors, %base, %output) : (index, index, index, encoding<layout>, encoding<layout>, view<[%count]xi64, %offset_layout>, buffer, buffer, buffer, buffer)
+  template.return
+}

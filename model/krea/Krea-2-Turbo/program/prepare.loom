@@ -1,0 +1,122 @@
+// Cold image preparation retains original checkpoint sources, prompt stages,
+// and a finite shared adapter arena. The source-owned state carries source
+// ordinals so request stages reuse the same native base parameter domains.
+
+func.decl @krea2.bind_image_parameters(%stage: i32, %encoder: i32, %dit: i32, %vae: i32)
+
+// Register adapters through options.adapters instead of the legacy asset field.
+global.rodata.def @krea2.legacy_adapter_error = bytes("7265676973746572206e616d656420636865636b706f696e7473207468726f756768206f7074696f6e732e6164617074657273")
+
+func.decl @krea2.adapter_options(%options: buffer) -> (i64, i64, buffer)
+
+func.decl import("prepare") @parameter_arena(%capacity: i64) -> (i32)
+
+func.decl import("prepare") @bind_parameters(%root: buffer)
+
+func.decl import("input") @require(%condition: i32, %diagnostic: buffer)
+
+func.decl import("prepare") @source_scope(%scope: buffer) -> (i32)
+
+func.decl @krea2.declare_image_stage(%height: i64, %width: i64, %text: i64, %workspace_limit: i64, %adapted: i1, %int8_flag: i64) -> (i32)
+
+config.decl @krea2.dit_int8 : %value: index where [range(%value, 0, 1)]
+
+// text_encoder
+global.rodata.def @encoder_scope = bytes("746578745f656e636f646572")
+
+// dit
+global.rodata.def @dit_scope = bytes("646974")
+
+// vae
+global.rodata.def @vae_scope = bytes("766165")
+
+// text
+global.rodata.def @tokenizer = bytes("74657874")
+
+// krea2-turbo
+global.rodata.def @identifier = bytes("6b726561322d747572626f")
+
+func.def @declare_stage(%height: i64, %width: i64, %text: i64, %workspace: i64, %int8_flag: i64, %encoder: i32, %dit: i32, %vae: i32) -> (i32) {
+  %adapted = scalar.constant false : i1
+  %stage = func.call @krea2.declare_image_stage(%height, %width, %text, %workspace, %adapted, %int8_flag) : (i64, i64, i64, i64, i1, i64) -> (i32)
+  func.call @krea2.bind_image_parameters(%stage, %encoder, %dit, %vae) : (i32, i32, i32, i32)
+  func.return %stage : i32
+}
+
+func.def public @image_prepare_v1(%height: i64, %width: i64, %text: i64, %directory: buffer, %adapter: buffer, %options: buffer) -> (i64, i64, buffer, buffer, buffer) {
+  %origin = index.constant 0 : offset
+  %adapter_length = buffer.length %adapter
+  %base = index.cmp eq, %adapter_length, %origin : offset
+  %condition = scalar.extui %base : i1 to i32
+  %error = global.load @krea2.legacy_adapter_error : buffer
+  func.call @require(%condition, %error) : (i32, buffer)
+  %workspace, %adapter_capacity, %registry = func.call @krea2.adapter_options(%options) : (buffer) -> (i64, i64, buffer)
+  %zero_capacity = scalar.constant 0 : i64
+  %has_adapters = scalar.cmpi ne, %adapter_capacity, %zero_capacity : i64
+  %arena = scf.if %has_adapters -> (i64) {
+    %value = func.call @parameter_arena(%adapter_capacity) : (i64) -> (i32)
+    %binding = global.load @krea2.adapter_binding : buffer
+    func.call @bind_parameters(%binding) : (buffer)
+    %value64 = scalar.extui %value : i32 to i64
+    scf.yield %value64 : i64
+  } else {
+    %missing = scalar.constant -1 : i64
+    scf.yield %missing : i64
+  }
+  %int8 = config.get @krea2.dit_int8 : index
+  %int8_flag = index.cast %int8 : index to i64
+  %encoder_scope = global.load @encoder_scope : buffer
+  %dit_scope = global.load @dit_scope : buffer
+  %vae_scope = global.load @vae_scope : buffer
+  %encoder = func.call @source_scope(%encoder_scope) : (buffer) -> (i32)
+  %dit = func.call @source_scope(%dit_scope) : (buffer) -> (i32)
+  %vae = func.call @source_scope(%vae_scope) : (buffer) -> (i32)
+  %maximum_stage = func.call @declare_stage(%height, %width, %text, %workspace, %int8_flag, %encoder, %dit, %vae) : (i64, i64, i64, i64, i64, i32, i32, i32) -> (i32)
+  %begin = scalar.constant 0 : i64
+  %alignment = scalar.constant 64 : i64
+  %small = scalar.constant 128 : i64
+  %larger = scalar.cmpi ugt, %text, %small : i64
+  %remainder = scalar.remui %text, %alignment : i64
+  %aligned = scalar.cmpi eq, %remainder, %begin : i64
+  %retain_small = scalar.andi %larger, %aligned : i1
+  %small_stage = scf.if %retain_small -> (i32) {
+    %stage = func.call @declare_stage(%height, %width, %small, %workspace, %int8_flag, %encoder, %dit, %vae) : (i64, i64, i64, i64, i64, i32, i32, i32) -> (i32)
+    scf.yield %stage : i32
+  } else {
+    scf.yield %maximum_stage : i32
+  }
+  // Variable selection metadata has no model-imposed count limit. Native
+  // request transport bounds inputs and allocates only the actual payload.
+  %capacity = scalar.constant 9223372036854775807 : i64
+  %tokenizer = global.load @tokenizer : buffer
+  %identifier = global.load @identifier : buffer
+  %state_header_bytes = index.constant 96 : offset
+  %registry_bytes = buffer.length %registry
+  %state_bytes = index.add %state_header_bytes, %registry_bytes : offset
+  %state = buffer.alloca<private> align(8) %state_bytes : buffer
+  %state_view = buffer.view %state[%origin] : buffer -> view<12xi64>
+  %small_flag = scalar.extui %retain_small : i1 to i64
+  %maximum_stage64 = scalar.extui %maximum_stage : i32 to i64
+  %small_stage64 = scalar.extui %small_stage : i32 to i64
+  view.store %arena, %state_view[0] : i64, view<12xi64>
+  view.store %height, %state_view[1] : i64, view<12xi64>
+  view.store %width, %state_view[2] : i64, view<12xi64>
+  view.store %workspace, %state_view[3] : i64, view<12xi64>
+  view.store %int8_flag, %state_view[4] : i64, view<12xi64>
+  view.store %text, %state_view[5] : i64, view<12xi64>
+  view.store %small_flag, %state_view[6] : i64, view<12xi64>
+  view.store %maximum_stage64, %state_view[7] : i64, view<12xi64>
+  view.store %small_stage64, %state_view[8] : i64, view<12xi64>
+  %encoder64 = scalar.extui %encoder : i32 to i64
+  %dit64 = scalar.extui %dit : i32 to i64
+  %vae64 = scalar.extui %vae : i32 to i64
+  view.store %encoder64, %state_view[9] : i64, view<12xi64>
+  view.store %dit64, %state_view[10] : i64, view<12xi64>
+  view.store %vae64, %state_view[11] : i64, view<12xi64>
+  buffer.copy %registry[%origin], %state[%state_header_bytes], %registry_bytes
+  %batch_units = scalar.constant 2 : i64
+  func.return %batch_units, %capacity, %tokenizer, %identifier, %state : i64, i64, buffer, buffer, buffer
+}
+
+// krea2.bind_adapter_banks
+global.rodata.def @krea2.adapter_binding = bytes("6b726561322e62696e645f616461707465725f62616e6b73")

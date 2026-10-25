@@ -1,0 +1,206 @@
+// Whole-row host copies check the production workitem-distributed tile copies.
+// The geometry variants use the same configuration keys as model preparation.
+
+config.decl @krea2.latent_height : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+config.decl @krea2.latent_width : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+config.decl @krea2.vae_tile_height : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+config.decl @krea2.vae_tile_width : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+kernel.decl @krea_vae_extract_tile() launch(%origin_y: index, %origin_x: index, %input: buffer, %output: buffer) where [range(%origin_y, 0, 1022), range(%origin_x, 0, 1022)]
+
+kernel.decl @krea_vae_stitch_tile(%launch_y_begin: index, %launch_y_end: index, %launch_x_begin: index, %launch_x_end: index) launch(%origin_y: index, %origin_x: index, %crop_y_begin: index, %crop_y_end: index, %crop_x_begin: index, %crop_x_end: index, %input: buffer, %output: buffer) where [range(%origin_y, 0, 1022), range(%origin_x, 0, 1022), range(%crop_y_begin, 0, 1024), range(%crop_y_end, 0, 1024), range(%crop_x_begin, 0, 1024), range(%crop_x_end, 0, 1024)]
+
+// F32 bit patterns: both zeros, both smallest subnormals, largest subnormals,
+// infinities, and quiet/signaling NaNs with distinct payloads and signs.
+global.rodata.def @copy_bits = align(4) bytes("00000000000000800100000001000080ffff7f00ffff7f800000807f000080ff0100c07f0100c0ff0100807f010080ff4523c17f4523c1ff0000803f000080bf")
+
+func.def @seed_copy_bits(%input: buffer) {
+  %values = global.load @copy_bits : buffer
+  %origin = index.constant 0 : offset
+  %bytes = index.constant 64 : offset
+  buffer.copy %values[%origin], %input[%origin], %bytes
+  func.return
+}
+
+func.def @tile_counts() -> (index, index, index, index, index, index, index, index) {
+  %height = config.get @krea2.latent_height : index
+  %width = config.get @krea2.latent_width : index
+  %tile_height = config.get @krea2.vae_tile_height : index
+  %tile_width = config.get @krea2.vae_tile_width : index
+  %feature_channels = index.constant 384 : index
+  %output_channels_scale = index.constant 192 : index
+  %guards = index.constant 32 : index
+  %pixels = index.mul %height, %width : index
+  %tile_pixels = index.mul %tile_height, %tile_width : index
+  %features = index.mul %pixels, %feature_channels : index
+  %tile_features = index.mul %tile_pixels, %feature_channels : index
+  %output = index.mul %pixels, %output_channels_scale : index
+  %tile_output = index.mul %tile_pixels, %output_channels_scale : index
+  %features_storage = index.add %features, %guards : index
+  %tile_features_storage = index.add %tile_features, %guards : index
+  %output_storage = index.add %output, %guards : index
+  %tile_output_storage = index.add %tile_output, %guards : index
+  func.return %features, %tile_features, %output, %tile_output, %features_storage, %tile_features_storage, %output_storage, %tile_output_storage : index, index, index, index, index, index, index, index
+}
+
+// Corners and a centered crop vary origins independently of the tile planner.
+// Crop rectangles include complete tiles, one pixel, a middle rectangle, and
+// one-pixel strips. They are expressed in global latent coordinates.
+func.def @tile_position(%configuration: index) -> (index, index, index, index, index, index) {
+  %height = config.get @krea2.latent_height : index
+  %width = config.get @krea2.latent_width : index
+  %tile_height = config.get @krea2.vae_tile_height : index
+  %tile_width = config.get @krea2.vae_tile_width : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %last_y = index.sub %height, %tile_height : index
+  %last_x = index.sub %width, %tile_width : index
+  %center_y = index.div %last_y, %c2 : index
+  %center_x = index.div %last_x, %c2 : index
+  %corner = index.cmp eq, %configuration, %c1 : index
+  %center = index.cmp eq, %configuration, %c2 : index
+  %bottom = index.cmp eq, %configuration, %c3 : index
+  %right = index.cmp eq, %configuration, %c4 : index
+  %bottom_origin = scalar.ori %corner, %bottom : i1
+  %right_origin = scalar.ori %corner, %right : i1
+  %edge_y = scf.select %bottom_origin, %last_y, %c0 : index
+  %edge_x = scf.select %right_origin, %last_x, %c0 : index
+  %origin_y = scf.select %center, %center_y, %edge_y : index
+  %origin_x = scf.select %center, %center_x, %edge_x : index
+  %tile_y_end = index.add %origin_y, %tile_height : index
+  %tile_x_end = index.add %origin_x, %tile_width : index
+  %last_pixel_y = index.sub %tile_y_end, %c1 : index
+  %last_pixel_x = index.sub %tile_x_end, %c1 : index
+  %middle_y_offset = index.div %tile_height, %c3 : index
+  %middle_x_offset = index.div %tile_width, %c3 : index
+  %half_height = index.div %tile_height, %c2 : index
+  %half_width = index.div %tile_width, %c2 : index
+  %middle_height = index.add %half_height, %c1 : index
+  %middle_width = index.add %half_width, %c1 : index
+  %middle_y_begin = index.add %origin_y, %middle_y_offset : index
+  %middle_x_begin = index.add %origin_x, %middle_x_offset : index
+  %middle_y_end = index.add %origin_y, %middle_height : index
+  %middle_x_end = index.add %origin_x, %middle_width : index
+  %one_row = scalar.ori %corner, %bottom : i1
+  %one_column = scalar.ori %corner, %right : i1
+  %edge_y_begin = scf.select %one_row, %last_pixel_y, %origin_y : index
+  %edge_x_begin = scf.select %one_column, %last_pixel_x, %origin_x : index
+  %y_begin = scf.select %center, %middle_y_begin, %edge_y_begin : index
+  %x_begin = scf.select %center, %middle_x_begin, %edge_x_begin : index
+  %y_end = scf.select %center, %middle_y_end, %tile_y_end : index
+  %x_end = scf.select %center, %middle_x_end, %tile_x_end : index
+  func.return %origin_y, %origin_x, %y_begin, %y_end, %x_begin, %x_end : index, index, index, index, index, index
+}
+
+func.def @extract_reference(%origin_y: index, %origin_x: index, %input: buffer, %output: buffer) {
+  %height = config.get @krea2.latent_height : index
+  %width = config.get @krea2.latent_width : index
+  %tile_height = config.get @krea2.vae_tile_height : index
+  %tile_width = config.get @krea2.vae_tile_width : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %channels = index.constant 384 : index
+  %word = index.constant 4 : offset
+  %row_bytes = index.scale %tile_width, %word : index, offset -> offset
+  scf.for %channel = [%c0 to %channels step %c1] {
+    %source_channel = index.mul %channel, %height : index
+    %source_first_row = index.add %source_channel, %origin_y : index
+    %destination_first_row = index.mul %channel, %tile_height : index
+    scf.for %row = [%c0 to %tile_height step %c1] {
+      %source_row = index.add %source_first_row, %row : index
+      %source_pixel = index.madd %source_row, %width, %origin_x : index
+      %destination_row = index.add %destination_first_row, %row : index
+      %destination_pixel = index.mul %destination_row, %tile_width : index
+      %source = index.scale %source_pixel, %word : index, offset -> offset
+      %destination = index.scale %destination_pixel, %word : index, offset -> offset
+      buffer.copy %input[%source], %output[%destination], %row_bytes
+    }
+  }
+  func.return
+}
+
+func.def @stitch_reference(%origin_y: index, %origin_x: index, %y_begin: index, %y_end: index, %x_begin: index, %x_end: index, %input: buffer, %output: buffer) {
+  %height = config.get @krea2.latent_height : index
+  %width = config.get @krea2.latent_width : index
+  %tile_height = config.get @krea2.vae_tile_height : index
+  %tile_width = config.get @krea2.vae_tile_width : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %channels = index.constant 3 : index
+  %scale = index.constant 8 : index
+  %word = index.constant 4 : offset
+  %full_rows = index.mul %height, %scale : index
+  %full_columns = index.mul %width, %scale : index
+  %tile_rows = index.mul %tile_height, %scale : index
+  %tile_columns = index.mul %tile_width, %scale : index
+  %first_row = index.mul %y_begin, %scale : index
+  %end_row = index.mul %y_end, %scale : index
+  %first_column = index.mul %x_begin, %scale : index
+  %tile_first_row = index.mul %origin_y, %scale : index
+  %tile_first_column = index.mul %origin_x, %scale : index
+  %local_column = index.sub %first_column, %tile_first_column : index
+  %latent_columns = index.sub %x_end, %x_begin : index
+  %columns = index.mul %latent_columns, %scale : index
+  %row_bytes = index.scale %columns, %word : index, offset -> offset
+  scf.for %channel = [%c0 to %channels step %c1] {
+    %source_channel = index.mul %channel, %tile_rows : index
+    %destination_channel = index.mul %channel, %full_rows : index
+    scf.for %row = [%first_row to %end_row step %c1] {
+      %local_row = index.sub %row, %tile_first_row : index
+      %source_row = index.add %source_channel, %local_row : index
+      %destination_row = index.add %destination_channel, %row : index
+      %source_pixel = index.madd %source_row, %tile_columns, %local_column : index
+      %destination_pixel = index.madd %destination_row, %full_columns, %first_column : index
+      %source = index.scale %source_pixel, %word : index, offset -> offset
+      %destination = index.scale %destination_pixel, %word : index, offset -> offset
+      buffer.copy %input[%source], %output[%destination], %row_bytes
+    }
+  }
+  func.return
+}
+
+check.scenario public @extract configure[5](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %full, %tile, %rgb, %tile_rgb, %full_storage, %tile_storage, %rgb_storage, %tile_rgb_storage = check.generate<@tile_counts>() : () -> (index, index, index, index, index, index, index, index)
+    %origin_y, %origin_x, %y_begin, %y_end, %x_begin, %x_end = check.generate<@tile_position>(%configuration) : (index) -> (index, index, index, index, index, index)
+    %input_storage = check.generate.iota offset(0.0) step(1.0) : tensor<[%full_storage]xf32>
+    %input = check.tensor.view %input_storage offset(64) : tensor<[%full_storage]xf32> -> tensor<[%full]xf32>
+    check.generate<@seed_copy_bits>(%input) : (tensor<[%full]xf32>) -> ()
+    %output_storage = check.generate.fill value(-77.0) : tensor<[%tile_storage]xf32>
+    %output = check.tensor.view %output_storage offset(64) : tensor<[%tile_storage]xf32> -> tensor<[%tile]xf32>
+    check.compare<@krea_vae_extract_tile, @extract_reference>(%origin_y, %origin_x, %input, %output) : (index, index, tensor<[%full]xf32>, tensor<[%tile]xf32>) -> () {
+      check.expect.bitwise actual(%input_storage) expected(%input_storage) : tensor<[%full_storage]xf32>
+      check.expect.bitwise actual(%output_storage) expected(%output_storage) : tensor<[%tile_storage]xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@extract> @extract_benchmark
+
+check.scenario public @stitch configure[5](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %full, %tile, %rgb, %tile_rgb, %full_storage, %tile_storage, %rgb_storage, %tile_rgb_storage = check.generate<@tile_counts>() : () -> (index, index, index, index, index, index, index, index)
+    %origin_y, %origin_x, %y_begin, %y_end, %x_begin, %x_end = check.generate<@tile_position>(%configuration) : (index) -> (index, index, index, index, index, index)
+    %input_storage = check.generate.iota offset(0.0) step(1.0) : tensor<[%tile_rgb_storage]xf32>
+    %input = check.tensor.view %input_storage offset(64) : tensor<[%tile_rgb_storage]xf32> -> tensor<[%tile_rgb]xf32>
+    check.generate<@seed_copy_bits>(%input) : (tensor<[%tile_rgb]xf32>) -> ()
+    %output_storage = check.generate.fill value(-77.0) : tensor<[%rgb_storage]xf32>
+    %output = check.tensor.view %output_storage offset(64) : tensor<[%rgb_storage]xf32> -> tensor<[%rgb]xf32>
+    check.compare<@krea_vae_stitch_tile, @stitch_reference>[%y_begin, %y_end, %x_begin, %x_end](%origin_y, %origin_x, %y_begin, %y_end, %x_begin, %x_end, %input, %output) : [index, index, index, index](index, index, index, index, index, index, tensor<[%tile_rgb]xf32>, tensor<[%rgb]xf32>) -> () {
+      check.expect.bitwise actual(%input_storage) expected(%input_storage) : tensor<[%tile_rgb_storage]xf32>
+      check.expect.bitwise actual(%output_storage) expected(%output_storage) : tensor<[%rgb_storage]xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@stitch> @stitch_benchmark

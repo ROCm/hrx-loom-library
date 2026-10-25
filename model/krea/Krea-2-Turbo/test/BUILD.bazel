@@ -1,0 +1,196 @@
+# Copyright 2026 AMD ROCm™ Software
+# SPDX-License-Identifier: MIT
+
+load("@hrx//build_tools/bazel:python.bzl", "iree_py_test")
+load("@hrx//build_tools/bazel:requirements.bzl", "apply_test_requirements")
+load("@hrx//loom/target/amdgpu:execution_profiles.bzl", "AMD_GPU_HARDWARE_PROFILE", "amd_gpu_execution_profile")
+load("@hrx//loom/target/vm:execution_profiles.bzl", "VM_REFERENCE_PROFILE")
+load("//build_tools/bazel:defs.bzl", "loom_test")
+
+package(default_visibility = ["//visibility:private"])
+
+iree_py_test(
+    name = "image_check_test",
+    srcs = [
+        "image_check.py",
+        "image_check_test.py",
+    ],
+    imports = ["."],
+    main = "image_check_test.py",
+    deps = [
+        "@hrx//loom/src/loom/serve/testing:http",
+        "@hrx//loom/src/loom/serve/testing:model_staging",
+    ],
+)
+
+_IMAGE_REQUIREMENTS = apply_test_requirements(
+    {},
+    build_requirements = AMD_GPU_HARDWARE_PROFILE.build_requirements,
+    resource_group = AMD_GPU_HARDWARE_PROFILE.resource_group,
+    run_requirements = AMD_GPU_HARDWARE_PROFILE.run_requirements,
+)
+
+[
+    filegroup(
+        name = representation + suffix + "_card",
+        srcs = ["//model/krea/Krea-2-Turbo:" + representation + suffix],
+        output_group = "model_card",
+    )
+    for representation in [
+        "source",
+        "archive",
+        "mixed",
+    ]
+    for suffix in [
+        "",
+        "_int8",
+        "_bounded_workspace",
+        "_lifecycle",
+    ]
+]
+
+# Full checkpoints are provisioned through LOOM_MODEL_ASSETS, outside Bazel.
+[
+    iree_py_test(
+        name = "image_" + representation + suffix + "_test",
+        size = "large",
+        srcs = ["image_check.py"],
+        args = [
+            "--server=$(location @hrx//loom/src/loom/tools/loom-serve)",
+            "--model=$(location :" + representation + suffix + "_card)",
+            "--reference=$(location reference.json)",
+        ] + AMD_GPU_HARDWARE_PROFILE.runner_args + (["--lifecycle"] if suffix == "_lifecycle" else []),
+        data = [
+            ":" + representation + suffix + "_card",
+            "reference.json",
+            "@hrx//loom/src/loom/tools/loom-serve",
+        ],
+        main = "image_check.py",
+        resource_group = _IMAGE_REQUIREMENTS["resource_group"],
+        tags = ["manual"] + _IMAGE_REQUIREMENTS["tags"],
+        target_compatible_with = _IMAGE_REQUIREMENTS["target_compatible_with"],
+        deps = [
+            "@hrx//loom/src/loom/serve/testing:http",
+            "@hrx//loom/src/loom/serve/testing:model_staging",
+        ],
+    )
+    for representation in [
+        "source",
+        "archive",
+        "mixed",
+    ]
+    for suffix in [
+        "",
+        "_int8",
+        "_bounded_workspace",
+        "_lifecycle",
+    ]
+]
+
+[
+    iree_py_test(
+        name = "adapter_" + representation + suffix + ("_" + case if case != "selections" else "") + "_test",
+        size = "large",
+        srcs = [
+            "adapter_check.py",
+            "image_check.py",
+        ],
+        args = [
+            "--server=$(location @hrx//loom/src/loom/tools/loom-serve)",
+            "--model=$(location :" + representation + suffix + "_card)",
+            "--reference=$(location reference.json)",
+            "--case=" + case,
+        ] + AMD_GPU_HARDWARE_PROFILE.runner_args,
+        data = [
+            ":" + representation + suffix + "_card",
+            "reference.json",
+            "@hrx//loom/src/loom/tools/loom-serve",
+        ],
+        main = "adapter_check.py",
+        resource_group = _IMAGE_REQUIREMENTS["resource_group"],
+        tags = ["manual"] + _IMAGE_REQUIREMENTS["tags"],
+        target_compatible_with = _IMAGE_REQUIREMENTS["target_compatible_with"],
+        deps = [
+            "@hrx//loom/src/loom/serve/testing:http",
+            "@hrx//loom/src/loom/serve/testing:model_staging",
+        ],
+    )
+    for representation in [
+        "source",
+        "archive",
+        "mixed",
+    ]
+    for suffix, case in [
+        ("", "selections"),
+        ("_int8", "selections"),
+        ("", "banks"),
+        ("", "pressure"),
+    ]
+]
+
+loom_test(
+    name = "adapter_binding",
+    srcs = ["adapter_binding.loom"],
+    execution_profiles = [VM_REFERENCE_PROFILE],
+    deps = ["//model/krea/Krea-2-Turbo/program:control"],
+)
+
+loom_test(
+    name = "geometry",
+    srcs = ["geometry.loom"],
+    execution_profiles = [VM_REFERENCE_PROFILE],
+    deps = ["//model/krea/Krea-2-Turbo/program:geometry"],
+)
+
+_PROFILES = [
+    AMD_GPU_HARDWARE_PROFILE,
+    amd_gpu_execution_profile(
+        name = "amd_gpu_access",
+        runner_args = ["--sanitizer=access"],
+        tags = ["notsan"],
+    ),
+    amd_gpu_execution_profile(
+        name = "amd_gpu_tsan",
+        runner_args = ["--sanitizer=tsan"],
+    ),
+]
+
+loom_test(
+    name = "vae_tile_axis",
+    srcs = ["vae_tile_axis.loom"],
+    execution_profiles = _PROFILES,
+    deps = ["//model/krea/Krea-2-Turbo/program:vae_tiles"],
+)
+
+iree_py_test(
+    name = "vae_tile_axis_generated_test",
+    srcs = ["generate_vae_tile_axis.py"],
+    args = ["--check"],
+    data = ["vae_tile_axis.loom"],
+    main = "generate_vae_tile_axis.py",
+)
+
+[
+    loom_test(
+        name = "vae_tiles_" + name,
+        size = "medium",
+        srcs = ["vae_tiles.loom"],
+        configs = {
+            "krea2.latent_height": str(height),
+            "krea2.latent_width": str(width),
+            "krea2.vae_tile_height": str(tile_height),
+            "krea2.vae_tile_width": str(tile_width),
+        },
+        execution_profiles = _PROFILES,
+        deps = ["//model/krea/Krea-2-Turbo/program:vae_tiles"],
+    )
+    for name, height, width, tile_height, tile_width in [
+        ("untiled", 2, 2, 2, 2),
+        ("minimum_overlap", 34, 34, 32, 32),
+        ("landscape", 48, 80, 40, 54),
+        ("portrait", 94, 66, 64, 40),
+        ("image1024", 128, 128, 80, 80),
+        ("one_axis", 16, 96, 16, 64),
+        ("long_axis", 1024, 2, 64, 2),
+    ]
+]
