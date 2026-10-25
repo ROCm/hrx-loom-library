@@ -15,9 +15,9 @@ remain withheld during streaming and are resolved at completion. Returned
 buffers have VM ownership; request-local scalar state remains opaque to the
 service caller.
 
-`epoch.loom` consumes a 32-record plan containing two cohorts of at most
-16 live rows. Each record carries length, causal and source positions,
-resident row, known-input range, flags, output credit, and continuation owner.
+`epoch.loom` consumes consecutive first and continuation cohorts. Each record
+carries length, causal and source positions, resident row, known-input range,
+flags, output credit, and continuation owner.
 Encoding builds the source's packed descriptors and selected-row mapping.
 It returns fourteen explicit upload ranges; unused capacity remains untouched
 and is not uploaded. The retained 976-byte control allocation contains an
@@ -29,6 +29,12 @@ work. The returned completion edge covers work using mutable state; feedback
 has its own transfer edge, which the owner joins before publishing progress.
 Publication consumes completed immutable feedback and reports consumed inputs,
 known inputs, output IDs, verification counts, and the next source position.
+Continuation flags are indexed by first-cohort ordinal, independently of the
+resident identity. Every plan record names its first-cohort owner explicitly,
+including records in the first cohort itself.
+State ownership and feedback publication use the supplied buffer extents and
+live cohort size. Device packet encoding still uses the composition's fixed
+sampling and descriptor layout described above.
 No transform waits for a device or recovers ownership from buffer contents.
 
 `media.loom` fills eight-word mixed-input records and tracks compressed image

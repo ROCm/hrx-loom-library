@@ -44,3 +44,59 @@ check.case public @retained_origins_survive_ownership_changes {
 }
 
 check.benchmark<@retained_origins_survive_ownership_changes> @ownership_changes
+
+// Host identities are not packed ordinals. A larger resident table receives
+// sparse ownership updates in reverse order while untouched rows and each
+// row's KV origin retain their original values.
+func.def @sparse_origins(%count: index) -> (i1) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %capacity = index.mul %count, %c2 : index
+  %record_bytes = index.constant 32 : offset
+  %event_bytes = index.scale %count, %record_bytes : index, offset -> offset
+  %table_bytes = index.scale %capacity, %record_bytes : index, offset -> offset
+  %bindings = buffer.alloca<private> align(8) %event_bytes : buffer
+  %origins = buffer.alloca<private> align(8) %table_bytes : buffer
+  %expected = buffer.alloca<private> align(8) %table_bytes : buffer
+  %sentinel = scalar.constant -99 : i64
+  buffer.fill %sentinel, %origins[%origin], %table_bytes : i64
+  buffer.fill %sentinel, %expected[%origin], %table_bytes : i64
+  %events = buffer.view %bindings[%origin] : buffer -> view<[%count]x4xi64>
+  %oracle = buffer.view %expected[%origin] : buffer -> view<[%capacity]x4xi64>
+  %last = index.sub %capacity, %c1 : index
+  %write_base = scalar.constant 1000 : i64
+  %fork_base = scalar.constant 2000 : i64
+  scf.for %i = [%c0 to %count step %c1] {
+    %step = index.mul %i, %c2 : index
+    %row = index.sub %last, %step : index
+    %identity = index.cast %row : index to i64
+    %read = index.cast %i : index to i64
+    %write = scalar.addi %identity, %write_base : i64
+    %position = scalar.addi %identity, %fork_base : i64
+    view.store %identity, %events[%i, 0] : i64, view<[%count]x4xi64>
+    view.store %read, %events[%i, 1] : i64, view<[%count]x4xi64>
+    view.store %write, %events[%i, 2] : i64, view<[%count]x4xi64>
+    view.store %position, %events[%i, 3] : i64, view<[%count]x4xi64>
+    view.store %read, %oracle[%row, 0] : i64, view<[%capacity]x4xi64>
+    view.store %write, %oracle[%row, 1] : i64, view<[%capacity]x4xi64>
+    view.store %position, %oracle[%row, 3] : i64, view<[%capacity]x4xi64>
+  }
+  %count_word = index.cast %count : index to i32
+  func.call @text_encode_state_v1(%bindings, %count_word, %origins) : (buffer, i32, buffer)
+  %difference = buffer.compare %origins[%origin], %expected[%origin], %table_bytes
+  %c0_i32 = scalar.constant 0 : i32
+  %equal = scalar.cmpi eq, %difference, %c0_i32 : i32
+  func.return %equal : i1
+}
+
+check.case public @ownership_events_do_not_bound_resident_identity {
+  %count = check.param.choice values([1, 17, 65, 129]) : index
+  %actual = func.call @sparse_origins(%count) : (index) -> (i1)
+  %expected = check.literal value(true) : i1
+  check.expect.equal actual(%actual) expected(%expected) : i1
+  check.return
+}
+
+check.benchmark<@ownership_events_do_not_bound_resident_identity> @sparse_ownership_changes
