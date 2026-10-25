@@ -1,5 +1,21 @@
 # Contributing to the Loom standard library
 
+## Scope
+
+This repository maintains the official Loom model set and shared library
+components. Forks, remixes, and independently published models are encouraged;
+using Loom does not require contributing a model here. The
+[model-authoring guide](docs/model-authoring.md) covers that workflow.
+
+Official additions are curated with maintainers. The library's organization,
+review process, and capacity for maintaining more models are still being
+established, so this is not an open submission queue for every model port.
+Open an issue to discuss a proposed model or substantial shared component
+before investing in a large pull request. Bug reports, focused fixes, and
+feedback on the authoring workflow help establish that foundation.
+
+## Review contract
+
 This repository admits reusable compiler inputs and complete model compositions. A contribution earns its place by strengthening a composable motif, exposing a deliberate launch or program ABI, or delivering a checked model through those components. The unit of review is the complete library closure: source, documentation, correctness programs, benchmark plans, target qualification, and the dependency edges that make it reusable.
 
 ## Admission surfaces
@@ -11,7 +27,7 @@ This repository admits reusable compiler inputs and complete model compositions.
 | `program/` | Shared service policy and executable compositions used by multiple models. | Explicit `loom_library` providers, scoped documentation, real service or command callers, and dependencies that do not point back to a model. |
 | `motif/**/test/`, `kernel/**/test/`, and `program/**/test/` | Test-only programs that exercise production contracts. | Private root-owned test module, semantic benchmarks and correctness cases, and one execution profile. |
 | `target/` | Genuinely repository-specific target or execution policy. | A concrete policy difference that cannot be expressed by canonical HRX profiles; upstream profiles are consumed directly otherwise. |
-| `model/` descriptions | Portable model facts, asset variants, service contracts, and provider composition. | A card validated through `loom_model_documentation`, a standalone overview with exact upstream links, and an explicit execution status. |
+| `model/` descriptions | Portable model facts, asset variants, service contracts, and provider composition. | A card validated through `loom_model_documentation`, a standalone overview with exact upstream links, and a precise supported-variant and hardware contract. |
 | `model/` executable ports | Model-specific programs and portable serving compositions. | Explicit `loom_library` providers, a card published through `loom_model`, and an independently checked native service output for each supported representation. |
 
 Source-bearing `target/` packages still require their own admission rule. Model programs use the repository's `loom_library` wrapper for canonical source, lint, explicit dependencies, and relocatable bytecode. The `loom_model` wrapper selects the card's preset and exact providers and auxiliary compiler inputs through HRX's public rule. Full checkpoints retain their acquisition descriptors for `loom-fetch` and stay outside Bazel's payload graph. Model-local `test/` packages use the same `loom_test` contract as other layers; small fixtures and swatches declare their full input closure for test caching. Full-model checks consume provisioned weights, trust that they match the declared acquisition lock, and run current built programs against independent inputs and checked outputs. The card, lock, and providers participate in Bazel cache identity; full checkpoint hashing belongs to acquisition.
@@ -39,7 +55,7 @@ complete build proves that no required experimental package was left behind.
 
 ## Source contract
 
-Each `.loom` file stands on its own as an implementation artifact. Its leading documentation establishes the represented format or operation, public symbol contract, parameter and shape meaning, storage layout, ABI ownership, and any specification or oracle used to establish behavior. Package READMEs carry information that cannot be recovered from `ls`: scope boundaries, external specifications, ABI relationships, implementation status, and the intended composition layer. Per-symbol inventories remain beside the source so they cannot drift from it.
+Each `.loom` file stands on its own as an implementation artifact. Its leading documentation establishes the represented format or operation, public symbol contract, parameter and shape meaning, storage layout, ABI ownership, and any specification or oracle used to establish behavior. Package READMEs carry information that cannot be recovered from `ls`: scope boundaries, external specifications, ABI relationships, supported behavior, and the intended composition layer. Per-symbol inventories remain beside the source so they cannot drift from it.
 
 Public symbols are the intended linking surface. Helpers whose only consumers are in the same module remain private. Motifs expose representation and algorithm contracts without a launch ABI; GGML-compatible kernels own GGML graph-operation ABI details, while native kernels may consume the same GGUF carriers without inheriting that ABI.
 
@@ -81,7 +97,7 @@ A focused performance capture adds an explicit target and device:
 ```shell
 python dev.py benchmark \
   --config=amdgpu \
-  --device=amdgpu2://0 \
+  --device=amdgpu://0 \
   --output-dir=/tmp/hrx-loom-library-candidate \
   --target=//kernel/ggml/quantize:q8_1_x4_f32 \
   -- \

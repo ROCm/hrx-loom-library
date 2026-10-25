@@ -15,7 +15,7 @@ with its `hf` extra, select text chat:
 loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/Qwen/Qwen3.8-27B/model.json \
   --preset chat --output "$HOME/models/qwen3.8-27b"
 loom-serve --model="$HOME/models/qwen3.8-27b/model.json" \
-  --device=amdgpu2://0
+  --device=amdgpu://0
 ```
 
 The `chat` preset uses checkpoint MTP without the image projector;
@@ -26,7 +26,7 @@ image projector, or `dflash2` to fetch the separate draft checkpoint. For exampl
 loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/Qwen/Qwen3.8-27B/model.json \
   --preset dflash2 --output "$HOME/models/qwen3.8-27b-dflash2"
 loom-serve --model="$HOME/models/qwen3.8-27b-dflash2/model.json" \
-  --device=amdgpu2://0
+  --device=amdgpu://0
 ```
 
 Fetch resolves the exact asset and compiler-input closure and reuses cached

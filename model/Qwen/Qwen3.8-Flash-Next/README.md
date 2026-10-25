@@ -11,7 +11,7 @@ loom-fetch model/Qwen/Qwen3.8-Flash-Next/model.json \
   --preset chat --origin "library=$PWD" \
   --output "$HOME/models/qwen3.8-flash-next"
 loom-serve --model="$HOME/models/qwen3.8-flash-next/model.json" \
-  --device=amdgpu2://0
+  --device=amdgpu://0
 ```
 
 Fetching selects the source providers and the four required GGUF shards, verifies their acquisition identities, and materializes one selected card. The library origin override uses this checkout's shared providers; omitting it uses the pinned library revision. Both flows use the installed SDK without a Bazel build. A published card URL can replace the local card path.

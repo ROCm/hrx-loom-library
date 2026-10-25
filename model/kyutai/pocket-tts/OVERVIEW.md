@@ -16,7 +16,7 @@ loom-fetch \
   https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/kyutai/pocket-tts/model.json \
   --preset=streaming --output=./pocket-tts
 
-loom-serve --model=./pocket-tts/model.json --device=amdgpu2 \
+loom-serve --model=./pocket-tts/model.json --device=amdgpu \
   --workers=4 --listen=127.0.0.1:8080
 ```
 

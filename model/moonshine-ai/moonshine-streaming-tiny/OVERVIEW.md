@@ -18,9 +18,7 @@ port of the numerical kernels.
 Install the `hrx-loom` SDK with its optional Hugging Face provider in a Python
 3.12+ virtual environment. The
 [installation guide](https://rocm.github.io/hrx-system/loom/getting-started/acquiring-loom/)
-explains Linux and Windows prerequisites and how to install a development wheel
-before the first PyPI release. A published SDK uses
-`python -m pip install 'hrx-loom[hf]'`.
+covers Linux and Windows prerequisites and SDK installation.
 
 With the SDK installed, fetch this model directly from its publication URL:
 
@@ -53,7 +51,7 @@ driver. No ROCm SDK installation is required. Start a server with an available
 AMD GPU:
 
 ```sh
-loom-serve --device=amdgpu2 --workers=4 --listen=127.0.0.1:8080 \
+loom-serve --device=amdgpu --workers=4 --listen=127.0.0.1:8080 \
   --model=./moonshine/model.json
 ```
 

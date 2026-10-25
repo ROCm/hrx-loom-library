@@ -15,7 +15,7 @@ build or Bazel installation:
 model_url=https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/krea/Krea-2-Turbo
 loom-fetch "$model_url/model.json" --list
 loom-fetch "$model_url/model.json" --preset=image --output=./krea2
-loom-serve --device=amdgpu2 --workers=4 --listen=127.0.0.1:8080 --model=./krea2/model.json
+loom-serve --device=amdgpu --workers=4 --listen=127.0.0.1:8080 --model=./krea2/model.json
 ```
 
 Fetch reads the adjacent acquisition lock, verifies the selected files, and
@@ -152,7 +152,7 @@ into the same parameter index. Factors must use the model's original tensor
 names, F32 storage, and rank 32.
 
 ```sh
-loom-serve --device=amdgpu2 --workers=4 --listen=127.0.0.1:8080 --model=./serve.json
+loom-serve --device=amdgpu --workers=4 --listen=127.0.0.1:8080 --model=./serve.json
 curl --fail-with-body http://127.0.0.1:8080/v1/images/generations \
   -H 'Content-Type: application/json' \
   -d '{"model":"krea2","prompt":"A deer grazing in a sunlit forest, Art Deco watercolor style","seed":42,"loras":[{"id":"watercolor","scale":0.75}],"response_format":"b64_json"}' \

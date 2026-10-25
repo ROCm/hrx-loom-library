@@ -15,7 +15,7 @@ repository. For example, after installing the `hrx-loom` SDK with its `hf` extra
 loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/Qwen/Qwen3.8-Flash-Next/model.json \
   --preset chat --output "$HOME/models/qwen3.8-flash-next"
 loom-serve --model="$HOME/models/qwen3.8-flash-next/model.json" \
-  --device=amdgpu2://0
+  --device=amdgpu://0
 ```
 
 The source card and acquisition lock identify the exact providers, ordered

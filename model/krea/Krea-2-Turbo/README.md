@@ -123,7 +123,7 @@ PROGRAMS="$(realpath bazel-bin/model/krea/Krea-2-Turbo/mixed)"
 loom-fetch "$PROGRAMS/model.json" --offline --update-lock \
   --lockfile="$PWD/.reports/krea2/mixed.lock.json" \
   --output="$PWD/.reports/krea2/mixed"
-loom-serve --device=amdgpu2 --model=./.reports/krea2/mixed/model.json
+loom-serve --device=amdgpu --model=./.reports/krea2/mixed/model.json
 ```
 
 This offline example requires the checkpoint files in the Hugging Face cache,

@@ -10,7 +10,6 @@ Loom's embedding service ABI 1.
 
 Install the Loom SDK using the
 [installation guide](https://rocm.github.io/hrx-system/loom/getting-started/acquiring-loom/).
-The first PyPI release is pending; development wheels provide the same commands.
 With the SDK installed, fetch the model card and start the server:
 
 ```sh
