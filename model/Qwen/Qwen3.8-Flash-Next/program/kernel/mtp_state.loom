@@ -6,9 +6,15 @@ config.decl @flash_next.token_count : %value: index where [range(%value, 1, 3276
 
 config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
 
+config.decl @flash_next.pool_capacity : %value: index where [range(%value, 64, 4194304), multiple_of(%value, 64)]
+
 func.decl @flash_next_span_active(%epoch: buffer, %span: index) -> (i1)
 
 func.decl @flash_next_row_state(%rows: buffer, %row: index, %position: index, %layer_origin: offset) -> (offset, offset)
+
+func.decl @flash_next_physical_token(%rows: buffer, %row: index, %position: index) -> (index)
+
+func.decl @flash_next_lookup_history_origin(%rows: buffer, %row: index) -> (offset)
 
 // Accepted descriptors retain original packed starts, including rejected holes.
 // Publish a dense predictor batch and origins keyed by compact token starts.
@@ -137,14 +143,15 @@ kernel.def @flash_next_mtp_restore() {
   kernel.return
 }
 
-// Gather accepted IDs only. Hidden normalization binds the original target
-// rows directly; first-row carry remains separate until all readers finish.
+// Gather accepted IDs and publish them to the registered paged history plane.
+// Rejected tokens never enter history. Hidden normalization binds the original
+// target rows directly; carry remains separate until all readers finish.
 kernel.def @flash_next_mtp_ids() {
   %spans = config.get @flash_next.span_capacity : index
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%spans, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%epoch: buffer, %origins: buffer, %target_tokens: buffer, %tokens: buffer) {
+} launch(%epoch: buffer, %origins: buffer, %target_tokens: buffer, %tokens: buffer, %rows: buffer, %cache: buffer) {
   %span = kernel.workgroup.id<x> : index
   %active = func.call @flash_next_span_active(%epoch, %span) : (buffer, index) -> (i1)
   scf.if %active {
@@ -156,6 +163,9 @@ kernel.def @flash_next_mtp_ids() {
     %source_begin = index.cast %source_begin_word : i32 to index
     %source_ids = buffer.view %target_tokens[%origin] : buffer -> view<[%capacity]xi32>
     %output_ids = buffer.view %tokens[%origin] : buffer -> view<[%capacity]xi32>
+    %pool = config.get @flash_next.pool_capacity : index
+    %history_origin = func.call @flash_next_lookup_history_origin(%rows, %row) : (buffer, index) -> (offset)
+    %history = buffer.view %cache[%history_origin] : buffer -> view<[%pool]xi32>
     %thread = kernel.workitem.id<x> : index
     %stride = index.constant 128 : index
     scf.for %relative = [%thread to %length step %stride] {
@@ -165,6 +175,9 @@ kernel.def @flash_next_mtp_ids() {
       %output_index = index.assume %output_index_value [range(%output_index_value, 0, 32767), lt(%output_index_value, %capacity)] : index
       %id = view.load %source_ids[%source_index] : view<[%capacity]xi32> -> i32
       view.store %id, %output_ids[%output_index] : i32, view<[%capacity]xi32>
+      %logical = index.add %position, %relative : index
+      %physical = func.call @flash_next_physical_token(%rows, %row, %logical) : (buffer, index, index) -> (index)
+      view.store %id, %history[%physical] : i32, view<[%pool]xi32>
     }
   }
   kernel.return

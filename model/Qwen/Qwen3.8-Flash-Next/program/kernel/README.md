@@ -25,7 +25,7 @@ The projection template forwards this argument to every shape-selected entry.
 | Sparse attention | Paged BF16 K/V, compressed index blocks, stable top-block selection, and per-query visibility. Cohort records retain resolved ownership and membership so matrix consumers do not repeat span lookup or selection. |
 | Experts | Stable top-ten routing among 512 experts, one shared expert, and the checkpoint's mixed GGML encodings. From capacity 256, task records group 128 routes per expert and share decoded F16 panels across them. Small-row paths retain their block-scaled dot arithmetic. |
 | PLE | Checkpoint hash multipliers and primes, packed IQ4_NL n-gram lookup, two prior token IDs, and nine prior BF16 convolution vectors. |
-| MTP and output | Accepted-history vocabulary membership, independent embedding/hidden projection rounding, private draft cache, target-authoritative acceptance, and selected output-row publication. |
+| MTP and output | Accepted IDs in a registered I32 plane sharing draft KV page ownership, accepted-history vocabulary membership, independent embedding/hidden projection rounding, private draft cache, target-authoritative acceptance, and selected output-row publication. |
 
 The tests use scalar and closed-form references, original encoded bytes,
 canaries, inactive NaNs, retained forks, and exact state comparisons. Matrix
