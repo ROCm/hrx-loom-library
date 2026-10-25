@@ -40,8 +40,17 @@ catch-up stages. Recursive proposals consume private working history.
 Target sampling decides acceptance; compact captured inputs replay only the
 accepted prefix into non-page state. Catch-up uses accepted target hidden
 rows to advance predictor state. Draft vocabulary membership is learned from
-accepted tokens and is retained with the request. Output-only target stages
-may compact final-layer work; MTP's full-hidden consumers keep their own root.
+accepted tokens and is retained with the request.
+
+Output-only stages at capacities of 128 tokens and above compact the final
+attention layer after every input row has been appended to its cache. Only
+selected query cohorts continue through attention and experts; results
+scatter back to their original packed rows.
+The normalized path retains its separate normalization and injection below
+2,048-token capacity, while larger shapes retain the fused arithmetic.
+Speculative verification and predictor catch-up consume the full hidden-state
+root and keep every row. Packet and scratch extents follow the configured
+span and token capacities rather than a fixed client count.
 
 The vocabulary projection shares each decoded Q8 row across four selected
 queries for small output capacities and eight for larger ones. Query groups

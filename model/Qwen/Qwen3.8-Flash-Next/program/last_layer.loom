@@ -18,6 +18,10 @@ kernel.decl @flash_next_finish_scatter() launch(%epoch: buffer, %origins: buffer
 
 kernel.decl @flash_next_map_tokens() launch(%epoch: buffer, %mapping: buffer)
 
+kernel.decl @hc_combine_normalize() launch(%span: buffer, %residual: buffer, %projected: buffer, %injection: buffer, %gamma: buffer, %output: buffer, %normalized: buffer)
+
+command.program.decl @flash_next_hc_ffn_normalized(%layer: index) launch(%parameters: buffer, %span: buffer, %normalized: buffer, %injection: buffer, %mixed: buffer)
+
 kernel.decl @hc_combine_normalize_inject() launch(%span: buffer, %residual: buffer, %projected: buffer, %injection: buffer, %gamma: buffer, %output: buffer, %normalized: buffer, %weight: buffer, %next_injection: buffer)
 
 kernel.decl @hc_combine() launch(%span: buffer, %residual: buffer, %projected: buffer, %injection: buffer, %output: buffer)
@@ -73,12 +77,20 @@ command.program.def public @flash_next_finish_output(%layer: index, %key_origin:
   %normalized = buffer.alloca<global> align(256) %residual_bytes : buffer
   %ffn_injection = buffer.alloca<global> align(256) %injection_bytes : buffer
   %gamma = command.parameter %parameters, "blk.{}.hc_ffn_norm.weight"[%layer] : view<4x2560xf32>
-  %down_weight = command.parameter %parameters, "blk.{}.hc_ffn_down.weight"[%layer] : view<3481600xi8>
-  %up_weight = command.parameter %parameters, "blk.{}.hc_ffn_up.weight"[%layer] : view<3481600xi8>
-  %inject_weight = command.parameter %parameters, "blk.{}.hc_ffn_inject.weight"[%layer] : view<4x10240xf32>
-  kernel.launch @hc_combine_normalize_inject(%compact, %residual, %projected, %injection, %gamma, %attention, %normalized, %inject_weight, %ffn_injection) : (buffer, buffer, buffer, buffer, view<4x2560xf32>, buffer, buffer, view<4x10240xf32>, buffer)
   %ffn_mixed = buffer.alloca<global> align(256) %hidden_bytes : buffer
-  command.program.launch @flash_next_hc_mix_normalized[%down_weight, %up_weight](%compact, %normalized, %ffn_mixed) : [view<3481600xi8>, view<3481600xi8>](buffer, buffer, buffer)
+  // Preserve the body variant's arithmetic while reducing only live rows.
+  %fusion_threshold = index.constant 2048 : index
+  %fused = index.cmp uge, %tokens, %fusion_threshold : index
+  scf.if %fused {
+    %down_weight = command.parameter %parameters, "blk.{}.hc_ffn_down.weight"[%layer] : view<3481600xi8>
+    %up_weight = command.parameter %parameters, "blk.{}.hc_ffn_up.weight"[%layer] : view<3481600xi8>
+    %inject_weight = command.parameter %parameters, "blk.{}.hc_ffn_inject.weight"[%layer] : view<4x10240xf32>
+    kernel.launch @hc_combine_normalize_inject(%compact, %residual, %projected, %injection, %gamma, %attention, %normalized, %inject_weight, %ffn_injection) : (buffer, buffer, buffer, buffer, view<4x2560xf32>, buffer, buffer, view<4x10240xf32>, buffer)
+    command.program.launch @flash_next_hc_mix_normalized[%down_weight, %up_weight](%compact, %normalized, %ffn_mixed) : [view<3481600xi8>, view<3481600xi8>](buffer, buffer, buffer)
+  } else {
+    kernel.launch @hc_combine_normalize(%compact, %residual, %projected, %injection, %gamma, %attention, %normalized) : (buffer, buffer, buffer, buffer, view<4x2560xf32>, buffer, buffer)
+    command.program.launch @flash_next_hc_ffn_normalized[%layer](%parameters, %compact, %normalized, %ffn_injection, %ffn_mixed) : [index](buffer, buffer, buffer, buffer, buffer)
+  }
   %ids = buffer.alloca<global> align(256) %selection_bytes : buffer
   %weights = buffer.alloca<global> align(256) %selection_bytes : buffer
   %shared_gate = buffer.alloca<global> align(256) %gate_bytes : buffer
