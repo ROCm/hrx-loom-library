@@ -101,6 +101,38 @@ strength returns the base bits without accessing factor storage. These scalar
 and gather providers are target-neutral, with finite active arithmetic and
 naturally aligned immutable inputs.
 
+`adapter.loom` applies runtime selections from shared rank-32 BF16 factor
+banks. The caller supplies strided I64 byte-offset and F32 strength views;
+the motifs know neither a request record format nor a model identifier.
+Duplicate offsets retain independent strengths. Changing the selection count
+does not add kernel arguments or specialize native code.
+
+`projection.adapter_down_bf16` shares a 16-row, 64-column activation panel
+between two banks, requiring `ceil(count / 2)` activation passes. Its four
+wave32 subgroups produce `[count, rows, 32]` BF16 scratch. Each down product
+is scaled in F32 before scratch rounding. `projection.adapter_up_bf16`
+shares a 64-row, 128-column output tile across those subgroups, retains all
+selected contributions in F32 accumulators, and adds the base once before
+BF16 publication. Rank scratch uses `count * rows * 64` bytes and can be
+reused between cohort members. It contains activations, not copied factors.
+
+Rows and output channels are positive multiples of sixteen; down reduction
+widths are multiples of sixty-four. Output supports caller-owned injective
+layouts and exact base/output aliasing. Inputs, factors, and scratch remain
+disjoint from output. Composition binds `tensor_adapter_rdna3` and supplies
+the 128-thread wave32 launch. The providers contain no concrete target or
+global configuration. Native matrix intermediates follow the target's
+arithmetic contract.
+
+`projection.adapter_layer_mix_12_bf16` is the scalar counterpart in
+`layer_mix.loom`. It retains the twelve gathered values for all selected
+banks, scales each down result before BF16 rounding, and accumulates the up
+products before adding the base. It uses no rank allocation or workgroup
+synchronization. Base coefficients may use BF16 or F32 storage; factors use
+prepared BF16 storage. All active values and intermediates remain finite.
+The caller selects its ordinary base program when no effective adapters are
+present, preserving its exact base behavior and avoiding factor reads.
+
 `attention_expanded.loom` provides causal or noncausal grouped attention with
 128-channel BF16 heads. Query heads divide into equal groups sharing a KV
 head. Q/K are row-major; V's token/channel layout is explicit. Tokens form
