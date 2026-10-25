@@ -43,6 +43,13 @@ rows to advance predictor state. Draft vocabulary membership is learned from
 accepted tokens and is retained with the request. Output-only target stages
 may compact final-layer work; MTP's full-hidden consumers keep their own root.
 
+The vocabulary projection shares each decoded Q8 row across four selected
+queries for small output capacities and eight for larger ones. Query groups
+occupy the contiguous grid axis, allowing neighboring workgroups to reuse the
+same vocabulary rows. Each query retains its original block reduction order
+and BF16 logit publication; inactive queries neither read inputs nor publish
+outputs.
+
 ## Link boundaries
 
 The dependency graph follows execution ownership:
