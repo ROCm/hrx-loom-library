@@ -2,7 +2,9 @@
 // Both launches take mixed_inputs first: 0 for contiguous target I32 IDs or
 // 1 for eight-word target records. Draft input always contains ordinary IDs.
 // Preparation consumes the target-capacity packet and compacts generated spans
-// into a six-word descriptor and origin entry per draft-capacity slot.
+// into a six-word descriptor and two-I32 origin record per draft-capacity slot.
+// Origin records retain {target input begin, target selected-output index};
+// neither coordinate is the compact draft slot or the resident state row.
 // The allocation capacities are independent of live cohort cardinality.
 // Advance consumes draft predictions, publishes round 0..6 into reserved target
 // slots, and advances draft causal/source positions. Target epoch frontiers
@@ -16,7 +18,7 @@ func.decl @qwen38_packet_options_origin(%capacity: index) -> (offset)
 
 // Option value two requests generated inputs; value one supplies candidates,
 // and zero supplies known input. Compaction preserves target-span order and
-// records the target token origin separately from ordinary draft descriptors.
+// records both target coordinates separately from ordinary draft descriptors.
 // No target frontier changes.
 kernel.def export("qwen38_mtp_proposal_prepare") @qwen38_mtp_proposal_prepare() {
   %c1 = index.constant 1 : index
@@ -34,7 +36,7 @@ kernel.def export("qwen38_mtp_proposal_prepare") @qwen38_mtp_proposal_prepare() 
   %options = buffer.view %input[%options_origin] : buffer -> view<[%target_capacity]x2xi32>
   %draft_header = buffer.view %draft[%origin] : buffer -> view<3xi32>
   %draft_spans = buffer.view %draft[%descriptor_origin] : buffer -> view<[%draft_capacity]x6xi32>
-  %mapping = buffer.view %origins[%origin] : buffer -> view<[%draft_capacity]xi32>
+  %mapping = buffer.view %origins[%origin] : buffer -> view<[%draft_capacity]x2xi32>
   %inputs = buffer.view %draft_tokens[%origin] : buffer -> view<[%draft_capacity]xi32>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -64,6 +66,7 @@ kernel.def export("qwen38_mtp_proposal_prepare") @qwen38_mtp_proposal_prepare() 
       %source_position = view.load %spans[%span, 4] : view<[%target_capacity]x6xi32> -> i32
       %begin_word = view.load %spans[%span, 2] : view<[%target_capacity]x6xi32> -> i32
       %row = view.load %spans[%span, 3] : view<[%target_capacity]x6xi32> -> i32
+      %selection = view.load %spans[%span, 5] : view<[%target_capacity]x6xi32> -> i32
       %begin_value = index.cast %begin_word : i32 to index
       %begin = index.assume %begin_value [ge(%begin_value, 0), lt(%begin_value, %target_capacity)] : index
       %anchor = func.call @qwen38_input_token(%mixed_inputs, %target_capacity, %target_tokens, %begin) : (index, index, buffer, index) -> (i32)
@@ -74,7 +77,8 @@ kernel.def export("qwen38_mtp_proposal_prepare") @qwen38_mtp_proposal_prepare() 
       view.store %row, %draft_spans[%slot, 3] : i32, view<[%draft_capacity]x6xi32>
       view.store %source_position, %draft_spans[%slot, 4] : i32, view<[%draft_capacity]x6xi32>
       view.store %slot_word, %draft_spans[%slot, 5] : i32, view<[%draft_capacity]x6xi32>
-      view.store %begin_word, %mapping[%slot] : i32, view<[%draft_capacity]xi32>
+      view.store %begin_word, %mapping[%slot, 0] : i32, view<[%draft_capacity]x2xi32>
+      view.store %selection, %mapping[%slot, 1] : i32, view<[%draft_capacity]x2xi32>
       view.store %anchor, %inputs[%slot] : i32, view<[%draft_capacity]xi32>
       %incremented = index.add %count, %c1 : index
       scf.yield %incremented : index
@@ -104,7 +108,7 @@ kernel.def export("qwen38_mtp_proposal_advance") @qwen38_mtp_proposal_advance(%r
   %descriptor_origin = index.constant 12 : offset
   %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
   %spans = buffer.view %draft[%descriptor_origin] : buffer -> view<[%draft_capacity]x6xi32>
-  %mapping = buffer.view %origins[%origin] : buffer -> view<[%draft_capacity]xi32>
+  %mapping = buffer.view %origins[%origin] : buffer -> view<[%draft_capacity]x2xi32>
   %outputs = buffer.view %predictions[%origin] : buffer -> view<[%draft_capacity]xi32>
   %inputs = buffer.view %draft_tokens[%origin] : buffer -> view<[%draft_capacity]xi32>
   %c0 = index.constant 0 : index
@@ -117,7 +121,7 @@ kernel.def export("qwen38_mtp_proposal_advance") @qwen38_mtp_proposal_advance(%r
   scf.for %slot_value = [%c0 to %count step %c1] {
     %slot = index.assume %slot_value [ge(%slot_value, 0), lt(%slot_value, %draft_capacity)] : index
     %prediction = view.load %outputs[%slot] : view<[%draft_capacity]xi32> -> i32
-    %begin_word = view.load %mapping[%slot] : view<[%draft_capacity]xi32> -> i32
+    %begin_word = view.load %mapping[%slot, 0] : view<[%draft_capacity]x2xi32> -> i32
     %begin_value = index.cast %begin_word : i32 to index
     %begin = index.assume %begin_value [ge(%begin_value, 0), lt(%begin_value, %target_capacity)] : index
     %destination_value = index.add %begin, %relative : index
