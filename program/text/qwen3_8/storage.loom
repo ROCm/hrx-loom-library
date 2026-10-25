@@ -1,0 +1,55 @@
+// Control storage keeps the stage header and resident sampling directory at
+// stable offsets. A cold layout recipe precedes the trailing upload table.
+// Growth changes capacity without declaring stages or touching parameters.
+
+func.def public @qwen38.control_create(%packet_capacity: i64, %context: i64, %pool: i64, %rows_arg: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer) {
+  %rows = scalar.assume %rows_arg [range(%rows_arg, 1, 2147483647)] : i64
+  %count = index.cast %rows : i64 to index
+  %origin = index.constant 0 : offset
+  %policy_stride = index.constant 24 : offset
+  %policy_bytes = index.scale %count, %policy_stride : index, offset -> offset
+  %header_bytes = index.constant 32 : offset
+  %recipe_origin = index.add %header_bytes, %policy_bytes : offset
+  %trailer_bytes = index.constant 624 : offset
+  %state_bytes = index.add %recipe_origin, %trailer_bytes : offset
+  %state = buffer.alloca<private> align(8) %state_bytes : buffer
+  %c0_i32 = scalar.constant 0 : i32
+  buffer.fill %c0_i32, %state[%origin], %state_bytes : i32
+  %recipe = buffer.view %state[%recipe_origin] : buffer -> view<8xi64>
+  %packed_word = scalar.extui %packed : i1 to i64
+  %enabled_word = scalar.extui %enabled : i1 to i64
+  %dflash_word = scalar.extui %dflash : i1 to i64
+  view.store %packet_capacity, %recipe[0] : i64, view<8xi64>
+  view.store %context, %recipe[1] : i64, view<8xi64>
+  view.store %pool, %recipe[2] : i64, view<8xi64>
+  view.store %rows, %recipe[3] : i64, view<8xi64>
+  view.store %pins, %recipe[4] : i64, view<8xi64>
+  view.store %packed_word, %recipe[5] : i64, view<8xi64>
+  view.store %enabled_word, %recipe[6] : i64, view<8xi64>
+  view.store %dflash_word, %recipe[7] : i64, view<8xi64>
+  func.return %state : buffer
+}
+
+func.def public @qwen38.control_resize(%state: buffer, %rows: i64) -> (buffer, i64, i64, i64, i64, i1, i1, i1) {
+  %origin = index.constant 0 : offset
+  %old_bytes = buffer.length %state
+  %trailer_bytes = index.constant 624 : offset
+  %recipe_origin = index.sub %old_bytes, %trailer_bytes : offset
+  %recipe = buffer.view %state[%recipe_origin] : buffer -> view<8xi64>
+  %packet_capacity = view.load %recipe[0] : view<8xi64> -> i64
+  %context = view.load %recipe[1] : view<8xi64> -> i64
+  %pool = view.load %recipe[2] : view<8xi64> -> i64
+  %pins = view.load %recipe[4] : view<8xi64> -> i64
+  %packed_word = view.load %recipe[5] : view<8xi64> -> i64
+  %enabled_word = view.load %recipe[6] : view<8xi64> -> i64
+  %dflash_word = view.load %recipe[7] : view<8xi64> -> i64
+  %c0_i64 = scalar.constant 0 : i64
+  %packed = scalar.cmpi ne, %packed_word, %c0_i64 : i64
+  %enabled = scalar.cmpi ne, %enabled_word, %c0_i64 : i64
+  %dflash = scalar.cmpi ne, %dflash_word, %c0_i64 : i64
+  %grown = func.call @qwen38.control_create(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer)
+  // The retired upload table is scratch. Only stages and existing sampling
+  // policies survive; new residents start with an empty request policy.
+  buffer.copy %state[%origin], %grown[%origin], %recipe_origin
+  func.return %grown, %packet_capacity, %context, %pool, %pins, %packed, %enabled, %dflash : buffer, i64, i64, i64, i64, i1, i1, i1
+}

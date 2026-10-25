@@ -16,6 +16,16 @@ func.decl import("prepare") @parameter(%stage: i32, %binding: i32, %input: i32, 
 
 config.decl @qwen38.draft_kind : %value: i32 where [range(%value, 0, 1)]
 
+func.decl @qwen38.control_create(%packet_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer)
+
+func.decl @qwen38.control_resize(%state: buffer, %rows: i64) -> (buffer, i64, i64, i64, i64, i1, i1, i1)
+
+func.def public @text_resize_state_v1(%state: buffer, %rows: i64) -> (buffer, buffer, buffer, buffer, buffer, buffer) {
+  %grown, %packet_capacity, %context, %pool, %pins, %packed, %enabled, %dflash = func.call @qwen38.control_resize(%state, %rows) : (buffer, i64) -> (buffer, i64, i64, i64, i64, i1, i1, i1)
+  %allocations, %views, %target, %draft, %geometry = func.call @qwen38.storage(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
+  func.return %grown, %allocations, %views, %target, %draft, %geometry : buffer, buffer, buffer, buffer, buffer, buffer
+}
+
 global.rodata.def @model_scope = bytes("6d6f64656c")
 
 global.rodata.def @draft_scope = bytes("6472616674")
@@ -171,7 +181,9 @@ func.def @row_view(%records: buffer, %row_count: index, %row: index, %slot: inde
   func.return
 }
 
-func.def @storage(%packet_capacity_arg: i64, %context: i64, %pool: i64, %rows_arg: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer, buffer, buffer, buffer, buffer) {
+// Fixed cache planes precede append-only private/recurrent slots. Increasing
+// resident capacity changes directories but preserves every payload address.
+func.def @qwen38.storage(%packet_capacity_arg: i64, %context: i64, %pool: i64, %rows_arg: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer, buffer, buffer, buffer, buffer) {
   %packet_capacity = scalar.assume %packet_capacity_arg [range(%packet_capacity_arg, 2, 2147483646)] : i64
   %rows = scalar.assume %rows_arg [range(%rows_arg, 1, 2147483647)] : i64
   %origin = index.constant 0 : offset
@@ -251,7 +263,7 @@ func.def @storage(%packet_capacity_arg: i64, %context: i64, %pool: i64, %rows_ar
   %allocation_bytes = index.constant 264 : offset
   %allocations = buffer.alloca<private> align(8) %allocation_bytes : buffer
   func.call @allocation(%allocations, %c0, %residual_bytes, %residual_bytes) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c1, %arena_bytes, %row_bytes) : (buffer, index, i64, i64)
+  func.call @allocation(%allocations, %c1, %arena_bytes, %zero64) : (buffer, index, i64, i64)
   %packed_metadata = scf.select %packed, %metadata_bytes, %zero64 : i64
   %packed_table = scf.select %packed, %table_bytes, %zero64 : i64
   %packed_tokens = scf.select %packed, %cohort_token_bytes, %zero64 : i64
@@ -293,7 +305,8 @@ func.def @storage(%packet_capacity_arg: i64, %context: i64, %pool: i64, %rows_ar
   }
   scf.for %i = [%c0 to %row_count step %c1] {
     %row = index.cast %i : index to i64
-    %base = scalar.muli %row, %row_stride : i64
+    %relative = scalar.muli %row, %row_stride : i64
+    %base = scalar.addi %pool_bytes, %relative : i64
     %gdn_base = scalar.addi %base, %gdn_offset : i64
     %attention_base = scalar.addi %base, %attention_offset : i64
     %tokens_base = scalar.addi %base, %tokens_offset : i64
@@ -302,7 +315,7 @@ func.def @storage(%packet_capacity_arg: i64, %context: i64, %pool: i64, %rows_ar
     func.call @row_view(%views, %row_count, %i, %c1, %attention_base, %attention_bytes) : (buffer, index, index, index, i64, i64)
     func.call @row_view(%views, %row_count, %i, %c2, %tokens_base, %token_bytes) : (buffer, index, index, index, i64, i64)
     func.call @row_view(%views, %row_count, %i, %c3, %progress_base, %progress_bytes) : (buffer, index, index, index, i64, i64)
-    %kv_base = scf.select %pooled, %row_bytes, %attention_base : i64
+    %kv_base = scf.select %pooled, %zero64, %attention_base : i64
     view.store %gdn_base, %target[%i, 0] : i64, view<[%row_count]x5xi64>
     view.store %gdn_base, %target[%i, 1] : i64, view<[%row_count]x5xi64>
     view.store %kv_base, %target[%i, 2] : i64, view<[%row_count]x5xi64>
@@ -331,7 +344,8 @@ func.def @storage(%packet_capacity_arg: i64, %context: i64, %pool: i64, %rows_ar
   %result_stride = scalar.constant 40 : i64
   %feedback_split = scalar.muli %packet_capacity, %result_stride : i64
   view.store %feedback_split, %geometry_view[3] : i64, view<8xi64>
-  view.store %gdn_offset, %geometry_view[4] : i64, view<8xi64>
+  %recurrent_origin = scalar.addi %pool_bytes, %gdn_offset : i64
+  view.store %recurrent_origin, %geometry_view[4] : i64, view<8xi64>
   view.store %row_stride, %geometry_view[5] : i64, view<8xi64>
   view.store %gdn_bytes, %geometry_view[6] : i64, view<8xi64>
   view.store %state_slots, %geometry_view[7] : i64, view<8xi64>
@@ -347,7 +361,7 @@ func.def @storage(%packet_capacity_arg: i64, %context: i64, %pool: i64, %rows_ar
     %plane_stride = scalar.muli %pool, %plane_token_bytes : i64
     %block_bytes = scalar.constant 131072 : i64
     view.store %one64, %regions[0] : i64, view<5xi64>
-    view.store %row_bytes, %regions[1] : i64, view<5xi64>
+    view.store %zero64, %regions[1] : i64, view<5xi64>
     view.store %target_planes, %regions[2] : i64, view<5xi64>
     view.store %plane_stride, %regions[3] : i64, view<5xi64>
     view.store %block_bytes, %regions[4] : i64, view<5xi64>
@@ -503,13 +517,8 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
   %two64 = scalar.constant 2 : i64
   %shared64 = scalar.addi %shape_count, %two64 : i64
   %shared = scalar.trunci %shared64 : i64 to i32
-  %resident_count = index.cast %rows : i64 to index
-  %policy_stride = index.constant 24 : offset
-  %policy_bytes = index.scale %resident_count, %policy_stride : index, offset -> offset
-  %control_overhead = index.constant 592 : offset
-  %state_bytes = index.add %control_overhead, %policy_bytes : offset
-  %state = buffer.alloca<private> align(8) %state_bytes : buffer
-  buffer.fill %zero32, %state[%origin], %state_bytes : i32
+  %packed = scalar.cmpi ne, %shape_count, %zero64 : i64
+  %state = func.call @qwen38.control_create(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer)
   %state_view = buffer.view %state[%origin] : buffer -> view<8xi32>
   %count32 = scalar.trunci %shape_count : i64 to i32
   view.store %prefill_stage, %state_view[0] : i32, view<8xi32>
@@ -522,7 +531,6 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
   view.store %mixed_target_first, %state_view[6] : i32, view<8xi32>
   view.store %mixed_proposal_stage, %state_view[7] : i32, view<8xi32>
   %terminal = global.load @terminal : buffer
-  %packed = scalar.cmpi ne, %shape_count, %zero64 : i64
-  %allocations, %views, %target_origins, %draft_origins, %geometry = func.call @storage(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
+  %allocations, %views, %target_origins, %draft_origins, %geometry = func.call @qwen38.storage(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
   func.return %effective_prefill, %shared, %state, %terminal, %allocations, %views, %target_origins, %draft_origins, %geometry : i64, i32, buffer, buffer, buffer, buffer, buffer, buffer, buffer
 }

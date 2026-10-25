@@ -1,0 +1,119 @@
+// Both Qwen layouts use the real model storage evaluator and shared controller.
+// Growth preserves payload addresses and request policies, not only byte sizes.
+
+config.decl @storage_test.dflash : i1
+
+func.decl @qwen38.control_create(%packet_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer)
+
+func.decl @qwen38.storage(%packet_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer, buffer, buffer, buffer, buffer)
+
+func.decl @text_resize_state_v1(%state: buffer, %rows: i64) -> (buffer, buffer, buffer, buffer, buffer, buffer)
+
+func.def @equal_words(%left: buffer, %right: buffer, %begin: offset, %count: index) -> (i1) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %lhs = buffer.view %left[%begin] : buffer -> view<[%count]xi64>
+  %rhs = buffer.view %right[%begin] : buffer -> view<[%count]xi64>
+  %true = scalar.constant true : i1
+  %result = scf.for %i = [%c0 to %count step %c1](%same = %true : i1) -> (i1) {
+    %a = view.load %lhs[%i] : view<[%count]xi64> -> i64
+    %b = view.load %rhs[%i] : view<[%count]xi64> -> i64
+    %equal = scalar.cmpi eq, %a, %b : i64
+    %next = scalar.andi %same, %equal : i1
+    scf.yield %next : i1
+  }
+  func.return %result : i1
+}
+
+func.def @equal_origins(%left: buffer, %right: buffer, %rows: index) -> (i1) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %lhs = buffer.view %left[%origin] : buffer -> view<[%rows]x5xi64>
+  %rhs = buffer.view %right[%origin] : buffer -> view<[%rows]x5xi64>
+  %true = scalar.constant true : i1
+  %result = scf.for %i = [%c0 to %rows step %c1](%same = %true : i1) -> (i1) {
+    // The fifth word points into the replaceable page directory, not payload.
+    %row_same = scf.for %j = [%c0 to %c4 step %c1](%prior = %same : i1) -> (i1) {
+      %a = view.load %lhs[%i, %j] : view<[%rows]x5xi64> -> i64
+      %b = view.load %rhs[%i, %j] : view<[%rows]x5xi64> -> i64
+      %equal = scalar.cmpi eq, %a, %b : i64
+      %next = scalar.andi %prior, %equal : i1
+      scf.yield %next : i1
+    }
+    scf.yield %row_same : i1
+  }
+  func.return %result : i1
+}
+
+func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64) -> (i1) {
+  %disabled = scalar.constant 0 : i32
+  %enabled = scalar.cmpi ne, %draft_depth, %disabled : i32
+  %origin = index.constant 0 : offset
+  %initial_rows = scalar.constant 4 : i64
+  %intermediate_rows = scalar.constant 17 : i64
+  %final_rows = scalar.constant 129 : i64
+  %tokens = scalar.constant 128 : i64
+  %context = scalar.constant 256 : i64
+  %pool = scalar.constant 4096 : i64
+  %packed = scalar.constant true : i1
+  %dflash = config.get @storage_test.dflash : i1
+  %state = func.call @qwen38.control_create(%tokens, %context, %pool, %initial_rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer)
+  %allocations, %views, %target, %draft, %geometry = func.call @qwen38.storage(%tokens, %context, %pool, %initial_rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
+  %prefix_bytes = index.constant 128 : offset
+  %sentinel = scalar.constant 93 : i32
+  buffer.fill %sentinel, %state[%origin], %prefix_bytes : i32
+  %next, %next_allocations, %next_views, %next_target, %next_draft, %next_geometry = func.call @text_resize_state_v1(%state, %intermediate_rows) : (buffer, i64) -> (buffer, buffer, buffer, buffer, buffer, buffer)
+  %grown, %grown_allocations, %grown_views, %grown_target, %grown_draft, %grown_geometry = func.call @text_resize_state_v1(%next, %final_rows) : (buffer, i64) -> (buffer, buffer, buffer, buffer, buffer, buffer)
+  %prefix_words = index.constant 16 : index
+  %controls_equal = func.call @equal_words(%state, %grown, %origin, %prefix_words) : (buffer, buffer, offset, index) -> (i1)
+  %view_words = index.constant 32 : index
+  %views_equal = func.call @equal_words(%views, %grown_views, %origin, %view_words) : (buffer, buffer, offset, index) -> (i1)
+  %rows = index.constant 4 : index
+  %target_equal = func.call @equal_origins(%target, %grown_target, %rows) : (buffer, buffer, index) -> (i1)
+  %draft_equal = func.call @equal_origins(%draft, %grown_draft, %rows) : (buffer, buffer, index) -> (i1)
+  %regions_begin = index.constant 64 : offset
+  %geometry_bytes = buffer.length %geometry
+  %regions_bytes = index.sub %geometry_bytes, %regions_begin : offset
+  %word_bytes = index.constant 8 : index
+  %region_bytes = index.cast %regions_bytes : offset to index
+  %region_words = index.div %region_bytes, %word_bytes : index
+  %regions_equal = func.call @equal_words(%geometry, %grown_geometry, %regions_begin, %region_words) : (buffer, buffer, offset, index) -> (i1)
+  %recurrent_begin = index.constant 32 : offset
+  %recurrent_words = index.constant 3 : index
+  %recurrent_equal = func.call @equal_words(%geometry, %grown_geometry, %recurrent_begin, %recurrent_words) : (buffer, buffer, offset, index) -> (i1)
+  %old_allocations = buffer.view %allocations[%origin] : buffer -> view<11x3xi64>
+  %new_allocations = buffer.view %grown_allocations[%origin] : buffer -> view<11x3xi64>
+  %old_bytes = view.load %old_allocations[1, 0] : view<11x3xi64> -> i64
+  %new_bytes = view.load %new_allocations[1, 0] : view<11x3xi64> -> i64
+  %increased = scalar.cmpi ugt, %new_bytes, %old_bytes : i64
+  %new_policy_begin = index.constant 128 : offset
+  %new_policy_words = index.constant 750 : index
+  %new_policies = buffer.view %grown[%new_policy_begin] : buffer -> view<750xi32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %empty = scf.for %i = [%c0 to %new_policy_words step %c1](%same = %increased : i1) -> (i1) {
+    %value = view.load %new_policies[%i] : view<750xi32> -> i32
+    %equal = scalar.cmpi eq, %value, %c0_i32 : i32
+    %next_equal = scalar.andi %same, %equal : i1
+    scf.yield %next_equal : i1
+  }
+  %a = scalar.andi %controls_equal, %views_equal : i1
+  %b = scalar.andi %target_equal, %draft_equal : i1
+  %c = scalar.andi %regions_equal, %recurrent_equal : i1
+  %ab = scalar.andi %a, %b : i1
+  %cd = scalar.andi %c, %empty : i1
+  %result = scalar.andi %ab, %cd : i1
+  func.return %result : i1
+}
+
+check.case public @append_stable_resident_growth {
+  %draft_depth = check.param.choice values([0, 1]) : i32
+  %pins = check.param.choice values([0, 3]) : i64
+  %valid = func.call @grows_without_moving_payloads(%draft_depth, %pins) : (i32, i64) -> (i1)
+  %expected = check.literal value(true) : i1
+  check.expect.equal actual(%valid) expected(%expected) : i1
+  check.return
+}
