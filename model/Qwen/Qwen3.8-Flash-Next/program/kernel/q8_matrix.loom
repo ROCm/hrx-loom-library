@@ -1,6 +1,7 @@
 // Cooperatively stage two original Q8 blocks per K64 panel. Each producer
 // owns a complete block and its scale. Coefficients round to F16, matrix
 // accumulators remain F32, and service input/output buffers remain BF16.
+// BF16 inputs convert to F16 in the panel, with its narrower exponent range.
 template.decl @flash_next.q8_stage64_contract(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>)
 
 template.def<@flash_next.q8_stage64_contract> device @flash_next_q8_stage64_contract(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>) {
@@ -643,7 +644,7 @@ template.def<@flash_next.q8_tile> device @flash_next_q8_tiled(%capacity: index, 
 
 // Schedule predicates are the public specialization contract. A kernel
 // launch class retains these exact values without inspecting the body.
-// Every selected provider calls the same contraction implementation.
+// Geometry and reduction width select the shared contraction and staging body.
 template.decl @flash_next.q8_schedule(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 template.def<@flash_next.q8_schedule> device @flash_next_q8_16x64_waves_1x4(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 16), eq(%tile_columns, 64), eq(%wave_rows, 1), eq(%wave_columns, 4), eq(%pipeline_depth, 1)] {
@@ -681,8 +682,11 @@ template.def<@flash_next.q8_schedule> device @flash_next_q8_128x128_read_ahead(%
   template.return
 }
 
-// Stage ownership is selected before the shared tile implementation.
-template.def<@flash_next.q8_schedule> device priority(20) @flash_next_q8_128x128_long_reduction(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [ge(%capacity, 2048), ge(%input_width, 2560), ge(%output_width, 2560), eq(%tile_rows, 128), eq(%tile_columns, 128), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 2)] {
+// Long reductions amortize whole-block Q8 producers across 128-token panels.
+// Paired K32 blocks share one K64 stage, halving publication barriers while
+// retaining next-stage operand loads in registers. Coefficients and inputs
+// round to F16 before F32 accumulation; no global conversion plane is needed.
+template.def<@flash_next.q8_schedule> device priority(20) @flash_next_q8_128x128_long_reduction(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [ge(%capacity, 256), ge(%input_width, 2560), ge(%output_width, 2560), eq(%tile_rows, 128), eq(%tile_columns, 128), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 2)] {
   %use_stage64 = scalar.constant true : i1
   template.apply<@flash_next.q8_tile_stage>(%capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %use_stage64, %span, %input, %weight, %output) : (index, index, index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
   template.return
