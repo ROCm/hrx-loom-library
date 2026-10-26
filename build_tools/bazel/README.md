@@ -15,8 +15,8 @@ owned by this repository:
   do not manufacture standalone target products. `configs` and named `variants`
   use the public workload-selection contract, so one source module can qualify
   each specialization with independent cached execution results.
-- `loom_library` is confined to production `model/` packages. It delegates
-  source verification, lint, strict linking, and relocatable bytecode to HRX,
+- `loom_library` is confined to production `model/` and `program/` packages.
+  It delegates source verification, lint, strict linking, and relocatable bytecode to HRX,
   and applies the model source policy without requiring host/control programs
   to masquerade as individually benchmarkable kernels.
 - `loom_model` is confined to `model/` and selects a card preset with an
@@ -77,3 +77,18 @@ private rule kind participates.
 
 The complete admission and review contract is documented in
 [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
+
+## Toolchain selection
+
+[`sdk_repository.bzl`](sdk_repository.bzl) registers the public HRX toolchain
+roles against either an installed SDK or the selected HRX source tree.
+`dev.py setup --sdk` selects the Python environment containing `hrx-loom`;
+`--hrx-source=PATH` and `--pinned-source` select source-built tools.
+The developer guide owns [setup examples](../../docs/development.md#select-a-compiler).
+
+The installed wheel's RECORD supplies the file inventory. Individual program,
+library, and Python file contents remain Bazel inputs; the wheel archive and
+RECORD are not blanket execution-test dependencies. Native tool outputs include
+their adjacent shared libraries in both the action-tool closure and runfiles,
+so local, sandboxed, and remote execution use the same SDK bytes. Selecting an
+invalid or incomplete SDK fails during repository resolution.

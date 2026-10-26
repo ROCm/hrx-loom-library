@@ -6,16 +6,28 @@ correctness and cost. For a complete model package, start with
 
 ## Select a compiler
 
-Source development uses Git, Python 3.12+, Bazelisk, and the
-[HRX source-build prerequisites](https://github.com/ROCm/hrx-system/blob/main/BUILDING.md).
-Bazelisk selects the Bazel version in `.bazelversion`. The checked-in
-`MODULE.bazel` pins the HRX sources used to build Loom's tools and rules:
+Library development uses Git, Python 3.12+, Bazelisk, and an installed
+[`hrx-loom` SDK](https://rocm.github.io/hrx-system/loom/getting-started/acquiring-loom/).
+Bazelisk selects the Bazel version in `.bazelversion`. Select the SDK installed
+in the Python environment running `dev.py`:
 
 ```sh
-python dev.py setup --release
+python dev.py setup --sdk
 ```
 
-To develop the compiler and library together, select an HRX checkout:
+`--sdk=/path/to/venv/bin/python` selects another environment. Bazel consumes
+that installation's native commands, shared libraries, and Python tools as
+declared inputs. Building a model with this toolchain does not rebuild HRX's
+native compiler or runtime. The HRX revision in `MODULE.bazel` still supplies
+the public Bazel rules and their Python build/test helpers.
+
+The wheel selects native optimization and instrumentation. An ASAN SDK uses
+the `+asan` wheel; `--config=asan` instruments tools built from source and does
+not change an installed Release SDK into an ASAN build.
+
+To develop the compiler and library together, use the
+[HRX source-build prerequisites](https://github.com/ROCm/hrx-system/blob/main/BUILDING.md)
+and select an HRX checkout:
 
 ```sh
 python dev.py setup --hrx-source=/path/to/hrx-system
@@ -23,10 +35,10 @@ python dev.py setup --hrx-source=/path/to/hrx-system
 
 The selection lives in the ignored `.bazelrc.hrx`; it does not change the
 published module dependency. Uncommitted compiler edits become inputs to the
-next library build through the same Bazel graph. `--release` removes this local
-selection and returns to the pin. `.bazelrc.local` remains available for other
-local settings. An installed SDK and a source-built Bazel toolchain are
-independent choices.
+next library build through the same Bazel graph. `--pinned-source` builds the
+tools from the revision in `MODULE.bazel`; `--sdk` returns to the installed
+package. `.bazelrc.local` remains available for other local settings. The model
+BUILD files and public Loom rule contracts are the same in each mode.
 
 With Lefthook installed, `python dev.py hook` enables the repository's
 pre-commit hook. It formats staged `.loom` files, stages their canonical form,

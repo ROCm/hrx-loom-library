@@ -7,11 +7,11 @@ publication does not require admission to the official catalog.
 
 ## Start from a fork
 
-Fork this repository and clone your fork. From its root, select the pinned HRX
-toolchain and build the small Moonshine package as a concrete starting point:
+Fork this repository and clone your fork. From its root, select your installed
+Loom SDK and build the small Moonshine package as a concrete starting point:
 
 ```sh
-python dev.py setup --release
+python dev.py setup --sdk
 bazelisk build //model/moonshine-ai/moonshine-streaming-tiny:source //model/moonshine-ai/moonshine-streaming-tiny:archive //model/moonshine-ai/moonshine-streaming-tiny:mixed
 ```
 
