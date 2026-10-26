@@ -75,6 +75,35 @@ same vocabulary rows. Each query retains its original block reduction order
 and BF16 logit publication; inactive queries neither read inputs nor publish
 outputs.
 
+## Panel reuse within an epoch
+
+Large GDN projection cohorts use 128-token by 256-channel workgroups. Eight
+waves share a K64 input panel; each lane retains two prepared K32 weight
+blocks in registers and exchanges them within its wave to form matrix
+operands. This doubles input reuse across output channels. Narrow cohorts
+keep their smaller schedules so that the wider register footprint does not
+penalize short requests.
+
+The paired projection publishes one 128-channel head at a time through the
+same 33 KiB shared-memory region. A collective barrier separates each
+producer phase from convolution and halo consumers, and another prevents
+the next head from overwriting live values. Both schedules call one
+publication body. BF16 rounding, retained history ownership, and speculative
+capture remain at the same boundaries.
+
+Sparse scoring keeps each 64-key panel resident while two four-query phases
+consume it. Query scratch changes only after all waves finish the previous
+phase; each query retains its own reduction order and cache-page ownership.
+Sparse attention exchanges eight-word lane records as two four-word planes
+so 128-bit LDS transfers use neighboring bank groups. Both BF16 probability
+components and the original peer-reduction order are retained.
+
+Q8 matrix panels express signed byte-to-half conversion directly with
+`vector.sitofp`. Every I8 value is exactly representable in F16; block scaling
+and F32 accumulation follow the existing operand-rounding contract. These
+schedules change operand reuse and exchange layout without changing the
+checkpoint quantization or adding a reduced-accuracy execution mode.
+
 ## Link boundaries
 
 The dependency graph follows execution ownership:

@@ -9,7 +9,7 @@ workload can be planned, executed, and measured through the ordinary Loom tools.
 | Checks | Independent expectation |
 | --- | --- |
 | Q8 projection and preparation | Scalar F64 decoding from original GGML bytes, including the selected operand-rounding boundary; batch-independent reductions and in-place preparation preserve output and untouched storage. |
-| GDN and fused convolution | Scalar channel traversal and per-value recurrence; a closed-form Q8 projection fixture tests tile boundaries, shared anchors, advancing writers, and speculative capture. |
+| GDN and fused convolution | Scalar channel traversal and per-value recurrence; a closed-form Q8 projection fixture varies inputs and codes across K and tests tile boundaries, shared anchors, advancing writers, and speculative capture in narrow and paired-head schedules. |
 | Hyperconnection and residual fusion | Independent normalization and projection, explicit BF16 publication, and complete inactive-buffer comparisons. |
 | Sparse attention | Independent cache addressing, scalar score and attention references, stable selection, long contexts, causal tails, retained forks, and query-cohort visibility. |
 | Copied-history proposals | Closed-form repeated-token fixtures cross page and subgroup boundaries, choose the newest equal-length match, reject short or incomplete continuations, and compare complete compacted buffers. Empty, copied, neural, mixed, and sampled cohorts retain distinct resident, input, output, and policy identities. |
