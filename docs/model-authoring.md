@@ -76,6 +76,9 @@ Keep architecture-specific parameter interpretation and orchestration in the
 model. Shared service policy belongs in `program/`, concrete launch contracts
 in `kernel/`, and reusable representations and algorithms in `motif/`.
 [Repository layers](development.md#repository-layers) explains these boundaries.
+The [component-authoring guide](component-authoring.md) follows real extractions
+and their small independent tests, including the separation of correctness
+checks from production-size benchmark workloads.
 
 Model programs use `loom_library` from `//build_tools/bazel:defs.bzl`.
 A `loom_model` target selects a card preset, maps program files through `files`,
