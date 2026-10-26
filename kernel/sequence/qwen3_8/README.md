@@ -56,3 +56,11 @@ and mask wrap at 32 and 64 spans. Publication covers every round in each input
 layout, followed by three- and seven-round chains. The thirty total samples
 check complete descriptor, origin, input, and target buffers against the
 independent fixture; a full 65-row draft exercises the last allocated slot.
+
+Continuation admission uses fifteen explicit cases. Every proposal width from
+two through eight fits exactly at its causal frontier with two outputs left;
+the reserved speculative width may exceed that remaining output credit.
+One-token-short contexts, exhausted context, zero/single-output credit, and EOS
+independently reject continuation. Each case supplies literal expected liveness
+and checks the complete active token plane and first-result identity tags.
+The large ordinary-plane and overlapping media-compaction checks remain separate.
