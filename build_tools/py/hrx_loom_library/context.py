@@ -33,6 +33,12 @@ class RepositoryContext:
     repository_root: Path
 
     def bazel_executable(self) -> str:
+        selected = os.environ.get("BAZEL")
+        if selected is not None:
+            executable = shutil.which(selected)
+            if executable is None:
+                raise UserError(f"BAZEL does not name an executable: {selected!r}")
+            return executable
         executable = shutil.which("bazelisk") or shutil.which("bazel")
         if executable is None:
             raise UserError("Bazelisk or Bazel must be available on PATH")

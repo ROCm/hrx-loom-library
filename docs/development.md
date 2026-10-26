@@ -15,6 +15,12 @@ in the Python environment running `dev.py`:
 python dev.py setup --sdk
 ```
 
+`dev.py` normally finds `bazelisk`, then `bazel`, on `PATH`. Environments with
+a required build launcher can select it with `BAZEL=/path/to/launcher`.
+`BAZEL` names one executable, without shell arguments; an invalid selection
+fails instead of falling back to another client. Exporting it also selects
+the launcher for developer commands invoked by the repository's Git hooks.
+
 `--sdk=/path/to/venv/bin/python` selects another environment. Bazel consumes
 that installation's native commands, shared libraries, and Python tools as
 declared inputs. Building a model with this toolchain does not rebuild HRX's
