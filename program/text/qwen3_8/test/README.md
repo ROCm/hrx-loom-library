@@ -20,3 +20,11 @@ origins. The epoch fixture retains sentinel padding so
 writes beyond the submitted prefix are visible. The benchmark declarations
 exercise the same cases through the normal runner; they are correctness smokes
 rather than performance baselines.
+
+The storage cases run each model's actual allocation evaluator and resize
+callback. Growth preserves resident payload addresses and request policies.
+Seven packet capacities check exact allocation sizes, alignment, and initial
+zeroing extents, including both sides of 2 GiB and the maximum supported token
+capacity. Only the small descriptor tables are created; represented model
+storage is never materialized. These cases and their VM benchmarks need no
+weights or device.

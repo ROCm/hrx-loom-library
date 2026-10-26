@@ -28,6 +28,9 @@ The packet holds two epoch banks, cohort-local sampling policies and identities,
 continuation indices, and compaction scratch. Device feedback uses the same
 capacity. Resident count does not determine packet geometry: a compact cohort
 can reference any resident in the model's state directory.
+Both model preparation programs use the packet extent function for their
+allocation records, so allocation and field addressing share one geometry.
+Byte extents remain 64-bit even when token capacity fits a 32-bit index.
 
 Each retained row contains five I64 words: immutable anchor origin, private
 writer origin, K/V origin, fork position, and page-map origin. The recurrent
