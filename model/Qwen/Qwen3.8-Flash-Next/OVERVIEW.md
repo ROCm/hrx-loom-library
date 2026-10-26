@@ -74,14 +74,23 @@ verification applies to both sources. The ID history shares draft KV page
 ownership, so retained forks and restored requests preserve it without a
 separate host-side history cache. Sampled requests use neural proposals.
 
+Proposal programs specialize for power-of-two cohort sizes. Each invocation
+selects from the live span count, so a one-request decode does not execute the
+largest prepared grid. All variants share parameters and the fixed packet
+layout; resident growth preserves their stage handles. Two-epoch continuation
+queues its second proposal and verification without waiting for CPU acceptance
+feedback.
+
 ## Capacity and memory
 
-The canonical chat configuration uses four rows, 16,384-position contexts,
-32,768 pooled tokens, 16,384-token packed epochs, four checkpoints, and a
-256-token default generation limit. `long-context` records eight rows,
+The canonical chat configuration starts with four resident rows,
+16,384-position contexts, 32,768 pooled tokens, 16,384-token packed epochs,
+four checkpoints, and a 256-token default generation limit. `long-context` starts with eight rows,
 131,072-position contexts, 262,144 pooled tokens, and eight checkpoints.
 Context capacity must be divisible by 64, an epoch holds at most 32,768 tokens,
-and the composition requires pooled cache storage.
+and the composition requires pooled cache storage. Resident rows can grow
+without redeclaring stages or changing the prepared packet capacity; cache
+space and execution shapes bound admitted work independently.
 
 The source parameter layout occupies approximately 103.68 GiB, including the
 26.82 GiB packed n-gram table; adding MTP brings it to approximately 106.26 GiB.
