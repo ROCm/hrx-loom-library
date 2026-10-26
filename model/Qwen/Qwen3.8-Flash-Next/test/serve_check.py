@@ -264,7 +264,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--device", default="amdgpu2://0")
+    parser.add_argument("--device", default="amdgpu://0")
     parser.add_argument("--memory-bytes", type=int, default=163208757248)
     parser.add_argument(
         "--assets", type=Path, default=os.environ.get("LOOM_MODEL_ASSETS")

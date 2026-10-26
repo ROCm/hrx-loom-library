@@ -67,6 +67,13 @@ only accepted tokens do. The choice stays fixed through a recursive proposal
 chain, and checkpoint forks retain the history with the request. The target
 continues to score the full vocabulary when verifying proposals.
 
+Greedy requests can also reuse a complete proposal tail from accepted token
+history. The GPU searches repeated suffixes, copies only committed IDs, and
+compacts the remaining requests into the neural predictor cohort. Target
+verification applies to both sources. The ID history shares draft KV page
+ownership, so retained forks and restored requests preserve it without a
+separate host-side history cache. Sampled requests use neural proposals.
+
 ## Capacity and memory
 
 The canonical chat configuration uses four rows, 16,384-position contexts,
@@ -83,7 +90,7 @@ hardware fit or reserve memory from those figures.
 
 Mutable storage is additional: 25,344 bytes per pooled KV token and
 115,651,840 bytes per recurrent endpoint. MTP adds 44,032 bytes of carry per
-retained owner, 2,112 bytes per pooled token, and a 768-byte working tail per
+retained owner, 2,116 bytes per pooled token, and a 768-byte working tail per
 execution row. The retained carry includes 22,784 bytes for draft-vocabulary
 membership and history. Allocation granularity, workspace, compiler,
 tokenizer, and driver overhead are also additional, so no complete transient
