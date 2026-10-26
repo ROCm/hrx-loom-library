@@ -1,0 +1,65 @@
+amdgpu.target<gfx11-generic> @q4_reference_wave64 {subgroup_size = 64}
+
+func.decl @ggml_q4_k_load_chunk16(%weight: buffer, %row_byte_base: offset, %q4_block: index, %q4_group: index, %q4_half: index) -> (vector<16xi8>, f32, f32)
+
+// Independent reference and observation kernels for model checks.
+// These kernels are owned by test roots and are not model providers.
+kernel.def target(@q4_reference_wave64) @qwen38_q4k_f32_reference_5120(%token_count: index) {
+  %bounded_token_count = index.assume %token_count [range(%token_count, 32, 512), multiple_of(%token_count, 32)] : index
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  kernel.launch.config workgroups(%c48, %bounded_token_count, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%token_count: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %bounded_token_count = index.assume %token_count [range(%token_count, 32, 512), multiple_of(%token_count, 32)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c20 = index.constant 20 : index
+  %c32 = index.constant 32 : index
+  %c144_bytes = index.constant 144 : offset
+  %c2880_bytes = index.constant 2880 : offset
+  %c256 = index.constant 256 : index
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c0_f32x16 = vector.constant 0.0 : vector<16xf32>
+  %c0_offset = index.constant 0 : offset
+  %channel0 = kernel.workgroup.id<x> : index
+  %channel = index.assume %channel0 [range(%channel0, 0, 47)] : index
+  %token0 = kernel.workgroup.id<y> : index
+  %token = index.assume %token0 [lt(%token0, %bounded_token_count)] : index
+  %lane = kernel.subgroup.lane.id : index
+  %input_view = buffer.view %input[%c0_offset] : buffer -> view<[%bounded_token_count]x5120xf16>
+  %output_view = buffer.view %output[%c0_offset] : buffer -> view<[%bounded_token_count]x48xf32>
+  %row_byte_base = index.scale %channel, %c2880_bytes : index, offset -> offset
+  %chunk_count = index.constant 320 : index
+  %lane_sum = scf.for %chunk = [%lane to %chunk_count step %c32](%acc = %c0_f32 : f32) -> (f32) {
+    %block = index.div %chunk, %c16 : index
+    %chunk_in_block = index.rem %chunk, %c16 : index
+    %group = index.div %chunk_in_block, %c2 : index
+    %half = index.rem %chunk_in_block, %c2 : index
+    %q4_values, %d_scale, %dmin_scale = func.call @ggml_q4_k_load_chunk16(%weight, %row_byte_base, %block, %group, %half) : (buffer, offset, index, index, index) -> (vector<16xi8>, f32, f32)
+    %q4_f32 = vector.uitofp %q4_values : vector<16xi8> to vector<16xf32>
+    %d_scale_vector = vector.splat %d_scale : vector<16xf32>
+    %dmin_scale_vector = vector.splat %dmin_scale : vector<16xf32>
+    %scaled = vector.mulf %q4_f32, %d_scale_vector : vector<16xf32>
+    %weight_values = vector.subf %scaled, %dmin_scale_vector : vector<16xf32>
+    %block_k = index.mul %block, %c256 : index
+    %group_k = index.mul %group, %c32 : index
+    %half_k = index.mul %half, %c16 : index
+    %block_group_k = index.add %block_k, %group_k : index
+    %input_k = index.add %block_group_k, %half_k : index
+    %input_values_f16 = vector.load %input_view[%token, %input_k] : view<[%bounded_token_count]x5120xf16> -> vector<16xf16>
+    %input_values = vector.extf %input_values_f16 : vector<16xf16> to vector<16xf32>
+    %products = vector.mulf %weight_values, %input_values : vector<16xf32>
+    %next = vector.reduce<addf> %products, %acc : vector<16xf32>, f32
+    scf.yield %next : f32
+  }
+  %sum = kernel.subgroup.reduce<addf> %lane_sum : f32
+  %is_lane_zero = index.cmp eq, %lane, %c0 : index
+  scf.if %is_lane_zero {
+    view.store %sum, %output_view[%token, %channel] : f32, view<[%bounded_token_count]x48xf32>
+  }
+  kernel.return
+}

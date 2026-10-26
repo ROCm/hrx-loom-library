@@ -1,0 +1,135 @@
+// Complete image roots bind the encoder, diffusion transformer, and VAE to an
+// opaque request and planar RGB output. Device kernels derive noise, token
+// framing, rotary coefficients, and diffusion constants from that request.
+// Their intermediate storage belongs to the reflected invocation workspace;
+// parameter storage remains shared across invocations.
+
+config.decl @krea2.image_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+config.decl @krea2.text_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+kernel.decl @request_noise() launch(%request: buffer, %output: buffer)
+
+kernel.decl @request_prompt() launch(%request: buffer, %tokens: buffer, %mask: buffer)
+
+kernel.decl @request_encoder_rotary() launch(%request: buffer, %cosine: buffer, %sine: buffer)
+
+kernel.decl @request_rotary() launch(%cosine: buffer, %sine: buffer)
+
+kernel.decl @request_constants() launch(%times: buffer, %deltas: buffer, %affine: buffer)
+
+command.program.decl @sample_image() launch(%encoder_parameters: buffer, %parameters: buffer, %vae_parameters: buffer, %sample: buffer, %token_ids: buffer, %encoder_cosine: buffer, %encoder_sine: buffer, %encoder_mask: buffer, %times: buffer, %cosine: buffer, %sine: buffer, %deltas: buffer, %affine: buffer, %output: buffer)
+
+command.program.decl @sample_image_adapted() launch(%encoder_parameters: buffer, %parameters: buffer, %adapter: buffer, %vae_parameters: buffer, %sample: buffer, %token_ids: buffer, %encoder_cosine: buffer, %encoder_sine: buffer, %encoder_mask: buffer, %times: buffer, %cosine: buffer, %sine: buffer, %deltas: buffer, %selection: buffer, %affine: buffer, %output: buffer)
+
+template.decl @krea2.generate_image(%images: index, %texts: index, %adapted: i1, %encoder_parameters: buffer, %parameters: buffer, %adapter: buffer, %vae_parameters: buffer, %selection: buffer, %request: buffer, %output: buffer)
+
+// Request-derived tensors live in the reflected command workspace. Only the
+// opaque request payload crosses from the host.
+// Preparation has no mutable RNG, checkpoint access or host completion boundary.
+template.def<@krea2.generate_image> @krea2_generate_image(%images: index, %texts: index, %adapted: i1, %encoder_parameters: buffer, %parameters: buffer, %adapter: buffer, %vae_parameters: buffer, %selection: buffer, %request: buffer, %output: buffer) {
+  %framing = index.constant 34 : index
+  %padding = index.constant 48 : index
+  %ids = index.add %texts, %framing : index
+  %encoder_rows = index.add %texts, %padding : index
+  %tokens = index.add %texts, %images : index
+  %c1 = index.constant 1 : offset
+  %c4 = index.constant 4 : offset
+  %latent_stride = index.constant 128 : offset
+  %encoder_stride = index.constant 256 : offset
+  %rotary_stride = index.constant 512 : offset
+  %noise_bytes = index.scale %images, %latent_stride : index, offset -> offset
+  %id_bytes = index.scale %ids, %c4 : index, offset -> offset
+  %mask_bytes = index.scale %encoder_rows, %c1 : index, offset -> offset
+  %encoder_bytes = index.scale %encoder_rows, %encoder_stride : index, offset -> offset
+  %rotary_bytes = index.scale %tokens, %rotary_stride : index, offset -> offset
+  %time_bytes = index.constant 16 : offset
+  %delta_bytes = index.constant 32 : offset
+  %affine_bytes = index.constant 128 : offset
+  %noise = buffer.alloca<global> align(256) %noise_bytes : buffer
+  %token_ids = buffer.alloca<global> align(256) %id_bytes : buffer
+  %mask = buffer.alloca<global> align(256) %mask_bytes : buffer
+  %encoder_cosine = buffer.alloca<global> align(256) %encoder_bytes : buffer
+  %encoder_sine = buffer.alloca<global> align(256) %encoder_bytes : buffer
+  %cosine = buffer.alloca<global> align(256) %rotary_bytes : buffer
+  %sine = buffer.alloca<global> align(256) %rotary_bytes : buffer
+  %times = buffer.alloca<global> align(256) %time_bytes : buffer
+  %deltas = buffer.alloca<global> align(256) %delta_bytes : buffer
+  %affine = buffer.alloca<global> align(256) %affine_bytes : buffer
+  command.concurrent {
+    kernel.launch @request_noise(%request, %noise) : (buffer, buffer)
+    kernel.launch @request_prompt(%request, %token_ids, %mask) : (buffer, buffer, buffer)
+    kernel.launch @request_encoder_rotary(%request, %encoder_cosine, %encoder_sine) : (buffer, buffer, buffer)
+    kernel.launch @request_rotary(%cosine, %sine) : (buffer, buffer)
+    kernel.launch @request_constants(%times, %deltas, %affine) : (buffer, buffer, buffer)
+  }
+  scf.if %adapted {
+    command.program.launch @sample_image_adapted(%encoder_parameters, %parameters, %adapter, %vae_parameters, %noise, %token_ids, %encoder_cosine, %encoder_sine, %mask, %times, %cosine, %sine, %deltas, %selection, %affine, %output) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  } else {
+    command.program.launch @sample_image(%encoder_parameters, %parameters, %vae_parameters, %noise, %token_ids, %encoder_cosine, %encoder_sine, %mask, %times, %cosine, %sine, %deltas, %affine, %output) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  template.return
+}
+
+command.program.def @krea2.generate_one(%adapted: i1) launch(%encoder_parameters: buffer, %parameters: buffer, %vae_parameters: buffer, %adapter: buffer, %selection: buffer, %request: buffer, %output: buffer) {
+  %images = config.get @krea2.image_tokens : index
+  %texts = config.get @krea2.text_tokens : index
+  template.apply<@krea2.generate_image>(%images, %texts, %adapted, %encoder_parameters, %parameters, %adapter, %vae_parameters, %selection, %request, %output) : (index, index, i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+config.decl @krea2.batch_items : %value: index where [range(%value, 1, 2)]
+
+config.decl @krea2.adapter_capacity : %value: index where [range(%value, 0, 2147483647)]
+
+template.decl @krea2.generate_cohort(%adapted: i1, %encoder_parameters: buffer, %parameters: buffer, %vae_parameters: buffer, %adapter: buffer, %request: buffer, %output: buffer)
+
+// Sequential members reuse invocation workspace. The selected-bank union is
+// captured once by the native owner, and all outputs retain request order.
+template.def<@krea2.generate_cohort> @krea2_generate_cohort(%adapted: i1, %encoder_parameters: buffer, %parameters: buffer, %vae_parameters: buffer, %adapter: buffer, %request: buffer, %output: buffer) {
+  %items = config.get @krea2.batch_items : index
+  %configured_capacity = config.get @krea2.adapter_capacity : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %capacity = scf.select %adapted, %configured_capacity, %c0 : index
+  %header_bytes = index.constant 16 : offset
+  %record_bytes = index.scale %capacity, %header_bytes : index, offset -> offset
+  %member_bytes = index.add %header_bytes, %record_bytes : offset
+  %metadata_bytes = index.scale %items, %member_bytes : index, offset -> offset
+  %packets_begin = index.add %header_bytes, %metadata_bytes : offset
+  %texts = config.get @krea2.text_tokens : index
+  %c4 = index.constant 4 : offset
+  %token_bytes = index.scale %texts, %c4 : index, offset -> offset
+  %packet_overhead = index.constant 152 : offset
+  %packet_bytes = index.add %token_bytes, %packet_overhead : offset
+  %images = config.get @krea2.image_tokens : index
+  %rgb_bytes_per_patch = index.constant 3072 : offset
+  %rgb_bytes = index.scale %images, %rgb_bytes_per_patch : index, offset -> offset
+  %member_extent = index.cast %member_bytes : offset to index
+  %packet_extent = index.cast %packet_bytes : offset to index
+  %rgb_extent = index.cast %rgb_bytes : offset to index
+  scf.for %item = [%c0 to %items step %c1] unroll {
+    %member_offset = index.scale %item, %member_bytes : index, offset -> offset
+    %member_begin = index.add %header_bytes, %member_offset : offset
+    %packet_offset = index.scale %item, %packet_bytes : index, offset -> offset
+    %packet_begin = index.add %packets_begin, %packet_offset : offset
+    %rgb_begin = index.scale %item, %rgb_bytes : index, offset -> offset
+    %selection = buffer.view %request[%member_begin] : buffer -> view<[%member_extent]xi8>
+    %packet = buffer.view %request[%packet_begin] : buffer -> view<[%packet_extent]xi8>
+    %rgb = buffer.view %output[%rgb_begin] : buffer -> view<[%rgb_extent]xi8>
+    command.program.launch @krea2.generate_one[%adapted](%encoder_parameters, %parameters, %vae_parameters, %adapter, %selection, %packet, %rgb) : [i1](buffer, buffer, buffer, buffer, view<[%member_extent]xi8>, view<[%packet_extent]xi8>, view<[%rgb_extent]xi8>)
+  }
+  template.return
+}
+
+command.program.def public @generate_image() launch(%encoder_parameters: buffer, %parameters: buffer, %vae_parameters: buffer, %request: buffer, %output: buffer) {
+  %adapted = scalar.constant false : i1
+  template.apply<@krea2.generate_cohort>(%adapted, %encoder_parameters, %parameters, %vae_parameters, %parameters, %request, %output) : (i1, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @generate_image_adapted() launch(%encoder_parameters: buffer, %parameters: buffer, %vae_parameters: buffer, %adapter: buffer, %request: buffer, %output: buffer) {
+  %adapted = scalar.constant true : i1
+  template.apply<@krea2.generate_cohort>(%adapted, %encoder_parameters, %parameters, %vae_parameters, %adapter, %request, %output) : (i1, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}

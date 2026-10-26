@@ -1,0 +1,391 @@
+// Complete copied-history round through the production query, scan, selector,
+// publication, and hidden gather. Closed-form sequences distinguish no match,
+// a page-crossing match, a newer equal-length match, sampled policy, a dense
+// match without enough continuation, and seventeen newer short candidates.
+// Draft slot, resident row, policy owner, input begin, and output identity are
+// independent. Poison remains in rejected history, inactive slots, and holes.
+
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
+kernel.decl @flash_next_lookup_parameters(%round: index) launch(%round_value: index, %epoch: buffer, %draft: buffer, %origins: buffer, %target_tokens: buffer, %parameters: buffer)
+
+kernel.decl @flash_next_lookup_query() launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer)
+
+kernel.decl @flash_next_lookup_scan() launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer)
+
+kernel.decl @flash_next_lookup_select() launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer, %output: buffer)
+
+kernel.decl @flash_next_lookup_publish(%round: index) launch(%round_value: index, %rows: buffer, %cache: buffer, %parameters: buffer, %selected: buffer, %draft: buffer, %origins: buffer, %ids: buffer, %plan: buffer, %target_tokens: buffer, %moves: buffer, %count_buffer: buffer)
+
+kernel.decl @flash_next_lookup_hidden(%count_buffer: buffer) launch(%moves: buffer, %hidden: buffer, %compacted: buffer)
+
+// A 24-token pattern ends at 65, crossing a page and a subgroup boundary.
+// A second copy ends at 129. Seventeen newer three-token matches hide the
+// original from a selector bounded to sixteen candidates. The query ends
+// with the same pattern across committed history and the pending chain.
+func.def @token(%slot: index, %position: index, %round: index, %match: i1, %newer: i1, %dense: i1, %crowded: i1) -> (i32) {
+  %c3 = index.constant 3 : index
+  %c5 = index.constant 5 : index
+  %pattern_size = index.constant 24 : index
+  %first_begin = index.constant 41 : index
+  %first_end = index.constant 65 : index
+  %second_begin = index.constant 105 : index
+  %second_end = index.constant 129 : index
+  %query_base = index.constant 169 : index
+  %query_begin = index.add %query_base, %round : index
+  %first_after = index.cmp uge, %position, %first_begin : index
+  %first_before = index.cmp ult, %position, %first_end : index
+  %first_range = scalar.andi %first_after, %first_before : i1
+  %first = scalar.andi %match, %first_range : i1
+  %second_after = index.cmp uge, %position, %second_begin : index
+  %second_before = index.cmp ult, %position, %second_end : index
+  %second_range = scalar.andi %second_after, %second_before : i1
+  %second = scalar.andi %newer, %second_range : i1
+  %query = index.cmp uge, %position, %query_begin : index
+  %pattern_begin = scf.select %second, %second_begin, %first_begin : index
+  %begin = scf.select %query, %query_begin, %pattern_begin : index
+  %earlier = scalar.ori %first, %second : i1
+  %uses_pattern = scalar.ori %earlier, %query : i1
+  %pattern_relative = index.sub %position, %begin : index
+  %crowd_begin = index.constant 80 : index
+  %crowd_end = index.constant 165 : index
+  %crowd_after = index.cmp uge, %position, %crowd_begin : index
+  %crowd_before = index.cmp ult, %position, %crowd_end : index
+  %crowd_range = scalar.andi %crowd_after, %crowd_before : i1
+  %crowd_relative = index.sub %position, %crowd_begin : index
+  %within = index.rem %crowd_relative, %c5 : index
+  %in_trigram = index.cmp ult, %within, %c3 : index
+  %crowd_trigram = scalar.andi %crowd_range, %in_trigram : i1
+  %short_match = scalar.andi %crowded, %crowd_trigram : i1
+  %last_three = index.sub %pattern_size, %c3 : index
+  %short_relative = index.add %last_three, %within : index
+  %relative = scf.select %short_match, %short_relative, %pattern_relative : index
+  %pattern = scalar.ori %uses_pattern, %short_match : i1
+  %slot_word = index.cast %slot : index to i32
+  %position_word = index.cast %position : index to i32
+  %relative_word = index.cast %relative : index to i32
+  %row_stride = scalar.constant 1000 : i32
+  %ordinary_base = scalar.constant 1000 : i32
+  %pattern_base = scalar.constant 100000 : i32
+  %row_base = scalar.muli %slot_word, %row_stride : i32
+  %ordinary_offset = scalar.addi %position_word, %ordinary_base : i32
+  %pattern_offset = scalar.addi %relative_word, %pattern_base : i32
+  %offset = scf.select %pattern, %pattern_offset, %ordinary_offset : i32
+  %varied = scalar.addi %row_base, %offset : i32
+  %constant_base = scalar.constant 42 : i32
+  %constant = scalar.addi %slot_word, %constant_base : i32
+  %result = scf.select %dense, %constant, %varied : i32
+  func.return %result : i32
+}
+
+func.def @fixture(%mode: index, %configuration_value: index, %count_value: index, %epoch: buffer, %draft: buffer, %origins: buffer, %target: buffer, %rows: buffer, %cache: buffer, %ids: buffer, %plan: buffer, %hidden: buffer, %expected_draft: buffer, %expected_origins: buffer, %expected_target: buffer, %expected_ids: buffer, %expected_plan: buffer, %expected_hidden: buffer, %expected_count: buffer, %expected_selected: buffer) {
+  %origin = index.constant 0 : offset
+  %descriptors = index.constant 12 : offset
+  %mode_origin = index.constant 36 : offset
+  %policy_origin = index.constant 77856 : offset
+  %identity_origin = index.constant 102432 : offset
+  %history_origin = index.constant 13516928 : offset
+  %configuration = index.assume %configuration_value [range(%configuration_value, 0, 2)] : index
+  %count = index.assume %count_value [range(%count_value, 0, 33)] : index
+  %row_maps_origin = index.constant 2560 : offset
+  %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
+  %expected_header = buffer.view %expected_draft[%origin] : buffer -> view<3xi32>
+  %spans = buffer.view %draft[%descriptors] : buffer -> view<33x6xi32>
+  %expected_spans = buffer.view %expected_draft[%descriptors] : buffer -> view<33x6xi32>
+  %mapping = buffer.view %origins[%origin] : buffer -> view<33x2xi32>
+  %expected_mapping = buffer.view %expected_origins[%origin] : buffer -> view<33x2xi32>
+  %policies = buffer.view %epoch[%policy_origin] : buffer -> view<1024x6xf32>
+  %identities = buffer.view %epoch[%identity_origin] : buffer -> view<1024x2xi32>
+  %directory = buffer.view %rows[%origin] : buffer -> view<64x5xi64>
+  %maps = buffer.view %rows[%row_maps_origin] : buffer -> view<64x33xi32>
+  %history = buffer.view %cache[%history_origin] : buffer -> view<6400xi32>
+  %inputs = buffer.view %target[%origin] : buffer -> view<4096xi32>
+  %expected_inputs = buffer.view %expected_target[%origin] : buffer -> view<4096xi32>
+  %draft_ids = buffer.view %ids[%origin] : buffer -> view<33xi32>
+  %expected_draft_ids = buffer.view %expected_ids[%origin] : buffer -> view<33xi32>
+  %modes = buffer.view %plan[%mode_origin] : buffer -> view<33xi32>
+  %expected_modes = buffer.view %expected_plan[%mode_origin] : buffer -> view<33xi32>
+  %cohorts = buffer.view %plan[%origin] : buffer -> view<9xi32>
+  %expected_cohorts = buffer.view %expected_plan[%origin] : buffer -> view<9xi32>
+  %selected = buffer.view %expected_selected[%origin] : buffer -> view<33x2xi32>
+  %counts = buffer.view %expected_count[%origin] : buffer -> view<1xi32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %c9 = index.constant 9 : index
+  %c33 = index.constant 33 : index
+  %c63 = index.constant 63 : index
+  %page_tokens = index.constant 64 : index
+  %page_shift = index.constant 17 : index
+  %pool_pages = index.constant 100 : index
+  %committed = index.constant 192 : index
+  %match_end = index.constant 65 : index
+  %newer_end = index.constant 129 : index
+  %dense_end = index.constant 191 : index
+  %match_length = index.constant 24 : index
+  %dense_length = index.constant 64 : index
+  %c0_word = scalar.constant 0 : i32
+  %c1_word = scalar.constant 1 : i32
+  %c0_float = scalar.constant 0.0 : f32
+  %c1_float = scalar.constant 1.0 : f32
+  %round = index.mul %configuration, %c3 : index
+  %tail = index.add %round, %c1 : index
+  %remaining = index.sub %c7, %round : index
+  %position = index.add %committed, %round : index
+  %position_word = index.cast %position : index to i32
+  %count_word = index.cast %count : index to i32
+  view.store %count_word, %header[0] : i32, view<3xi32>
+  view.store %count_word, %header[1] : i32, view<3xi32>
+  view.store %count_word, %header[2] : i32, view<3xi32>
+  %mixed = config.get @runner.qwen38.mixed_inputs : index
+  %is_mixed = index.cmp ne, %mixed, %c0 : index
+  %input_stride = scf.select %is_mixed, %c8, %c1 : index
+  %none = index.cmp eq, %mode, %c0 : index
+  %mixed_cohort = index.cmp eq, %mode, %c2 : index
+  %all_sampled = index.cmp eq, %mode, %c3 : index
+  %dense = index.cmp eq, %mode, %c4 : index
+  %crowded = index.cmp eq, %mode, %c5 : index
+  scf.for %cohort = [%c0 to %c9 step %c1] {
+    view.store %c0_word, %cohorts[%cohort] : i32, view<9xi32>
+    view.store %c0_word, %expected_cohorts[%cohort] : i32, view<9xi32>
+  }
+  %survivors = scf.for %slot = [%c0 to %count step %c1](%next_value = %c0 : index) -> (index) {
+    %next = index.assume %next_value [ge(%next_value, 0), le(%next_value, %slot)] : index
+    %flavor = index.rem %slot, %c4 : index
+    %no_match_slot = index.cmp eq, %flavor, %c1 : index
+    %sampled_slot = index.cmp eq, %flavor, %c3 : index
+    %newer_slot = index.cmp eq, %flavor, %c2 : index
+    %mixed_miss = scalar.andi %mixed_cohort, %no_match_slot : i1
+    %missing = scalar.ori %none, %mixed_miss : i1
+    %true = scalar.constant true : i1
+    %match = scalar.xori %missing, %true : i1
+    %mixed_sampled = scalar.andi %mixed_cohort, %sampled_slot : i1
+    %sampled = scalar.ori %all_sampled, %mixed_sampled : i1
+    %newer = scalar.andi %mixed_cohort, %newer_slot : i1
+    %resident = index.sub %c63, %slot : index
+    %resident_word = index.cast %resident : index to i32
+    %input_begin = index.madd %slot, %c8, %c3 : index
+    %selection = index.madd %slot, %c8, %c4 : index
+    %policy_value = index.madd %slot, %c5, %c2 : index
+    %policy = index.rem %policy_value, %c33 : index
+    %policy_word = index.cast %policy : index to i32
+    %temperature = scf.select %sampled, %c1_float, %c0_float : f32
+    view.store %temperature, %policies[%policy, 0] : f32, view<1024x6xf32>
+    view.store %policy_word, %identities[%selection, 0] : i32, view<1024x2xi32>
+    %input_word = index.cast %input_begin : index to i32
+    %selection_word = index.cast %selection : index to i32
+    %slot_word = index.cast %slot : index to i32
+    %source_base = scalar.constant 900 : i32
+    %source_position = scalar.addi %slot_word, %source_base : i32
+    view.store %c1_word, %spans[%slot, 0] : i32, view<33x6xi32>
+    view.store %position_word, %spans[%slot, 1] : i32, view<33x6xi32>
+    view.store %slot_word, %spans[%slot, 2] : i32, view<33x6xi32>
+    view.store %resident_word, %spans[%slot, 3] : i32, view<33x6xi32>
+    view.store %source_position, %spans[%slot, 4] : i32, view<33x6xi32>
+    view.store %slot_word, %spans[%slot, 5] : i32, view<33x6xi32>
+    view.store %input_word, %mapping[%slot, 0] : i32, view<33x2xi32>
+    view.store %selection_word, %mapping[%slot, 1] : i32, view<33x2xi32>
+    %record_stride = index.constant 24 : offset
+    %record_delta = index.scale %slot, %record_stride : index, offset -> offset
+    %record_origin = index.add %descriptors, %record_delta : offset
+    buffer.copy %draft[%record_origin], %expected_draft[%record_origin], %record_stride
+    view.store %input_word, %expected_mapping[%slot, 0] : i32, view<33x2xi32>
+    view.store %selection_word, %expected_mapping[%slot, 1] : i32, view<33x2xi32>
+    %vocabulary_mode_value = index.rem %slot, %c2 : index
+    %vocabulary_mode = index.cast %vocabulary_mode_value : index to i32
+    view.store %vocabulary_mode, %modes[%slot] : i32, view<33xi32>
+    view.store %vocabulary_mode, %expected_modes[%slot] : i32, view<33xi32>
+    %cohort = index.div %slot, %c4 : index
+    %prior = view.load %cohorts[%cohort] : view<9xi32> -> i32
+    %combined = scalar.ori %prior, %vocabulary_mode : i32
+    view.store %combined, %cohorts[%cohort] : i32, view<9xi32>
+    %resident_i64 = index.cast %resident : index to i64
+    %map_stride = scalar.constant 132 : i64
+    %map_base = scalar.constant 2560 : i64
+    %map_relative = scalar.muli %resident_i64, %map_stride : i64
+    %map_address = scalar.addi %map_base, %map_relative : i64
+    %cache_base = scalar.constant 128 : i64
+    view.store %cache_base, %directory[%resident, 2] : i64, view<64x5xi64>
+    view.store %map_address, %directory[%resident, 4] : i64, view<64x5xi64>
+    scf.for %page = [%c0 to %c3 step %c1] {
+      %logical_page = index.madd %slot, %c3, %page : index
+      %shifted_page = index.add %logical_page, %page_shift : index
+      %physical_page = index.rem %shifted_page, %pool_pages : index
+      %physical_word = index.cast %physical_page : index to i32
+      view.store %physical_word, %maps[%resident, %page] : i32, view<64x33xi32>
+      scf.for %within = [%c0 to %page_tokens step %c1] {
+        %logical = index.madd %page, %page_tokens, %within : index
+        %physical = index.madd %physical_page, %page_tokens, %within : index
+        %id = func.call @token(%slot, %logical, %round, %match, %newer, %dense, %crowded) : (index, index, index, i1, i1, i1, i1) -> (i32)
+        view.store %id, %history[%physical] : i32, view<6400xi32>
+      }
+    }
+    scf.for %relative = [%c0 to %tail step %c1] {
+      %logical = index.add %committed, %relative : index
+      %id = func.call @token(%slot, %logical, %round, %match, %newer, %dense, %crowded) : (index, index, index, i1, i1, i1, i1) -> (i32)
+      %input = index.add %input_begin, %relative : index
+      %word = index.mul %input, %input_stride : index
+      view.store %id, %inputs[%word] : i32, view<4096xi32>
+      view.store %id, %expected_inputs[%word] : i32, view<4096xi32>
+    }
+    %anchor = func.call @token(%slot, %position, %round, %match, %newer, %dense, %crowded) : (index, index, index, i1, i1, i1, i1) -> (i32)
+    view.store %anchor, %draft_ids[%slot] : i32, view<33xi32>
+    view.store %anchor, %expected_draft_ids[%slot] : i32, view<33xi32>
+    %unavailable = scalar.ori %missing, %sampled : i1
+    %blocked = scalar.ori %unavailable, %crowded : i1
+    %ordinary_end = scf.select %newer, %newer_end, %match_end : index
+    %available_end = scf.select %dense, %dense_end, %ordinary_end : index
+    %selected_end = scf.select %blocked, %c0, %available_end : index
+    %available_length = scf.select %dense, %dense_length, %match_length : index
+    %selected_length = scf.select %blocked, %c0, %available_length : index
+    %end_word = index.cast %selected_end : index to i32
+    %length_word = index.cast %selected_length : index to i32
+    view.store %end_word, %selected[%slot, 0] : i32, view<33x2xi32>
+    view.store %length_word, %selected[%slot, 1] : i32, view<33x2xi32>
+    %source_end = index.add %selected_end, %remaining : index
+    %has_match = index.cmp ne, %selected_end, %c0 : index
+    %fits = index.cmp ule, %source_end, %committed : index
+    %copied = scalar.andi %has_match, %fits : i1
+    %new_count = scf.if %copied -> (index) {
+      scf.for %relative = [%c0 to %remaining step %c1] {
+        %logical = index.add %selected_end, %relative : index
+        %id = func.call @token(%slot, %logical, %round, %match, %newer, %dense, %crowded) : (index, index, index, i1, i1, i1, i1) -> (i32)
+        %after_pending = index.add %input_begin, %tail : index
+        %input = index.add %after_pending, %relative : index
+        %word = index.mul %input, %input_stride : index
+        view.store %id, %expected_inputs[%word] : i32, view<4096xi32>
+      }
+      scf.yield %next : index
+    } else {
+      %new_word = index.cast %next : index to i32
+      %new_delta = index.scale %next, %record_stride : index, offset -> offset
+      %new_origin = index.add %descriptors, %new_delta : offset
+      buffer.copy %draft[%record_origin], %expected_draft[%new_origin], %record_stride
+      view.store %new_word, %expected_spans[%next, 2] : i32, view<33x6xi32>
+      view.store %new_word, %expected_spans[%next, 5] : i32, view<33x6xi32>
+      view.store %input_word, %expected_mapping[%next, 0] : i32, view<33x2xi32>
+      view.store %selection_word, %expected_mapping[%next, 1] : i32, view<33x2xi32>
+      view.store %anchor, %expected_draft_ids[%next] : i32, view<33xi32>
+      view.store %vocabulary_mode, %expected_modes[%next] : i32, view<33xi32>
+      %new_cohort = index.div %next, %c4 : index
+      %prior_mode = view.load %expected_cohorts[%new_cohort] : view<9xi32> -> i32
+      %combined_mode = scalar.ori %prior_mode, %vocabulary_mode : i32
+      view.store %combined_mode, %expected_cohorts[%new_cohort] : i32, view<9xi32>
+      %hidden_stride = index.constant 20480 : offset
+      %hidden_source = index.scale %slot, %hidden_stride : index, offset -> offset
+      %hidden_destination = index.scale %next, %hidden_stride : index, offset -> offset
+      buffer.copy %hidden[%hidden_source], %expected_hidden[%hidden_destination], %hidden_stride
+      %incremented = index.add %next, %c1 : index
+      scf.yield %incremented : index
+    }
+    scf.yield %new_count : index
+  }
+  %survivor_word = index.cast %survivors : index to i32
+  view.store %survivor_word, %expected_header[0] : i32, view<3xi32>
+  view.store %survivor_word, %expected_header[1] : i32, view<3xi32>
+  view.store %survivor_word, %expected_header[2] : i32, view<3xi32>
+  view.store %survivor_word, %counts[0] : i32, view<1xi32>
+  func.return
+}
+
+func.def @geometry(%trial: index) -> (index, index) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c17 = index.constant 17 : index
+  %c33 = index.constant 33 : index
+  %mode = index.div %trial, %c4 : index
+  %count_ordinal = index.rem %trial, %c4 : index
+  %empty = index.cmp eq, %count_ordinal, %c0 : index
+  %single = index.cmp eq, %count_ordinal, %c1 : index
+  %partial = index.cmp eq, %count_ordinal, %c2 : index
+  %large = scf.select %partial, %c17, %c33 : index
+  %nonempty = scf.select %single, %c1, %large : index
+  %count = scf.select %empty, %c0, %nonempty : index
+  func.return %mode, %count : index, index
+}
+
+command.program.def @lookup_round(%configuration: index) launch(%epoch: buffer, %draft: buffer, %origins: buffer, %target: buffer, %rows: buffer, %cache: buffer, %ids: buffer, %plan: buffer, %hidden: buffer, %compacted: buffer, %counts: buffer, %expected_draft: buffer, %expected_origins: buffer, %expected_target: buffer, %expected_ids: buffer, %expected_plan: buffer, %expected_hidden: buffer, %expected_count: buffer, %expected_selected: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer, %selected: buffer, %moves: buffer) {
+  %c3 = index.constant 3 : index
+  %round = index.mul %configuration, %c3 : index
+  kernel.launch @flash_next_lookup_parameters[%round](%round, %epoch, %draft, %origins, %target, %parameters) : [index](index, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_lookup_query(%rows, %cache, %parameters, %query) : (buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_lookup_scan(%rows, %cache, %parameters, %query, %matches, %summaries) : (buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_lookup_select(%rows, %cache, %parameters, %query, %matches, %summaries, %selected) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_lookup_publish[%round](%round, %rows, %cache, %parameters, %selected, %draft, %origins, %ids, %plan, %target, %moves, %counts) : [index](index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_lookup_hidden[%counts](%moves, %hidden, %compacted) : [buffer](buffer, buffer, buffer)
+  command.return
+}
+
+func.def @reference(%epoch: buffer, %draft: buffer, %origins: buffer, %target: buffer, %rows: buffer, %cache: buffer, %ids: buffer, %plan: buffer, %hidden: buffer, %compacted: buffer, %counts: buffer, %expected_draft: buffer, %expected_origins: buffer, %expected_target: buffer, %expected_ids: buffer, %expected_plan: buffer, %expected_hidden: buffer, %expected_count: buffer, %expected_selected: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer, %selected: buffer, %moves: buffer) {
+  %origin = index.constant 0 : offset
+  %draft_bytes = buffer.length %draft
+  buffer.copy %expected_draft[%origin], %draft[%origin], %draft_bytes
+  %origins_bytes = buffer.length %origins
+  buffer.copy %expected_origins[%origin], %origins[%origin], %origins_bytes
+  %target_bytes = buffer.length %target
+  buffer.copy %expected_target[%origin], %target[%origin], %target_bytes
+  %ids_bytes = buffer.length %ids
+  buffer.copy %expected_ids[%origin], %ids[%origin], %ids_bytes
+  %plan_bytes = buffer.length %plan
+  buffer.copy %expected_plan[%origin], %plan[%origin], %plan_bytes
+  %compacted_bytes = buffer.length %compacted
+  buffer.copy %expected_hidden[%origin], %compacted[%origin], %compacted_bytes
+  %counts_bytes = buffer.length %counts
+  buffer.copy %expected_count[%origin], %counts[%origin], %counts_bytes
+  %selected_bytes = buffer.length %selected
+  buffer.copy %expected_selected[%origin], %selected[%origin], %selected_bytes
+  func.return
+}
+
+check.scenario public @copied_and_neural_cohorts configure[3](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[24](%trial: index, %entropy: check.entropy) {
+    %mode, %count = check.generate<@geometry>(%trial) : (index) -> (index, index)
+    %epoch = check.generate.fill value(-7) : tensor<28682xi32>
+    %draft = check.generate.fill value(-7) : tensor<201xi32>
+    %origins = check.generate.fill value(-7) : tensor<33x2xi32>
+    %target = check.generate.fill value(-7) : tensor<4096xi32>
+    %rows = check.generate.fill value(-7) : tensor<1376xi64>
+    %cache = check.generate.fill value(-7) : tensor<3385632xi32>
+    %ids = check.generate.fill value(-7) : tensor<33xi32>
+    %plan = check.generate.fill value(-7) : tensor<42xi32>
+    %hidden = check.generate.iota offset(100000) step(1) : tensor<33x5120xi32>
+    %compacted = check.generate.fill value(-7) : tensor<33x5120xi32>
+    %counts = check.generate.fill value(-7) : tensor<1xi32>
+    %expected_draft = check.generate.fill value(-7) : tensor<201xi32>
+    %expected_origins = check.generate.fill value(-7) : tensor<33x2xi32>
+    %expected_target = check.generate.fill value(-7) : tensor<4096xi32>
+    %expected_ids = check.generate.fill value(-7) : tensor<33xi32>
+    %expected_plan = check.generate.fill value(-7) : tensor<42xi32>
+    %expected_hidden = check.generate.fill value(-7) : tensor<33x5120xi32>
+    %expected_count = check.generate.fill value(-7) : tensor<1xi32>
+    %expected_selected = check.generate.fill value(0) : tensor<33x2xi32>
+    check.generate<@fixture>(%mode, %configuration, %count, %epoch, %draft, %origins, %target, %rows, %cache, %ids, %plan, %hidden, %expected_draft, %expected_origins, %expected_target, %expected_ids, %expected_plan, %expected_hidden, %expected_count, %expected_selected) : (index, index, index, tensor<28682xi32>, tensor<201xi32>, tensor<33x2xi32>, tensor<4096xi32>, tensor<1376xi64>, tensor<3385632xi32>, tensor<33xi32>, tensor<42xi32>, tensor<33x5120xi32>, tensor<201xi32>, tensor<33x2xi32>, tensor<4096xi32>, tensor<33xi32>, tensor<42xi32>, tensor<33x5120xi32>, tensor<1xi32>, tensor<33x2xi32>) -> ()
+    %parameters = check.generate.fill value(-7) : tensor<33x16xi32>
+    %query = check.generate.fill value(-7) : tensor<33x65xi32>
+    %matches = check.generate.fill value(-1) : tensor<33x96xi32>
+    %summaries = check.generate.fill value(-1) : tensor<33x3xi32>
+    %selected = check.generate.fill value(-7) : tensor<33x2xi32>
+    %moves = check.generate.fill value(-7) : tensor<33xi32>
+    check.compare<@lookup_round, @reference>[%configuration](%epoch, %draft, %origins, %target, %rows, %cache, %ids, %plan, %hidden, %compacted, %counts, %expected_draft, %expected_origins, %expected_target, %expected_ids, %expected_plan, %expected_hidden, %expected_count, %expected_selected, %parameters, %query, %matches, %summaries, %selected, %moves) : [index](tensor<28682xi32>, tensor<201xi32>, tensor<33x2xi32>, tensor<4096xi32>, tensor<1376xi64>, tensor<3385632xi32>, tensor<33xi32>, tensor<42xi32>, tensor<33x5120xi32>, tensor<33x5120xi32>, tensor<1xi32>, tensor<201xi32>, tensor<33x2xi32>, tensor<4096xi32>, tensor<33xi32>, tensor<42xi32>, tensor<33x5120xi32>, tensor<1xi32>, tensor<33x2xi32>, tensor<33x16xi32>, tensor<33x65xi32>, tensor<33x96xi32>, tensor<33x3xi32>, tensor<33x2xi32>, tensor<33xi32>) -> () {
+      check.expect.bitwise actual(%selected) expected(%selected) : tensor<33x2xi32>
+      check.expect.bitwise actual(%draft) expected(%draft) : tensor<201xi32>
+      check.expect.bitwise actual(%origins) expected(%origins) : tensor<33x2xi32>
+      check.expect.bitwise actual(%target) expected(%target) : tensor<4096xi32>
+      check.expect.bitwise actual(%ids) expected(%ids) : tensor<33xi32>
+      check.expect.bitwise actual(%plan) expected(%plan) : tensor<42xi32>
+      check.expect.bitwise actual(%compacted) expected(%compacted) : tensor<33x5120xi32>
+      check.expect.bitwise actual(%counts) expected(%counts) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@copied_and_neural_cohorts> @copied_and_neural_cohorts_benchmark

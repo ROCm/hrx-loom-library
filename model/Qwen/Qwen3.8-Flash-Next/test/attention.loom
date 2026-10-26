@@ -1,0 +1,521 @@
+func.decl pure @qsa_cohort_capacity() -> (index)
+
+kernel.decl @qsa_merge_cohorts(%neural_enabled: i1) launch(%epoch: buffer, %selected: buffer, %cohorts: buffer)
+
+kernel.decl @qsa_cohort_attention(%neural_enabled: i1) launch(%key_origin: offset, %value_origin: offset, %rows: buffer, %queries: buffer, %gates: buffer, %arena: buffer, %cohorts: buffer, %output: buffer)
+
+command.program.decl @qsa_split_attention(%neural_enabled: i1, %key_origin: offset, %value_origin: offset) launch(%epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %gates: buffer, %arena: buffer, %selected: buffer, %output: buffer)
+
+func.def @cohort_fixture_span(%trial: index, %span: index) -> (index, index, index, index) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %p63 = index.constant 63 : index
+  %p2045 = index.constant 2045 : index
+  %p2046 = index.constant 2046 : index
+  %p2104 = index.constant 2104 : index
+  %p2105 = index.constant 2105 : index
+  %p2107 = index.constant 2107 : index
+  %p2108 = index.constant 2108 : index
+  %mixed = index.cmp eq, %trial, %c1 : index
+  %split = index.cmp eq, %trial, %c2 : index
+  %singles = index.cmp eq, %trial, %c3 : index
+  %late = index.cmp eq, %trial, %c5 : index
+  %poisoned_tail = index.cmp eq, %trial, %c6 : index
+  %first = index.cmp eq, %span, %c0 : index
+  %second = index.cmp eq, %span, %c1 : index
+  %mixed_length0 = scf.select %second, %c4, %c1 : index
+  %mixed_length = scf.select %first, %c3, %mixed_length0 : index
+  %split_length = scf.select %first, %c5, %c3 : index
+  %length0 = scf.select %split, %split_length, %c8 : index
+  %length1 = scf.select %mixed, %mixed_length, %length0 : index
+  %length2 = scf.select %singles, %c1, %length1 : index
+  %length = scf.select %poisoned_tail, %c3, %length2 : index
+  %mixed_position0 = scf.select %second, %p2046, %p2107 : index
+  %mixed_position = scf.select %first, %p63, %mixed_position0 : index
+  %split_position = scf.select %first, %p2045, %p2105 : index
+  %single_position = index.sub %p2108, %span : index
+  %long_prefix = scalar.ori %late, %poisoned_tail : i1
+  %position0 = scf.select %long_prefix, %p2104, %c0 : index
+  %position1 = scf.select %mixed, %mixed_position, %position0 : index
+  %position2 = scf.select %split, %split_position, %position1 : index
+  %position = scf.select %singles, %single_position, %position2 : index
+  %mixed_begin0 = scf.select %second, %c3, %c7 : index
+  %mixed_begin = scf.select %first, %c0, %mixed_begin0 : index
+  %split_begin = scf.select %first, %c0, %c5 : index
+  %begin0 = scf.select %mixed, %mixed_begin, %c0 : index
+  %begin1 = scf.select %split, %split_begin, %begin0 : index
+  %begin = scf.select %singles, %span, %begin1 : index
+  %row = index.madd %span, %c4, %c1 : index
+  func.return %length, %position, %begin, %row : index, index, index, index
+}
+
+// Keys repeat two values across alternating channels. Queries vary across all
+// channels, exercising every matrix panel and wave while letting the oracle
+// reduce even and odd query components before traversing the selected keys.
+// Values vary with physical token, KV head, and channel; their exact BF16
+// offsets let the oracle reconstruct every channel from one weighted value.
+// Page permutations and nonzero plane origins make logical/physical addressing
+// observable without making the oracle repeat the production address helpers.
+func.def @cohort_fixture(%trial: index, %epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %gates: buffer, %arena: buffer, %selected: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c7 = index.constant 7 : index
+  %c9 = index.constant 9 : index
+  %heads = index.constant 24 : index
+  %pages = index.constant 33 : index
+  %channels = index.constant 256 : index
+  %pool = index.constant 2112 : index
+  %budget = index.constant 512 : index
+  %origin = index.constant 0 : offset
+  %key_base = index.constant 384 : offset
+  %value_base = index.constant 2163072 : offset
+  %map_base = index.constant 640 : offset
+  %counts = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %c3_index = index.constant 3 : index
+  %c6_index = index.constant 6 : index
+  %c8_index = index.constant 8 : index
+  %singles = index.cmp eq, %trial, %c3_index : index
+  %poisoned_tail = index.cmp eq, %trial, %c6_index : index
+  %empty = index.cmp eq, %trial, %c4 : index
+  %partial = scalar.ori %singles, %poisoned_tail : i1
+  %live0 = scf.select %partial, %c3_index, %c8_index : index
+  %live = scf.select %empty, %c0, %live0 : index
+  %live_word = index.cast %live : index to i32
+  view.store %live_word, %counts[0] : i32, view<3xi32>
+  %positions = buffer.view %mapping[%origin] : buffer -> view<8x4xi32>
+  %entries = buffer.view %rows[%origin] : buffer -> view<16x5xi64>
+  %maps = buffer.view %rows[%map_base] : buffer -> view<16x33xi32>
+  %query = buffer.view %queries[%origin] : buffer -> view<8x24x256xbf16>
+  %gate = buffer.view %gates[%origin] : buffer -> view<8x24x512xbf16>
+  %key = buffer.view %arena[%key_base] : buffer -> view<1081344xbf16>
+  %value = buffer.view %arena[%value_base] : buffer -> view<1081344xbf16>
+  %ids = buffer.view %selected[%origin] : buffer -> view<8x512xi32>
+  %half = scalar.constant 0.5 : f64
+  %quarter = scalar.constant 0.25 : f64
+  %eighth = scalar.constant 0.125 : f64
+  %sixteenth = scalar.constant 0.0625 : f64
+  %sixty_fourth = scalar.constant 0.015625 : f64
+  %c15_f64 = scalar.constant 15.0 : f64
+  %c6_f64 = scalar.constant 6.0 : f64
+  %c8_f64 = scalar.constant 8.0 : f64
+  %c5 = index.constant 5 : index
+  %c13 = index.constant 13 : index
+  %c17 = index.constant 17 : index
+  %c31 = index.constant 31 : index
+  // Trial six ends at logical position 2,106 in resident row one. The next
+  // member maps to physical token 1,787 and is not published. Raw packet loads
+  // may contain these NaNs, but membership must mask them before arithmetic.
+  %unpublished_physical = index.constant 1787 : index
+  %poison = scalar.constant nan : bf16
+  scf.for %physical = [%c0 to %pool step %c1] {
+    %is_unpublished = index.cmp eq, %physical, %unpublished_physical : index
+    %poison_member = scalar.andi %poisoned_tail, %is_unpublished : i1
+    %key_index = index.madd %physical, %c7, %c1 : index
+    %key_remainder = index.rem %key_index, %c31 : index
+    %key_word = index.cast %key_remainder : index to i32
+    %key_unsigned = scalar.uitofp %key_word : i32 to f64
+    %key_centered = scalar.subf %key_unsigned, %c15_f64 : f64
+    %key_scaled = scalar.mulf %key_centered, %eighth : f64
+    %key0 = scalar.fptrunc %key_scaled : f64 to bf16
+    %other_remainder = index.rem %physical, %c13 : index
+    %other_word = index.cast %other_remainder : index to i32
+    %other_unsigned = scalar.uitofp %other_word : i32 to f64
+    %other_centered = scalar.subf %other_unsigned, %c6_f64 : f64
+    %other_scaled = scalar.mulf %other_centered, %quarter : f64
+    %key1 = scalar.fptrunc %other_scaled : f64 to bf16
+    %value_remainder = index.rem %physical, %c17 : index
+    %value_word = index.cast %value_remainder : index to i32
+    %value_unsigned = scalar.uitofp %value_word : i32 to f64
+    %value_centered = scalar.subf %value_unsigned, %c8_f64 : f64
+    %value_scaled = scalar.mulf %value_centered, %sixteenth : f64
+    scf.for %head = [%c0 to %c2 step %c1] {
+      %head_word = index.cast %head : index to i32
+      %head_float = scalar.uitofp %head_word : i32 to f64
+      %head_offset = scalar.mulf %head_float, %eighth : f64
+      %value_base = scalar.addf %value_scaled, %head_offset : f64
+      scf.for %channel = [%c0 to %channels step %c1] {
+        %parity = index.rem %channel, %c2 : index
+        %even = index.cmp eq, %parity, %c0 : index
+        %key_value = scf.select %even, %key0, %key1 : bf16
+        %key_component = scf.select %poison_member, %poison, %key_value : bf16
+        %c16_index = index.constant 16 : index
+        %c64_index = index.constant 64 : index
+        %head_elements = index.constant 1024 : index
+        %block_elements = index.constant 2048 : index
+        %block = index.div %physical, %c4 : index
+        %member = index.rem %physical, %c4 : index
+        %head_start = index.mul %head, %head_elements : index
+        %block_start = index.madd %block, %block_elements, %head_start : index
+        %group = index.div %channel, %c16_index : index
+        %component = index.rem %channel, %c16_index : index
+        %member_start = index.madd %member, %c16_index, %component : index
+        %channel_start = index.madd %group, %c64_index, %member_start : index
+        %key_element = index.add %block_start, %channel_start : index
+        view.store %key_component, %key[%key_element] : bf16, view<1081344xbf16>
+        %channel_remainder = index.rem %channel, %c9 : index
+        %channel_word = index.cast %channel_remainder : index to i32
+        %channel_float = scalar.uitofp %channel_word : i32 to f64
+        %channel_offset = scalar.mulf %channel_float, %sixty_fourth : f64
+        %value_float = scalar.addf %value_base, %channel_offset : f64
+        %value_packed = scalar.fptrunc %value_float : f64 to bf16
+        %packed = scf.select %poison_member, %poison, %value_packed : bf16
+        %value_within = index.madd %channel, %c4, %member : index
+        %value_element = index.add %block_start, %value_within : index
+        view.store %packed, %value[%value_element] : bf16, view<1081344xbf16>
+      }
+    }
+  }
+  %base_word = scalar.constant 256 : i64
+
+  %mixed = index.cmp eq, %trial, %c1 : index
+  %split = index.cmp eq, %trial, %c2 : index
+  %several = scalar.ori %mixed, %singles : i1
+  %span_count0 = scf.select %split, %c2, %c1 : index
+  %span_count1 = scf.select %several, %c3_index, %span_count0 : index
+  %span_count = scf.select %empty, %c0, %span_count1 : index
+  %span_word = index.cast %span_count : index to i32
+  view.store %span_word, %counts[1] : i32, view<3xi32>
+  %span_header_bytes = index.constant 12 : offset
+  %span_record_bytes = index.constant 24 : offset
+  scf.for %span = [%c0 to %span_count step %c1] {
+    %length, %position, %begin, %row = func.call @cohort_fixture_span(%trial, %span) : (index, index) -> (index, index, index, index)
+    %relative = index.scale %span, %span_record_bytes : index, offset -> offset
+    %record_origin = index.add %span_header_bytes, %relative : offset
+    %record = buffer.view %epoch[%record_origin] : buffer -> view<6xi32>
+    %length_word = index.cast %length : index to i32
+    %position_word = index.cast %position : index to i32
+    %begin_word = index.cast %begin : index to i32
+    %row_word = index.cast %row : index to i32
+    view.store %length_word, %record[0] : i32, view<6xi32>
+    view.store %position_word, %record[1] : i32, view<6xi32>
+    view.store %begin_word, %record[2] : i32, view<6xi32>
+    view.store %row_word, %record[3] : i32, view<6xi32>
+  }
+  scf.for %token = [%c0 to %live step %c1] {
+    %after_three = index.cmp uge, %token, %c3_index : index
+    %after_seven = index.cmp uge, %token, %c7 : index
+    %after_five = index.cmp uge, %token, %c5 : index
+    %mixed_span0 = scf.select %after_three, %c1, %c0 : index
+    %mixed_span = scf.select %after_seven, %c2, %mixed_span0 : index
+    %split_span = scf.select %after_five, %c1, %c0 : index
+    %span0 = scf.select %mixed, %mixed_span, %c0 : index
+    %span1 = scf.select %split, %split_span, %span0 : index
+    %span = scf.select %singles, %token, %span1 : index
+    %span_length, %first_position, %first_token, %resident_value = func.call @cohort_fixture_span(%trial, %span) : (index, index) -> (index, index, index, index)
+    %resident_row = index.assume %resident_value [range(%resident_value, 0, 15)] : index
+    view.store %base_word, %entries[%resident_row, 2] : i64, view<16x5xi64>
+    %map_stride = index.constant 132 : offset
+    %map_relative = index.scale %resident_row, %map_stride : index, offset -> offset
+    %row_map = index.add %map_base, %map_relative : offset
+    %map_word = index.cast %row_map : offset to i64
+    view.store %map_word, %entries[%resident_row, 4] : i64, view<16x5xi64>
+    scf.for %page = [%c0 to %pages step %c1] {
+      %biased = index.madd %page, %c7, %resident_row : index
+      %physical = index.rem %biased, %pages : index
+      %word = index.cast %physical : index to i32
+      view.store %word, %maps[%resident_row, %page] : i32, view<16x33xi32>
+    }
+    %relative_token = index.sub %token, %first_token : index
+    %position_value = index.add %first_position, %relative_token : index
+    %position = index.assume %position_value [range(%position_value, 0, 2111)] : index
+    %length = index.add %position, %c1 : index
+    %position_word = index.cast %position : index to i32
+    %row_word = index.cast %resident_row : index to i32
+    %c0_i32 = scalar.constant 0 : i32
+    view.store %position_word, %positions[%token, 0] : i32, view<8x4xi32>
+    view.store %row_word, %positions[%token, 1] : i32, view<8x4xi32>
+    %first_token_word = index.cast %first_token : index to i32
+    %first_position_word = index.cast %first_position : index to i32
+    view.store %first_token_word, %positions[%token, 2] : i32, view<8x4xi32>
+    view.store %first_position_word, %positions[%token, 3] : i32, view<8x4xi32>
+    %complete = index.div %length, %c4 : index
+    %sparse = index.cmp ugt, %complete, %budget : index
+    %count = scf.select %sparse, %budget, %complete : index
+    scf.for %slot = [%c0 to %count step %c1] {
+      %numerator = index.mul %slot, %complete : index
+      %id = index.div %numerator, %count : index
+      %word = index.cast %id : index to i32
+      view.store %word, %ids[%token, %slot] : i32, view<8x512xi32>
+    }
+    scf.for %head = [%c0 to %heads step %c1] {
+      %head_remainder = index.rem %head, %c5 : index
+      %head_word = index.cast %head_remainder : index to i32
+      %head_float = scalar.uitofp %head_word : i32 to f64
+      %query_scaled = scalar.mulf %head_float, %quarter : f64
+      %query_centered = scalar.subf %query_scaled, %half : f64
+      %sharp = index.cmp eq, %head, %c0 : index
+      %large = scalar.constant 64.0 : f64
+      %query0 = scf.select %sharp, %large, %query_centered : f64
+      %query1 = scalar.negf %query0 : f64
+      scf.for %channel = [%c0 to %channels step %c1] {
+        %parity = index.rem %channel, %c2 : index
+        %even = index.cmp eq, %parity, %c0 : index
+        %component = scf.select %even, %query0, %query1 : f64
+        %pattern = index.rem %channel, %c5 : index
+        %factor0 = index.add %pattern, %c1 : index
+        %factor = index.add %factor0, %token : index
+        %factor_word = index.cast %factor : index to i32
+        %factor_float = scalar.uitofp %factor_word : i32 to f64
+        %factor_scaled = scalar.mulf %factor_float, %sixteenth : f64
+        %query_value = scalar.mulf %component, %factor_scaled : f64
+        %query_packed = scalar.fptrunc %query_value : f64 to bf16
+        view.store %query_packed, %query[%token, %head, %channel] : bf16, view<8x24x256xbf16>
+        %biased0 = index.add %head, %channel : index
+        %biased = index.add %biased0, %token : index
+        %remainder = index.rem %biased, %c17 : index
+        %word = index.cast %remainder : index to i32
+        %unsigned = scalar.uitofp %word : i32 to f64
+        %centered = scalar.subf %unsigned, %c8_f64 : f64
+        %scaled = scalar.mulf %centered, %half : f64
+        %packed = scalar.fptrunc %scaled : f64 to bf16
+        %column = index.add %channels, %channel : index
+        view.store %packed, %gate[%token, %head, %column] : bf16, view<8x24x512xbf16>
+      }
+    }
+  }
+  func.return
+}
+
+// The VM exposes F32 exponential. Keep its error separate from F64 reductions;
+// this fixture's finite logits bound its error far below one BF16 output step.
+func.def @cohort_reference_exp(%value: f64) -> (f64) {
+  %narrow = scalar.fptrunc %value : f64 to f32
+  %exponential = scalar.expf<afn> %narrow : f32
+  %wide = scalar.extf %exponential : f32 to f64
+  func.return %wide : f64
+}
+
+// The oracle uses scalar softmax and the fixture's two repeating key values.
+// It shares no subgroup reductions, matrix layout, partition merge, or page
+// helper with the production kernel. Accumulation, normalization, and output gating
+// use F64, with explicit BF16 attention and output rounding boundaries.
+func.def @cohort_reference(%key_origin: offset, %value_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %gates: buffer, %arena: buffer, %selected: buffer, %output: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c9 = index.constant 9 : index
+  %c12 = index.constant 12 : index
+  %heads = index.constant 24 : index
+  %page_tokens = index.constant 64 : index
+  %channels = index.constant 256 : index
+  %budget = index.constant 512 : index
+  %origin = index.constant 0 : offset
+  %row_base = index.constant 256 : offset
+  %key_base = index.add %row_base, %key_origin : offset
+  %value_base = index.add %row_base, %value_origin : offset
+  %map_base = index.constant 640 : offset
+  %positions = buffer.view %mapping[%origin] : buffer -> view<8x4xi32>
+  %maps = buffer.view %rows[%map_base] : buffer -> view<16x33xi32>
+  %query = buffer.view %queries[%origin] : buffer -> view<8x24x256xbf16>
+  %gate = buffer.view %gates[%origin] : buffer -> view<8x24x512xbf16>
+  %key = buffer.view %arena[%key_base] : buffer -> view<1081344xbf16>
+  %value = buffer.view %arena[%value_base] : buffer -> view<1081344xbf16>
+  %ids = buffer.view %selected[%origin] : buffer -> view<8x512xi32>
+  %result = buffer.view %output[%origin] : buffer -> view<8x24x256xbf16>
+  %fzero = scalar.constant 0.0 : f64
+  %fone = scalar.constant 1.0 : f64
+  %lowest = scalar.constant -1e+30 : f64
+  %scale = scalar.constant 0.0625 : f64
+  %channel_scale = scalar.constant 0.015625 : f64
+  %epoch_header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %live_word = view.load %epoch_header[0] : view<3xi32> -> i32
+  %live_value = index.cast %live_word : i32 to index
+  %live = index.assume %live_value [range(%live_value, 0, 8)] : index
+  scf.for %token = [%c0 to %live step %c1] {
+    %position_word = view.load %positions[%token, 0] : view<8x4xi32> -> i32
+    %row_word = view.load %positions[%token, 1] : view<8x4xi32> -> i32
+    %position_value = index.cast %position_word : i32 to index
+    %position = index.assume %position_value [range(%position_value, 0, 2111)] : index
+    %row_value = index.cast %row_word : i32 to index
+    %row = index.assume %row_value [range(%row_value, 0, 15)] : index
+    %visible = index.add %position, %c1 : index
+    %complete = index.div %visible, %c4 : index
+    %sparse = index.cmp ugt, %complete, %budget : index
+    %count = scf.select %sparse, %budget, %complete : index
+    %selected_tokens = index.mul %count, %c4 : index
+    %tail = index.rem %visible, %c4 : index
+    %length = index.add %selected_tokens, %tail : index
+    scf.for %head = [%c0 to %heads step %c1] {
+      %kv_head = index.div %head, %c12 : index
+      %q0, %q1 = scf.for %channel = [%c0 to %channels step %c2](%even_sum = %fzero : f64, %odd_sum = %fzero : f64) -> (f64, f64) {
+        %odd_channel = index.add %channel, %c1 : index
+        %q0_packed = view.load %query[%token, %head, %channel] : view<8x24x256xbf16> -> bf16
+        %q1_packed = view.load %query[%token, %head, %odd_channel] : view<8x24x256xbf16> -> bf16
+        %q0 = scalar.extf %q0_packed : bf16 to f64
+        %q1 = scalar.extf %q1_packed : bf16 to f64
+        %next_even = scalar.addf %even_sum, %q0 : f64
+        %next_odd = scalar.addf %odd_sum, %q1 : f64
+        scf.yield %next_even, %next_odd : f64, f64
+      }
+      %maximum, %denominator, %accumulator = scf.for %slot = [%c0 to %length step %c1](%old_maximum = %lowest : f64, %old_denominator = %fzero : f64, %old_accumulator = %fzero : f64) -> (f64, f64, f64) {
+        %in_block = index.cmp ult, %slot, %selected_tokens : index
+        %logical_value = scf.if %in_block -> (index) {
+          %block_slot = index.div %slot, %c4 : index
+          %word = view.load %ids[%token, %block_slot] : view<8x512xi32> -> i32
+          %block_value = index.cast %word : i32 to index
+          %block = index.assume %block_value [range(%block_value, 0, 527)] : index
+          %member = index.rem %slot, %c4 : index
+          %logical = index.madd %block, %c4, %member : index
+          scf.yield %logical : index
+        } else {
+          %relative = index.sub %slot, %selected_tokens : index
+          %logical = index.madd %complete, %c4, %relative : index
+          scf.yield %logical : index
+        }
+        %logical = index.assume %logical_value [range(%logical_value, 0, 2111)] : index
+        %page = index.div %logical, %page_tokens : index
+        %within = index.rem %logical, %page_tokens : index
+        %physical_word = view.load %maps[%row, %page] : view<16x33xi32> -> i32
+        %physical_value = index.cast %physical_word : i32 to index
+        %physical_page = index.assume %physical_value [range(%physical_value, 0, 32)] : index
+        %physical = index.madd %physical_page, %page_tokens, %within : index
+        %c7_index = index.constant 7 : index
+        %c13_index = index.constant 13 : index
+        %c17_index = index.constant 17 : index
+        %c31_index = index.constant 31 : index
+        %key_seed = index.madd %physical, %c7_index, %c1 : index
+        %key_remainder = index.rem %key_seed, %c31_index : index
+        %other_remainder = index.rem %physical, %c13_index : index
+        %value_remainder = index.rem %physical, %c17_index : index
+        %key_word = index.cast %key_remainder : index to i32
+        %other_word = index.cast %other_remainder : index to i32
+        %value_word = index.cast %value_remainder : index to i32
+        %head_word = index.cast %kv_head : index to i32
+        %key_unsigned = scalar.uitofp %key_word : i32 to f64
+        %other_unsigned = scalar.uitofp %other_word : i32 to f64
+        %value_unsigned = scalar.uitofp %value_word : i32 to f64
+        %head_unsigned = scalar.uitofp %head_word : i32 to f64
+        %c15_f64 = scalar.constant 15.0 : f64
+        %c6_f64 = scalar.constant 6.0 : f64
+        %c8_f64 = scalar.constant 8.0 : f64
+        %eighth = scalar.constant 0.125 : f64
+        %quarter = scalar.constant 0.25 : f64
+        %sixteenth = scalar.constant 0.0625 : f64
+        %key_centered = scalar.subf %key_unsigned, %c15_f64 : f64
+        %other_centered = scalar.subf %other_unsigned, %c6_f64 : f64
+        %value_centered = scalar.subf %value_unsigned, %c8_f64 : f64
+        %k0 = scalar.mulf %key_centered, %eighth : f64
+        %k1 = scalar.mulf %other_centered, %quarter : f64
+        %value_scaled = scalar.mulf %value_centered, %sixteenth : f64
+        %head_scaled = scalar.mulf %head_unsigned, %eighth : f64
+        %v = scalar.addf %value_scaled, %head_scaled : f64
+        %product0 = scalar.mulf %q0, %k0 : f64
+        %product1 = scalar.mulf %q1, %k1 : f64
+        %dot = scalar.addf %product0, %product1 : f64
+        %logit = scalar.mulf %dot, %scale : f64
+        %next_maximum = scalar.maxnumf %old_maximum, %logit : f64
+        %old_delta = scalar.subf %old_maximum, %next_maximum : f64
+        %delta = scalar.subf %logit, %next_maximum : f64
+        %rescale = func.call @cohort_reference_exp(%old_delta) : (f64) -> (f64)
+        %weight = func.call @cohort_reference_exp(%delta) : (f64) -> (f64)
+        %old_sum = scalar.mulf %old_denominator, %rescale : f64
+        %next_sum = scalar.addf %old_sum, %weight : f64
+        %old_value = scalar.mulf %old_accumulator, %rescale : f64
+        %weighted = scalar.mulf %v, %weight : f64
+        %next_value = scalar.addf %old_value, %weighted : f64
+        scf.yield %next_maximum, %next_sum, %next_value : f64, f64, f64
+      }
+      %base = scalar.divf %accumulator, %denominator : f64
+      scf.for %channel = [%c0 to %channels step %c1] {
+        %remainder = index.rem %channel, %c9 : index
+        %word = index.cast %remainder : index to i32
+        %number = scalar.uitofp %word : i32 to f64
+        %offset = scalar.mulf %number, %channel_scale : f64
+        %weighted = scalar.addf %base, %offset : f64
+        %rounded = scalar.fptrunc %weighted : f64 to bf16
+        %attention = scalar.extf %rounded : bf16 to f64
+        %gate_channel = index.add %channels, %channel : index
+        %gate_packed = view.load %gate[%token, %head, %gate_channel] : view<8x24x512xbf16> -> bf16
+        %gate_value = scalar.extf %gate_packed : bf16 to f64
+        %negative = scalar.negf %gate_value : f64
+        %exponential = func.call @cohort_reference_exp(%negative) : (f64) -> (f64)
+        %gate_denominator = scalar.addf %fone, %exponential : f64
+        %gated = scalar.divf %attention, %gate_denominator : f64
+        %packed = scalar.fptrunc %gated : f64 to bf16
+        view.store %packed, %result[%token, %head, %channel] : bf16, view<8x24x256xbf16>
+      }
+    }
+  }
+  func.return
+}
+
+command.program.def @cohort_attention_subject() launch(%epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %gates: buffer, %arena: buffer, %selected: buffer, %output: buffer) {
+  %neural_enabled = scalar.constant true : i1
+  %groups = func.call pure @qsa_cohort_capacity() : () -> (index)
+  %record_bytes = index.constant 8224 : offset
+  %bytes = index.scale %groups, %record_bytes : index, offset -> offset
+  %cohorts = buffer.alloca<global> align(16) %bytes : buffer
+  %key_origin = index.constant 128 : offset
+  %value_origin = index.constant 2162816 : offset
+  kernel.launch @qsa_merge_cohorts[%neural_enabled](%epoch, %selected, %cohorts) : [i1](buffer, buffer, buffer)
+  kernel.launch @qsa_cohort_attention[%neural_enabled](%key_origin, %value_origin, %rows, %queries, %gates, %arena, %cohorts, %output) : [i1](offset, offset, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+func.def @cohort_attention_reference(%epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %gates: buffer, %arena: buffer, %selected: buffer, %output: buffer) {
+  %key_origin = index.constant 128 : offset
+  %value_origin = index.constant 2162816 : offset
+  func.call @cohort_reference(%key_origin, %value_origin, %epoch, %mapping, %rows, %queries, %gates, %arena, %selected, %output) : (offset, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+command.program.def @partitioned_attention_subject() launch(%epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %gates: buffer, %arena: buffer, %selected: buffer, %output: buffer) {
+  %neural_enabled = scalar.constant true : i1
+  %key_origin = index.constant 128 : offset
+  %value_origin = index.constant 2162816 : offset
+  command.program.launch @qsa_split_attention[%neural_enabled, %key_origin, %value_origin](%epoch, %mapping, %rows, %queries, %gates, %arena, %selected, %output) : [i1, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+check.scenario public @paged_sparse_attention_original_f64 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[7](%trial: index, %entropy: check.entropy) {
+    %epoch = check.generate.fill value(0) : tensor<99xi32>
+    %mapping = check.generate.fill value(-99) : tensor<8x4xi32>
+    %rows = check.generate.fill value(0) : tensor<2752xi8>
+    %queries = check.generate.fill value(0.0) : tensor<8x24x256xbf16>
+    %gates = check.generate.fill value(0.0) : tensor<8x24x512xbf16>
+    %arena = check.generate.fill value(0) : tensor<4325760xi8>
+    %selected = check.generate.fill value(-99) : tensor<8x512xi32>
+    %output = check.generate.fill value(-17.0) : tensor<8x24x256xbf16>
+    check.generate<@cohort_fixture>(%trial, %epoch, %mapping, %rows, %queries, %gates, %arena, %selected) : (index, tensor<99xi32>, tensor<8x4xi32>, tensor<2752xi8>, tensor<8x24x256xbf16>, tensor<8x24x512xbf16>, tensor<4325760xi8>, tensor<8x512xi32>) -> ()
+    check.compare<@cohort_attention_subject, @cohort_attention_reference>(%epoch, %mapping, %rows, %queries, %gates, %arena, %selected, %output) : (tensor<99xi32>, tensor<8x4xi32>, tensor<2752xi8>, tensor<8x24x256xbf16>, tensor<8x24x512xbf16>, tensor<4325760xi8>, tensor<8x512xi32>, tensor<8x24x256xbf16>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<8x24x256xbf16>
+    }
+  }
+  check.return
+}
+
+check.scenario public @paged_partitioned_attention_original_f64 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[7](%trial: index, %entropy: check.entropy) {
+    %epoch = check.generate.fill value(0) : tensor<99xi32>
+    %mapping = check.generate.fill value(-99) : tensor<8x4xi32>
+    %rows = check.generate.fill value(0) : tensor<2752xi8>
+    %queries = check.generate.fill value(0.0) : tensor<8x24x256xbf16>
+    %gates = check.generate.fill value(0.0) : tensor<8x24x512xbf16>
+    %arena = check.generate.fill value(0) : tensor<4325760xi8>
+    %selected = check.generate.fill value(-99) : tensor<8x512xi32>
+    %output = check.generate.fill value(-17.0) : tensor<8x24x256xbf16>
+    check.generate<@cohort_fixture>(%trial, %epoch, %mapping, %rows, %queries, %gates, %arena, %selected) : (index, tensor<99xi32>, tensor<8x4xi32>, tensor<2752xi8>, tensor<8x24x256xbf16>, tensor<8x24x512xbf16>, tensor<4325760xi8>, tensor<8x512xi32>) -> ()
+    check.compare<@partitioned_attention_subject, @cohort_attention_reference>(%epoch, %mapping, %rows, %queries, %gates, %arena, %selected, %output) : (tensor<99xi32>, tensor<8x4xi32>, tensor<2752xi8>, tensor<8x24x256xbf16>, tensor<8x24x512xbf16>, tensor<4325760xi8>, tensor<8x512xi32>, tensor<8x24x256xbf16>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<8x24x256xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@paged_sparse_attention_original_f64> @paged_sparse_attention_original_f64_benchmark
+
+check.benchmark<@paged_partitioned_attention_original_f64> @paged_partitioned_attention_original_f64_benchmark

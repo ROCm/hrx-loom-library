@@ -1,0 +1,72 @@
+# Copyright 2026 AMD ROCm™ Software
+# SPDX-License-Identifier: MIT
+
+load("@hrx//build_tools/bazel:python.bzl", "iree_py_test")
+load("@hrx//build_tools/bazel:requirements.bzl", "apply_test_requirements")
+load("@hrx//loom/target/amd/xdna:execution_profiles.bzl", "XDNA_HARDWARE_PROFILE")
+
+package(default_visibility = ["//visibility:private"])
+
+iree_py_test(
+    name = "mathematical_tables_test",
+    srcs = ["generate_tables.py"],
+    args = ["--source=$(location //model/Qwen/Qwen3-Embedding-0.6B/program:constants.loom)"],
+    data = ["//model/Qwen/Qwen3-Embedding-0.6B/program:constants.loom"],
+    main = "generate_tables.py",
+    tags = ["hostonly"],
+)
+
+[
+    filegroup(
+        name = representation + "_card",
+        srcs = ["//model/Qwen/Qwen3-Embedding-0.6B:" + representation],
+        output_group = "model_card",
+    )
+    for representation in [
+        "source",
+        "archive",
+        "mixed",
+    ]
+]
+
+_REQUIREMENTS = apply_test_requirements(
+    {},
+    build_requirements = XDNA_HARDWARE_PROFILE.build_requirements,
+    resource_group = XDNA_HARDWARE_PROFILE.resource_group,
+    run_requirements = XDNA_HARDWARE_PROFILE.run_requirements,
+)
+
+# Full weights remain externally provisioned; the card and lock carry their
+# trusted cache identity. The composition requires an eight-column context.
+[
+    iree_py_test(
+        name = "embedding_" + representation + "_test",
+        size = "medium",
+        srcs = ["embedding_check.py"],
+        args = [
+            "--server=$(location @loom_sdk//:loom-serve)",
+            "--model=$(location :" + representation + "_card)",
+            "--reference=$(location reference.json)",
+            "--device=xdna://0?columns=8",
+        ],
+        data = [
+            ":" + representation + "_card",
+            "publisher.f32",
+            "reference.json",
+            "@loom_sdk//:loom-serve",
+        ],
+        main = "embedding_check.py",
+        resource_group = _REQUIREMENTS["resource_group"],
+        tags = ["manual"] + _REQUIREMENTS["tags"],
+        target_compatible_with = _REQUIREMENTS["target_compatible_with"],
+        deps = [
+            "@hrx//loom/src/loom/serve/testing:http",
+            "@hrx//loom/src/loom/serve/testing:model_staging",
+        ],
+    )
+    for representation in [
+        "source",
+        "archive",
+        "mixed",
+    ]
+]

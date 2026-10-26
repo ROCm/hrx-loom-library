@@ -1,0 +1,23 @@
+// One recurrent-attention and expert layer over caller-owned residual and
+// retained-state buffers. The GDN update precedes the FFN update, with the
+// layer-local PLE contribution already present on entry.
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+command.program.decl @flash_next_gdn_residual(%layer: index, %state_origin: offset) launch(%parameters: buffer, %span: buffer, %residual: buffer, %rows: buffer, %arena: buffer, %output: buffer, %capture: buffer)
+
+command.program.decl @flash_next_ffn_residual(%neural_enabled: i1, %layer: index) launch(%parameters: buffer, %span: buffer, %residual: buffer, %output: buffer)
+
+// Input residuals already include any layer-local PLE update. The GDN layer
+// advances caller-owned recurrent state and convolution history, then applies
+// the FFN to the attention-updated residual streams.
+command.program.def public @flash_next_gdn_layer(%layer: index, %state_origin: offset) launch(%parameters: buffer, %span: buffer, %residual: buffer, %rows: buffer, %arena: buffer, %output: buffer, %capture: buffer) {
+  %neural_enabled = scalar.constant true : i1
+  %tokens = config.get @flash_next.token_count : index
+  %row_bytes = index.constant 20480 : offset
+  %bytes = index.scale %tokens, %row_bytes : index, offset -> offset
+  %attention = buffer.alloca<global> align(256) %bytes : buffer
+  command.program.launch @flash_next_gdn_residual[%layer, %state_origin](%parameters, %span, %residual, %rows, %arena, %attention, %capture) : [index, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.program.launch @flash_next_ffn_residual[%neural_enabled, %layer](%parameters, %span, %attention, %output) : [i1, index](buffer, buffer, buffer, buffer)
+  command.return
+}

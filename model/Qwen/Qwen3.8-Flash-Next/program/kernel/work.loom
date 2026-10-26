@@ -1,0 +1,128 @@
+// Packed epochs contain {tokens, spans, outputs}, then six-word span records
+// {length, absolute_position, packed_begin, resident_row, source, selection}.
+// Source and selection are independent signed 32-bit coordinates. The
+// host owns distinct rows and immutable read/write origins through completion.
+// Stateless kernels visit the active packed prefix. Recurrent workers visit
+// independent spans and publish only their private writers, including at a
+// retained fork.
+func.def public inline @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index) {
+  %origin = index.constant 0 : offset
+  %view = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %word = view.load %view[0] : view<3xi32> -> i32
+  %value = index.cast %word : i32 to index
+  %count = index.assume %value [range(%value, 0, %capacity)] : index
+  func.return %count : index
+}
+
+func.def public inline @flash_next_span_count(%epoch: buffer) -> (index) {
+  %origin = index.constant 0 : offset
+  %view = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %word = view.load %view[1] : view<3xi32> -> i32
+  %value = index.cast %word : i32 to index
+  %count = index.assume %value [range(%value, 0, 2147483647)] : index
+  func.return %count : index
+}
+
+func.def public inline @flash_next_span_active(%epoch: buffer, %span: index) -> (i1) {
+  %count = func.call @flash_next_span_count(%epoch) : (buffer) -> (index)
+  %active = index.cmp ult, %span, %count : index
+  func.return %active : i1
+}
+
+// Each head/channel tile has a bounded set of span workers. Their grid-stride
+// traversal covers the live header count without launching one workgroup per
+// capacity slot when a large stage contains only a few spans.
+func.def public pure inline @flash_next_span_workers(%capacity: index) -> (index) {
+  %parallel_spans = index.constant 16 : index
+  %workers = index.min %capacity, %parallel_spans : index
+  func.return %workers : index
+}
+
+// A fresh span has no readable history. Otherwise the fork frontier selects
+// the immutable anchor once; subsequent spans read their own advancing writer.
+// Origins are byte offsets in one retained arena, independent of token packing.
+func.def public inline @flash_next_span_state(%epoch: buffer, %rows: buffer, %span: index, %layer_origin: offset, %capacity: index) -> (index, index, i1, offset, offset) {
+  %header_bytes = index.constant 12 : offset
+  %record_bytes = index.constant 24 : offset
+  %relative_origin = index.scale %span, %record_bytes : index, offset -> offset
+  %origin = index.add %header_bytes, %relative_origin : offset
+  %record = buffer.view %epoch[%origin] : buffer -> view<6xi32>
+  %length_word = view.load %record[0] : view<6xi32> -> i32
+  %position_word = view.load %record[1] : view<6xi32> -> i32
+  %begin_word = view.load %record[2] : view<6xi32> -> i32
+  %row_word = view.load %record[3] : view<6xi32> -> i32
+  %length_value = index.cast %length_word : i32 to index
+  %length = index.assume %length_value [range(%length_value, 1, %capacity)] : index
+  %begin_value = index.cast %begin_word : i32 to index
+  %begin = index.assume %begin_value [range(%begin_value, 0, %capacity)] : index
+  %end_value = index.add %begin, %length : index
+  %end = index.assume %end_value [range(%end_value, 1, %capacity)] : index
+  %row_value = index.cast %row_word : i32 to index
+  %row = index.assume %row_value [range(%row_value, 0, 2147483647)] : index
+  %row_bytes = index.constant 40 : offset
+  %row_origin = index.scale %row, %row_bytes : index, offset -> offset
+  %entry = buffer.view %rows[%row_origin] : buffer -> view<5xi64>
+  %anchor_word = view.load %entry[0] : view<5xi64> -> i64
+  %writer_word = view.load %entry[1] : view<5xi64> -> i64
+  %frontier = view.load %entry[3] : view<5xi64> -> i64
+  %position = scalar.extui %position_word : i32 to i64
+  %first = scalar.cmpi eq, %position, %frontier : i64
+  %reader_word = scf.select %first, %anchor_word, %writer_word : i64
+  %reader_value = scalar.assume %reader_word [range(%reader_word, 0, 9223372036854775807)] : i64
+  %writer_value = scalar.assume %writer_word [range(%writer_word, 0, 9223372036854775807)] : i64
+  %reader_base = index.cast %reader_value : i64 to offset
+  %writer_base = index.cast %writer_value : i64 to offset
+  %reader = index.add %reader_base, %layer_origin : offset
+  %writer = index.add %writer_base, %layer_origin : offset
+  %c0 = scalar.constant 0 : i64
+  %fresh = scalar.cmpi eq, %position, %c0 : i64
+  func.return %begin, %end, %fresh, %reader, %writer : index, index, i1, offset, offset
+}
+
+config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 8)]
+
+func.def public pure inline @flash_next_output_capacity() -> (index) {
+  %spans = config.get @flash_next.span_capacity : index
+  %width = config.get @flash_next.verification_width : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %ordinary = index.cmp eq, %width, %c0 : index
+  %outputs = scf.select %ordinary, %c1, %width : index
+  %count = index.mul %spans, %outputs : index
+  // Each selected output belongs to a distinct packed input. Small scheduler
+  // buckets can hold fewer inputs than span_capacity * verification_width.
+  %tokens = config.get @flash_next.token_count : index
+  %smaller = index.cmp ult, %count, %tokens : index
+  %capacity = scf.select %smaller, %count, %tokens : index
+  func.return %capacity : index
+}
+
+// Final attention retains up to four original query rows per selected span.
+func.def public pure inline @flash_next_finish_capacity() -> (index) {
+  %spans = config.get @flash_next.span_capacity : index
+  %tokens = config.get @flash_next.token_count : index
+  %queries = index.constant 4 : index
+  %rows = index.mul %spans, %queries : index
+  %capacity = index.min %rows, %tokens : index
+  func.return %capacity : index
+}
+
+// One flag per four-query cohort precedes one flag per draft token.
+func.def public pure inline @flash_next_draft_cohorts(%capacity: index) -> (index) {
+  %rounding = index.constant 3 : index
+  %width = index.constant 4 : index
+  %rounded = index.add %capacity, %rounding : index
+  %count = index.div %rounded, %width : index
+  func.return %count : index
+}
+
+func.def public pure inline @flash_next_draft_mode_origin(%capacity: index) -> (offset) {
+  %cohorts = func.call pure @flash_next_draft_cohorts(%capacity) : (index) -> (index)
+  %word_bytes = index.constant 4 : offset
+  %origin = index.scale %cohorts, %word_bytes : index, offset -> offset
+  func.return %origin : offset
+}

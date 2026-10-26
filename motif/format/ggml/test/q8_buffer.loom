@@ -1,0 +1,349 @@
+// Q8_1 x4 readers through complete, half-block, and single-word consumers.
+// Independent scalar byte loads check signed payloads and both F16 metadata
+// fields across physical groups, row gaps, and nonzero origins. The narrow
+// word reader publishes only scale; untouched sum slots remain sentinels.
+
+amdgpu.target<gfx11-generic> @native
+
+func.decl @ggml_q8_1_x4_block(%input: buffer, %row: offset, %block: index) -> (vector<32xi8>, f32, f32)
+
+func.decl @ggml_q8_1_x4_chunk16(%input: buffer, %row: offset, %block: index, %half: index) -> (vector<16xi8>, f32, f32)
+
+func.decl @ggml_q8_1_x4_word(%input: buffer, %row: offset, %block: index, %word: index) -> (vector<4xi8>, f32)
+
+func.def @initialize_metadata(%input: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %rows = index.constant 2 : index
+  %groups = index.constant 3 : index
+  %blocks_per_group = index.constant 4 : index
+  %blocks_per_row = index.constant 12 : index
+  %origin = index.constant 16 : offset
+  %stride = index.constant 448 : offset
+  %group_bytes = index.constant 144 : offset
+  %scale_bias = scalar.constant 4.0 : f32
+  %sum_bias = scalar.constant 12.0 : f32
+  %scale_unit = scalar.constant 0.03125 : f32
+  %sum_unit = scalar.constant 0.125 : f32
+  scf.for %row = [%begin to %rows step %step] {
+    %row_add = index.scale %row, %stride : index, offset -> offset
+    %row_origin = index.add %origin, %row_add : offset
+    scf.for %group = [%begin to %groups step %step] {
+      %group_add = index.scale %group, %group_bytes : index, offset -> offset
+      %group_origin = index.add %row_origin, %group_add : offset
+      %header = buffer.view %input[%group_origin] : buffer -> view<4x2xf16>
+      scf.for %block = [%begin to %blocks_per_group step %step] {
+        %row_block = index.madd %group, %blocks_per_group, %block : index
+        %ordinal = index.madd %row, %blocks_per_row, %row_block : index
+        %integer = index.cast %ordinal : index to i32
+        %floating = scalar.uitofp %integer : i32 to f32
+        %scale_centered = scalar.subf %floating, %scale_bias : f32
+        %sum_centered = scalar.subf %floating, %sum_bias : f32
+        %scale = scalar.mulf %scale_centered, %scale_unit : f32
+        %sum = scalar.mulf %sum_centered, %sum_unit : f32
+        %scale_half = scalar.fptrunc %scale : f32 to f16
+        %sum_half = scalar.fptrunc %sum : f32 to f16
+        view.store %scale_half, %header[%block, 0] : f16, view<4x2xf16>
+        view.store %sum_half, %header[%block, 1] : f16, view<4x2xf16>
+      }
+    }
+  }
+  func.return
+}
+
+func.def @reference(%width: index, %has_sum: i1, %input: buffer, %output: buffer, %metadata: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %rows = index.constant 2 : index
+  %blocks = index.constant 12 : index
+  %blocks_per_group = index.constant 4 : index
+  %values_per_block = index.constant 32 : index
+  %origin = index.constant 16 : offset
+  %stride = index.constant 448 : offset
+  %group_bytes = index.constant 144 : offset
+  %outputs = buffer.view %output[%origin] : buffer -> view<2x12x32xf32>
+  %coefficients = buffer.view %metadata[%origin] : buffer -> view<2x12x8x2xf32>
+  scf.for %row = [%begin to %rows step %step] {
+    %row_add = index.scale %row, %stride : index, offset -> offset
+    %row_origin = index.add %origin, %row_add : offset
+    scf.for %block = [%begin to %blocks step %step] {
+      %group = index.div %block, %blocks_per_group : index
+      %inner = index.rem %block, %blocks_per_group : index
+      %group_add = index.scale %group, %group_bytes : index, offset -> offset
+      %group_origin = index.add %row_origin, %group_add : offset
+      %payload_origin = index.add %group_origin, %origin : offset
+      %header = buffer.view %input[%group_origin] : buffer -> view<4x2xf16>
+      %payload = buffer.view %input[%payload_origin] : buffer -> view<4x32xi8>
+      %scale_half = view.load %header[%inner, 0] : view<4x2xf16> -> f16
+      %sum_half = view.load %header[%inner, 1] : view<4x2xf16> -> f16
+      %scale = scalar.extf %scale_half : f16 to f32
+      %sum = scalar.extf %sum_half : f16 to f32
+      scf.for %value = [%begin to %values_per_block step %step] {
+        %byte = view.load %payload[%inner, %value] : view<4x32xi8> -> i8
+        %floating = scalar.sitofp %byte : i8 to f32
+        view.store %floating, %outputs[%row, %block, %value] : f32, view<2x12x32xf32>
+        %within = index.rem %value, %width : index
+        %first = index.cmp eq, %within, %begin : index
+        scf.if %first {
+          %packet = index.div %value, %width : index
+          view.store %scale, %coefficients[%row, %block, %packet, 0] : f32, view<2x12x8x2xf32>
+          scf.if %has_sum {
+            view.store %sum, %coefficients[%row, %block, %packet, 1] : f32, view<2x12x8x2xf32>
+          }
+        }
+      }
+    }
+  }
+  func.return
+}
+
+kernel.def target(@native) @read_4() {
+  %blocks = index.constant 12 : index
+  %rows = index.constant 2 : index
+  %unit = index.constant 1 : index
+  %threads = index.constant 8 : index
+  kernel.launch.config workgroups(%blocks, %rows, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%input: buffer, %output: buffer, %metadata: buffer) {
+  %block = kernel.workgroup.id<x> : index
+  %row = kernel.workgroup.id<y> : index
+  %packet = kernel.workitem.id<x> : index
+  %width = index.constant 4 : index
+  %origin = index.constant 16 : offset
+  %stride = index.constant 448 : offset
+  %row_add = index.scale %row, %stride : index, offset -> offset
+  %row_origin = index.add %origin, %row_add : offset
+  %codes, %scale = func.call @ggml_q8_1_x4_word(%input, %row_origin, %block, %packet) : (buffer, offset, index, index) -> (vector<4xi8>, f32)
+  %values = vector.sitofp %codes : vector<4xi8> to vector<4xf32>
+  %outputs = buffer.view %output[%origin] : buffer -> view<2x12x32xf32>
+  %coefficients = buffer.view %metadata[%origin] : buffer -> view<2x12x8x2xf32>
+  %column = index.mul %packet, %width : index
+  vector.store %values, %outputs[%row, %block, %column] : vector<4xf32>, view<2x12x32xf32>
+  view.store %scale, %coefficients[%row, %block, %packet, 0] : f32, view<2x12x8x2xf32>
+  kernel.return
+}
+
+func.def @reference_4(%input: buffer, %output: buffer, %metadata: buffer) {
+  %width = index.constant 4 : index
+  %has_sum = scalar.constant false : i1
+  func.call @reference(%width, %has_sum, %input, %output, %metadata) : (index, i1, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @reader_4_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<912xi8>
+    check.generate<@initialize_metadata>(%input) : (tensor<912xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<776xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<392xf32>
+    check.compare<@read_4, @reference_4>(%input, %output, %metadata) : (tensor<912xi8>, tensor<776xf32>, tensor<392xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<776xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<392xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<912xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_4_negative {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(-128) : tensor<912xi8>
+    check.generate<@initialize_metadata>(%input) : (tensor<912xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<776xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<392xf32>
+    check.compare<@read_4, @reference_4>(%input, %output, %metadata) : (tensor<912xi8>, tensor<776xf32>, tensor<392xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<776xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<392xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<912xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_4_positive {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(127) : tensor<912xi8>
+    check.generate<@initialize_metadata>(%input) : (tensor<912xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<776xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<392xf32>
+    check.compare<@read_4, @reference_4>(%input, %output, %metadata) : (tensor<912xi8>, tensor<776xf32>, tensor<392xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<776xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<392xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<912xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@reader_4_random> @reader_4_records
+
+kernel.def target(@native) @read_16() {
+  %blocks = index.constant 12 : index
+  %rows = index.constant 2 : index
+  %unit = index.constant 1 : index
+  %threads = index.constant 2 : index
+  kernel.launch.config workgroups(%blocks, %rows, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%input: buffer, %output: buffer, %metadata: buffer) {
+  %block = kernel.workgroup.id<x> : index
+  %row = kernel.workgroup.id<y> : index
+  %packet = kernel.workitem.id<x> : index
+  %width = index.constant 16 : index
+  %origin = index.constant 16 : offset
+  %stride = index.constant 448 : offset
+  %row_add = index.scale %row, %stride : index, offset -> offset
+  %row_origin = index.add %origin, %row_add : offset
+  %codes, %scale, %sum = func.call @ggml_q8_1_x4_chunk16(%input, %row_origin, %block, %packet) : (buffer, offset, index, index) -> (vector<16xi8>, f32, f32)
+  %values = vector.sitofp %codes : vector<16xi8> to vector<16xf32>
+  %outputs = buffer.view %output[%origin] : buffer -> view<2x12x32xf32>
+  %coefficients = buffer.view %metadata[%origin] : buffer -> view<2x12x8x2xf32>
+  %column = index.mul %packet, %width : index
+  vector.store %values, %outputs[%row, %block, %column] : vector<16xf32>, view<2x12x32xf32>
+  view.store %scale, %coefficients[%row, %block, %packet, 0] : f32, view<2x12x8x2xf32>
+  view.store %sum, %coefficients[%row, %block, %packet, 1] : f32, view<2x12x8x2xf32>
+  kernel.return
+}
+
+func.def @reference_16(%input: buffer, %output: buffer, %metadata: buffer) {
+  %width = index.constant 16 : index
+  %has_sum = scalar.constant true : i1
+  func.call @reference(%width, %has_sum, %input, %output, %metadata) : (index, i1, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @reader_16_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<912xi8>
+    check.generate<@initialize_metadata>(%input) : (tensor<912xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<776xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<392xf32>
+    check.compare<@read_16, @reference_16>(%input, %output, %metadata) : (tensor<912xi8>, tensor<776xf32>, tensor<392xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<776xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<392xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<912xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_16_negative {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(-128) : tensor<912xi8>
+    check.generate<@initialize_metadata>(%input) : (tensor<912xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<776xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<392xf32>
+    check.compare<@read_16, @reference_16>(%input, %output, %metadata) : (tensor<912xi8>, tensor<776xf32>, tensor<392xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<776xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<392xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<912xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_16_positive {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(127) : tensor<912xi8>
+    check.generate<@initialize_metadata>(%input) : (tensor<912xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<776xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<392xf32>
+    check.compare<@read_16, @reference_16>(%input, %output, %metadata) : (tensor<912xi8>, tensor<776xf32>, tensor<392xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<776xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<392xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<912xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@reader_16_random> @reader_16_records
+
+kernel.def target(@native) @read_32() {
+  %blocks = index.constant 12 : index
+  %rows = index.constant 2 : index
+  %unit = index.constant 1 : index
+  %threads = index.constant 1 : index
+  kernel.launch.config workgroups(%blocks, %rows, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%input: buffer, %output: buffer, %metadata: buffer) {
+  %block = kernel.workgroup.id<x> : index
+  %row = kernel.workgroup.id<y> : index
+  %packet = kernel.workitem.id<x> : index
+  %width = index.constant 32 : index
+  %origin = index.constant 16 : offset
+  %stride = index.constant 448 : offset
+  %row_add = index.scale %row, %stride : index, offset -> offset
+  %row_origin = index.add %origin, %row_add : offset
+  %codes, %scale, %sum = func.call @ggml_q8_1_x4_block(%input, %row_origin, %block) : (buffer, offset, index) -> (vector<32xi8>, f32, f32)
+  %values = vector.sitofp %codes : vector<32xi8> to vector<32xf32>
+  %outputs = buffer.view %output[%origin] : buffer -> view<2x12x32xf32>
+  %coefficients = buffer.view %metadata[%origin] : buffer -> view<2x12x8x2xf32>
+  %column = index.mul %packet, %width : index
+  vector.store %values, %outputs[%row, %block, %column] : vector<32xf32>, view<2x12x32xf32>
+  view.store %scale, %coefficients[%row, %block, %packet, 0] : f32, view<2x12x8x2xf32>
+  view.store %sum, %coefficients[%row, %block, %packet, 1] : f32, view<2x12x8x2xf32>
+  kernel.return
+}
+
+func.def @reference_32(%input: buffer, %output: buffer, %metadata: buffer) {
+  %width = index.constant 32 : index
+  %has_sum = scalar.constant true : i1
+  func.call @reference(%width, %has_sum, %input, %output, %metadata) : (index, i1, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @reader_32_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<912xi8>
+    check.generate<@initialize_metadata>(%input) : (tensor<912xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<776xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<392xf32>
+    check.compare<@read_32, @reference_32>(%input, %output, %metadata) : (tensor<912xi8>, tensor<776xf32>, tensor<392xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<776xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<392xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<912xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_32_negative {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(-128) : tensor<912xi8>
+    check.generate<@initialize_metadata>(%input) : (tensor<912xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<776xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<392xf32>
+    check.compare<@read_32, @reference_32>(%input, %output, %metadata) : (tensor<912xi8>, tensor<776xf32>, tensor<392xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<776xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<392xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<912xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_32_positive {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(127) : tensor<912xi8>
+    check.generate<@initialize_metadata>(%input) : (tensor<912xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<776xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<392xf32>
+    check.compare<@read_32, @reference_32>(%input, %output, %metadata) : (tensor<912xi8>, tensor<776xf32>, tensor<392xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<776xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<392xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<912xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@reader_32_random> @reader_32_records

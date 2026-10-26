@@ -1,0 +1,348 @@
+// Nineteen mixed spans bracket seventeen speculative prefixes with known
+// two-token spans. Accepted prefixes cycle through one, two, three, and four
+// inputs. Rows share an immutable anchor, start fresh, or continue a private
+// writer. Both traversal and compact replay cross the sixteen-span boundary;
+// the complete arena comparison includes anchors and inactive padding.
+
+config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+template.decl @flash_next.ple_convolve.body(%capacity: index, %verification: index, %history_origin: offset, %origins: buffer, %span_arg: buffer, %gated_arg: buffer, %normalized_arg: buffer, %weight_arg: buffer, %history_arg: buffer, %residual_arg: buffer, %output_arg: buffer)
+
+kernel.decl @gdn_convolve() launch(%span: buffer, %origins: buffer, %layer_origin: offset, %qkv: buffer, %weight: buffer, %history: buffer, %convolved: buffer, %norm: buffer)
+
+kernel.decl @gdn_recur() launch(%span: buffer, %origins: buffer, %layer_origin: offset, %qkv: buffer, %norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer)
+
+kernel.decl @gdn_recur_window() launch(%span: buffer, %origins: buffer, %layer_origin: offset, %qkv: buffer, %norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer)
+
+kernel.decl @gdn_convolve_commit() launch(%span: buffer, %origins: buffer, %layer_origin: offset, %qkv: buffer, %weight: buffer, %history: buffer, %convolved: buffer, %norm: buffer)
+
+kernel.decl @gdn_recur_commit() launch(%span: buffer, %origins: buffer, %layer_origin: offset, %qkv: buffer, %norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer)
+
+kernel.decl @flash_next_ple_convolve() launch(%history_origin: offset, %origins: buffer, %span: buffer, %gated: buffer, %normalized: buffer, %weight: buffer, %history: buffer, %residual: buffer, %output: buffer)
+
+kernel.decl @flash_next_ple_publish_history() launch(%history_origin: offset, %span: buffer, %rows: buffer, %tokens: buffer, %arena: buffer)
+
+kernel.decl @flash_next_ple_publish_history_commit() launch(%history_origin: offset, %span: buffer, %rows: buffer, %tokens: buffer, %arena: buffer)
+
+kernel.decl @qsa_publish_tail(%neural_enabled: i1) launch(%tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer)
+
+kernel.decl @qsa_publish_tail_commit() launch(%tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer)
+
+kernel.decl @flash_next_capture_rows(%neural_enabled: i1, %span_capacity: index, %row_bytes: offset) launch(%source_capacity: index, %width: index, %row_bytes_value: offset, %epoch: buffer, %input: buffer, %capture: buffer, %capture_origin: offset)
+
+kernel.decl @flash_next_commit_ple_history() launch(%history_origin: offset, %epoch: buffer, %rows: buffer, %input: buffer, %arena: buffer)
+
+kernel.decl @qwen38_accept_spans() launch(%mixed_inputs: index, %width: index, %token_capacity: index, %packet_capacity: index, %epoch: buffer, %inputs: buffer, %predictions: buffer, %committed: buffer, %replay: buffer, %results: buffer)
+
+// Direct reference execution publishes the prefix through the ordinary
+// convolution, independently of compact-history publication.
+kernel.def @reference_ple_convolve() {
+  %groups = index.constant 20 : index
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  %spans = config.get @flash_next.span_capacity : index
+  kernel.launch.config workgroups(%groups, %spans, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%history_origin: offset, %origins: buffer, %span_arg: buffer, %gated_arg: buffer, %normalized_arg: buffer, %weight_arg: buffer, %history_arg: buffer, %residual_arg: buffer, %output_arg: buffer) {
+  %capacity = config.get @flash_next.token_count : index
+  %verification = index.constant 0 : index
+  template.apply<@flash_next.ple_convolve.body>(%capacity, %verification, %history_origin, %origins, %span_arg, %gated_arg, %normalized_arg, %weight_arg, %history_arg, %residual_arg, %output_arg) : (index, index, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def @fixture() {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%epoch: buffer, %reference: buffer, %rows: buffer, %ids: buffer, %predictions: buffer, %expected_results: buffer) {
+  %origin = index.constant 0 : offset
+  %descriptor_origin = index.constant 12 : offset
+  %options_origin = index.constant 3596 : offset
+  %eos_origin = index.constant 4620 : offset
+  %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %reference_header = buffer.view %reference[%origin] : buffer -> view<3xi32>
+  %descriptors = buffer.view %epoch[%descriptor_origin] : buffer -> view<19x6xi32>
+  %accepted = buffer.view %reference[%descriptor_origin] : buffer -> view<19x6xi32>
+  %options = buffer.view %epoch[%options_origin] : buffer -> view<19x2xi32>
+  %eos = buffer.view %epoch[%eos_origin] : buffer -> view<1xi32>
+  %origins = buffer.view %rows[%origin] : buffer -> view<19x5xi64>
+  %tokens = buffer.view %ids[%origin] : buffer -> view<72xi32>
+  %selected = buffer.view %predictions[%origin] : buffer -> view<128xi32>
+  %results = buffer.view %expected_results[%origin] : buffer -> view<128x10xi32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %span_count = index.constant 19 : index
+  %c10 = index.constant 10 : index
+  %token_capacity = index.constant 72 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %span_count_word = scalar.constant 19 : i32
+  %token_count_word = scalar.constant 72 : i32
+  %selection_count_word = scalar.constant 70 : i32
+  %none = scalar.constant -1 : i32
+  view.store %token_count_word, %header[0] : i32, view<3xi32>
+  view.store %span_count_word, %header[1] : i32, view<3xi32>
+  view.store %selection_count_word, %header[2] : i32, view<3xi32>
+  view.store %token_count_word, %reference_header[0] : i32, view<3xi32>
+  view.store %span_count_word, %reference_header[1] : i32, view<3xi32>
+  view.store %none, %eos[0] : i32, view<1xi32>
+  %id_base = scalar.constant 100 : i32
+  scf.for %token = [%c0 to %token_capacity step %c1] {
+    %word = index.cast %token : index to i32
+    %id = scalar.addi %id_base, %word : i32
+    view.store %id, %tokens[%token] : i32, view<72xi32>
+  }
+  %stride = scalar.constant 3392512 : i64
+  %c0_i64 = scalar.constant 0 : i64
+  %frontier = scalar.constant 63 : i64
+  %known_prediction = scalar.constant 900 : i32
+  scf.for %span = [%c0 to %span_count step %c1] {
+    %last_span = index.constant 18 : index
+    %last_known_row = index.constant 17 : index
+    %first_known = index.cmp eq, %span, %c0 : index
+    %last_known = index.cmp eq, %span, %last_span : index
+    %known = scalar.ori %first_known, %last_known : i1
+    %nonzero_span = scf.select %first_known, %c1, %span : index
+    %relative = index.sub %nonzero_span, %c1 : index
+    %following_row = scf.select %last_known, %last_known_row, %relative : index
+    %row = scf.select %first_known, %last_span, %following_row : index
+    %row_word = index.cast %row : index to i32
+    %first_value = index.madd %relative, %c4, %c2 : index
+    %begin = scf.select %first_known, %c0, %first_value : index
+    %begin_word = index.cast %begin : index to i32
+    %length = scf.select %known, %c2, %c4 : index
+    %length_word = index.cast %length : index to i32
+    %phase = index.rem %relative, %c4 : index
+    %prefix = index.add %phase, %c1 : index
+    %consumed = scf.select %known, %c2, %prefix : index
+    %consumed_word = index.cast %consumed : index to i32
+    %row_zero = index.cmp eq, %row, %c0 : index
+    %continued = index.cmp eq, %row, %c3 : index
+    %p63 = index.constant 63 : index
+    %p64 = index.constant 64 : index
+    %p65 = index.constant 65 : index
+    %nonfresh = scf.select %continued, %p65, %p63 : index
+    %spec_position = scf.select %row_zero, %c0, %nonfresh : index
+    %position = scf.select %known, %p64, %spec_position : index
+    %position_word = index.cast %position : index to i32
+    %selection_value = index.madd %relative, %c4, %c1 : index
+    %selection = scf.select %first_known, %c0, %selection_value : index
+    %selection_word = index.cast %selection : index to i32
+    view.store %length_word, %descriptors[%span, 0] : i32, view<19x6xi32>
+    view.store %position_word, %descriptors[%span, 1] : i32, view<19x6xi32>
+    view.store %begin_word, %descriptors[%span, 2] : i32, view<19x6xi32>
+    view.store %row_word, %descriptors[%span, 3] : i32, view<19x6xi32>
+    view.store %position_word, %descriptors[%span, 4] : i32, view<19x6xi32>
+    view.store %selection_word, %descriptors[%span, 5] : i32, view<19x6xi32>
+    view.store %consumed_word, %accepted[%span, 0] : i32, view<19x6xi32>
+    view.store %position_word, %accepted[%span, 1] : i32, view<19x6xi32>
+    view.store %begin_word, %accepted[%span, 2] : i32, view<19x6xi32>
+    view.store %row_word, %accepted[%span, 3] : i32, view<19x6xi32>
+    view.store %position_word, %accepted[%span, 4] : i32, view<19x6xi32>
+    view.store %none, %accepted[%span, 5] : i32, view<19x6xi32>
+    %flag = scf.select %known, %c0_i32, %c1_i32 : i32
+    %credit = scalar.constant 4 : i32
+    view.store %flag, %options[%span, 0] : i32, view<19x2xi32>
+    view.store %credit, %options[%span, 1] : i32, view<19x2xi32>
+    %slot = index.add %row, %c1 : index
+    %slot_word = index.cast %slot : index to i64
+    %writer = scalar.muli %slot_word, %stride : i64
+    view.store %c0_i64, %origins[%row, 0] : i64, view<19x5xi64>
+    view.store %writer, %origins[%row, 1] : i64, view<19x5xi64>
+    view.store %frontier, %origins[%row, 3] : i64, view<19x5xi64>
+    scf.for %i = [%c0 to %c10 step %c1] {
+      view.store %c0_i32, %results[%span, %i] : i32, view<128x10xi32>
+    }
+    %emitted = scf.select %known, %c1_i32, %consumed_word : i32
+    view.store %consumed_word, %results[%span, 0] : i32, view<128x10xi32>
+    view.store %emitted, %results[%span, 1] : i32, view<128x10xi32>
+    scf.if %known {
+      view.store %known_prediction, %selected[%selection] : i32, view<128xi32>
+      view.store %known_prediction, %results[%span, 2] : i32, view<128x10xi32>
+    } else {
+      scf.for %i = [%c0 to %c4 step %c1] {
+        %next = index.add %i, %c1 : index
+        %matches = index.cmp ult, %next, %consumed : index
+        %candidate = index.add %begin, %next : index
+        %candidate_word = index.cast %candidate : index to i32
+        %matching = scalar.addi %id_base, %candidate_word : i32
+        %mismatch = scalar.constant 777 : i32
+        %prediction = scf.select %matches, %matching, %mismatch : i32
+        %selected_index = index.add %selection, %i : index
+        view.store %prediction, %selected[%selected_index] : i32, view<128xi32>
+        %live = index.cmp ult, %i, %consumed : index
+        scf.if %live {
+          %output_index = index.add %i, %c2 : index
+          view.store %prediction, %results[%span, %output_index] : i32, view<128x10xi32>
+        }
+      }
+    }
+  }
+  kernel.return
+}
+
+// Distinct exact initial values make the immutable anchor and private writers
+// distinguishable. Their low halfwords are finite BF16 values for histories.
+kernel.def @initialize_arena() {
+  %groups = index.constant 3313 : index
+  %rows = index.constant 20 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %rows, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%arena: buffer) {
+  %row = kernel.workgroup.id<y> : index
+  %group = kernel.workgroup.id<x> : index
+  %thread = kernel.workitem.id<x> : index
+  %threads = index.constant 256 : index
+  %element = index.madd %group, %threads, %thread : index
+  %length = index.constant 848128 : index
+  %active = index.cmp ult, %element, %length : index
+  scf.if %active {
+    %row_word = index.cast %row : index to i32
+    %row_float = scalar.sitofp %row_word : i32 to f32
+    %c1_f32 = scalar.constant 1.0 : f32
+    %quarter = scalar.constant 0.25 : f32
+    %base = scalar.addf %row_float, %c1_f32 : f32
+    %value = scalar.mulf %base, %quarter : f32
+    %origin = index.constant 0 : offset
+    %view = buffer.view %arena[%origin] : buffer -> view<20x848128xf32>
+    view.store %value, %view[%row, %element] : f32, view<20x848128xf32>
+  }
+  kernel.return
+}
+
+kernel.def @untouched_speculation() {
+  %rows = index.constant 18 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%initial: buffer, %actual: buffer, %results: buffer) {
+  %row = kernel.workgroup.id<x> : index
+  %thread = kernel.workitem.id<x> : index
+  %threads = index.constant 256 : index
+  %length = index.constant 848128 : index
+  %origin = index.constant 0 : offset
+  %before = buffer.view %initial[%origin] : buffer -> view<20x848128xi32>
+  %after = buffer.view %actual[%origin] : buffer -> view<20x848128xi32>
+  %outputs = buffer.view %results[%origin] : buffer -> view<18xi32>
+  %c1_i32 = scalar.constant 1 : i32
+  %same = scf.for %element = [%thread to %length step %threads](%prior = %c1_i32 : i32) -> (i32) {
+    %a = view.load %before[%row, %element] : view<20x848128xi32> -> i32
+    %b = view.load %after[%row, %element] : view<20x848128xi32> -> i32
+    %equal = scalar.cmpi eq, %a, %b : i32
+    %word = scalar.extui %equal : i1 to i32
+    %next = scalar.andi %prior, %word : i32
+    scf.yield %next : i32
+  }
+  %all = kernel.workgroup.reduce<andi> %same : i32
+  %c0 = index.constant 0 : index
+  %leader = index.cmp eq, %thread, %c0 : index
+  scf.if %leader {
+    view.store %all, %outputs[%row] : i32, view<18xi32>
+  }
+  kernel.return
+}
+
+check.case public @accepted_prefixes_preserve_all_state {
+  %neural_enabled = check.literal value(true) : i1
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %seed = check.param.seed base(7139) count(2) : i64
+  %packet_capacity = check.literal value(128) : index
+  %capacity = check.literal value(72) : index
+  %spans = check.literal value(19) : index
+  %width = check.literal value(4) : index
+  %zero = check.literal value(0) : offset
+  %state_origin = check.literal value(0) : offset
+  %history_origin = check.literal value(3145728) : offset
+  %ple_origin = check.literal value(3207168) : offset
+  %qsa_origin = check.literal value(3391488) : offset
+  %ids_origin = check.literal value(3392256) : offset
+  %epoch = check.generate.fill value(-7) : tensor<3594xi32>
+  %reference = check.generate.fill value(-7) : tensor<771xi32>
+  %rows = check.generate.fill value(0) : tensor<95xi64>
+  %ids = check.generate.fill value(-7) : tensor<72xi32>
+  %predictions = check.generate.fill value(-7) : tensor<128xi32>
+  %expected_results = check.generate.fill value(-7) : tensor<128x10xi32>
+  kernel.launch @fixture(%epoch, %reference, %rows, %ids, %predictions, %expected_results) : (tensor<3594xi32>, tensor<771xi32>, tensor<95xi64>, tensor<72xi32>, tensor<128xi32>, tensor<128x10xi32>)
+  %initial = check.generate.fill value(0.0) : tensor<20x848128xf32>
+  %actual = check.generate.fill value(0.0) : tensor<20x848128xf32>
+  %expected = check.generate.fill value(0.0) : tensor<20x848128xf32>
+  kernel.launch @initialize_arena(%initial) : (tensor<20x848128xf32>)
+  kernel.launch @initialize_arena(%actual) : (tensor<20x848128xf32>)
+  kernel.launch @initialize_arena(%expected) : (tensor<20x848128xf32>)
+  %qkv = check.generate.random.uniform seed(%seed) range(-0.5 to 0.5) : tensor<72x10240xbf16>
+  %weight = check.generate.random.uniform seed(%seed) range(-0.25 to 0.25) : tensor<10240x4xf32>
+  %alpha = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<72x48xf32>
+  %beta = check.generate.random.uniform seed(%seed) range(-0.5 to 0.5) : tensor<72x48xf32>
+  %a = check.generate.fill value(-0.25) : tensor<48xf32>
+  %bias = check.generate.fill value(0.125) : tensor<48xf32>
+  %ple = check.generate.random.uniform seed(%seed) range(-0.25 to 0.25) : tensor<72x10240xbf16>
+  %raw_keys = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<72x128xbf16>
+  %convolved = check.generate.fill value(-7.0) : tensor<72x10240xbf16>
+  %norm = check.generate.fill value(-7.0) : tensor<72x32xf32>
+  %raw = check.generate.fill value(-7.0) : tensor<72x6144xbf16>
+  %ple_output = check.generate.fill value(-7.0) : tensor<72x10240xbf16>
+  kernel.launch @gdn_convolve(%epoch, %rows, %history_origin, %qkv, %weight, %actual, %convolved, %norm) : (tensor<3594xi32>, tensor<95xi64>, offset, tensor<72x10240xbf16>, tensor<10240x4xf32>, tensor<20x848128xf32>, tensor<72x10240xbf16>, tensor<72x32xf32>)
+  kernel.launch @gdn_recur(%epoch, %rows, %state_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %actual, %raw) : (tensor<3594xi32>, tensor<95xi64>, offset, tensor<72x10240xbf16>, tensor<72x32xf32>, tensor<72x48xf32>, tensor<72x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<20x848128xf32>, tensor<72x6144xbf16>)
+  %gated = check.generate.random.uniform seed(%seed) range(-0.125 to 0.125) : tensor<72x10240xbf16>
+  %residual = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<72x10240xbf16>
+  kernel.launch @flash_next_ple_convolve(%ple_origin, %rows, %epoch, %gated, %ple, %weight, %actual, %residual, %ple_output) : (offset, tensor<95xi64>, tensor<3594xi32>, tensor<72x10240xbf16>, tensor<72x10240xbf16>, tensor<10240x4xf32>, tensor<20x848128xf32>, tensor<72x10240xbf16>, tensor<72x10240xbf16>)
+  kernel.launch @flash_next_ple_publish_history(%ids_origin, %epoch, %rows, %ids, %actual) : (offset, tensor<3594xi32>, tensor<95xi64>, tensor<72xi32>, tensor<20x848128xf32>)
+  kernel.launch @qsa_publish_tail[%neural_enabled](%qsa_origin, %epoch, %rows, %raw_keys, %actual) : [i1](offset, tensor<3594xi32>, tensor<95xi64>, tensor<72x128xbf16>, tensor<20x848128xf32>)
+  %unchanged = check.generate.fill value(0) : tensor<18xi32>
+  %ones = check.generate.fill value(1) : tensor<18xi32>
+  kernel.launch @untouched_speculation(%initial, %actual, %unchanged) : (tensor<20x848128xf32>, tensor<20x848128xf32>, tensor<18xi32>)
+  check.expect.bitwise actual(%unchanged) expected(%ones) : tensor<18xi32>
+
+  // The initial arena is no longer needed after the immutability check.
+  // Reuse it for the windowed recurrence, preserving the original output
+  // for comparison while accepted-prefix replay uses separate scratch.
+  %raw_window = check.generate.fill value(-7.0) : tensor<72x6144xbf16>
+  %replay_output = check.generate.fill value(-7.0) : tensor<72x6144xbf16>
+  kernel.launch @gdn_recur_window(%epoch, %rows, %state_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %initial, %raw_window) : (tensor<3594xi32>, tensor<95xi64>, offset, tensor<72x10240xbf16>, tensor<72x32xf32>, tensor<72x48xf32>, tensor<72x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<20x848128xf32>, tensor<72x6144xbf16>)
+  check.expect.close actual(%raw_window) expected(%raw) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<72x6144xbf16>
+  %qkv_bytes = check.literal value(20480) : offset
+  %qkv_capture = check.generate.fill value(-7.0) : tensor<72x10240xbf16>
+  kernel.launch @flash_next_capture_rows[%neural_enabled, %spans, %qkv_bytes](%capacity, %width, %qkv_bytes, %epoch, %qkv, %qkv_capture, %zero) : [i1, index, offset](index, index, offset, tensor<3594xi32>, tensor<72x10240xbf16>, tensor<72x10240xbf16>, offset)
+  %alpha_bytes = check.literal value(192) : offset
+  %alpha_capture = check.generate.fill value(-7.0) : tensor<72x48xf32>
+  kernel.launch @flash_next_capture_rows[%neural_enabled, %spans, %alpha_bytes](%capacity, %width, %alpha_bytes, %epoch, %alpha, %alpha_capture, %zero) : [i1, index, offset](index, index, offset, tensor<3594xi32>, tensor<72x48xf32>, tensor<72x48xf32>, offset)
+  %beta_bytes = check.literal value(192) : offset
+  %beta_capture = check.generate.fill value(-7.0) : tensor<72x48xf32>
+  kernel.launch @flash_next_capture_rows[%neural_enabled, %spans, %beta_bytes](%capacity, %width, %beta_bytes, %epoch, %beta, %beta_capture, %zero) : [i1, index, offset](index, index, offset, tensor<3594xi32>, tensor<72x48xf32>, tensor<72x48xf32>, offset)
+  %ple_bytes = check.literal value(20480) : offset
+  %ple_capture = check.generate.fill value(-7.0) : tensor<72x10240xbf16>
+  kernel.launch @flash_next_capture_rows[%neural_enabled, %spans, %ple_bytes](%capacity, %width, %ple_bytes, %epoch, %ple, %ple_capture, %zero) : [i1, index, offset](index, index, offset, tensor<3594xi32>, tensor<72x10240xbf16>, tensor<72x10240xbf16>, offset)
+  %raw_keys_bytes = check.literal value(256) : offset
+  %raw_keys_capture = check.generate.fill value(-7.0) : tensor<72x128xbf16>
+  kernel.launch @flash_next_capture_rows[%neural_enabled, %spans, %raw_keys_bytes](%capacity, %width, %raw_keys_bytes, %epoch, %raw_keys, %raw_keys_capture, %zero) : [i1, index, offset](index, index, offset, tensor<3594xi32>, tensor<72x128xbf16>, tensor<72x128xbf16>, offset)
+  %ids_bytes = check.literal value(4) : offset
+  %ids_capture = check.generate.fill value(-7) : tensor<72xi32>
+  kernel.launch @flash_next_capture_rows[%neural_enabled, %spans, %ids_bytes](%capacity, %width, %ids_bytes, %epoch, %ids, %ids_capture, %zero) : [i1, index, offset](index, index, offset, tensor<3594xi32>, tensor<72xi32>, tensor<72xi32>, offset)
+  %committed = check.generate.fill value(-7) : tensor<771xi32>
+  %replay = check.generate.fill value(-7) : tensor<771xi32>
+  %results = check.generate.fill value(-7) : tensor<128x10xi32>
+  %mixed_inputs = check.literal value(0) : index
+  kernel.launch @qwen38_accept_spans(%mixed_inputs, %width, %capacity, %packet_capacity, %epoch, %ids, %predictions, %committed, %replay, %results) : (index, index, index, index, tensor<3594xi32>, tensor<72xi32>, tensor<128xi32>, tensor<771xi32>, tensor<771xi32>, tensor<128x10xi32>)
+  check.expect.bitwise actual(%results) expected(%expected_results) : tensor<128x10xi32>
+  kernel.launch @gdn_convolve_commit(%replay, %rows, %history_origin, %qkv_capture, %weight, %actual, %convolved, %norm) : (tensor<771xi32>, tensor<95xi64>, offset, tensor<72x10240xbf16>, tensor<10240x4xf32>, tensor<20x848128xf32>, tensor<72x10240xbf16>, tensor<72x32xf32>)
+  kernel.launch @gdn_recur_commit(%replay, %rows, %state_origin, %convolved, %norm, %alpha_capture, %beta_capture, %a, %bias, %actual, %replay_output) : (tensor<771xi32>, tensor<95xi64>, offset, tensor<72x10240xbf16>, tensor<72x32xf32>, tensor<72x48xf32>, tensor<72x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<20x848128xf32>, tensor<72x6144xbf16>)
+  kernel.launch @flash_next_commit_ple_history(%ple_origin, %replay, %rows, %ple_capture, %actual) : (offset, tensor<771xi32>, tensor<95xi64>, tensor<72x10240xbf16>, tensor<20x848128xf32>)
+  kernel.launch @flash_next_ple_publish_history_commit(%ids_origin, %replay, %rows, %ids_capture, %actual) : (offset, tensor<771xi32>, tensor<95xi64>, tensor<72xi32>, tensor<20x848128xf32>)
+  kernel.launch @qsa_publish_tail_commit(%qsa_origin, %replay, %rows, %raw_keys_capture, %actual) : (offset, tensor<771xi32>, tensor<95xi64>, tensor<72x128xbf16>, tensor<20x848128xf32>)
+
+  // Direct execution of the selected prefixes never sees rejected inputs.
+  // Compare the entire retained arena, including anchor and padding bytes.
+  kernel.launch @gdn_convolve_commit(%reference, %rows, %history_origin, %qkv, %weight, %expected, %convolved, %norm) : (tensor<771xi32>, tensor<95xi64>, offset, tensor<72x10240xbf16>, tensor<10240x4xf32>, tensor<20x848128xf32>, tensor<72x10240xbf16>, tensor<72x32xf32>)
+  kernel.launch @gdn_recur_commit(%reference, %rows, %state_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %expected, %replay_output) : (tensor<771xi32>, tensor<95xi64>, offset, tensor<72x10240xbf16>, tensor<72x32xf32>, tensor<72x48xf32>, tensor<72x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<20x848128xf32>, tensor<72x6144xbf16>)
+  kernel.launch @reference_ple_convolve(%ple_origin, %rows, %reference, %gated, %ple, %weight, %expected, %residual, %ple_output) : (offset, tensor<95xi64>, tensor<771xi32>, tensor<72x10240xbf16>, tensor<72x10240xbf16>, tensor<10240x4xf32>, tensor<20x848128xf32>, tensor<72x10240xbf16>, tensor<72x10240xbf16>)
+  kernel.launch @flash_next_ple_publish_history_commit(%ids_origin, %reference, %rows, %ids, %expected) : (offset, tensor<771xi32>, tensor<95xi64>, tensor<72xi32>, tensor<20x848128xf32>)
+  kernel.launch @qsa_publish_tail_commit(%qsa_origin, %reference, %rows, %raw_keys, %expected) : (offset, tensor<771xi32>, tensor<95xi64>, tensor<72x128xbf16>, tensor<20x848128xf32>)
+  check.expect.bitwise actual(%actual) expected(%expected) : tensor<20x848128xf32>
+  check.return
+}
+
+check.benchmark<@accepted_prefixes_preserve_all_state> @accepted_prefixes_preserve_all_state_benchmark

@@ -1,0 +1,437 @@
+// Prefix-normalized BF16 rows against an independent serial binary64 sum.
+// Three binary64 Newton steps remove the F32 reciprocal-root seed error.
+// Selected lengths cross packet boundaries. Nonzero buffer origins and exact
+// guards check ownership; the full output row verifies scaling beyond the prefix.
+
+template.decl @normalization.l2_prefix_bf16(%width: index, %dimension_count: i32, %minimum_norm_squared: f32, %normalized: view<[%width]xbf16>, %output: view<[%width]xf32>)
+
+func.def @prefix_reference(%width: index, %dimension_count: i32, %minimum_norm_squared: f32, %input_origin: offset, %output_origin: offset, %input: buffer, %output: buffer) {
+  %source = buffer.view %input[%input_origin] : buffer -> view<[%width]xbf16>
+  %target = buffer.view %output[%output_origin] : buffer -> view<[%width]xf32>
+  %begin = index.constant 0 : index
+  %element_step = index.constant 1 : index
+  %bounded = scalar.assume %dimension_count [range(%dimension_count, 1, 65504)] : i32
+  %count = index.cast %bounded : i32 to index
+  %dimensions = index.assume %count [le(%count, %width)] : index
+  %initial = scalar.constant 0.0 : f64
+  %squares = scf.for %position = [%begin to %dimensions step %element_step](%partial = %initial : f64) -> (f64) {
+    %stored = view.load %source[%position] : view<[%width]xbf16> -> bf16
+    %value = scalar.extf %stored : bf16 to f64
+    %square = scalar.mulf %value, %value : f64
+    %next = scalar.addf %partial, %square : f64
+    scf.yield %next : f64
+  }
+  %minimum = scalar.extf %minimum_norm_squared : f32 to f64
+  %denominator = scalar.maxnumf %squares, %minimum : f64
+  %seed_input = scalar.fptrunc %denominator : f64 to f32
+  %seed = scalar.rsqrtf<afn> %seed_input : f32
+  %seed_wide = scalar.extf %seed : f32 to f64
+  %one_half = scalar.constant 0.5 : f64
+  %three_halves = scalar.constant 1.5 : f64
+  %iterations = index.constant 3 : index
+  %half_input = scalar.mulf %denominator, %one_half : f64
+  %inverse = scf.for %iteration = [%begin to %iterations step %element_step](%prior = %seed_wide : f64) -> (f64) {
+    %square = scalar.mulf %prior, %prior : f64
+    %product = scalar.mulf %half_input, %square : f64
+    %correction = scalar.subf %three_halves, %product : f64
+    %next = scalar.mulf %prior, %correction : f64
+    scf.yield %next : f64
+  }
+  scf.for %position = [%begin to %width step %element_step] {
+    %stored = view.load %source[%position] : view<[%width]xbf16> -> bf16
+    %value = scalar.extf %stored : bf16 to f64
+    %scaled = scalar.mulf %value, %inverse : f64
+    %result = scalar.fptrunc %scaled : f64 to f32
+    view.store %result, %target[%position] : f32, view<[%width]xf32>
+  }
+  func.return
+}
+
+global.rodata.def @prefix_counts = align(4) bytes("010000000f00000010000000110000001f00000020000000010000001f00000020000000210000003f00000040000000010000003f00000040000000410000005f00000060000000010000001f0000002000000021000000ff0100000002000001020000ff03000000040000")
+
+func.def @prefix_count(%position: index) -> (i32) {
+  %ordinal = index.assume %position [range(%position, 0, 26)] : index
+  %origin = index.constant 0 : offset
+  %storage = global.load @prefix_counts : buffer
+  %values = buffer.view %storage[%origin] : buffer -> view<27xi32>
+  %count = view.load %values[%ordinal] : view<27xi32> -> i32
+  func.return %count : i32
+}
+
+func.def @initialize_prefix_count(%count: i32, %metadata: buffer) {
+  %origin = index.constant 0 : offset
+  %values = buffer.view %metadata[%origin] : buffer -> view<16xi32>
+  view.store %count, %values[0] : i32, view<16xi32>
+  func.return
+}
+
+func.def @initialize_prefix_trial(%trial: index, %base: index, %metadata: buffer) {
+  %position = index.add %base, %trial : index
+  %count = func.call @prefix_count(%position) : (index) -> (i32)
+  func.call @initialize_prefix_count(%count, %metadata) : (i32, buffer)
+  func.return
+}
+
+func.def @prefix_values_32(%metadata: buffer, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %parameters = buffer.view %metadata[%origin] : buffer -> view<16xi32>
+  %dimension_count = view.load %parameters[0] : view<16xi32> -> i32
+  %width = index.constant 32 : index
+  %input_origin = index.constant 64 : offset
+  %output_origin = index.constant 128 : offset
+  %minimum = scalar.constant 9.9999999999999992e-25 : f32
+  %source = buffer.view %input[%input_origin] : buffer -> view<[%width]xbf16>
+  %target = buffer.view %output[%output_origin] : buffer -> view<[%width]xf32>
+  template.apply<@normalization.l2_prefix_bf16>(%width, %dimension_count, %minimum, %source, %target) : (index, i32, f32, view<[%width]xbf16>, view<[%width]xf32>)
+  func.return
+}
+
+func.def @prefix_reference_32(%metadata: buffer, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %parameters = buffer.view %metadata[%origin] : buffer -> view<16xi32>
+  %dimension_count = view.load %parameters[0] : view<16xi32> -> i32
+  %width = index.constant 32 : index
+  %input_origin = index.constant 64 : offset
+  %output_origin = index.constant 128 : offset
+  %minimum = scalar.constant 9.9999999999999992e-25 : f32
+  func.call @prefix_reference(%width, %dimension_count, %minimum, %input_origin, %output_origin, %input, %output) : (index, i32, f32, offset, offset, buffer, buffer)
+  func.return
+}
+
+check.scenario @prefix_32_boundaries {
+  check.trial[6](%trial: index, %entropy: check.entropy) {
+    %base = check.literal value(0) : index
+    %metadata = check.generate.fill value(0) : tensor<16xi32>
+    check.generate<@initialize_prefix_trial>(%trial, %base, %metadata) : (index, index, tensor<16xi32>) -> ()
+    %input = check.generate.iota offset(-5.0) step(0.03125) : tensor<96xbf16>
+    %output = check.generate.fill value(127.0) : tensor<96xf32>
+    %prefix_guard = check.tensor.view %output offset(0) : tensor<96xf32> -> tensor<32xf32>
+    %suffix_guard = check.tensor.view %output offset(256) : tensor<96xf32> -> tensor<32xf32>
+    %expected_guard = check.generate.fill value(127.0) : tensor<32xf32>
+    check.compare<@prefix_values_32, @prefix_reference_32>(%metadata, %input, %output) : (tensor<16xi32>, tensor<96xbf16>, tensor<96xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(1.9999999999999999e-07) rtol(1.9999999999999999e-06) nan(same) : tensor<96xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<16xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<96xbf16>
+      check.expect.bitwise actual(%prefix_guard) expected(%expected_guard) : tensor<32xf32>
+      check.expect.bitwise actual(%suffix_guard) expected(%expected_guard) : tensor<32xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario @prefix_32_zero {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %count = check.literal value(32) : i32
+    %metadata = check.generate.fill value(0) : tensor<16xi32>
+    check.generate<@initialize_prefix_count>(%count, %metadata) : (i32, tensor<16xi32>) -> ()
+    %input = check.generate.fill value(0.0) : tensor<96xbf16>
+    %output = check.generate.fill value(127.0) : tensor<96xf32>
+    %prefix_guard = check.tensor.view %output offset(0) : tensor<96xf32> -> tensor<32xf32>
+    %suffix_guard = check.tensor.view %output offset(256) : tensor<96xf32> -> tensor<32xf32>
+    %expected_guard = check.generate.fill value(127.0) : tensor<32xf32>
+    check.compare<@prefix_values_32, @prefix_reference_32>(%metadata, %input, %output) : (tensor<16xi32>, tensor<96xbf16>, tensor<96xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(1.9999999999999999e-07) rtol(1.9999999999999999e-06) nan(same) : tensor<96xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<16xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<96xbf16>
+      check.expect.bitwise actual(%prefix_guard) expected(%expected_guard) : tensor<32xf32>
+      check.expect.bitwise actual(%suffix_guard) expected(%expected_guard) : tensor<32xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario @prefix_32_floor {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %count = check.literal value(32) : i32
+    %metadata = check.generate.fill value(0) : tensor<16xi32>
+    check.generate<@initialize_prefix_count>(%count, %metadata) : (i32, tensor<16xi32>) -> ()
+    %input = check.generate.fill value(1e-14) : tensor<96xbf16>
+    %output = check.generate.fill value(127.0) : tensor<96xf32>
+    %prefix_guard = check.tensor.view %output offset(0) : tensor<96xf32> -> tensor<32xf32>
+    %suffix_guard = check.tensor.view %output offset(256) : tensor<96xf32> -> tensor<32xf32>
+    %expected_guard = check.generate.fill value(127.0) : tensor<32xf32>
+    check.compare<@prefix_values_32, @prefix_reference_32>(%metadata, %input, %output) : (tensor<16xi32>, tensor<96xbf16>, tensor<96xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(1.9999999999999999e-07) rtol(1.9999999999999999e-06) nan(same) : tensor<96xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<16xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<96xbf16>
+      check.expect.bitwise actual(%prefix_guard) expected(%expected_guard) : tensor<32xf32>
+      check.expect.bitwise actual(%suffix_guard) expected(%expected_guard) : tensor<32xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@prefix_32_boundaries> @prefix_width_32
+
+func.def @prefix_values_64(%metadata: buffer, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %parameters = buffer.view %metadata[%origin] : buffer -> view<16xi32>
+  %dimension_count = view.load %parameters[0] : view<16xi32> -> i32
+  %width = index.constant 64 : index
+  %input_origin = index.constant 64 : offset
+  %output_origin = index.constant 128 : offset
+  %minimum = scalar.constant 9.9999999999999992e-25 : f32
+  %source = buffer.view %input[%input_origin] : buffer -> view<[%width]xbf16>
+  %target = buffer.view %output[%output_origin] : buffer -> view<[%width]xf32>
+  template.apply<@normalization.l2_prefix_bf16>(%width, %dimension_count, %minimum, %source, %target) : (index, i32, f32, view<[%width]xbf16>, view<[%width]xf32>)
+  func.return
+}
+
+func.def @prefix_reference_64(%metadata: buffer, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %parameters = buffer.view %metadata[%origin] : buffer -> view<16xi32>
+  %dimension_count = view.load %parameters[0] : view<16xi32> -> i32
+  %width = index.constant 64 : index
+  %input_origin = index.constant 64 : offset
+  %output_origin = index.constant 128 : offset
+  %minimum = scalar.constant 9.9999999999999992e-25 : f32
+  func.call @prefix_reference(%width, %dimension_count, %minimum, %input_origin, %output_origin, %input, %output) : (index, i32, f32, offset, offset, buffer, buffer)
+  func.return
+}
+
+check.scenario @prefix_64_boundaries {
+  check.trial[6](%trial: index, %entropy: check.entropy) {
+    %base = check.literal value(6) : index
+    %metadata = check.generate.fill value(0) : tensor<16xi32>
+    check.generate<@initialize_prefix_trial>(%trial, %base, %metadata) : (index, index, tensor<16xi32>) -> ()
+    %input = check.generate.iota offset(-5.0) step(0.03125) : tensor<128xbf16>
+    %output = check.generate.fill value(127.0) : tensor<128xf32>
+    %prefix_guard = check.tensor.view %output offset(0) : tensor<128xf32> -> tensor<32xf32>
+    %suffix_guard = check.tensor.view %output offset(384) : tensor<128xf32> -> tensor<32xf32>
+    %expected_guard = check.generate.fill value(127.0) : tensor<32xf32>
+    check.compare<@prefix_values_64, @prefix_reference_64>(%metadata, %input, %output) : (tensor<16xi32>, tensor<128xbf16>, tensor<128xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(1.9999999999999999e-07) rtol(1.9999999999999999e-06) nan(same) : tensor<128xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<16xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<128xbf16>
+      check.expect.bitwise actual(%prefix_guard) expected(%expected_guard) : tensor<32xf32>
+      check.expect.bitwise actual(%suffix_guard) expected(%expected_guard) : tensor<32xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario @prefix_64_zero {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %count = check.literal value(64) : i32
+    %metadata = check.generate.fill value(0) : tensor<16xi32>
+    check.generate<@initialize_prefix_count>(%count, %metadata) : (i32, tensor<16xi32>) -> ()
+    %input = check.generate.fill value(0.0) : tensor<128xbf16>
+    %output = check.generate.fill value(127.0) : tensor<128xf32>
+    %prefix_guard = check.tensor.view %output offset(0) : tensor<128xf32> -> tensor<32xf32>
+    %suffix_guard = check.tensor.view %output offset(384) : tensor<128xf32> -> tensor<32xf32>
+    %expected_guard = check.generate.fill value(127.0) : tensor<32xf32>
+    check.compare<@prefix_values_64, @prefix_reference_64>(%metadata, %input, %output) : (tensor<16xi32>, tensor<128xbf16>, tensor<128xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(1.9999999999999999e-07) rtol(1.9999999999999999e-06) nan(same) : tensor<128xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<16xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<128xbf16>
+      check.expect.bitwise actual(%prefix_guard) expected(%expected_guard) : tensor<32xf32>
+      check.expect.bitwise actual(%suffix_guard) expected(%expected_guard) : tensor<32xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario @prefix_64_floor {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %count = check.literal value(64) : i32
+    %metadata = check.generate.fill value(0) : tensor<16xi32>
+    check.generate<@initialize_prefix_count>(%count, %metadata) : (i32, tensor<16xi32>) -> ()
+    %input = check.generate.fill value(1e-14) : tensor<128xbf16>
+    %output = check.generate.fill value(127.0) : tensor<128xf32>
+    %prefix_guard = check.tensor.view %output offset(0) : tensor<128xf32> -> tensor<32xf32>
+    %suffix_guard = check.tensor.view %output offset(384) : tensor<128xf32> -> tensor<32xf32>
+    %expected_guard = check.generate.fill value(127.0) : tensor<32xf32>
+    check.compare<@prefix_values_64, @prefix_reference_64>(%metadata, %input, %output) : (tensor<16xi32>, tensor<128xbf16>, tensor<128xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(1.9999999999999999e-07) rtol(1.9999999999999999e-06) nan(same) : tensor<128xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<16xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<128xbf16>
+      check.expect.bitwise actual(%prefix_guard) expected(%expected_guard) : tensor<32xf32>
+      check.expect.bitwise actual(%suffix_guard) expected(%expected_guard) : tensor<32xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@prefix_64_boundaries> @prefix_width_64
+
+func.def @prefix_values_96(%metadata: buffer, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %parameters = buffer.view %metadata[%origin] : buffer -> view<16xi32>
+  %dimension_count = view.load %parameters[0] : view<16xi32> -> i32
+  %width = index.constant 96 : index
+  %input_origin = index.constant 64 : offset
+  %output_origin = index.constant 128 : offset
+  %minimum = scalar.constant 9.9999999999999992e-25 : f32
+  %source = buffer.view %input[%input_origin] : buffer -> view<[%width]xbf16>
+  %target = buffer.view %output[%output_origin] : buffer -> view<[%width]xf32>
+  template.apply<@normalization.l2_prefix_bf16>(%width, %dimension_count, %minimum, %source, %target) : (index, i32, f32, view<[%width]xbf16>, view<[%width]xf32>)
+  func.return
+}
+
+func.def @prefix_reference_96(%metadata: buffer, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %parameters = buffer.view %metadata[%origin] : buffer -> view<16xi32>
+  %dimension_count = view.load %parameters[0] : view<16xi32> -> i32
+  %width = index.constant 96 : index
+  %input_origin = index.constant 64 : offset
+  %output_origin = index.constant 128 : offset
+  %minimum = scalar.constant 9.9999999999999992e-25 : f32
+  func.call @prefix_reference(%width, %dimension_count, %minimum, %input_origin, %output_origin, %input, %output) : (index, i32, f32, offset, offset, buffer, buffer)
+  func.return
+}
+
+check.scenario @prefix_96_boundaries {
+  check.trial[6](%trial: index, %entropy: check.entropy) {
+    %base = check.literal value(12) : index
+    %metadata = check.generate.fill value(0) : tensor<16xi32>
+    check.generate<@initialize_prefix_trial>(%trial, %base, %metadata) : (index, index, tensor<16xi32>) -> ()
+    %input = check.generate.iota offset(-5.0) step(0.03125) : tensor<160xbf16>
+    %output = check.generate.fill value(127.0) : tensor<160xf32>
+    %prefix_guard = check.tensor.view %output offset(0) : tensor<160xf32> -> tensor<32xf32>
+    %suffix_guard = check.tensor.view %output offset(512) : tensor<160xf32> -> tensor<32xf32>
+    %expected_guard = check.generate.fill value(127.0) : tensor<32xf32>
+    check.compare<@prefix_values_96, @prefix_reference_96>(%metadata, %input, %output) : (tensor<16xi32>, tensor<160xbf16>, tensor<160xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(1.9999999999999999e-07) rtol(1.9999999999999999e-06) nan(same) : tensor<160xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<16xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<160xbf16>
+      check.expect.bitwise actual(%prefix_guard) expected(%expected_guard) : tensor<32xf32>
+      check.expect.bitwise actual(%suffix_guard) expected(%expected_guard) : tensor<32xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario @prefix_96_zero {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %count = check.literal value(96) : i32
+    %metadata = check.generate.fill value(0) : tensor<16xi32>
+    check.generate<@initialize_prefix_count>(%count, %metadata) : (i32, tensor<16xi32>) -> ()
+    %input = check.generate.fill value(0.0) : tensor<160xbf16>
+    %output = check.generate.fill value(127.0) : tensor<160xf32>
+    %prefix_guard = check.tensor.view %output offset(0) : tensor<160xf32> -> tensor<32xf32>
+    %suffix_guard = check.tensor.view %output offset(512) : tensor<160xf32> -> tensor<32xf32>
+    %expected_guard = check.generate.fill value(127.0) : tensor<32xf32>
+    check.compare<@prefix_values_96, @prefix_reference_96>(%metadata, %input, %output) : (tensor<16xi32>, tensor<160xbf16>, tensor<160xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(1.9999999999999999e-07) rtol(1.9999999999999999e-06) nan(same) : tensor<160xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<16xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<160xbf16>
+      check.expect.bitwise actual(%prefix_guard) expected(%expected_guard) : tensor<32xf32>
+      check.expect.bitwise actual(%suffix_guard) expected(%expected_guard) : tensor<32xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario @prefix_96_floor {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %count = check.literal value(96) : i32
+    %metadata = check.generate.fill value(0) : tensor<16xi32>
+    check.generate<@initialize_prefix_count>(%count, %metadata) : (i32, tensor<16xi32>) -> ()
+    %input = check.generate.fill value(1e-14) : tensor<160xbf16>
+    %output = check.generate.fill value(127.0) : tensor<160xf32>
+    %prefix_guard = check.tensor.view %output offset(0) : tensor<160xf32> -> tensor<32xf32>
+    %suffix_guard = check.tensor.view %output offset(512) : tensor<160xf32> -> tensor<32xf32>
+    %expected_guard = check.generate.fill value(127.0) : tensor<32xf32>
+    check.compare<@prefix_values_96, @prefix_reference_96>(%metadata, %input, %output) : (tensor<16xi32>, tensor<160xbf16>, tensor<160xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(1.9999999999999999e-07) rtol(1.9999999999999999e-06) nan(same) : tensor<160xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<16xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<160xbf16>
+      check.expect.bitwise actual(%prefix_guard) expected(%expected_guard) : tensor<32xf32>
+      check.expect.bitwise actual(%suffix_guard) expected(%expected_guard) : tensor<32xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@prefix_96_boundaries> @prefix_width_96
+
+func.def @prefix_values_1024(%metadata: buffer, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %parameters = buffer.view %metadata[%origin] : buffer -> view<16xi32>
+  %dimension_count = view.load %parameters[0] : view<16xi32> -> i32
+  %width = index.constant 1024 : index
+  %input_origin = index.constant 64 : offset
+  %output_origin = index.constant 128 : offset
+  %minimum = scalar.constant 9.9999999999999992e-25 : f32
+  %source = buffer.view %input[%input_origin] : buffer -> view<[%width]xbf16>
+  %target = buffer.view %output[%output_origin] : buffer -> view<[%width]xf32>
+  template.apply<@normalization.l2_prefix_bf16>(%width, %dimension_count, %minimum, %source, %target) : (index, i32, f32, view<[%width]xbf16>, view<[%width]xf32>)
+  func.return
+}
+
+func.def @prefix_reference_1024(%metadata: buffer, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %parameters = buffer.view %metadata[%origin] : buffer -> view<16xi32>
+  %dimension_count = view.load %parameters[0] : view<16xi32> -> i32
+  %width = index.constant 1024 : index
+  %input_origin = index.constant 64 : offset
+  %output_origin = index.constant 128 : offset
+  %minimum = scalar.constant 9.9999999999999992e-25 : f32
+  func.call @prefix_reference(%width, %dimension_count, %minimum, %input_origin, %output_origin, %input, %output) : (index, i32, f32, offset, offset, buffer, buffer)
+  func.return
+}
+
+check.scenario @prefix_1024_boundaries {
+  check.trial[9](%trial: index, %entropy: check.entropy) {
+    %base = check.literal value(18) : index
+    %metadata = check.generate.fill value(0) : tensor<16xi32>
+    check.generate<@initialize_prefix_trial>(%trial, %base, %metadata) : (index, index, tensor<16xi32>) -> ()
+    %input = check.generate.iota offset(-5.0) step(0.03125) : tensor<1088xbf16>
+    %output = check.generate.fill value(127.0) : tensor<1088xf32>
+    %prefix_guard = check.tensor.view %output offset(0) : tensor<1088xf32> -> tensor<32xf32>
+    %suffix_guard = check.tensor.view %output offset(4224) : tensor<1088xf32> -> tensor<32xf32>
+    %expected_guard = check.generate.fill value(127.0) : tensor<32xf32>
+    check.compare<@prefix_values_1024, @prefix_reference_1024>(%metadata, %input, %output) : (tensor<16xi32>, tensor<1088xbf16>, tensor<1088xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(1.9999999999999999e-07) rtol(1.9999999999999999e-06) nan(same) : tensor<1088xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<16xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<1088xbf16>
+      check.expect.bitwise actual(%prefix_guard) expected(%expected_guard) : tensor<32xf32>
+      check.expect.bitwise actual(%suffix_guard) expected(%expected_guard) : tensor<32xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario @prefix_1024_zero {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %count = check.literal value(1024) : i32
+    %metadata = check.generate.fill value(0) : tensor<16xi32>
+    check.generate<@initialize_prefix_count>(%count, %metadata) : (i32, tensor<16xi32>) -> ()
+    %input = check.generate.fill value(0.0) : tensor<1088xbf16>
+    %output = check.generate.fill value(127.0) : tensor<1088xf32>
+    %prefix_guard = check.tensor.view %output offset(0) : tensor<1088xf32> -> tensor<32xf32>
+    %suffix_guard = check.tensor.view %output offset(4224) : tensor<1088xf32> -> tensor<32xf32>
+    %expected_guard = check.generate.fill value(127.0) : tensor<32xf32>
+    check.compare<@prefix_values_1024, @prefix_reference_1024>(%metadata, %input, %output) : (tensor<16xi32>, tensor<1088xbf16>, tensor<1088xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(1.9999999999999999e-07) rtol(1.9999999999999999e-06) nan(same) : tensor<1088xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<16xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<1088xbf16>
+      check.expect.bitwise actual(%prefix_guard) expected(%expected_guard) : tensor<32xf32>
+      check.expect.bitwise actual(%suffix_guard) expected(%expected_guard) : tensor<32xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario @prefix_1024_floor {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %count = check.literal value(1024) : i32
+    %metadata = check.generate.fill value(0) : tensor<16xi32>
+    check.generate<@initialize_prefix_count>(%count, %metadata) : (i32, tensor<16xi32>) -> ()
+    %input = check.generate.fill value(1e-14) : tensor<1088xbf16>
+    %output = check.generate.fill value(127.0) : tensor<1088xf32>
+    %prefix_guard = check.tensor.view %output offset(0) : tensor<1088xf32> -> tensor<32xf32>
+    %suffix_guard = check.tensor.view %output offset(4224) : tensor<1088xf32> -> tensor<32xf32>
+    %expected_guard = check.generate.fill value(127.0) : tensor<32xf32>
+    check.compare<@prefix_values_1024, @prefix_reference_1024>(%metadata, %input, %output) : (tensor<16xi32>, tensor<1088xbf16>, tensor<1088xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(1.9999999999999999e-07) rtol(1.9999999999999999e-06) nan(same) : tensor<1088xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<16xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<1088xbf16>
+      check.expect.bitwise actual(%prefix_guard) expected(%expected_guard) : tensor<32xf32>
+      check.expect.bitwise actual(%suffix_guard) expected(%expected_guard) : tensor<32xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@prefix_1024_boundaries> @prefix_width_1024

@@ -1,0 +1,496 @@
+// Categorical sampling checks against ordinal-rank support selection and
+// independent F64 race evaluation. Covers greedy ties, top-k/nucleus
+// combinations, excluded IDs, non-power-of-two tails, and a 248320-token
+// vocabulary with analytically known support.
+
+amdgpu.target<gfx11-generic> @sampling_wave32 {subgroup_size = 32}
+
+template.decl @sampling.categorical_f32(%columns: index, %logits: buffer, %logits_origin: offset, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64) -> (i32)
+
+template.decl @sampling.categorical_excluding_f32(%columns: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64) -> (i32)
+
+// The integer counter contract has its own exact known-answer checks.
+// This oracle independently evaluates the race with F64 logarithms; it never
+// calls the device sampler's key, support-partition, or race implementation.
+template.decl @random.philox4x32(%counter0: i32, %counter1: i32, %counter2: i32, %counter3: i32, %seed0: i32, %seed1: i32) -> (i32, i32, i32, i32)
+
+// Positive normal F64 logarithm for the scalar oracle. Decompose x = m*2^e,
+// with m in [1, 2), and evaluate log(m) = 2*atanh((m-1)/(m+1)). Twenty terms
+// leave a truncation error below 2e-21 because the series argument is <1/3.
+// The VM need only supply ordinary F64 arithmetic, not a logarithm recipe.
+func.def @reference_log(%value: f64) -> (f64) {
+  %bits = scalar.bitcast %value : f64 to i64
+  %mantissa_bits = scalar.constant 4503599627370495 : i64
+  %unit_exponent_bits = scalar.constant 4607182418800017408 : i64
+  %exponent_shift = scalar.constant 52 : i64
+  %bias = scalar.constant 1023 : i64
+  %fraction = scalar.andi %bits, %mantissa_bits : i64
+  %normalized_bits = scalar.ori %fraction, %unit_exponent_bits : i64
+  %mantissa = scalar.bitcast %normalized_bits : i64 to f64
+  %encoded_exponent = scalar.shrui %bits, %exponent_shift : i64
+  %exponent = scalar.subi %encoded_exponent, %bias : i64
+  %exponent_float = scalar.sitofp %exponent : i64 to f64
+  %c1 = scalar.constant 1.0 : f64
+  %c2 = scalar.constant 2.0 : f64
+  %initial = scalar.constant 0.0 : f64
+  %log_two = scalar.constant 0.69314718055994529 : f64
+  %difference = scalar.subf %mantissa, %c1 : f64
+  %sum = scalar.addf %mantissa, %c1 : f64
+  %argument = scalar.divf %difference, %sum : f64
+  %square = scalar.mulf %argument, %argument : f64
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %terms = index.constant 20 : index
+  %series, %unused_power, %unused_denominator = scf.for %term = [%begin to %terms step %step](%accumulator = %initial : f64, %power = %argument : f64, %denominator = %c1 : f64) -> (f64, f64, f64) {
+    %contribution = scalar.divf %power, %denominator : f64
+    %next = scalar.addf %accumulator, %contribution : f64
+    %next_power = scalar.mulf %power, %square : f64
+    %next_denominator = scalar.addf %denominator, %c2 : f64
+    scf.yield %next, %next_power, %next_denominator : f64, f64, f64
+  }
+  %log_mantissa = scalar.mulf %c2, %series : f64
+  %log_exponent = scalar.mulf %exponent_float, %log_two : f64
+  %result = scalar.addf %log_mantissa, %log_exponent : f64
+  func.return %result : f64
+}
+
+func.def @reference_race(%logit: f32, %maximum: f32, %temperature: f32, %seed: i64, %position: i64, %id: i32) -> (f32) {
+  %word_shift = scalar.constant 32 : i64
+  %seed_high = scalar.shrui %seed, %word_shift : i64
+  %position_high = scalar.shrui %position, %word_shift : i64
+  %key_low = scalar.trunci %seed : i64 to i32
+  %key_high = scalar.trunci %seed_high : i64 to i32
+  %position_low = scalar.trunci %position : i64 to i32
+  %position_high_word = scalar.trunci %position_high : i64 to i32
+  %domain = scalar.constant 0 : i32
+  %word, %unused1, %unused2, %unused3 = template.apply<@random.philox4x32>(%id, %position_low, %position_high_word, %domain, %key_low, %key_high) : (i32, i32, i32, i32, i32, i32) -> (i32, i32, i32, i32)
+  %mantissa_shift = scalar.constant 8 : i32
+  %mantissa = scalar.shrui %word, %mantissa_shift : i32
+  %value = scalar.uitofp %mantissa : i32 to f32
+  %half_bin = scalar.constant 0.5 : f32
+  %unit_scale = scalar.constant 5.9604644775390625e-08 : f32
+  %open_upper = scalar.constant 0.99999994039535522 : f32
+  %center = scalar.addf %value, %half_bin : f32
+  %unit = scalar.mulf %center, %unit_scale : f32
+  %uniform = scalar.minnumf %unit, %open_upper : f32
+  %uniform64 = scalar.extf %uniform : f32 to f64
+  %log_uniform = func.call @reference_log(%uniform64) : (f64) -> (f64)
+  %exponential = scalar.negf %log_uniform : f64
+  %noise = func.call @reference_log(%exponential) : (f64) -> (f64)
+  %logit64 = scalar.extf %logit : f32 to f64
+  %maximum64 = scalar.extf %maximum : f32 to f64
+  %temperature64 = scalar.extf %temperature : f32 to f64
+  %centered = scalar.subf %logit64, %maximum64 : f64
+  %scaled = scalar.divf %centered, %temperature64 : f64
+  %score = scalar.subf %scaled, %noise : f64
+  %result = scalar.fptrunc %score : f64 to f32
+  func.return %result : f32
+}
+
+kernel.def target(@sampling_wave32) @sample(%columns: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%columns: index, %logits: buffer, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64, %output: buffer) {
+  %logits_origin = index.constant 0 : offset
+  %token = template.apply<@sampling.categorical_f32>(%columns, %logits, %logits_origin, %temperature, %top_p, %top_k, %seed, %position) : (index, buffer, offset, f32, f32, i32, i64, i64) -> (i32)
+  %thread = kernel.workitem.id<x> : index
+  %leader_index = index.constant 0 : index
+  %leader = index.cmp eq, %thread, %leader_index : index
+  scf.if %leader {
+    %origin = index.constant 0 : offset
+    %result = buffer.view %output[%origin] : buffer -> view<1xi32>
+    view.store %token, %result[0] : i32, view<1xi32>
+  }
+  kernel.return
+}
+
+// Independent ordinal-rank oracle. Each candidate counts its predecessors
+// directly instead of using the device's key interval or partition algorithm.
+func.def @reference(%columns: index, %logits: buffer, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64, %output: buffer) {
+  %none = scalar.constant -1 : i32
+  func.call @reference_excluding(%columns, %logits, %none, %temperature, %top_p, %top_k, %seed, %position, %output) : (index, buffer, i32, f32, f32, i32, i64, i64, buffer)
+  func.return
+}
+
+func.def @reference_excluding(%columns: index, %logits: buffer, %excluded_id: i32, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %zero_mass = scalar.constant 0.0 : f32
+  %negative = scalar.constant -inf : f32
+  %zero32 = scalar.constant 0 : i32
+  %one32 = scalar.constant 1 : i32
+  %largest = scalar.constant 2147483647 : i32
+  %input = buffer.view %logits[%origin] : buffer -> view<[%columns]xf32>
+  %result = buffer.view %output[%origin] : buffer -> view<1xi32>
+  %bytes_per_element = index.constant 4 : offset
+  %bytes = index.scale %columns, %bytes_per_element : index, offset -> offset
+  %rank_storage = buffer.alloca<private> align(4) %bytes : buffer
+  %weight_storage = buffer.alloca<private> align(4) %bytes : buffer
+  %ranks = buffer.view %rank_storage[%origin] : buffer -> view<[%columns]xi32>
+  %weights = buffer.view %weight_storage[%origin] : buffer -> view<[%columns]xf32>
+  %maximum = scf.for %column = [%c0 to %columns step %c1](%best = %negative : f32) -> (f32) {
+    %value = view.load %input[%column] : view<[%columns]xf32> -> f32
+    %id = index.cast %column : index to i32
+    %permitted = scalar.cmpi ne, %id, %excluded_id : i32
+    %eligible = scf.select %permitted, %value, %negative : f32
+    %next = scalar.maxnumf %best, %eligible : f32
+    scf.yield %next : f32
+  }
+  %vocabulary = index.cast %columns : index to i32
+  %unbounded = scalar.cmpi eq, %top_k, %zero32 : i32
+  %limit = scf.select %unbounded, %vocabulary, %top_k : i32
+  %greedy = scalar.cmpf oeq, %temperature, %zero_mass : f32
+  %neutral_temperature = scalar.constant 1.0 : f32
+  %safe_temperature = scf.select %greedy, %neutral_temperature, %temperature : f32
+  %total = scf.for %column = [%c0 to %columns step %c1](%total = %zero_mass : f32) -> (f32) {
+    %value = view.load %input[%column] : view<[%columns]xf32> -> f32
+    %rank = scf.for %other = [%c0 to %columns step %c1](%rank = %zero32 : i32) -> (i32) {
+      %candidate = view.load %input[%other] : view<[%columns]xf32> -> f32
+      %greater = scalar.cmpf ogt, %candidate, %value : f32
+      %equal = scalar.cmpf oeq, %candidate, %value : f32
+      %earlier = index.cmp ult, %other, %column : index
+      %tie = scalar.andi %equal, %earlier : i1
+      %before = scalar.ori %greater, %tie : i1
+      %id = index.cast %other : index to i32
+      %permitted = scalar.cmpi ne, %id, %excluded_id : i32
+      %predecessor = scalar.andi %before, %permitted : i1
+      %increment = scalar.extui %predecessor : i1 to i32
+      %next = scalar.addi %rank, %increment : i32
+      scf.yield %next : i32
+    }
+    view.store %rank, %ranks[%column] : i32, view<[%columns]xi32>
+    %within_k = scalar.cmpi slt, %rank, %limit : i32
+    %id = index.cast %column : index to i32
+    %permitted = scalar.cmpi ne, %id, %excluded_id : i32
+    %eligible = scalar.andi %within_k, %permitted : i1
+    %difference = scalar.subf %value, %maximum : f32
+    %scaled = scalar.divf %difference, %safe_temperature : f32
+    %exponential = scalar.expf<afn> %scaled : f32
+    %weight = scf.select %eligible, %exponential, %zero_mass : f32
+    view.store %weight, %weights[%column] : f32, view<[%columns]xf32>
+    %next = scalar.addf %total, %weight : f32
+    scf.yield %next : f32
+  }
+  %target = scalar.mulf %total, %top_p : f32
+  %best, %token = scf.for %column = [%c0 to %columns step %c1](%best = %negative : f32, %id = %largest : i32) -> (f32, i32) {
+    %rank = view.load %ranks[%column] : view<[%columns]xi32> -> i32
+    %prefix = scf.for %other = [%c0 to %columns step %c1](%mass = %zero_mass : f32) -> (f32) {
+      %other_rank = view.load %ranks[%other] : view<[%columns]xi32> -> i32
+      %weight = view.load %weights[%other] : view<[%columns]xf32> -> f32
+      %earlier = scalar.cmpi slt, %other_rank, %rank : i32
+      %contribution = scf.select %earlier, %weight, %zero_mass : f32
+      %next = scalar.addf %mass, %contribution : f32
+      scf.yield %next : f32
+    }
+    %within_k = scalar.cmpi slt, %rank, %limit : i32
+    %within_p = scalar.cmpf olt, %prefix, %target : f32
+    %first = scalar.cmpi eq, %rank, %zero32 : i32
+    %selected = scalar.andi %within_k, %within_p : i1
+    %in_support = scf.select %greedy, %first, %selected : i1
+    %column_id = index.cast %column : index to i32
+    %permitted = scalar.cmpi ne, %column_id, %excluded_id : i32
+    %eligible = scalar.andi %in_support, %permitted : i1
+    %next_best, %next_id = scf.if %eligible -> (f32, i32) {
+      %value = view.load %input[%column] : view<[%columns]xf32> -> f32
+      %candidate_id = index.cast %column : index to i32
+      %race = scf.if %greedy -> (f32) {
+        scf.yield %value : f32
+      } else {
+        %race = func.call @reference_race(%value, %maximum, %temperature, %seed, %position, %candidate_id) : (f32, f32, f32, i64, i64, i32) -> (f32)
+        scf.yield %race : f32
+      }
+      %better = scalar.cmpf ogt, %race, %best : f32
+      %next = scf.select %better, %race, %best : f32
+      %next_id = scf.select %better, %candidate_id, %id : i32
+      scf.yield %next, %next_id : f32, i32
+    } else {
+      scf.yield %best, %id : f32, i32
+    }
+    scf.yield %next_best, %next_id : f32, i32
+  }
+  view.store %token, %result[0] : i32, view<1xi32>
+  func.return
+}
+
+kernel.def target(@sampling_wave32) @sample_excluding(%columns: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%columns: index, %logits: buffer, %excluded_id: i32, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %token = template.apply<@sampling.categorical_excluding_f32>(%columns, %logits, %origin, %excluded_id, %temperature, %top_p, %top_k, %seed, %position) : (index, buffer, offset, i32, f32, f32, i32, i64, i64) -> (i32)
+  %thread = kernel.workitem.id<x> : index
+  %leader_index = index.constant 0 : index
+  %leader = index.cmp eq, %thread, %leader_index : index
+  scf.if %leader {
+    %result = buffer.view %output[%origin] : buffer -> view<1xi32>
+    view.store %token, %result[0] : i32, view<1xi32>
+  }
+  kernel.return
+}
+
+func.def @exclusion_policy(%trial: index) -> (i32, f32, f32, i32) {
+  %ordinal = index.cast %trial : index to i32
+  %none = scalar.constant -1 : i32
+  %c0 = scalar.constant 0 : i32
+  %c1 = scalar.constant 1 : i32
+  %c2 = scalar.constant 2 : i32
+  %c3 = scalar.constant 3 : i32
+  %c4 = scalar.constant 4 : i32
+  %c8 = scalar.constant 8 : i32
+  %c16 = scalar.constant 16 : i32
+  %c20 = scalar.constant 20 : i32
+  %tail = scalar.constant 66 : i32
+  %c100 = scalar.constant 100 : i32
+  %excluded_index = scalar.andi %ordinal, %c3 : i32
+  %first = scalar.cmpi eq, %excluded_index, %c0 : i32
+  %second = scalar.cmpi eq, %excluded_index, %c1 : i32
+  %third = scalar.cmpi eq, %excluded_index, %c2 : i32
+  %last_pair = scf.select %third, %c16, %tail : i32
+  %present = scf.select %second, %c0, %last_pair : i32
+  %excluded = scf.select %first, %none, %present : i32
+  %temperature_bit = scalar.andi %ordinal, %c4 : i32
+  %sampled = scalar.cmpi ne, %temperature_bit, %c0 : i32
+  %greedy_temperature = scalar.constant 0.0 : f32
+  %sample_temperature = scalar.constant 0.69999999999999996 : f32
+  %temperature = scf.select %sampled, %sample_temperature, %greedy_temperature : f32
+  %nucleus_bit = scalar.andi %ordinal, %c8 : i32
+  %nucleus = scalar.cmpi ne, %nucleus_bit, %c0 : i32
+  %all_mass = scalar.constant 1.0 : f32
+  %partial_mass = scalar.constant 0.72999999999999998 : f32
+  %top_p = scf.select %nucleus, %partial_mass, %all_mass : f32
+  %k_index = scalar.shrui %ordinal, %c4 : i32
+  %unbounded = scalar.cmpi eq, %k_index, %c0 : i32
+  %single = scalar.cmpi eq, %k_index, %c1 : i32
+  %bounded = scalar.cmpi eq, %k_index, %c2 : i32
+  %wide_k = scf.select %bounded, %c20, %c100 : i32
+  %nonzero_k = scf.select %single, %c1, %wide_k : i32
+  %top_k = scf.select %unbounded, %c0, %nonzero_k : i32
+  func.return %excluded, %temperature, %top_p, %top_k : i32, f32, f32, i32
+}
+
+// Exclude the leading tied maximum, a low logit, the final tail element, or
+// nothing. Cross greedy, top-k=1, bounded and unbounded support, and nucleus.
+check.scenario public @sampling_exclusion {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[64](%trial: index, %entropy: check.entropy) {
+    %columns = check.literal value(67) : index
+    %excluded, %temperature, %top_p, %top_k = check.generate<@exclusion_policy>(%trial) : (index) -> (i32, f32, f32, i32)
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %position = check.literal value(117) : i64
+    %input = check.generate.iota offset(-1.0) step(0.125) period(17) : tensor<67xf32>
+    %output = check.generate.fill value(-1) : tensor<1xi32>
+    check.compare<@sample_excluding, @reference_excluding>[%columns](%columns, %input, %excluded, %temperature, %top_p, %top_k, %seed, %position, %output) : [index](index, tensor<67xf32>, i32, f32, f32, i32, i64, i64, tensor<1xi32>) -> () {
+      check.expect.equal actual(%output) expected(%output) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @sampling_greedy {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[12](%trial: index, %entropy: check.entropy) {
+    %columns = check.literal value(67) : index
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %position = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.iota offset(-1.0) step(0.125) period(17) : tensor<67xf32>
+    %output = check.generate.fill value(-1) : tensor<1xi32>
+    %temperature = check.literal value(0.0) : f32
+    %top_p = check.literal value(1.0) : f32
+    %top_k = check.literal value(0) : i32
+    check.compare<@sample, @reference>[%columns](%columns, %input, %temperature, %top_p, %top_k, %seed, %position, %output) : [index](index, tensor<67xf32>, f32, f32, i32, i64, i64, tensor<1xi32>) -> () {
+      check.expect.equal actual(%output) expected(%output) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @sampling_full {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[12](%trial: index, %entropy: check.entropy) {
+    %columns = check.literal value(67) : index
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %position = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.iota offset(-1.0) step(0.125) period(17) : tensor<67xf32>
+    %output = check.generate.fill value(-1) : tensor<1xi32>
+    %temperature = check.literal value(0.69999999999999996) : f32
+    %top_p = check.literal value(1.0) : f32
+    %top_k = check.literal value(0) : i32
+    check.compare<@sample, @reference>[%columns](%columns, %input, %temperature, %top_p, %top_k, %seed, %position, %output) : [index](index, tensor<67xf32>, f32, f32, i32, i64, i64, tensor<1xi32>) -> () {
+      check.expect.equal actual(%output) expected(%output) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @sampling_nucleus {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[12](%trial: index, %entropy: check.entropy) {
+    %columns = check.literal value(67) : index
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %position = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.iota offset(-1.0) step(0.125) period(17) : tensor<67xf32>
+    %output = check.generate.fill value(-1) : tensor<1xi32>
+    %temperature = check.literal value(0.69999999999999996) : f32
+    %top_p = check.literal value(0.72999999999999998) : f32
+    %top_k = check.literal value(0) : i32
+    check.compare<@sample, @reference>[%columns](%columns, %input, %temperature, %top_p, %top_k, %seed, %position, %output) : [index](index, tensor<67xf32>, f32, f32, i32, i64, i64, tensor<1xi32>) -> () {
+      check.expect.equal actual(%output) expected(%output) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @sampling_single {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[12](%trial: index, %entropy: check.entropy) {
+    %columns = check.literal value(67) : index
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %position = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.iota offset(-1.0) step(0.125) period(17) : tensor<67xf32>
+    %output = check.generate.fill value(-1) : tensor<1xi32>
+    %temperature = check.literal value(0.69999999999999996) : f32
+    %top_p = check.literal value(0.72999999999999998) : f32
+    %top_k = check.literal value(1) : i32
+    check.compare<@sample, @reference>[%columns](%columns, %input, %temperature, %top_p, %top_k, %seed, %position, %output) : [index](index, tensor<67xf32>, f32, f32, i32, i64, i64, tensor<1xi32>) -> () {
+      check.expect.equal actual(%output) expected(%output) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @sampling_small {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[12](%trial: index, %entropy: check.entropy) {
+    %columns = check.literal value(67) : index
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %position = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.iota offset(-1.0) step(0.125) period(17) : tensor<67xf32>
+    %output = check.generate.fill value(-1) : tensor<1xi32>
+    %temperature = check.literal value(0.69999999999999996) : f32
+    %top_p = check.literal value(0.72999999999999998) : f32
+    %top_k = check.literal value(20) : i32
+    check.compare<@sample, @reference>[%columns](%columns, %input, %temperature, %top_p, %top_k, %seed, %position, %output) : [index](index, tensor<67xf32>, f32, f32, i32, i64, i64, tensor<1xi32>) -> () {
+      check.expect.equal actual(%output) expected(%output) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @sampling_large {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[12](%trial: index, %entropy: check.entropy) {
+    %columns = check.literal value(67) : index
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %position = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.iota offset(-1.0) step(0.125) period(17) : tensor<67xf32>
+    %output = check.generate.fill value(-1) : tensor<1xi32>
+    %temperature = check.literal value(0.69999999999999996) : f32
+    %top_p = check.literal value(1.0) : f32
+    %top_k = check.literal value(66) : i32
+    check.compare<@sample, @reference>[%columns](%columns, %input, %temperature, %top_p, %top_k, %seed, %position, %output) : [index](index, tensor<67xf32>, f32, f32, i32, i64, i64, tensor<1xi32>) -> () {
+      check.expect.equal actual(%output) expected(%output) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @sampling_beyond {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[12](%trial: index, %entropy: check.entropy) {
+    %columns = check.literal value(67) : index
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %position = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.iota offset(-1.0) step(0.125) period(17) : tensor<67xf32>
+    %output = check.generate.fill value(-1) : tensor<1xi32>
+    %temperature = check.literal value(0.69999999999999996) : f32
+    %top_p = check.literal value(0.72999999999999998) : f32
+    %top_k = check.literal value(100) : i32
+    check.compare<@sample, @reference>[%columns](%columns, %input, %temperature, %top_p, %top_k, %seed, %position, %output) : [index](index, tensor<67xf32>, f32, f32, i32, i64, i64, tensor<1xi32>) -> () {
+      check.expect.equal actual(%output) expected(%output) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+// The first twenty repeated maxima are top-k; p=.95 retains nineteen of
+// them. This analytic support avoids a quadratic oracle over the vocabulary.
+func.def @vocabulary_reference(%columns: index, %logits: buffer, %temperature_argument: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c19 = index.constant 19 : index
+  %period = scalar.constant 1009 : i32
+  %first = scalar.constant 1008 : i32
+  %negative = scalar.constant -inf : f32
+  %maximum_logit = scalar.constant 1.0 : f32
+  %temperature = scalar.constant 0.69999999999999996 : f32
+  %score, %winner = scf.for %i = [%c0 to %c19 step %c1](%best = %negative : f32, %id = %first : i32) -> (f32, i32) {
+    %ordinal = index.cast %i : index to i32
+    %offset = scalar.muli %ordinal, %period : i32
+    %token = scalar.addi %first, %offset : i32
+    %race = func.call @reference_race(%maximum_logit, %maximum_logit, %temperature, %seed, %position, %token) : (f32, f32, f32, i64, i64, i32) -> (f32)
+    %better = scalar.cmpf ogt, %race, %best : f32
+    %next = scf.select %better, %race, %best : f32
+    %next_id = scf.select %better, %token, %id : i32
+    scf.yield %next, %next_id : f32, i32
+  }
+  %result = buffer.view %output[%origin] : buffer -> view<1xi32>
+  view.store %winner, %result[0] : i32, view<1xi32>
+  func.return
+}
+
+check.scenario public @sampling_vocabulary {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %columns = check.literal value(248320) : index
+    %seed = check.literal value(1234567890123) : i64
+    %position = check.literal value(1234) : i64
+    %input = check.generate.iota offset(-1.0) step(0.001) period(1009) : tensor<248320xf32>
+    %output = check.generate.fill value(-1) : tensor<1xi32>
+    %temperature = check.literal value(0.69999999999999996) : f32
+    %top_p = check.literal value(0.94999999999999996) : f32
+    %top_k = check.literal value(20) : i32
+    check.compare<@sample, @vocabulary_reference>[%columns](%columns, %input, %temperature, %top_p, %top_k, %seed, %position, %output) : [index](index, tensor<248320xf32>, f32, f32, i32, i64, i64, tensor<1xi32>) -> () {
+      check.expect.equal actual(%output) expected(%output) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@sampling_vocabulary> @sampling_vocabulary_benchmark
+
+// Independent libm answers span both logarithms used by the race oracle.
+check.case public @reference_log_values {
+  %input0 = check.literal value(2.9802322387695312e-08) : f64
+  %actual0 = func.call @reference_log(%input0) : (f64) -> (f64)
+  %expected0 = check.literal value(-17.328679513998633) : f64
+  check.expect.close actual(%actual0) expected(%expected0) atol(1.0000000000000001e-15) rtol(2e-14) nan(different) : f64
+  %input1 = check.literal value(0.99999994039535522) : f64
+  %actual1 = func.call @reference_log(%input1) : (f64) -> (f64)
+  %expected1 = check.literal value(-5.9604646551747531e-08) : f64
+  check.expect.close actual(%actual1) expected(%expected1) atol(1.0000000000000001e-15) rtol(2e-14) nan(different) : f64
+  %input2 = check.literal value(0.5) : f64
+  %actual2 = func.call @reference_log(%input2) : (f64) -> (f64)
+  %expected2 = check.literal value(-0.69314718055994529) : f64
+  check.expect.close actual(%actual2) expected(%expected2) atol(1.0000000000000001e-15) rtol(2e-14) nan(different) : f64
+  %input3 = check.literal value(1.0) : f64
+  %actual3 = func.call @reference_log(%input3) : (f64) -> (f64)
+  %expected3 = check.literal value(0.0) : f64
+  check.expect.close actual(%actual3) expected(%expected3) atol(1.0000000000000001e-15) rtol(2e-14) nan(different) : f64
+  %input4 = check.literal value(2.0) : f64
+  %actual4 = func.call @reference_log(%input4) : (f64) -> (f64)
+  %expected4 = check.literal value(0.69314718055994529) : f64
+  check.expect.close actual(%actual4) expected(%expected4) atol(1.0000000000000001e-15) rtol(2e-14) nan(different) : f64
+  %input5 = check.literal value(0.123456789) : f64
+  %actual5 = func.call @reference_log(%input5) : (f64) -> (f64)
+  %expected5 = check.literal value(-2.0918640707783931) : f64
+  check.expect.close actual(%actual5) expected(%expected5) atol(1.0000000000000001e-15) rtol(2e-14) nan(different) : f64
+  %input6 = check.literal value(17.328679513998633) : f64
+  %actual6 = func.call @reference_log(%input6) : (f64) -> (f64)
+  %expected6 = check.literal value(2.8523629042865366) : f64
+  check.expect.close actual(%actual6) expected(%expected6) atol(1.0000000000000001e-15) rtol(2e-14) nan(different) : f64
+  check.return
+}

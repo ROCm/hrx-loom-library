@@ -1,0 +1,104 @@
+// Q6_K cohorts over contiguous F32 activation rows.
+//
+// ggml_linear_q6k_f32_cohort accepts a compile-time positive row-bank
+// extent, K and N, and disjoint activation, weight, and output buffers.
+// K is 256..32768, divisible by 256; N is 1..262144. Storage is rows*K
+// F32 activations, N*K/256*210 raw weight bytes, and rows*N F32 outputs.
+// Each subgroup owns two output channels, sharing activation packets and
+// retaining a pair of accumulators for every row before advancing K.
+//
+// The caller supplies whole 32- or 64-lane subgroups per X workgroup and
+// ceil(N/(2*subgroups)) workgroups; Y and Z are one. Sixteen lanes process
+// each block. Missing blocks and channel pairs are masked, and the final
+// odd channel suppresses its partner's store. No rounded weight tensor is
+// materialized; the block primitive retains the raw Q6 carrier arithmetic.
+
+func.decl @ggml_q6k_f32_block_lane_row2(%input: buffer, %input_row: offset, %weight: buffer, %weight_row0: offset, %weight_row1: offset, %block: index, %lane: index) -> (f32, f32)
+
+func.def public inline @ggml_linear_q6k_f32_cohort(%rows: index, %inputs0: index, %outputs0: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %input_noalias, %weight_noalias, %output_noalias = buffer.assume.noalias %input, %weight, %output : buffer, buffer, buffer
+  %inputs = index.assume %inputs0 [range(%inputs0, 256, 32768), multiple_of(%inputs0, 256)] : index
+  %outputs = index.assume %outputs0 [range(%outputs0, 1, 262144)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c16 = index.constant 16 : index
+  %block_values = index.constant 256 : index
+  %q6_bytes = index.constant 210 : offset
+  %f32_bytes = index.constant 4 : offset
+  %slots = index.mul %rows, %c2 : index
+  %initial_accumulators = vector.constant 0.0 : vector<[%slots]xf32>
+  %width = target.subgroup.size : index
+  %group = kernel.workgroup.id<x> : index
+  %subgroup = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %workgroup_size = kernel.workgroup.size<x> : index
+  %subgroups = index.div %workgroup_size, %width : index
+  %group_base = index.mul %group, %subgroups : index
+  %pair = index.add %group_base, %subgroup : index
+  %channel0 = index.mul %pair, %c2 : index
+  %channel1 = index.add %channel0, %c1 : index
+  %valid = index.cmp ult, %channel0, %outputs : index
+  %valid_second = index.cmp ult, %channel1, %outputs : index
+  %second = scf.select %valid_second, %channel1, %c0 : index
+  %partials = scf.if %valid -> (vector<[%slots]xf32>) {
+    %blocks = index.div %inputs, %block_values : index
+    %weight_stride = index.scale %blocks, %q6_bytes : index, offset -> offset
+    %weight_origin0 = index.scale %channel0, %weight_stride : index, offset -> offset
+    %weight_origin1 = index.scale %second, %weight_stride : index, offset -> offset
+    %input_stride = index.scale %inputs, %f32_bytes : index, offset -> offset
+    %blocks_per_iteration = index.div %width, %c16 : index
+    %padding = index.sub %blocks_per_iteration, %c1 : index
+    %padded_blocks = index.add %blocks, %padding : index
+    %iterations = index.div %padded_blocks, %blocks_per_iteration : index
+    %lane_block = index.div %lane, %c16 : index
+    %virtual = index.rem %lane, %c16 : index
+    %sums = scf.for %iteration = [%c0 to %iterations step %c1](%bank = %initial_accumulators : vector<[%slots]xf32>) -> (vector<[%slots]xf32>) {
+      %block_base = index.mul %iteration, %blocks_per_iteration : index
+      %block = index.add %block_base, %lane_block : index
+      %active = index.cmp ult, %block, %blocks : index
+      %next = scf.if %active -> (vector<[%slots]xf32>) {
+        %updated = scf.for %row = [%c0 to %rows step %c1](%values = %bank : vector<[%slots]xf32>) -> (vector<[%slots]xf32>) unroll {
+          %input_origin = index.scale %row, %input_stride : index, offset -> offset
+          %dot0, %dot1 = func.call @ggml_q6k_f32_block_lane_row2(%input_noalias, %input_origin, %weight_noalias, %weight_origin0, %weight_origin1, %block, %virtual) : (buffer, offset, buffer, offset, offset, index, index) -> (f32, f32)
+          %slot0 = index.mul %row, %c2 : index
+          %slot1 = index.add %slot0, %c1 : index
+          %prior0 = vector.extract %values[%slot0] : vector<[%slots]xf32> -> f32
+          %prior1 = vector.extract %values[%slot1] : vector<[%slots]xf32> -> f32
+          %sum0 = scalar.addf<reassoc|nnan|ninf|nsz> %prior0, %dot0 : f32
+          %sum1 = scalar.addf<reassoc|nnan|ninf|nsz> %prior1, %dot1 : f32
+          %result0 = vector.insert %sum0 into %values[%slot0] : f32, vector<[%slots]xf32>
+          %result1 = vector.insert %sum1 into %result0[%slot1] : f32, vector<[%slots]xf32>
+          scf.yield %result1 : vector<[%slots]xf32>
+        }
+        scf.yield %updated : vector<[%slots]xf32>
+      } else {
+        scf.yield %bank : vector<[%slots]xf32>
+      }
+      scf.yield %next : vector<[%slots]xf32>
+    }
+    scf.yield %sums : vector<[%slots]xf32>
+  } else {
+    scf.yield %initial_accumulators : vector<[%slots]xf32>
+  }
+  %leader = index.cmp eq, %lane, %c0 : index
+  %write = scalar.andi %leader, %valid : i1
+  %output_stride = index.scale %outputs, %f32_bytes : index, offset -> offset
+  scf.for %row = [%c0 to %rows step %c1] unroll {
+    %slot0 = index.mul %row, %c2 : index
+    %slot1 = index.add %slot0, %c1 : index
+    %partial0 = vector.extract %partials[%slot0] : vector<[%slots]xf32> -> f32
+    %partial1 = vector.extract %partials[%slot1] : vector<[%slots]xf32> -> f32
+    %value0 = kernel.subgroup.reduce<addf> %partial0 : f32
+    %value1 = kernel.subgroup.reduce<addf> %partial1 : f32
+    scf.if %write {
+      %origin = index.scale %row, %output_stride : index, offset -> offset
+      %view = buffer.view %output_noalias[%origin] : buffer -> view<[%outputs]xf32>
+      view.store %value0, %view[%channel0] : f32, view<[%outputs]xf32>
+      scf.if %valid_second {
+        view.store %value1, %view[%channel1] : f32, view<[%outputs]xf32>
+      }
+    }
+  }
+  func.return
+}

@@ -1,6 +1,22 @@
 # Contributing to the Loom standard library
 
-This repository admits reusable compiler inputs, not a catalog of model ports. A contribution earns its place by strengthening a composable motif, exposing a deliberate launch or program ABI, or qualifying a reusable target profile. The unit of review is the complete library closure: source, documentation, correctness programs, benchmark plans, target qualification, and the dependency edges that make it reusable.
+## Scope
+
+This repository maintains the official Loom model set and shared library
+components. Forks, remixes, and independently published models are encouraged;
+using Loom does not require contributing a model here. The
+[model-authoring guide](docs/model-authoring.md) covers that workflow.
+
+Official additions are curated with maintainers. The library's organization,
+review process, and capacity for maintaining more models are still being
+established, so this is not an open submission queue for every model port.
+Open an issue to discuss a proposed model or substantial shared component
+before investing in a large pull request. Bug reports, focused fixes, and
+feedback on the authoring workflow help establish that foundation.
+
+## Review contract
+
+This repository admits reusable compiler inputs and complete model compositions. A contribution earns its place by strengthening a composable motif, exposing a deliberate launch or program ABI, or delivering a checked model through those components. The unit of review is the complete library closure: source, documentation, correctness programs, benchmark plans, target qualification, and the dependency edges that make it reusable.
 
 ## Admission surfaces
 
@@ -8,11 +24,15 @@ This repository admits reusable compiler inputs, not a catalog of model ports. A
 | --- | --- | --- |
 | `motif/` | Target-neutral data representations and algorithms expressed as `func.def`, `template.def`, encodings, and related declarations. | Canonical and lint-clean source, scoped documentation, no launch surface, and reachability from a qualified kernel or test leaf. |
 | `kernel/` | Concrete `kernel.def` entry points implementing one operation contract and ABI. | A semantic benchmark plan, at least one target profile, at least one execution profile, and dependencies confined to production motifs. |
-| `motif/**/test/` and `kernel/**/test/` | Test-only wrapper programs used when production code has no natural launch witness. | Private root-owned test module, semantic benchmarks and correctness cases, and one execution profile. |
+| `program/` | Shared service policy and executable compositions used by multiple models. | Explicit `loom_library` providers, scoped documentation, real service or command callers, and dependencies that do not point back to a model. |
+| `motif/**/test/`, `kernel/**/test/`, and `program/**/test/` | Test-only programs that exercise production contracts. | Private root-owned test module, semantic benchmarks and correctness cases, and one execution profile. |
 | `target/` | Genuinely repository-specific target or execution policy. | A concrete policy difference that cannot be expressed by canonical HRX profiles; upstream profiles are consumed directly otherwise. |
-| `model/` | Composition roots for model and command programs. | A repository-owned model admission rule must define modules, planning, execution, and deployment behavior before source enters this layer. |
+| `model/` descriptions | Portable model facts, asset variants, service contracts, and provider composition. | A card validated through `loom_model_documentation`, a standalone overview with exact upstream links, and a precise supported-variant and hardware contract. |
+| `model/` executable ports | Model-specific programs and portable serving compositions. | Explicit `loom_library` providers, a card published through `loom_model`, and an independently checked native service output for each supported representation. |
 
-Source-bearing `model/` and `target/` packages currently fail repository policy. That failure is intentional: raw `.loom` files cannot bypass the same build and evidence contract applied to motifs and kernels. A new source surface begins with its repository rule and production lifecycle.
+Source-bearing `target/` packages still require their own admission rule. Model programs use the repository's `loom_library` wrapper for canonical source, lint, explicit dependencies, and relocatable bytecode. The `loom_model` wrapper selects the card's preset and exact providers and auxiliary compiler inputs through HRX's public rule. Full checkpoints retain their acquisition descriptors for `loom-fetch` and stay outside Bazel's payload graph. Model-local `test/` packages use the same `loom_test` contract as other layers; small fixtures and swatches declare their full input closure for test caching. Full-model checks consume provisioned weights, trust that they match the declared acquisition lock, and run current built programs against independent inputs and checked outputs. The card, lock, and providers participate in Bazel cache identity; full checkpoint hashing belongs to acquisition.
+
+Model identity follows the original publisher and base model under `model/<publisher>/<model>/`. Source, bytecode, and mixed inputs are program representations within a card, not separate model identities. Quantized checkpoints and services are selected through the card. Physical placement remains deployment input; request-time adapters do not become base-model parameters. Model-specific code composes shared programs, kernels, and motifs. Shared programs own service policy and multi-stage execution; kernels own individual launch contracts; motifs own reusable representations and algorithms. These layers cannot depend back on a model, and motifs cannot depend on a program or kernel.
 
 ## Branch-local incubation
 
@@ -26,7 +46,7 @@ standard-library layer.
 Pull requests and pushes targeting the repository release line fail while the
 candidate tree tracks any `experimental/**` path. The gate reads the candidate
 tree rather than branch history, so a branch may carry experiments for as long
-as needed, extract reusable work into `motif/`, `kernel/`, `model/`, or
+as needed, extract reusable work into `motif/`, `kernel/`, `program/`, `model/`, or
 `target/`, and remove the incubation payload before promotion. Feature branches
 may compose experimental targets with sources at any repository path; those
 paths are working locations until the candidate tree passes release admission.
@@ -35,11 +55,11 @@ complete build proves that no required experimental package was left behind.
 
 ## Source contract
 
-Each `.loom` file stands on its own as an implementation artifact. Its leading documentation establishes the represented format or operation, public symbol contract, parameter and shape meaning, storage layout, ABI ownership, and any specification or oracle used to establish behavior. Package READMEs carry information that cannot be recovered from `ls`: scope boundaries, external specifications, ABI relationships, implementation status, and the intended composition layer. Per-symbol inventories remain beside the source so they cannot drift from it.
+Each `.loom` file stands on its own as an implementation artifact. Its leading documentation establishes the represented format or operation, public symbol contract, parameter and shape meaning, storage layout, ABI ownership, and any specification or oracle used to establish behavior. Package READMEs carry information that cannot be recovered from `ls`: scope boundaries, external specifications, ABI relationships, supported behavior, and the intended composition layer. Per-symbol inventories remain beside the source so they cannot drift from it.
 
 Public symbols are the intended linking surface. Helpers whose only consumers are in the same module remain private. Motifs expose representation and algorithm contracts without a launch ABI; GGML-compatible kernels own GGML graph-operation ABI details, while native kernels may consume the same GGUF carriers without inheriting that ABI.
 
-Dynamic workloads and shapes remain values whenever the implementation can support them. Configuration represents facts that materially select the compiled program—model architecture choices, formats, or target capabilities—not convenient constants such as one observed element count or workgroup size. Production motifs do not declare configuration; their functions and templates receive values and facts from composition roots so one linked motif can serve every invocation in a command program. Test-only wrappers may declare case configuration when it is part of the execution witness. Range facts on `config.decl`, `index.assume`, `buffer.assume`, and precise view types carry caller knowledge into specialization. Target-specific source belongs in a target-scoped motif only when the algorithm truly cannot be expressed from target facts supplied at the leaf.
+Dynamic workloads and shapes remain values whenever the implementation can support them. Configuration represents facts that materially select the compiled program—model architecture choices, formats, or target capabilities—not convenient constants such as one observed element count or workgroup size. Production motifs neither declare nor read global configuration: `config.decl`, `config.def`, and `config.get` stay in composition and test leaves. Motif functions and templates receive values and facts from composition roots so one linked motif can serve every invocation in a command program. Concrete target records also stay in leaves; motifs may declare an external target contract or query their execution context. Test-only wrappers may declare case configuration when it is part of the execution witness. Range facts on `config.decl`, `index.assume`, `buffer.assume`, and precise view types carry caller knowledge into specialization. Target-specific source belongs in a target-scoped motif only when the algorithm truly cannot be expressed from target facts supplied at the leaf.
 
 Canonical text and authoring policy are independent gates. `loom-format` parses, verifies, and canonicalizes syntax. `loom-lint` checks human-facing source conventions such as semantic constant names. Repository policy then verifies layer placement, dependency direction, explicit BUILD declarations, scoped documentation, and qualification closure.
 
@@ -62,7 +82,7 @@ Correctness admission and performance claims are separate. Shared CI establishes
 ## Local admission sequence
 
 ```shell
-python dev.py setup --release
+python dev.py setup --sdk
 python dev.py format --check
 python dev.py lint
 python dev.py test
@@ -78,7 +98,7 @@ A focused performance capture adds an explicit target and device:
 python dev.py benchmark \
   --config=amdgpu \
   --device=amdgpu://0 \
-  --output-dir=/tmp/hrx-loom-kernels-candidate \
+  --output-dir=/tmp/hrx-loom-library-candidate \
   --target=//kernel/ggml/quantize:q8_1_x4_f32 \
   -- \
   --measure=dispatch_complete \

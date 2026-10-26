@@ -1,0 +1,501 @@
+// Q8_0 packets in raw records and prepared channel-four planes.
+// Scalar references read the physical layouts independently of reader address
+// calculations. Whole-storage comparisons include guards and unused metadata.
+
+amdgpu.target<gfx11-generic> @native
+
+func.decl @ggml_q8_0_load_block(%input: buffer, %scale_origin: offset, %code_origin: offset) -> (vector<32xi8>, f32)
+
+func.decl @ggml_q8_0_load_chunk16(%input: buffer, %scale_origin: offset, %code_origin: offset) -> (vector<16xi8>, f32)
+
+func.decl @ggml_q8_0_word(%input: buffer, %row: offset, %block: index, %word: index) -> (vector<4xi8>, f32)
+
+// Signed zero, normal/subnormal endpoints, and finite F16 magnitude extrema.
+global.rodata.def @scale_words = bytes("0000008001000180ff03ff8300040084003c00bcff7bfffb553555b5004000c0")
+
+func.def @initialize(%ordered: i1, %input: buffer) {
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %rows = index.constant 8 : index
+  %blocks = index.constant 4 : index
+  %width = index.constant 32 : index
+  %scale_count = index.constant 16 : index
+  %raw_origin = index.constant 6 : offset
+  %raw_row_bytes = index.constant 146 : offset
+  %block_bytes = index.constant 34 : offset
+  %header_bytes = index.constant 2 : offset
+  %prepared_origin = index.constant 1238 : offset
+  %group_bytes = index.constant 554 : offset
+  %scale_plane_bytes = index.constant 32 : offset
+  %zero_origin = index.constant 0 : offset
+  %table = global.load @scale_words : buffer
+  %scale_bits = buffer.view %table[%zero_origin] : buffer -> view<16xi16>
+  scf.for %row = [%begin to %rows step %unit] {
+    %row_delta = index.scale %row, %raw_row_bytes : index, offset -> offset
+    %row_origin = index.add %raw_origin, %row_delta : offset
+    %group = index.div %row, %blocks : index
+    %channel = index.rem %row, %blocks : index
+    %group_delta = index.scale %group, %group_bytes : index, offset -> offset
+    %group_origin = index.add %prepared_origin, %group_delta : offset
+    %payload_origin = index.add %group_origin, %scale_plane_bytes : offset
+    %prepared_scales = buffer.view %input[%group_origin] : buffer -> view<4x4xi16>
+    %prepared_codes = buffer.view %input[%payload_origin] : buffer -> view<4x4x32xi8>
+    scf.for %block = [%begin to %blocks step %unit] {
+      %ordinal = index.madd %row, %blocks, %block : index
+      %scale_index = index.rem %ordinal, %scale_count : index
+      %scale = view.load %scale_bits[%scale_index] : view<16xi16> -> i16
+      %block_delta = index.scale %block, %block_bytes : index, offset -> offset
+      %block_origin = index.add %row_origin, %block_delta : offset
+      %code_origin = index.add %block_origin, %header_bytes : offset
+      %raw_scale = buffer.view %input[%block_origin] : buffer -> view<1xi16>
+      %raw_codes = buffer.view %input[%code_origin] : buffer -> view<32xi8>
+      view.store %scale, %raw_scale[0] : i16, view<1xi16>
+      view.store %scale, %prepared_scales[%block, %channel] : i16, view<4x4xi16>
+      scf.if %ordered {
+        scf.for %value = [%begin to %width step %unit] {
+          %integer = index.madd %ordinal, %width, %value : index
+          %byte = index.cast %integer : index to i8
+          view.store %byte, %raw_codes[%value] : i8, view<32xi8>
+          view.store %byte, %prepared_codes[%block, %channel, %value] : i8, view<4x4x32xi8>
+        }
+      }
+    }
+  }
+  func.return
+}
+
+func.def @initialize_ordered(%input: buffer) {
+  %ordered = scalar.constant true : i1
+  func.call @initialize(%ordered, %input) : (i1, buffer)
+  func.return
+}
+
+func.def @initialize_headers(%input: buffer) {
+  %ordered = scalar.constant false : i1
+  func.call @initialize(%ordered, %input) : (i1, buffer)
+  func.return
+}
+
+func.def @reference(%packet_width: index, %layout_count: index, %input: buffer, %output: buffer, %metadata: buffer) {
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %rows = index.constant 8 : index
+  %blocks = index.constant 4 : index
+  %width = index.constant 32 : index
+  %header_bytes = index.constant 2 : index
+  %raw_origin = index.constant 6 : offset
+  %prepared_origin = index.constant 1238 : offset
+  %group_bytes = index.constant 554 : offset
+  %scale_plane_bytes = index.constant 32 : offset
+  %output_origin = index.constant 16 : offset
+  %raw_scale_layout = encoding.layout.strided [73, 17] : encoding<layout>
+  %raw_code_layout = encoding.layout.strided [146, 34, 1] : encoding<layout>
+  %raw_scales = buffer.view %input[%raw_origin] : buffer -> view<8x4xf16, %raw_scale_layout>
+  %raw_codes = buffer.view %input[%raw_origin] : buffer -> view<8x4x34xi8, %raw_code_layout>
+  %outputs = buffer.view %output[%output_origin] : buffer -> view<2x8x4x32xf32>
+  %coefficients = buffer.view %metadata[%output_origin] : buffer -> view<2x8x4x8xf32>
+  scf.for %layout = [%begin to %layout_count step %unit] {
+    %prepared = index.cmp ne, %layout, %begin : index
+    scf.for %row = [%begin to %rows step %unit] {
+      %group = index.div %row, %blocks : index
+      %channel = index.rem %row, %blocks : index
+      %group_delta = index.scale %group, %group_bytes : index, offset -> offset
+      %group_origin = index.add %prepared_origin, %group_delta : offset
+      %payload_origin = index.add %group_origin, %scale_plane_bytes : offset
+      %prepared_scales = buffer.view %input[%group_origin] : buffer -> view<4x4xf16>
+      %prepared_codes = buffer.view %input[%payload_origin] : buffer -> view<4x4x32xi8>
+      scf.for %block = [%begin to %blocks step %unit] {
+        %scale_half = scf.if %prepared -> (f16) {
+          %value = view.load %prepared_scales[%block, %channel] : view<4x4xf16> -> f16
+          scf.yield %value : f16
+        } else {
+          %value = view.load %raw_scales[%row, %block] : view<8x4xf16, %raw_scale_layout> -> f16
+          scf.yield %value : f16
+        }
+        %scale = scalar.extf %scale_half : f16 to f32
+        scf.for %value = [%begin to %width step %unit] {
+          %code = scf.if %prepared -> (i8) {
+            %byte = view.load %prepared_codes[%block, %channel, %value] : view<4x4x32xi8> -> i8
+            scf.yield %byte : i8
+          } else {
+            %column = index.add %value, %header_bytes : index
+            %byte = view.load %raw_codes[%row, %block, %column] : view<8x4x34xi8, %raw_code_layout> -> i8
+            scf.yield %byte : i8
+          }
+          %floating = scalar.sitofp %code : i8 to f32
+          view.store %floating, %outputs[%layout, %row, %block, %value] : f32, view<2x8x4x32xf32>
+          %within = index.rem %value, %packet_width : index
+          %first = index.cmp eq, %within, %begin : index
+          scf.if %first {
+            %packet = index.div %value, %packet_width : index
+            view.store %scale, %coefficients[%layout, %row, %block, %packet] : f32, view<2x8x4x8xf32>
+          }
+        }
+      }
+    }
+  }
+  func.return
+}
+
+kernel.def target(@native) @read_4() {
+  %blocks = index.constant 4 : index
+  %rows = index.constant 8 : index
+  %layouts = index.constant 1 : index
+  %unit = index.constant 1 : index
+  %threads = index.constant 8 : index
+  kernel.launch.config workgroups(%blocks, %rows, %layouts) workgroup_size(%threads, %unit, %unit) : index
+} launch(%input: buffer, %output: buffer, %metadata: buffer) {
+  %block = kernel.workgroup.id<x> : index
+  %row = kernel.workgroup.id<y> : index
+  %layout = kernel.workgroup.id<z> : index
+  %packet = kernel.workitem.id<x> : index
+  %width = index.constant 4 : index
+  %raw_origin = index.constant 6 : offset
+  %row_bytes = index.constant 146 : offset
+  %output_origin = index.constant 16 : offset
+  %row_delta = index.scale %row, %row_bytes : index, offset -> offset
+  %row_origin = index.add %raw_origin, %row_delta : offset
+  %codes, %scale = func.call @ggml_q8_0_word(%input, %row_origin, %block, %packet) : (buffer, offset, index, index) -> (vector<4xi8>, f32)
+  %values = vector.sitofp %codes : vector<4xi8> to vector<4xf32>
+  %outputs = buffer.view %output[%output_origin] : buffer -> view<2x8x4x32xf32>
+  %coefficients = buffer.view %metadata[%output_origin] : buffer -> view<2x8x4x8xf32>
+  %column = index.mul %packet, %width : index
+  vector.store %values, %outputs[%layout, %row, %block, %column] : vector<4xf32>, view<2x8x4x32xf32>
+  view.store %scale, %coefficients[%layout, %row, %block, %packet] : f32, view<2x8x4x8xf32>
+  kernel.return
+}
+
+func.def @reference_4(%input: buffer, %output: buffer, %metadata: buffer) {
+  %width = index.constant 4 : index
+  %layouts = index.constant 1 : index
+  func.call @reference(%width, %layouts, %input, %output, %metadata) : (index, index, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @reader_4_ordered {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(85) : tensor<2352xi8>
+    check.generate<@initialize_ordered>(%input) : (tensor<2352xi8>) -> ()
+    %output = check.generate.fill value(-999.0) : tensor<2056xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<520xf32>
+    check.compare<@read_4, @reference_4>(%input, %output, %metadata) : (tensor<2352xi8>, tensor<2056xf32>, tensor<520xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<2056xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<520xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2352xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_4_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<2352xi8>
+    check.generate<@initialize_headers>(%input) : (tensor<2352xi8>) -> ()
+    %output = check.generate.fill value(-999.0) : tensor<2056xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<520xf32>
+    check.compare<@read_4, @reference_4>(%input, %output, %metadata) : (tensor<2352xi8>, tensor<2056xf32>, tensor<520xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<2056xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<520xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2352xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_4_negative {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(-128) : tensor<2352xi8>
+    check.generate<@initialize_headers>(%input) : (tensor<2352xi8>) -> ()
+    %output = check.generate.fill value(-999.0) : tensor<2056xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<520xf32>
+    check.compare<@read_4, @reference_4>(%input, %output, %metadata) : (tensor<2352xi8>, tensor<2056xf32>, tensor<520xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<2056xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<520xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2352xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_4_positive {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(127) : tensor<2352xi8>
+    check.generate<@initialize_headers>(%input) : (tensor<2352xi8>) -> ()
+    %output = check.generate.fill value(-999.0) : tensor<2056xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<520xf32>
+    check.compare<@read_4, @reference_4>(%input, %output, %metadata) : (tensor<2352xi8>, tensor<2056xf32>, tensor<520xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<2056xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<520xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2352xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@reader_4_random> @reader_4_layouts
+
+kernel.def target(@native) @read_16() {
+  %blocks = index.constant 4 : index
+  %rows = index.constant 8 : index
+  %layouts = index.constant 2 : index
+  %unit = index.constant 1 : index
+  %threads = index.constant 2 : index
+  kernel.launch.config workgroups(%blocks, %rows, %layouts) workgroup_size(%threads, %unit, %unit) : index
+} launch(%input: buffer, %output: buffer, %metadata: buffer) {
+  %block = kernel.workgroup.id<x> : index
+  %row = kernel.workgroup.id<y> : index
+  %layout = kernel.workgroup.id<z> : index
+  %packet = kernel.workitem.id<x> : index
+  %width = index.constant 16 : index
+  %raw_origin = index.constant 6 : offset
+  %row_bytes = index.constant 146 : offset
+  %output_origin = index.constant 16 : offset
+  %row_delta = index.scale %row, %row_bytes : index, offset -> offset
+  %row_origin = index.add %raw_origin, %row_delta : offset
+  %begin = index.constant 0 : index
+  %channels = index.constant 4 : index
+  %block_bytes = index.constant 34 : offset
+  %header_bytes = index.constant 2 : offset
+  %prepared_origin = index.constant 1238 : offset
+  %group_bytes = index.constant 554 : offset
+  %scale_plane_bytes = index.constant 32 : offset
+  %code_bytes = index.constant 32 : offset
+  %prepared = index.cmp ne, %layout, %begin : index
+  %scale_origin, %payload_origin = scf.if %prepared -> (offset, offset) {
+    %group = index.div %row, %channels : index
+    %channel = index.rem %row, %channels : index
+    %ordinal = index.madd %block, %channels, %channel : index
+    %group_delta = index.scale %group, %group_bytes : index, offset -> offset
+    %group_origin = index.add %prepared_origin, %group_delta : offset
+    %scale_delta = index.scale %ordinal, %header_bytes : index, offset -> offset
+    %scale_origin = index.add %group_origin, %scale_delta : offset
+    %code_plane = index.add %group_origin, %scale_plane_bytes : offset
+    %code_delta = index.scale %ordinal, %code_bytes : index, offset -> offset
+    %code_origin = index.add %code_plane, %code_delta : offset
+    scf.yield %scale_origin, %code_origin : offset, offset
+  } else {
+    %block_delta = index.scale %block, %block_bytes : index, offset -> offset
+    %scale_origin = index.add %row_origin, %block_delta : offset
+    %code_origin = index.add %scale_origin, %header_bytes : offset
+    scf.yield %scale_origin, %code_origin : offset, offset
+  }
+  %packet_bytes = index.constant 16 : offset
+  %packet_delta = index.scale %packet, %packet_bytes : index, offset -> offset
+  %code_origin = index.add %payload_origin, %packet_delta : offset
+  %codes, %scale = func.call @ggml_q8_0_load_chunk16(%input, %scale_origin, %code_origin) : (buffer, offset, offset) -> (vector<16xi8>, f32)
+  %values = vector.sitofp %codes : vector<16xi8> to vector<16xf32>
+  %outputs = buffer.view %output[%output_origin] : buffer -> view<2x8x4x32xf32>
+  %coefficients = buffer.view %metadata[%output_origin] : buffer -> view<2x8x4x8xf32>
+  %column = index.mul %packet, %width : index
+  vector.store %values, %outputs[%layout, %row, %block, %column] : vector<16xf32>, view<2x8x4x32xf32>
+  view.store %scale, %coefficients[%layout, %row, %block, %packet] : f32, view<2x8x4x8xf32>
+  kernel.return
+}
+
+func.def @reference_16(%input: buffer, %output: buffer, %metadata: buffer) {
+  %width = index.constant 16 : index
+  %layouts = index.constant 2 : index
+  func.call @reference(%width, %layouts, %input, %output, %metadata) : (index, index, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @reader_16_ordered {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(85) : tensor<2352xi8>
+    check.generate<@initialize_ordered>(%input) : (tensor<2352xi8>) -> ()
+    %output = check.generate.fill value(-999.0) : tensor<2056xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<520xf32>
+    check.compare<@read_16, @reference_16>(%input, %output, %metadata) : (tensor<2352xi8>, tensor<2056xf32>, tensor<520xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<2056xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<520xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2352xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_16_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<2352xi8>
+    check.generate<@initialize_headers>(%input) : (tensor<2352xi8>) -> ()
+    %output = check.generate.fill value(-999.0) : tensor<2056xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<520xf32>
+    check.compare<@read_16, @reference_16>(%input, %output, %metadata) : (tensor<2352xi8>, tensor<2056xf32>, tensor<520xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<2056xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<520xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2352xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_16_negative {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(-128) : tensor<2352xi8>
+    check.generate<@initialize_headers>(%input) : (tensor<2352xi8>) -> ()
+    %output = check.generate.fill value(-999.0) : tensor<2056xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<520xf32>
+    check.compare<@read_16, @reference_16>(%input, %output, %metadata) : (tensor<2352xi8>, tensor<2056xf32>, tensor<520xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<2056xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<520xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2352xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_16_positive {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(127) : tensor<2352xi8>
+    check.generate<@initialize_headers>(%input) : (tensor<2352xi8>) -> ()
+    %output = check.generate.fill value(-999.0) : tensor<2056xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<520xf32>
+    check.compare<@read_16, @reference_16>(%input, %output, %metadata) : (tensor<2352xi8>, tensor<2056xf32>, tensor<520xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<2056xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<520xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2352xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@reader_16_random> @reader_16_layouts
+
+kernel.def target(@native) @read_32() {
+  %blocks = index.constant 4 : index
+  %rows = index.constant 8 : index
+  %layouts = index.constant 2 : index
+  %unit = index.constant 1 : index
+  %threads = index.constant 1 : index
+  kernel.launch.config workgroups(%blocks, %rows, %layouts) workgroup_size(%threads, %unit, %unit) : index
+} launch(%input: buffer, %output: buffer, %metadata: buffer) {
+  %block = kernel.workgroup.id<x> : index
+  %row = kernel.workgroup.id<y> : index
+  %layout = kernel.workgroup.id<z> : index
+  %packet = kernel.workitem.id<x> : index
+  %width = index.constant 32 : index
+  %raw_origin = index.constant 6 : offset
+  %row_bytes = index.constant 146 : offset
+  %output_origin = index.constant 16 : offset
+  %row_delta = index.scale %row, %row_bytes : index, offset -> offset
+  %row_origin = index.add %raw_origin, %row_delta : offset
+  %begin = index.constant 0 : index
+  %channels = index.constant 4 : index
+  %block_bytes = index.constant 34 : offset
+  %header_bytes = index.constant 2 : offset
+  %prepared_origin = index.constant 1238 : offset
+  %group_bytes = index.constant 554 : offset
+  %scale_plane_bytes = index.constant 32 : offset
+  %code_bytes = index.constant 32 : offset
+  %prepared = index.cmp ne, %layout, %begin : index
+  %scale_origin, %payload_origin = scf.if %prepared -> (offset, offset) {
+    %group = index.div %row, %channels : index
+    %channel = index.rem %row, %channels : index
+    %ordinal = index.madd %block, %channels, %channel : index
+    %group_delta = index.scale %group, %group_bytes : index, offset -> offset
+    %group_origin = index.add %prepared_origin, %group_delta : offset
+    %scale_delta = index.scale %ordinal, %header_bytes : index, offset -> offset
+    %scale_origin = index.add %group_origin, %scale_delta : offset
+    %code_plane = index.add %group_origin, %scale_plane_bytes : offset
+    %code_delta = index.scale %ordinal, %code_bytes : index, offset -> offset
+    %code_origin = index.add %code_plane, %code_delta : offset
+    scf.yield %scale_origin, %code_origin : offset, offset
+  } else {
+    %block_delta = index.scale %block, %block_bytes : index, offset -> offset
+    %scale_origin = index.add %row_origin, %block_delta : offset
+    %code_origin = index.add %scale_origin, %header_bytes : offset
+    scf.yield %scale_origin, %code_origin : offset, offset
+  }
+  %codes, %scale = func.call @ggml_q8_0_load_block(%input, %scale_origin, %payload_origin) : (buffer, offset, offset) -> (vector<32xi8>, f32)
+  %values = vector.sitofp %codes : vector<32xi8> to vector<32xf32>
+  %outputs = buffer.view %output[%output_origin] : buffer -> view<2x8x4x32xf32>
+  %coefficients = buffer.view %metadata[%output_origin] : buffer -> view<2x8x4x8xf32>
+  %column = index.mul %packet, %width : index
+  vector.store %values, %outputs[%layout, %row, %block, %column] : vector<32xf32>, view<2x8x4x32xf32>
+  view.store %scale, %coefficients[%layout, %row, %block, %packet] : f32, view<2x8x4x8xf32>
+  kernel.return
+}
+
+func.def @reference_32(%input: buffer, %output: buffer, %metadata: buffer) {
+  %width = index.constant 32 : index
+  %layouts = index.constant 2 : index
+  func.call @reference(%width, %layouts, %input, %output, %metadata) : (index, index, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @reader_32_ordered {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(85) : tensor<2352xi8>
+    check.generate<@initialize_ordered>(%input) : (tensor<2352xi8>) -> ()
+    %output = check.generate.fill value(-999.0) : tensor<2056xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<520xf32>
+    check.compare<@read_32, @reference_32>(%input, %output, %metadata) : (tensor<2352xi8>, tensor<2056xf32>, tensor<520xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<2056xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<520xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2352xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_32_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<2352xi8>
+    check.generate<@initialize_headers>(%input) : (tensor<2352xi8>) -> ()
+    %output = check.generate.fill value(-999.0) : tensor<2056xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<520xf32>
+    check.compare<@read_32, @reference_32>(%input, %output, %metadata) : (tensor<2352xi8>, tensor<2056xf32>, tensor<520xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<2056xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<520xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2352xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_32_negative {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(-128) : tensor<2352xi8>
+    check.generate<@initialize_headers>(%input) : (tensor<2352xi8>) -> ()
+    %output = check.generate.fill value(-999.0) : tensor<2056xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<520xf32>
+    check.compare<@read_32, @reference_32>(%input, %output, %metadata) : (tensor<2352xi8>, tensor<2056xf32>, tensor<520xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<2056xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<520xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2352xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @reader_32_positive {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(127) : tensor<2352xi8>
+    check.generate<@initialize_headers>(%input) : (tensor<2352xi8>) -> ()
+    %output = check.generate.fill value(-999.0) : tensor<2056xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<520xf32>
+    check.compare<@read_32, @reference_32>(%input, %output, %metadata) : (tensor<2352xi8>, tensor<2056xf32>, tensor<520xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<2056xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<520xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<2352xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@reader_32_random> @reader_32_layouts

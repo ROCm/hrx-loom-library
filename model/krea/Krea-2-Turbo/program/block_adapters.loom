@@ -1,0 +1,332 @@
+// Transformer projection adapters over the original shared factor banks.
+// Base and down contractions overlap; up contractions combine all selected
+// contributions before one base update. Only rank activations use workspace.
+
+template.decl @krea2.adapter_up(%rows: index, %outputs: index, %layout: encoding<layout>, %low: buffer, %factors: buffer, %selection: buffer, %base: buffer, %output: buffer)
+
+template.decl @krea2.adapter_down(%rows: index, %inputs: index, %input: buffer, %factors: buffer, %selection: buffer, %output: buffer)
+
+template.decl @krea2.adapter_scratch(%rows: index) -> (buffer)
+
+config.decl @krea2.block_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+amdgpu.target<gfx11-generic> @block_adapter_wave32 {subgroup_size = 32}
+
+command.program.decl @krea2.block_query(%layer: index) launch(%parameters: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %output: buffer)
+
+command.program.decl @krea2.block_key(%layer: index) launch(%parameters: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %output: buffer)
+
+command.program.decl @krea2.block_value(%layer: index) launch(%parameters: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %output: buffer)
+
+command.program.decl @krea2.block_gate(%layer: index) launch(%parameters: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %output: buffer)
+
+command.program.decl @krea2.block_attention_output(%layer: index) launch(%parameters: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %output: buffer)
+
+command.program.decl @krea2.block_feed_forward_gate(%layer: index) launch(%parameters: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %output: buffer)
+
+command.program.decl @krea2.block_feed_forward_up(%layer: index) launch(%parameters: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %output: buffer)
+
+command.program.decl @krea2.block_feed_forward_down(%layer: index) launch(%parameters: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %output: buffer)
+
+// Factor commands expose independent numerical boundaries. The adapted
+// commands overlap base and A contractions, then add B(Ax) in place without
+// materializing a full-width delta. Base and adapter parameters never alias.
+command.program.def public @krea2.block_query_adapter_down(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.attn.to_q.lora_A.weight"[%layer] : view<32x6144xbf16>
+  %weight_base = command.parameter.base %weight : view<32x6144xbf16> -> buffer
+  kernel.launch @block_adapter_linear_6144_32(%input, %weight_base, %selection, %output) : (buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_query_adapter_add(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.attn.to_q.lora_B.weight"[%layer] : view<6144x32xbf16>
+  %weight_base = command.parameter.base %weight : view<6144x32xbf16> -> buffer
+  kernel.launch @block_adapter_add_6144(%input, %weight_base, %selection, %base, %output) : (buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_query_adapted(%layer: index) launch(%parameters: buffer, %adapter: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %selection: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %low = template.apply<@krea2.adapter_scratch>(%rows) : (index) -> (buffer)
+  command.concurrent {
+    command.program.launch @krea2.block_query[%layer](%parameters, %input, %quantized, %input_scales, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+    command.program.launch @krea2.block_query_adapter_down[%layer](%adapter, %input, %selection, %low) : [index](buffer, buffer, buffer, buffer)
+  }
+  command.program.launch @krea2.block_query_adapter_add[%layer](%adapter, %low, %selection, %output, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_key_adapter_down(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.attn.to_k.lora_A.weight"[%layer] : view<32x6144xbf16>
+  %weight_base = command.parameter.base %weight : view<32x6144xbf16> -> buffer
+  kernel.launch @block_adapter_linear_6144_32(%input, %weight_base, %selection, %output) : (buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_key_adapter_add(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.attn.to_k.lora_B.weight"[%layer] : view<1536x32xbf16>
+  %weight_base = command.parameter.base %weight : view<1536x32xbf16> -> buffer
+  kernel.launch @block_adapter_add_1536(%input, %weight_base, %selection, %base, %output) : (buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_key_adapted(%layer: index) launch(%parameters: buffer, %adapter: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %selection: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %low = template.apply<@krea2.adapter_scratch>(%rows) : (index) -> (buffer)
+  command.concurrent {
+    command.program.launch @krea2.block_key[%layer](%parameters, %input, %quantized, %input_scales, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+    command.program.launch @krea2.block_key_adapter_down[%layer](%adapter, %input, %selection, %low) : [index](buffer, buffer, buffer, buffer)
+  }
+  command.program.launch @krea2.block_key_adapter_add[%layer](%adapter, %low, %selection, %output, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_value_adapter_down(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.attn.to_v.lora_A.weight"[%layer] : view<32x6144xbf16>
+  %weight_base = command.parameter.base %weight : view<32x6144xbf16> -> buffer
+  kernel.launch @block_adapter_linear_6144_32(%input, %weight_base, %selection, %output) : (buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_value_adapter_add(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.attn.to_v.lora_B.weight"[%layer] : view<1536x32xbf16>
+  %weight_base = command.parameter.base %weight : view<1536x32xbf16> -> buffer
+  kernel.launch @block_adapter_add_1536_column_major(%input, %weight_base, %selection, %base, %output) : (buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_value_adapted(%layer: index) launch(%parameters: buffer, %adapter: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %selection: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %low = template.apply<@krea2.adapter_scratch>(%rows) : (index) -> (buffer)
+  command.concurrent {
+    command.program.launch @krea2.block_value[%layer](%parameters, %input, %quantized, %input_scales, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+    command.program.launch @krea2.block_value_adapter_down[%layer](%adapter, %input, %selection, %low) : [index](buffer, buffer, buffer, buffer)
+  }
+  command.program.launch @krea2.block_value_adapter_add[%layer](%adapter, %low, %selection, %output, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_gate_adapter_down(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.attn.to_gate.lora_A.weight"[%layer] : view<32x6144xbf16>
+  %weight_base = command.parameter.base %weight : view<32x6144xbf16> -> buffer
+  kernel.launch @block_adapter_linear_6144_32(%input, %weight_base, %selection, %output) : (buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_gate_adapter_add(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.attn.to_gate.lora_B.weight"[%layer] : view<6144x32xbf16>
+  %weight_base = command.parameter.base %weight : view<6144x32xbf16> -> buffer
+  kernel.launch @block_adapter_add_6144(%input, %weight_base, %selection, %base, %output) : (buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_gate_adapted(%layer: index) launch(%parameters: buffer, %adapter: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %selection: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %low = template.apply<@krea2.adapter_scratch>(%rows) : (index) -> (buffer)
+  command.concurrent {
+    command.program.launch @krea2.block_gate[%layer](%parameters, %input, %quantized, %input_scales, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+    command.program.launch @krea2.block_gate_adapter_down[%layer](%adapter, %input, %selection, %low) : [index](buffer, buffer, buffer, buffer)
+  }
+  command.program.launch @krea2.block_gate_adapter_add[%layer](%adapter, %low, %selection, %output, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_attention_output_adapter_down(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.attn.to_out.0.lora_A.weight"[%layer] : view<32x6144xbf16>
+  %weight_base = command.parameter.base %weight : view<32x6144xbf16> -> buffer
+  kernel.launch @block_adapter_linear_6144_32(%input, %weight_base, %selection, %output) : (buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_attention_output_adapter_add(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.attn.to_out.0.lora_B.weight"[%layer] : view<6144x32xbf16>
+  %weight_base = command.parameter.base %weight : view<6144x32xbf16> -> buffer
+  kernel.launch @block_adapter_add_6144(%input, %weight_base, %selection, %base, %output) : (buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_attention_output_adapted(%layer: index) launch(%parameters: buffer, %adapter: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %selection: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %low = template.apply<@krea2.adapter_scratch>(%rows) : (index) -> (buffer)
+  command.concurrent {
+    command.program.launch @krea2.block_attention_output[%layer](%parameters, %input, %quantized, %input_scales, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+    command.program.launch @krea2.block_attention_output_adapter_down[%layer](%adapter, %input, %selection, %low) : [index](buffer, buffer, buffer, buffer)
+  }
+  command.program.launch @krea2.block_attention_output_adapter_add[%layer](%adapter, %low, %selection, %output, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_feed_forward_gate_adapter_down(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.ff.gate.lora_A.weight"[%layer] : view<32x6144xbf16>
+  %weight_base = command.parameter.base %weight : view<32x6144xbf16> -> buffer
+  kernel.launch @block_adapter_linear_6144_32(%input, %weight_base, %selection, %output) : (buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_feed_forward_gate_adapter_add(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.ff.gate.lora_B.weight"[%layer] : view<16384x32xbf16>
+  %weight_base = command.parameter.base %weight : view<16384x32xbf16> -> buffer
+  kernel.launch @block_adapter_add_16384(%input, %weight_base, %selection, %base, %output) : (buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_feed_forward_gate_adapted(%layer: index) launch(%parameters: buffer, %adapter: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %selection: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %low = template.apply<@krea2.adapter_scratch>(%rows) : (index) -> (buffer)
+  command.concurrent {
+    command.program.launch @krea2.block_feed_forward_gate[%layer](%parameters, %input, %quantized, %input_scales, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+    command.program.launch @krea2.block_feed_forward_gate_adapter_down[%layer](%adapter, %input, %selection, %low) : [index](buffer, buffer, buffer, buffer)
+  }
+  command.program.launch @krea2.block_feed_forward_gate_adapter_add[%layer](%adapter, %low, %selection, %output, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_feed_forward_up_adapter_down(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.ff.up.lora_A.weight"[%layer] : view<32x6144xbf16>
+  %weight_base = command.parameter.base %weight : view<32x6144xbf16> -> buffer
+  kernel.launch @block_adapter_linear_6144_32(%input, %weight_base, %selection, %output) : (buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_feed_forward_up_adapter_add(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.ff.up.lora_B.weight"[%layer] : view<16384x32xbf16>
+  %weight_base = command.parameter.base %weight : view<16384x32xbf16> -> buffer
+  kernel.launch @block_adapter_add_16384(%input, %weight_base, %selection, %base, %output) : (buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_feed_forward_up_adapted(%layer: index) launch(%parameters: buffer, %adapter: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %selection: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %low = template.apply<@krea2.adapter_scratch>(%rows) : (index) -> (buffer)
+  command.concurrent {
+    command.program.launch @krea2.block_feed_forward_up[%layer](%parameters, %input, %quantized, %input_scales, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+    command.program.launch @krea2.block_feed_forward_up_adapter_down[%layer](%adapter, %input, %selection, %low) : [index](buffer, buffer, buffer, buffer)
+  }
+  command.program.launch @krea2.block_feed_forward_up_adapter_add[%layer](%adapter, %low, %selection, %output, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_feed_forward_down_adapter_down(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.ff.down.lora_A.weight"[%layer] : view<32x16384xbf16>
+  %weight_base = command.parameter.base %weight : view<32x16384xbf16> -> buffer
+  kernel.launch @block_adapter_linear_16384_32(%input, %weight_base, %selection, %output) : (buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_feed_forward_down_adapter_add(%layer: index) launch(%adapter: buffer, %input: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %weight = command.parameter %adapter, "transformer.transformer_blocks.{}.ff.down.lora_B.weight"[%layer] : view<6144x32xbf16>
+  %weight_base = command.parameter.base %weight : view<6144x32xbf16> -> buffer
+  kernel.launch @block_adapter_add_6144(%input, %weight_base, %selection, %base, %output) : (buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.program.def public @krea2.block_feed_forward_down_adapted(%layer: index) launch(%parameters: buffer, %adapter: buffer, %input: buffer, %quantized: buffer, %input_scales: buffer, %selection: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %low = template.apply<@krea2.adapter_scratch>(%rows) : (index) -> (buffer)
+  command.concurrent {
+    command.program.launch @krea2.block_feed_forward_down[%layer](%parameters, %input, %quantized, %input_scales, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+    command.program.launch @krea2.block_feed_forward_down_adapter_down[%layer](%adapter, %input, %selection, %low) : [index](buffer, buffer, buffer, buffer)
+  }
+  command.program.launch @krea2.block_feed_forward_down_adapter_add[%layer](%adapter, %low, %selection, %output, %output) : [index](buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+kernel.def target(@block_adapter_wave32) @block_adapter_add_1536() {
+  %rows = config.get @krea2.block_tokens : index
+  %columns = index.constant 12 : index
+  %row_padding = index.constant 63 : index
+  %row_tile = index.constant 64 : index
+  %padded_rows = index.add %rows, %row_padding : index
+  %groups = index.div %padded_rows, %row_tile : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%columns, %groups, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%low: buffer, %factors: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %adapter_outputs = index.constant 1536 : index
+  %adapter_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@krea2.adapter_up>(%rows, %adapter_outputs, %adapter_layout, %low, %factors, %selection, %base, %output) : (index, index, encoding<layout>, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@block_adapter_wave32) @block_adapter_add_1536_column_major() {
+  %rows = config.get @krea2.block_tokens : index
+  %columns = index.constant 12 : index
+  %row_padding = index.constant 63 : index
+  %row_tile = index.constant 64 : index
+  %padded_rows = index.add %rows, %row_padding : index
+  %groups = index.div %padded_rows, %row_tile : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%columns, %groups, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%low: buffer, %factors: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %adapter_outputs = index.constant 1536 : index
+  %adapter_layout = encoding.layout.strided [1, %rows] : encoding<layout>
+  template.apply<@krea2.adapter_up>(%rows, %adapter_outputs, %adapter_layout, %low, %factors, %selection, %base, %output) : (index, index, encoding<layout>, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@block_adapter_wave32) @block_adapter_add_16384() {
+  %rows = config.get @krea2.block_tokens : index
+  %columns = index.constant 128 : index
+  %row_padding = index.constant 63 : index
+  %row_tile = index.constant 64 : index
+  %padded_rows = index.add %rows, %row_padding : index
+  %groups = index.div %padded_rows, %row_tile : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%columns, %groups, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%low: buffer, %factors: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %adapter_outputs = index.constant 16384 : index
+  %adapter_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@krea2.adapter_up>(%rows, %adapter_outputs, %adapter_layout, %low, %factors, %selection, %base, %output) : (index, index, encoding<layout>, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@block_adapter_wave32) @block_adapter_add_6144() {
+  %rows = config.get @krea2.block_tokens : index
+  %columns = index.constant 48 : index
+  %row_padding = index.constant 63 : index
+  %row_tile = index.constant 64 : index
+  %padded_rows = index.add %rows, %row_padding : index
+  %groups = index.div %padded_rows, %row_tile : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%columns, %groups, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%low: buffer, %factors: buffer, %selection: buffer, %base: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %adapter_outputs = index.constant 6144 : index
+  %adapter_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@krea2.adapter_up>(%rows, %adapter_outputs, %adapter_layout, %low, %factors, %selection, %base, %output) : (index, index, encoding<layout>, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@block_adapter_wave32) @block_adapter_linear_16384_32() {
+  %rows = config.get @krea2.block_tokens : index
+  %launch_tile = index.constant 16 : index
+  %groups = index.div %rows, %launch_tile : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %factors: buffer, %selection: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %adapter_inputs = index.constant 16384 : index
+  template.apply<@krea2.adapter_down>(%rows, %adapter_inputs, %input, %factors, %selection, %output) : (index, index, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@block_adapter_wave32) @block_adapter_linear_6144_32() {
+  %rows = config.get @krea2.block_tokens : index
+  %launch_tile = index.constant 16 : index
+  %groups = index.div %rows, %launch_tile : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %factors: buffer, %selection: buffer, %output: buffer) {
+  %rows = config.get @krea2.block_tokens : index
+  %adapter_inputs = index.constant 6144 : index
+  template.apply<@krea2.adapter_down>(%rows, %adapter_inputs, %input, %factors, %selection, %output) : (index, index, buffer, buffer, buffer, buffer)
+  kernel.return
+}

@@ -1,0 +1,363 @@
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+// The checkpoint remains in its published BF16 representation. This policy
+// captures original tensor ranges for initialization commands; it never writes
+// a checkpoint. Logical projection-column and constant views are runtime-only.
+func.decl import("weights") @parameter(%source: i32, %key: buffer) -> (buffer, i64)
+
+func.decl import("weights") @input(%source: i32, %key: buffer, %offset: i64, %length: i64, %alignment: i64) -> (i64)
+
+func.decl import("prepare") @stage(%root: buffer, %tag: i64) -> (i32)
+
+func.decl import("json") @members(%json: buffer) -> (buffer, i32, i64)
+
+func.decl import("json") @parse_i64(%json: buffer, %offset: i64, %length: i64) -> (i64)
+
+func.decl import("input") @require(%condition: i32, %diagnostic: buffer)
+
+// layers.
+global.rodata.def @layer_prefix = bytes("6c61796572732e")
+
+// self_attn.q_proj.weight
+global.rodata.def @q = bytes("73656c665f6174746e2e715f70726f6a2e776569676874")
+
+// self_attn.k_proj.weight
+global.rodata.def @k = bytes("73656c665f6174746e2e6b5f70726f6a2e776569676874")
+
+// self_attn.v_proj.weight
+global.rodata.def @v = bytes("73656c665f6174746e2e765f70726f6a2e776569676874")
+
+// self_attn.o_proj.weight
+global.rodata.def @o = bytes("73656c665f6174746e2e6f5f70726f6a2e776569676874")
+
+// mlp.gate_proj.weight
+global.rodata.def @gate = bytes("6d6c702e676174655f70726f6a2e776569676874")
+
+// mlp.up_proj.weight
+global.rodata.def @up = bytes("6d6c702e75705f70726f6a2e776569676874")
+
+// mlp.down_proj.weight
+global.rodata.def @down = bytes("6d6c702e646f776e5f70726f6a2e776569676874")
+
+// self_attn.q_norm.weight
+global.rodata.def @q_norm = bytes("73656c665f6174746e2e715f6e6f726d2e776569676874")
+
+// self_attn.k_norm.weight
+global.rodata.def @k_norm = bytes("73656c665f6174746e2e6b5f6e6f726d2e776569676874")
+
+// input_layernorm.weight
+global.rodata.def @input_norm = bytes("696e7075745f6c617965726e6f726d2e776569676874")
+
+// post_attention_layernorm.weight
+global.rodata.def @post_norm = bytes("706f73745f617474656e74696f6e5f6c617965726e6f726d2e776569676874")
+
+// norm.weight
+global.rodata.def @final_norm = bytes("6e6f726d2e776569676874")
+
+// embed_tokens.weight
+global.rodata.def @embedding = bytes("656d6265645f746f6b656e732e776569676874")
+
+// projection.
+global.rodata.def @projection_prefix = bytes("70726f6a656374696f6e2e")
+
+// constants
+global.rodata.def @constants = bytes("636f6e7374616e7473")
+
+// qwen3_embedding.prepare_projection_column
+global.rodata.def @projection_command = bytes("7177656e335f656d62656464696e672e707265706172655f70726f6a656374696f6e5f636f6c756d6e")
+
+// qwen3_embedding.prepare_constants
+global.rodata.def @constant_command = bytes("7177656e335f656d62656464696e672e707265706172655f636f6e7374616e7473")
+
+// dtype
+global.rodata.def @dtype = bytes("6474797065")
+
+// shape
+global.rodata.def @shape = bytes("7368617065")
+
+// BF16
+global.rodata.def @bf16 = bytes("42463136")
+
+// Expected the original Qwen3-Embedding-0.6B BF16 checkpoint tensor names, shapes, and data types.
+global.rodata.def @invalid = bytes("457870656374656420746865206f726967696e616c205177656e332d456d62656464696e672d302e3642204246313620636865636b706f696e742074656e736f72206e616d65732c207368617065732c20616e6420646174612074797065732e")
+
+func.def @check(%condition: i1) {
+  %value = scalar.extui %condition : i1 to i32
+  %diagnostic = global.load @invalid : buffer
+  func.call @require(%value, %diagnostic) : (i32, buffer)
+  func.return
+}
+
+func.def @equal(%left: buffer, %right: buffer) -> (i1) {
+  %left_length = buffer.length %left
+  %right_length = buffer.length %right
+  %sized = index.cmp eq, %left_length, %right_length : offset
+  %result = scf.if %sized -> (i1) {
+    %origin = index.constant 0 : offset
+    %c0 = scalar.constant 0 : i32
+    %order = buffer.compare %left[%origin], %right[%origin], %left_length
+    %same = scalar.cmpi eq, %order, %c0 : i32
+    scf.yield %same : i1
+  } else {
+    %no = scalar.constant false : i1
+    scf.yield %no : i1
+  }
+  func.return %result : i1
+}
+
+// Metadata is external input. Select one field, rejecting duplicate/missing
+// keys; JSON member offsets are retained from the parser that validated them.
+func.def @field(%json: buffer, %wanted: buffer) -> (buffer) {
+  %records, %type, %count = func.call @members(%json) : (buffer) -> (buffer, i32, i64)
+  %object = scalar.constant 2 : i32
+  %valid = scalar.cmpi eq, %type, %object : i32
+  func.call @check(%valid) : (i1)
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %extent = index.cast %count : i64 to index
+  %table = buffer.view %records[%origin] : buffer -> view<[%extent]x5xi64>
+  %empty = buffer.alloca<private> align(1) %origin : buffer
+  %no = scalar.constant false : i1
+  %result, %found = scf.for %i = [%c0 to %extent step %c1](%result = %empty : buffer, %found = %no : i1) -> (buffer, i1) {
+    %key_offset_i64 = view.load %table[%i, 0] : view<[%extent]x5xi64> -> i64
+    %key_length_i64 = view.load %table[%i, 1] : view<[%extent]x5xi64> -> i64
+    %key_offset_bounded = scalar.assume %key_offset_i64 [range(%key_offset_i64, 0, 9223372036854775807)] : i64
+    %key_offset = index.cast %key_offset_bounded : i64 to offset
+    %key_length_bounded = scalar.assume %key_length_i64 [range(%key_length_i64, 0, 9223372036854775807)] : i64
+    %key_length = index.cast %key_length_bounded : i64 to offset
+    %key = buffer.alloca<private> align(1) %key_length : buffer
+    buffer.copy %json[%key_offset], %key[%origin], %key_length
+    %matches = func.call @equal(%key, %wanted) : (buffer, buffer) -> (i1)
+    %next, %seen = scf.if %matches -> (buffer, i1) {
+      %fresh = scalar.cmpi eq, %found, %no : i1
+      func.call @check(%fresh) : (i1)
+      %offset_i64 = view.load %table[%i, 2] : view<[%extent]x5xi64> -> i64
+      %length_i64 = view.load %table[%i, 3] : view<[%extent]x5xi64> -> i64
+      %offset_bounded = scalar.assume %offset_i64 [range(%offset_i64, 0, 9223372036854775807)] : i64
+      %offset = index.cast %offset_bounded : i64 to offset
+      %length_bounded = scalar.assume %length_i64 [range(%length_i64, 0, 9223372036854775807)] : i64
+      %length = index.cast %length_bounded : i64 to offset
+      %value = buffer.alloca<private> align(1) %length : buffer
+      buffer.copy %json[%offset], %value[%origin], %length
+      %yes = scalar.constant true : i1
+      scf.yield %value, %yes : buffer, i1
+    } else {
+      scf.yield %result, %found : buffer, i1
+    }
+    scf.yield %next, %seen : buffer, i1
+  }
+  func.call @check(%found) : (i1)
+  func.return %result : buffer
+}
+
+// A zero second dimension denotes a vector; otherwise the tensor is a matrix.
+func.def @tensor(%key: buffer, %rows: i64, %columns: i64) -> (i64) {
+  %source = scalar.constant 0 : i32
+  %metadata, %length = func.call @parameter(%source, %key) : (i32, buffer) -> (buffer, i64)
+  %dtype_key = global.load @dtype : buffer
+  %dtype = func.call @field(%metadata, %dtype_key) : (buffer, buffer) -> (buffer)
+  %expected = global.load @bf16 : buffer
+  %typed = func.call @equal(%dtype, %expected) : (buffer, buffer) -> (i1)
+  func.call @check(%typed) : (i1)
+  %shape_key = global.load @shape : buffer
+  %shape = func.call @field(%metadata, %shape_key) : (buffer, buffer) -> (buffer)
+  %dimensions, %kind, %rank = func.call @members(%shape) : (buffer) -> (buffer, i32, i64)
+  %array = scalar.constant 3 : i32
+  %array_kind = scalar.cmpi eq, %kind, %array : i32
+  func.call @check(%array_kind) : (i1)
+  %c0 = scalar.constant 0 : i64
+  %c1 = scalar.constant 1 : i64
+  %c2 = scalar.constant 2 : i64
+  %matrix = scalar.cmpi ne, %columns, %c0 : i64
+  %expected_rank = scf.select %matrix, %c2, %c1 : i64
+  %ranked = scalar.cmpi eq, %rank, %expected_rank : i64
+  func.call @check(%ranked) : (i1)
+  %origin = index.constant 0 : offset
+  %table = buffer.view %dimensions[%origin] : buffer -> view<1x5xi64>
+  %first_offset = view.load %table[0, 2] : view<1x5xi64> -> i64
+  %first_length = view.load %table[0, 3] : view<1x5xi64> -> i64
+  %first = func.call @parse_i64(%shape, %first_offset, %first_length) : (buffer, i64, i64) -> (i64)
+  %rows_match = scalar.cmpi eq, %first, %rows : i64
+  func.call @check(%rows_match) : (i1)
+  scf.if %matrix {
+    %matrix_table = buffer.view %dimensions[%origin] : buffer -> view<2x5xi64>
+    %second_offset = view.load %matrix_table[1, 2] : view<2x5xi64> -> i64
+    %second_length = view.load %matrix_table[1, 3] : view<2x5xi64> -> i64
+    %second = func.call @parse_i64(%shape, %second_offset, %second_length) : (buffer, i64, i64) -> (i64)
+    %columns_match = scalar.cmpi eq, %second, %columns : i64
+    func.call @check(%columns_match) : (i1)
+  }
+  %width = scf.select %matrix, %columns, %c1 : i64
+  %elements = scalar.muli %rows, %width : i64
+  %bytes = scalar.muli %elements, %c2 : i64
+  %sized = scalar.cmpi eq, %length, %bytes : i64
+  func.call @check(%sized) : (i1)
+  func.return %length : i64
+}
+
+func.def @layer_key(%layer: index, %suffix: buffer) -> (buffer) {
+  %origin = index.constant 0 : offset
+  %prefix_length = index.constant 7 : offset
+  %c1 = index.constant 1 : offset
+  %c2 = index.constant 2 : offset
+  %c10 = index.constant 10 : index
+  %multiple_digits = index.cmp uge, %layer, %c10 : index
+  %digits = scf.select %multiple_digits, %c2, %c1 : offset
+  %decimal_end = index.add %prefix_length, %digits : offset
+  %suffix_start = index.add %decimal_end, %c1 : offset
+  %suffix_length = buffer.length %suffix
+  %length = index.add %suffix_start, %suffix_length : offset
+  %key = buffer.alloca<private> align(1) %length : buffer
+  %prefix = global.load @layer_prefix : buffer
+  buffer.copy %prefix[%origin], %key[%origin], %prefix_length
+  %ascii_zero = scalar.constant 48 : i32
+  scf.if %multiple_digits {
+    %tens = index.div %layer, %c10 : index
+    %tens_i32 = index.cast %tens : index to i32
+    %digit = scalar.addi %ascii_zero, %tens_i32 : i32
+    buffer.store.i8 %digit, %key[%prefix_length]
+  }
+  %units = index.rem %layer, %c10 : index
+  %units_i32 = index.cast %units : index to i32
+  %digit = scalar.addi %ascii_zero, %units_i32 : i32
+  %unit_offset = index.sub %decimal_end, %c1 : offset
+  buffer.store.i8 %digit, %key[%unit_offset]
+  %dot = scalar.constant 46 : i32
+  buffer.store.i8 %dot, %key[%decimal_end]
+  buffer.copy %suffix[%origin], %key[%suffix_start], %suffix_length
+  func.return %key : buffer
+}
+
+func.def @capture_strip(%layer: index, %suffix: buffer, %panel: i64, %rows: i64, %columns: i64) {
+  %key = func.call @layer_key(%layer, %suffix) : (index, buffer) -> (buffer)
+  %length = func.call @tensor(%key, %rows, %columns) : (buffer, i64, i64) -> (i64)
+  %row_bytes = scalar.constant 256 : i64
+  %bytes = scalar.muli %columns, %row_bytes : i64
+  %offset = scalar.muli %panel, %bytes : i64
+  %source = scalar.constant 0 : i32
+  %alignment = scalar.constant 64 : i64
+  %staging_offset = func.call @input(%source, %key, %offset, %bytes, %alignment) : (i32, buffer, i64, i64, i64) -> (i64)
+  func.return
+}
+
+func.def @capture_vector(%key: buffer, %elements: i64) {
+  %c0 = scalar.constant 0 : i64
+  %length = func.call @tensor(%key, %elements, %c0) : (buffer, i64, i64) -> (i64)
+  %source = scalar.constant 0 : i32
+  %alignment = scalar.constant 64 : i64
+  %offset = func.call @input(%source, %key, %c0, %length, %alignment) : (i32, buffer, i64, i64, i64) -> (i64)
+  func.return
+}
+
+func.def @capture_projection(%column: i64) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %layers = index.constant 28 : index
+  %c3 = index.constant 3 : index
+  %c8 = scalar.constant 8 : i64
+  %width1024 = scalar.constant 1024 : i64
+  %width2048 = scalar.constant 2048 : i64
+  %width3072 = scalar.constant 3072 : i64
+  %high = scalar.addi %column, %c8 : i64
+  %q = global.load @q : buffer
+  %k = global.load @k : buffer
+  %v = global.load @v : buffer
+  %o = global.load @o : buffer
+  %gate = global.load @gate : buffer
+  %up = global.load @up : buffer
+  %down = global.load @down : buffer
+  scf.for %layer = [%c0 to %layers step %c1] {
+    func.call @capture_strip(%layer, %q, %column, %width2048, %width1024) : (index, buffer, i64, i64, i64)
+    func.call @capture_strip(%layer, %k, %column, %width1024, %width1024) : (index, buffer, i64, i64, i64)
+    func.call @capture_strip(%layer, %q, %high, %width2048, %width1024) : (index, buffer, i64, i64, i64)
+    func.call @capture_strip(%layer, %v, %column, %width1024, %width1024) : (index, buffer, i64, i64, i64)
+    func.call @capture_strip(%layer, %o, %column, %width1024, %width2048) : (index, buffer, i64, i64, i64)
+    scf.for %group = [%c0 to %c3 step %c1] {
+      %group_i64 = index.cast %group : index to i64
+      %group_base = scalar.muli %group_i64, %c8 : i64
+      %panel = scalar.addi %column, %group_base : i64
+      func.call @capture_strip(%layer, %gate, %panel, %width3072, %width1024) : (index, buffer, i64, i64, i64)
+      func.call @capture_strip(%layer, %up, %panel, %width3072, %width1024) : (index, buffer, i64, i64, i64)
+    }
+    func.call @capture_strip(%layer, %down, %column, %width1024, %width3072) : (index, buffer, i64, i64, i64)
+  }
+  func.return
+}
+
+func.def @capture_constants() {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %layers = index.constant 28 : index
+  %head = scalar.constant 128 : i64
+  %hidden = scalar.constant 1024 : i64
+  %q = global.load @q_norm : buffer
+  %k = global.load @k_norm : buffer
+  %input = global.load @input_norm : buffer
+  %post = global.load @post_norm : buffer
+  scf.for %layer = [%c0 to %layers step %c1] {
+    %q_key = func.call @layer_key(%layer, %q) : (index, buffer) -> (buffer)
+    %k_key = func.call @layer_key(%layer, %k) : (index, buffer) -> (buffer)
+    %input_key = func.call @layer_key(%layer, %input) : (index, buffer) -> (buffer)
+    %post_key = func.call @layer_key(%layer, %post) : (index, buffer) -> (buffer)
+    func.call @capture_vector(%q_key, %head) : (buffer, i64)
+    func.call @capture_vector(%k_key, %head) : (buffer, i64)
+    func.call @capture_vector(%input_key, %hidden) : (buffer, i64)
+    func.call @capture_vector(%post_key, %hidden) : (buffer, i64)
+  }
+  %final = global.load @final_norm : buffer
+  func.call @capture_vector(%final, %hidden) : (buffer, i64)
+  func.return
+}
+
+func.def public @prepare_weight(%key: buffer) -> (i64) {
+  %c0 = scalar.constant 0 : i64
+  %embedding_key = global.load @embedding : buffer
+  %embedding = func.call @equal(%key, %embedding_key) : (buffer, buffer) -> (i1)
+  %bytes = scf.if %embedding -> (i64) {
+    %rows = scalar.constant 151669 : i64
+    %columns = scalar.constant 1024 : i64
+    %length = func.call @tensor(%key, %rows, %columns) : (buffer, i64, i64) -> (i64)
+    scf.yield %c0 : i64
+  } else {
+    %constants_key = global.load @constants : buffer
+    %constants = func.call @equal(%key, %constants_key) : (buffer, buffer) -> (i1)
+    %result = scf.if %constants -> (i64) {
+      func.call @capture_constants() : ()
+      %root = global.load @constant_command : buffer
+      %stage = func.call @stage(%root, %c0) : (buffer, i64) -> (i32)
+      %size = scalar.constant 278528 : i64
+      scf.yield %size : i64
+    } else {
+      %origin = index.constant 0 : offset
+      %prefix_bytes = index.constant 11 : offset
+      %key_bytes = index.constant 12 : offset
+      %length = buffer.length %key
+      %sized = index.cmp eq, %length, %key_bytes : offset
+      func.call @check(%sized) : (i1)
+      %prefix = global.load @projection_prefix : buffer
+      %order = buffer.compare %key[%origin], %prefix[%origin], %prefix_bytes
+      %c0_i32 = scalar.constant 0 : i32
+      %matches = scalar.cmpi eq, %order, %c0_i32 : i32
+      func.call @check(%matches) : (i1)
+      %digit = buffer.load.i8.u %key[%prefix_bytes]
+      %ascii_zero = scalar.constant 48 : i32
+      %c8 = scalar.constant 8 : i32
+      %column = scalar.subi %digit, %ascii_zero : i32
+      %valid = scalar.cmpi ult, %column, %c8 : i32
+      func.call @check(%valid) : (i1)
+      %column_i64 = scalar.extui %column : i32 to i64
+      func.call @capture_projection(%column_i64) : (i64)
+      %root = global.load @projection_command : buffer
+      %stage = func.call @stage(%root, %c0) : (buffer, i64) -> (i32)
+      %size = scalar.constant 62146560 : i64
+      scf.yield %size : i64
+    }
+    scf.yield %result : i64
+  }
+  func.return %bytes : i64
+}

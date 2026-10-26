@@ -1,0 +1,375 @@
+// Deployment-owned adapter identities and original checkpoint files. Native
+// preparation owns file indexes, packed bank residency, and capture lifetime.
+// This source retains only names and source ordinals; requests never supply
+// paths. Relative files use the selected model directory, like other sources.
+
+func.decl import("input") @require(%condition: i32, %diagnostic: buffer)
+
+func.decl import("json") @members(%json: buffer) -> (buffer, i32, i64)
+
+func.decl import("json") @parse_i64(%source: buffer, %offset: i64, %length: i64) -> (i64)
+
+func.decl import("json") @unescape(%source: buffer, %offset: i64, %length: i64, %target: buffer, %target_offset: i64) -> (i64)
+
+func.decl import("prepare") @source(%directory: buffer, %path: buffer) -> (i32)
+
+func.decl import("prepare") @source_append(%source: i32, %directory: buffer, %path: buffer)
+
+// Krea options require workspace_limit_bytes, adapter_capacity_bytes, or adapters; byte limits are positive integers and registered adapters require a capacity
+global.rodata.def @krea2.adapter_options_error = bytes("4b726561206f7074696f6e73207265717569726520776f726b73706163655f6c696d69745f62797465732c20616461707465725f63617061636974795f62797465732c206f722061646170746572733b2062797465206c696d6974732061726520706f73697469766520696e74656765727320616e64207265676973746572656420616461707465727320726571756972652061206361706163697479")
+
+// each adapter requires a unique nonempty ID and a checkpoint file or nonempty ordered shard list
+global.rodata.def @krea2.adapter_files_error = bytes("656163682061646170746572207265717569726573206120756e69717565206e6f6e656d70747920494420616e64206120636865636b706f696e742066696c65206f72206e6f6e656d707479206f726465726564207368617264206c697374")
+
+// request selects an unregistered Krea adapter ID
+global.rodata.def @krea2.adapter_unknown_error = bytes("726571756573742073656c6563747320616e20756e72656769737465726564204b7265612061646170746572204944")
+
+// workspace_limit_bytes
+global.rodata.def @krea2.workspace_option = bytes("776f726b73706163655f6c696d69745f6279746573")
+
+// adapter_capacity_bytes
+global.rodata.def @krea2.capacity_option = bytes("616461707465725f63617061636974795f6279746573")
+
+// adapters
+global.rodata.def @krea2.adapters_option = bytes("6164617074657273")
+
+// {}
+global.rodata.def @krea2.empty_adapters = bytes("7b7d")
+
+func.def @krea2.check_adapter_options(%valid: i1) {
+  %condition = scalar.extui %valid : i1 to i32
+  %error = global.load @krea2.adapter_options_error : buffer
+  func.call @require(%condition, %error) : (i32, buffer)
+  func.return
+}
+
+func.def @krea2.check_adapter_files(%valid: i1) {
+  %condition = scalar.extui %valid : i1 to i32
+  %error = global.load @krea2.adapter_files_error : buffer
+  func.call @require(%condition, %error) : (i32, buffer)
+  func.return
+}
+
+func.def @krea2.json_slice(%json: buffer, %begin: i64, %length: i64) -> (buffer) {
+  %offset_nonnegative = scalar.assume %begin [range(%begin, 0, 9223372036854775807)] : i64
+  %offset = index.cast %offset_nonnegative : i64 to offset
+  %bytes_nonnegative = scalar.assume %length [range(%length, 0, 9223372036854775807)] : i64
+  %bytes = index.cast %bytes_nonnegative : i64 to offset
+  %origin = index.constant 0 : offset
+  %result = buffer.alloca<private> align(8) %bytes : buffer
+  buffer.copy %json[%offset], %result[%origin], %bytes
+  func.return %result : buffer
+}
+
+func.def @krea2.json_string(%json: buffer, %begin: i64, %length: i64) -> (buffer) {
+  %capacity_nonnegative = scalar.assume %length [range(%length, 0, 9223372036854775807)] : i64
+  %capacity = index.cast %capacity_nonnegative : i64 to offset
+  %decoded = buffer.alloca<private> align(1) %capacity : buffer
+  %c0 = scalar.constant 0 : i64
+  %size = func.call @unescape(%json, %begin, %length, %decoded, %c0) : (buffer, i64, i64, buffer, i64) -> (i64)
+  %result = func.call @krea2.json_slice(%decoded, %c0, %size) : (buffer, i64, i64) -> (buffer)
+  func.return %result : buffer
+}
+
+func.def @krea2.adapter_name_equal(%source: buffer, %begin: offset, %length: offset, %name: buffer) -> (i1) {
+  %name_length = buffer.length %name
+  %same_length = index.cmp eq, %length, %name_length : offset
+  %equal = scf.if %same_length -> (i1) {
+    %origin = index.constant 0 : offset
+    %order = buffer.compare %source[%begin], %name[%origin], %length
+    %c0 = scalar.constant 0 : i32
+    %same = scalar.cmpi eq, %order, %c0 : i32
+    scf.yield %same : i1
+  } else {
+    %false = scalar.constant false : i1
+    scf.yield %false : i1
+  }
+  func.return %equal : i1
+}
+
+// Registry: count U64, then [name offset, name length, source ordinal] U64
+// records, followed by decoded UTF-8 names. The bounded prefix supports cold
+// duplicate detection without interpreting unused records.
+func.def @krea2.find_adapter(%registry: buffer, %registry_begin: offset, %count: index, %name: buffer, %name_begin: offset, %name_length: offset) -> (i64) {
+  %header = index.constant 8 : offset
+  %records_begin = index.add %registry_begin, %header : offset
+  %records = buffer.view %registry[%records_begin] : buffer -> view<[%count]x3xi64>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %missing = scalar.constant -1 : i64
+  %source = scf.for %i = [%c0 to %count step %c1](%found = %missing : i64) -> (i64) {
+    %begin64 = view.load %records[%i, 0] : view<[%count]x3xi64> -> i64
+    %length64 = view.load %records[%i, 1] : view<[%count]x3xi64> -> i64
+    %ordinal = view.load %records[%i, 2] : view<[%count]x3xi64> -> i64
+    %relative_nonnegative = scalar.assume %begin64 [range(%begin64, 0, 9223372036854775807)] : i64
+    %relative = index.cast %relative_nonnegative : i64 to offset
+    %begin = index.add %registry_begin, %relative : offset
+    %length_nonnegative = scalar.assume %length64 [range(%length64, 0, 9223372036854775807)] : i64
+    %length = index.cast %length_nonnegative : i64 to offset
+    %same_length = index.cmp eq, %length, %name_length : offset
+    %equal = scf.if %same_length -> (i1) {
+      %order = buffer.compare %registry[%begin], %name[%name_begin], %length
+      %c0_i32 = scalar.constant 0 : i32
+      %same = scalar.cmpi eq, %order, %c0_i32 : i32
+      scf.yield %same : i1
+    } else {
+      %false = scalar.constant false : i1
+      scf.yield %false : i1
+    }
+    %next = scf.select %equal, %ordinal, %found : i64
+    scf.yield %next : i64
+  }
+  func.return %source : i64
+}
+
+func.def @krea2.register_adapter_file(%json: buffer, %begin: i64, %length: i64, %previous: i32) -> (i32) {
+  %file = func.call @krea2.json_string(%json, %begin, %length) : (buffer, i64, i64) -> (buffer)
+  %origin = index.constant 0 : offset
+  %bytes = buffer.length %file
+  %nonempty = index.cmp ne, %bytes, %origin : offset
+  func.call @krea2.check_adapter_files(%nonempty) : (i1)
+  %directory = buffer.alloca<private> align(1) %origin : buffer
+  %missing = scalar.constant -1 : i32
+  %first = scalar.cmpi eq, %previous, %missing : i32
+  %ordinal = scf.if %first -> (i32) {
+    %registered = func.call @source(%directory, %file) : (buffer, buffer) -> (i32)
+    scf.yield %registered : i32
+  } else {
+    func.call @source_append(%previous, %directory, %file) : (i32, buffer, buffer)
+    scf.yield %previous : i32
+  }
+  func.return %ordinal : i32
+}
+
+func.def @krea2.register_adapter(%json: buffer, %begin: i64, %length: i64, %type: i64) -> (i32) {
+  %c0 = scalar.constant 0 : i64
+  %array_type = scalar.constant 3 : i64
+  %string = scalar.cmpi eq, %type, %c0 : i64
+  %array = scalar.cmpi eq, %type, %array_type : i64
+  %valid = scalar.ori %string, %array : i1
+  func.call @krea2.check_adapter_files(%valid) : (i1)
+  %missing = scalar.constant -1 : i32
+  %ordinal = scf.if %string -> (i32) {
+    %value = func.call @krea2.register_adapter_file(%json, %begin, %length, %missing) : (buffer, i64, i64, i32) -> (i32)
+    scf.yield %value : i32
+  } else {
+    %shards = func.call @krea2.json_slice(%json, %begin, %length) : (buffer, i64, i64) -> (buffer)
+    %fields, %kind, %count64 = func.call @members(%shards) : (buffer) -> (buffer, i32, i64)
+    %nonempty = scalar.cmpi sgt, %count64, %c0 : i64
+    func.call @krea2.check_adapter_files(%nonempty) : (i1)
+    %count_nonnegative = scalar.assume %count64 [range(%count64, 0, 9223372036854775807)] : i64
+    %count = index.cast %count_nonnegative : i64 to index
+    %origin = index.constant 0 : offset
+    %records = buffer.view %fields[%origin] : buffer -> view<[%count]x5xi64>
+    %first = index.constant 0 : index
+    %step = index.constant 1 : index
+    %value = scf.for %i = [%first to %count step %step](%previous = %missing : i32) -> (i32) {
+      %file_begin = view.load %records[%i, 2] : view<[%count]x5xi64> -> i64
+      %file_length = view.load %records[%i, 3] : view<[%count]x5xi64> -> i64
+      %file_type = view.load %records[%i, 4] : view<[%count]x5xi64> -> i64
+      %file_string = scalar.cmpi eq, %file_type, %c0 : i64
+      func.call @krea2.check_adapter_files(%file_string) : (i1)
+      %next = func.call @krea2.register_adapter_file(%shards, %file_begin, %file_length, %previous) : (buffer, i64, i64, i32) -> (i32)
+      scf.yield %next : i32
+    }
+    scf.yield %value : i32
+  }
+  func.return %ordinal : i32
+}
+
+func.def @krea2.register_adapters(%json: buffer) -> (buffer) {
+  %fields, %type, %count64 = func.call @members(%json) : (buffer) -> (buffer, i32, i64)
+  %object_type = scalar.constant 2 : i32
+  %object = scalar.cmpi eq, %type, %object_type : i32
+  func.call @krea2.check_adapter_files(%object) : (i1)
+  %origin = index.constant 0 : offset
+  %count_nonnegative = scalar.assume %count64 [range(%count64, 0, 9223372036854775807)] : i64
+  %count = index.cast %count_nonnegative : i64 to index
+  %stride = index.constant 24 : offset
+  %header = index.constant 8 : offset
+  %record_bytes = index.scale %count, %stride : index, offset -> offset
+  %names_begin = index.add %header, %record_bytes : offset
+  %json_bytes = buffer.length %json
+  %bytes = index.add %names_begin, %json_bytes : offset
+  %registry = buffer.alloca<private> align(8) %bytes : buffer
+  %header_view = buffer.view %registry[%origin] : buffer -> view<1xi64>
+  view.store %count64, %header_view[0] : i64, view<1xi64>
+  %records = buffer.view %registry[%header] : buffer -> view<[%count]x3xi64>
+  %members = buffer.view %fields[%origin] : buffer -> view<[%count]x5xi64>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %missing = scalar.constant -1 : i64
+  %end = scf.for %i = [%c0 to %count step %c1](%cursor = %names_begin : offset) -> (offset) {
+    %name_begin = view.load %members[%i, 0] : view<[%count]x5xi64> -> i64
+    %name_length = view.load %members[%i, 1] : view<[%count]x5xi64> -> i64
+    %file_begin = view.load %members[%i, 2] : view<[%count]x5xi64> -> i64
+    %file_length = view.load %members[%i, 3] : view<[%count]x5xi64> -> i64
+    %file_type = view.load %members[%i, 4] : view<[%count]x5xi64> -> i64
+    %name = func.call @krea2.json_string(%json, %name_begin, %name_length) : (buffer, i64, i64) -> (buffer)
+    %name_bytes = buffer.length %name
+    %nonempty = index.cmp ne, %name_bytes, %origin : offset
+    %previous = func.call @krea2.find_adapter(%registry, %origin, %i, %name, %origin, %name_bytes) : (buffer, offset, index, buffer, offset, offset) -> (i64)
+    %unique = scalar.cmpi eq, %previous, %missing : i64
+    %valid = scalar.andi %nonempty, %unique : i1
+    func.call @krea2.check_adapter_files(%valid) : (i1)
+    %source = func.call @krea2.register_adapter(%json, %file_begin, %file_length, %file_type) : (buffer, i64, i64, i64) -> (i32)
+    %source64 = scalar.extui %source : i32 to i64
+    %offset64 = index.cast %cursor : offset to i64
+    %bytes64 = index.cast %name_bytes : offset to i64
+    view.store %offset64, %records[%i, 0] : i64, view<[%count]x3xi64>
+    view.store %bytes64, %records[%i, 1] : i64, view<[%count]x3xi64>
+    view.store %source64, %records[%i, 2] : i64, view<[%count]x3xi64>
+    buffer.copy %name[%origin], %registry[%cursor], %name_bytes
+    %next = index.add %cursor, %name_bytes : offset
+    scf.yield %next : offset
+  }
+  %result = buffer.alloca<private> align(8) %end : buffer
+  buffer.copy %registry[%origin], %result[%origin], %end
+  func.return %result : buffer
+}
+
+func.def public @krea2.adapter_options(%options: buffer) -> (i64, i64, buffer) {
+  %fields, %type, %count64 = func.call @members(%options) : (buffer) -> (buffer, i32, i64)
+  %object_type = scalar.constant 2 : i32
+  %object = scalar.cmpi eq, %type, %object_type : i32
+  func.call @krea2.check_adapter_options(%object) : (i1)
+  %origin = index.constant 0 : offset
+  %count_nonnegative = scalar.assume %count64 [range(%count64, 0, 9223372036854775807)] : i64
+  %count = index.cast %count_nonnegative : i64 to index
+  %records = buffer.view %fields[%origin] : buffer -> view<[%count]x5xi64>
+  %workspace_key = global.load @krea2.workspace_option : buffer
+  %capacity_key = global.load @krea2.capacity_option : buffer
+  %adapters_key = global.load @krea2.adapters_option : buffer
+  %empty = global.load @krea2.empty_adapters : buffer
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c0_i64 = scalar.constant 0 : i64
+  %c1_i64 = scalar.constant 1 : i64
+  %c2_i64 = scalar.constant 2 : i64
+  %c4_i64 = scalar.constant 4 : i64
+  %workspace, %capacity, %registrations, %seen = scf.for %i = [%c0 to %count step %c1](%workspace = %c0_i64 : i64, %capacity = %c0_i64 : i64, %registrations = %empty : buffer, %seen = %c0_i64 : i64) -> (i64, i64, buffer, i64) {
+    %name_begin = view.load %records[%i, 0] : view<[%count]x5xi64> -> i64
+    %name_length = view.load %records[%i, 1] : view<[%count]x5xi64> -> i64
+    %value_begin = view.load %records[%i, 2] : view<[%count]x5xi64> -> i64
+    %value_length = view.load %records[%i, 3] : view<[%count]x5xi64> -> i64
+    %value_type = view.load %records[%i, 4] : view<[%count]x5xi64> -> i64
+    %name = func.call @krea2.json_string(%options, %name_begin, %name_length) : (buffer, i64, i64) -> (buffer)
+    %name_bytes = buffer.length %name
+    %is_workspace = func.call @krea2.adapter_name_equal(%name, %origin, %name_bytes, %workspace_key) : (buffer, offset, offset, buffer) -> (i1)
+    %is_capacity = func.call @krea2.adapter_name_equal(%name, %origin, %name_bytes, %capacity_key) : (buffer, offset, offset, buffer) -> (i1)
+    %is_adapters = func.call @krea2.adapter_name_equal(%name, %origin, %name_bytes, %adapters_key) : (buffer, offset, offset, buffer) -> (i1)
+    %bytes_option = scalar.ori %is_workspace, %is_capacity : i1
+    %known = scalar.ori %bytes_option, %is_adapters : i1
+    %byte_bit = scf.select %is_workspace, %c1_i64, %c2_i64 : i64
+    %bit = scf.select %is_adapters, %c4_i64, %byte_bit : i64
+    %prior = scalar.andi %seen, %bit : i64
+    %unique = scalar.cmpi eq, %prior, %c0_i64 : i64
+    %valid = scalar.andi %known, %unique : i1
+    func.call @krea2.check_adapter_options(%valid) : (i1)
+    %next_workspace, %next_capacity, %next_registrations = scf.if %is_adapters -> (i64, i64, buffer) {
+      %object = scalar.cmpi eq, %value_type, %c2_i64 : i64
+      func.call @krea2.check_adapter_options(%object) : (i1)
+      %value = func.call @krea2.json_slice(%options, %value_begin, %value_length) : (buffer, i64, i64) -> (buffer)
+      scf.yield %workspace, %capacity, %value : i64, i64, buffer
+    } else {
+      %number = scalar.cmpi eq, %value_type, %c1_i64 : i64
+      func.call @krea2.check_adapter_options(%number) : (i1)
+      %value = func.call @parse_i64(%options, %value_begin, %value_length) : (buffer, i64, i64) -> (i64)
+      %positive = scalar.cmpi sgt, %value, %c0_i64 : i64
+      func.call @krea2.check_adapter_options(%positive) : (i1)
+      %next_workspace = scf.select %is_workspace, %value, %workspace : i64
+      %next_capacity = scf.select %is_capacity, %value, %capacity : i64
+      scf.yield %next_workspace, %next_capacity, %registrations : i64, i64, buffer
+    }
+    %next_seen = scalar.ori %seen, %bit : i64
+    scf.yield %next_workspace, %next_capacity, %next_registrations, %next_seen : i64, i64, buffer, i64
+  }
+  %registry = func.call @krea2.register_adapters(%registrations) : (buffer) -> (buffer)
+  %header = buffer.view %registry[%origin] : buffer -> view<1xi64>
+  %registered = view.load %header[0] : view<1xi64> -> i64
+  %has_adapters = scalar.cmpi ne, %registered, %c0_i64 : i64
+  %has_capacity = scalar.cmpi ne, %capacity, %c0_i64 : i64
+  %consistent = scalar.cmpi eq, %has_adapters, %has_capacity : i1
+  func.call @krea2.check_adapter_options(%consistent) : (i1)
+  func.return %workspace, %capacity, %registry : i64, i64, buffer
+}
+
+// Native ingress has decoded names, bounded records, and finite F32 strengths.
+// Resolve each occurrence once, retain its order and strength, and drop only
+// registered zero-strength occurrences. Unknown IDs fail even at zero.
+func.def public @krea2.select_adapters(%state: buffer, %loras: buffer) -> (buffer, i64) {
+  %origin = index.constant 0 : offset
+  %registry_begin = index.constant 96 : offset
+  %registry_header = buffer.view %state[%registry_begin] : buffer -> view<1xi64>
+  %registered64 = view.load %registry_header[0] : view<1xi64> -> i64
+  %registered_nonnegative = scalar.assume %registered64 [range(%registered64, 0, 9223372036854775807)] : i64
+  %registered = index.cast %registered_nonnegative : i64 to index
+  %length = buffer.length %loras
+  %header_bytes = index.constant 16 : offset
+  %capacity = index.add %length, %header_bytes : offset
+  %selections = buffer.alloca<private> align(8) %capacity : buffer
+  %zero32 = scalar.constant 0 : i32
+  buffer.fill %zero32, %selections[%origin], %capacity : i32
+  %c0_i64 = scalar.constant 0 : i64
+  %c1_i64 = scalar.constant 1 : i64
+  %missing = scalar.constant -1 : i64
+  %error = global.load @krea2.adapter_unknown_error : buffer
+  %end, %count = scf.while(%position = %origin : offset, %count = %c0_i64 : i64) -> (offset, i64) {
+    %more = index.cmp ult, %position, %length : offset
+    scf.condition %more, %position, %count : i1, offset, i64
+  } do(%position: offset, %count: i64) {
+    %header = buffer.view %loras[%position] : buffer -> view<1xi64>
+    %name_length64 = view.load %header[0] : view<1xi64> -> i64
+    %name_length_nonnegative = scalar.assume %name_length64 [range(%name_length64, 0, 9223372036854775807)] : i64
+    %name_length = index.cast %name_length_nonnegative : i64 to offset
+    %name_begin = index.add %position, %header_bytes : offset
+    %source = func.call @krea2.find_adapter(%state, %registry_begin, %registered, %loras, %name_begin, %name_length) : (buffer, offset, index, buffer, offset, offset) -> (i64)
+    %known = scalar.cmpi ne, %source, %missing : i64
+    %known32 = scalar.extui %known : i1 to i32
+    func.call @require(%known32, %error) : (i32, buffer)
+    %strength_field = index.constant 8 : offset
+    %strength_begin = index.add %position, %strength_field : offset
+    %strength_view = buffer.view %loras[%strength_begin] : buffer -> view<1xi32>
+    %strength_bits = view.load %strength_view[0] : view<1xi32> -> i32
+    // Masking sign treats both IEEE signed zeros as the ordinary base path.
+    %magnitude_mask = scalar.constant 2147483647 : i32
+    %magnitude = scalar.andi %strength_bits, %magnitude_mask : i32
+    %active = scalar.cmpi ne, %magnitude, %zero32 : i32
+    %next_count = scf.if %active -> (i64) {
+      %slot_nonnegative = scalar.assume %count [range(%count, 0, 9223372036854775807)] : i64
+      %slot = index.cast %slot_nonnegative : i64 to index
+      %record = index.scale %slot, %header_bytes : index, offset -> offset
+      %record_begin = index.add %header_bytes, %record : offset
+      %record_view = buffer.view %selections[%record_begin] : buffer -> view<1xi64>
+      view.store %source, %record_view[0] : i64, view<1xi64>
+      %scale_begin = index.add %record_begin, %strength_field : offset
+      %scale_view = buffer.view %selections[%scale_begin] : buffer -> view<1xi32>
+      view.store %strength_bits, %scale_view[0] : i32, view<1xi32>
+      %next = scalar.addi %count, %c1_i64 : i64
+      scf.yield %next : i64
+    } else {
+      scf.yield %count : i64
+    }
+    %padding = scalar.constant 7 : i64
+    %mask = scalar.constant -8 : i64
+    %rounded = scalar.addi %name_length64, %padding : i64
+    %padded64 = scalar.andi %rounded, %mask : i64
+    %padded_nonnegative = scalar.assume %padded64 [range(%padded64, 0, 9223372036854775807)] : i64
+    %padded = index.cast %padded_nonnegative : i64 to offset
+    %next_position = index.add %name_begin, %padded : offset
+    scf.yield %next_position, %next_count : offset, i64
+  }
+  %maximum_count = scalar.constant 2147483647 : i64
+  %representable = scalar.cmpi ule, %count, %maximum_count : i64
+  func.call @krea2.check_adapter_files(%representable) : (i1)
+  %count32 = scalar.trunci %count : i64 to i32
+  %header = buffer.view %selections[%origin] : buffer -> view<1xi32>
+  view.store %count32, %header[0] : i32, view<1xi32>
+  %count_index_nonnegative = scalar.assume %count [range(%count, 0, 9223372036854775807)] : i64
+  %count_index = index.cast %count_index_nonnegative : i64 to index
+  %record_bytes = index.scale %count_index, %header_bytes : index, offset -> offset
+  %bytes = index.add %header_bytes, %record_bytes : offset
+  %result = buffer.alloca<private> align(8) %bytes : buffer
+  buffer.copy %selections[%origin], %result[%origin], %bytes
+  func.return %result, %count : buffer, i64
+}

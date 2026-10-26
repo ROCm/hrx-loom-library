@@ -1,0 +1,69 @@
+// GGML Q5_1 retained weight blocks.
+//
+// Reference: block_q5_1 and dequantize_row_q5_1 in llama.cpp commit
+// 030ebb558a5820b444a8f836ed5cdd46c9b4bd7a:
+// https://github.com/ggml-org/llama.cpp/blob/030ebb558a5820b444a8f836ed5cdd46c9b4bd7a/ggml/src/ggml-common.h
+// https://github.com/ggml-org/llama.cpp/blob/030ebb558a5820b444a8f836ed5cdd46c9b4bd7a/ggml/src/ggml-quants.c
+//
+// Each 24-byte record holds little-endian F16 scale and minimum, a 32-bit
+// high-code plane, and 16 nibble-pair bytes. Low nibbles encode the first
+// 16 unsigned codes; high nibbles encode the remaining 16. Bit j of the high
+// word supplies bit four of code j. A logical value is scale * code + minimum.
+//
+// The block loader returns retained physical carriers and expanded affine
+// coefficients separately. Its byte origin needs only F16 alignment; the
+// caller owns bounds. The decoder accepts those carriers or values already
+// staged in another memory space, and selects half 0 or 1 without rereading
+// the block. Consumers own arithmetic, rounding, reuse, and launch geometry.
+
+// Loads the complete header and payload once for reuse across both halves.
+func.def public inline @ggml_q5_1_load_block(%weight: buffer, %block_origin: offset) -> (vector<16xi8>, i32, f32, f32) {
+  %high_add = index.constant 4 : offset
+  %code_add = index.constant 8 : offset
+  %high_origin = index.add %block_origin, %high_add : offset
+  %code_origin = index.add %block_origin, %code_add : offset
+  %header = buffer.view %weight[%block_origin] : buffer -> view<2xf16>
+  %high_view = buffer.view %weight[%high_origin] : buffer -> view<1xi32>
+  %code_view = buffer.view %weight[%code_origin] : buffer -> view<16xi8>
+  %scale_half = view.load %header[0] : view<2xf16> -> f16
+  %minimum_half = view.load %header[1] : view<2xf16> -> f16
+  %scale = scalar.extf %scale_half : f16 to f32
+  %minimum = scalar.extf %minimum_half : f16 to f32
+  %high_word = view.load %high_view[0] : view<1xi32> -> i32
+  %packed = vector.load %code_view[0] : view<16xi8> -> vector<16xi8>
+  func.return %packed, %high_word, %scale, %minimum : vector<16xi8>, i32, f32, f32
+}
+
+// Expands half 0 or 1 to its 16 unsigned codes. A constant selector specializes
+// the shifts; retained carriers remain reusable across either selection.
+func.def public inline @ggml_q5_1_unpack_codes16(%packed: vector<16xi8>, %packed_high: i32, %half_value: index) -> (vector<16xi8>) {
+  %half = index.assume %half_value [range(%half_value, 0, 1)] : index
+  %high_words = vector.splat %packed_high : vector<4xi32>
+  %nibble_bits = scalar.constant 4 : i32
+  %half_width = scalar.constant 16 : i32
+  %nibble_mask = vector.constant 15 : vector<16xi8>
+  %high_mask = vector.constant 15 : vector<4xi32>
+  %spread_factor = vector.constant 2113665 : vector<4xi32>
+  %low_bits_in_bytes = vector.constant 16843009 : vector<4xi32>
+  %high_bit_shift = vector.constant 4 : vector<4xi32>
+  %half_i32 = index.cast %half : index to i32
+  %nibble_shift = scalar.muli %half_i32, %nibble_bits : i32
+  %nibble_shift_i8 = scalar.trunci %nibble_shift : i32 to i8
+  %nibble_shifts = vector.splat %nibble_shift_i8 : vector<16xi8>
+  %shifted = vector.shrui %packed, %nibble_shifts : vector<16xi8>
+  %low_codes = vector.andi %shifted, %nibble_mask : vector<16xi8>
+  %first_bit = scalar.muli %half_i32, %half_width : i32
+  // Multiplication by 0x00204081 places four copies of each nibble seven
+  // bits apart without overlap. Masking with 0x01010101 selects one bit
+  // per byte; shifting by four places each original high bit over its
+  // low nibble. The four words bitcast directly to sixteen code bytes.
+  %bit_positions = vector.iota %first_bit step %nibble_bits : vector<4xi32>
+  %high_shifted = vector.shrui %high_words, %bit_positions : vector<4xi32>
+  %high_nibbles = vector.andi %high_shifted, %high_mask : vector<4xi32>
+  %spread_bits = vector.muli %high_nibbles, %spread_factor : vector<4xi32>
+  %high_bits = vector.andi %spread_bits, %low_bits_in_bytes : vector<4xi32>
+  %high_values = vector.shli %high_bits, %high_bit_shift : vector<4xi32>
+  %high_codes = vector.bitcast %high_values : vector<4xi32> to vector<16xi8>
+  %codes = vector.ori %low_codes, %high_codes : vector<16xi8>
+  func.return %codes : vector<16xi8>
+}

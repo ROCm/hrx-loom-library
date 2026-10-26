@@ -14,14 +14,22 @@ from pathlib import Path
 from typing import Iterable
 
 
-CONFIG_DECLARATION_PATTERN = re.compile(r"^\s*config\.decl(?:\s|@)", re.MULTILINE)
-KERNEL_DEFINITION_PATTERN = re.compile(r"^\s*kernel\.def(?:\s|@)", re.MULTILINE)
+SOURCE_NON_CODE_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|//[^\r\n]*')
+LAYER_OPERATION_PATTERN = re.compile(
+    r"(?<![\w.$%@#^-])"
+    r"(?:config\.[A-Za-z_][A-Za-z0-9_.]*|kernel\.def|"
+    r"[A-Za-z_][A-Za-z0-9_.]*\.target|target\.generic)"
+    r"(?![\w.-])"
+)
 LOCAL_RULES_LABEL = '"//build_tools/bazel:defs.bzl"'
 UPSTREAM_RULES_LABEL = '"@hrx//loom/build_tools/bazel:defs.bzl"'
 
 
-def _code_without_line_comments(source: str) -> str:
-    return "\n".join(line.partition("//")[0] for line in source.splitlines())
+def _layer_operations(source: str) -> set[str]:
+    # The compiler owns grammar validation. These lexical layer checks ignore
+    # literals, comments, and sigil-prefixed references to operation-like names.
+    code = SOURCE_NON_CODE_PATTERN.sub(" ", source)
+    return set(LAYER_OPERATION_PATTERN.findall(code))
 
 
 def _starlark_without_line_comments(source: str) -> str:
@@ -33,20 +41,29 @@ def check_sources(layer: str, sources: Iterable[tuple[str, str]]) -> list[str]:
     source_definitions = [
         (
             name,
-            _code_without_line_comments(text),
+            _layer_operations(text),
         )
         for name, text in sources
     ]
     if layer == "motif":
         violations = []
-        for name, code in source_definitions:
-            if KERNEL_DEFINITION_PATTERN.search(code):
+        for name, operations in source_definitions:
+            if "kernel.def" in operations:
                 violations.append(f"{name}: motif sources cannot declare kernel.def")
-            if CONFIG_DECLARATION_PATTERN.search(code):
-                violations.append(f"{name}: motif sources cannot declare config.decl")
+            for operation in sorted(operations - {"kernel.def"}):
+                if operation.startswith("config."):
+                    violations.append(
+                        f"{name}: motif sources cannot use {operation}; "
+                        "pass configuration values from a composition leaf"
+                    )
+                else:
+                    violations.append(
+                        f"{name}: motif sources cannot declare {operation}; "
+                        "define concrete targets at a composition leaf"
+                    )
         return violations
     if layer == "kernel" and not any(
-        KERNEL_DEFINITION_PATTERN.search(code) for _, code in source_definitions
+        "kernel.def" in operations for _, operations in source_definitions
     ):
         names = ", ".join(name for name, _ in source_definitions)
         return [f"kernel package has no kernel.def declaration: {names}"]
@@ -58,13 +75,15 @@ def _package_policy(layer: str, relative_directory: Path) -> tuple[str, str]:
         return "test", "loom_test"
     if layer == "kernel":
         return "kernel", "loom_kernel_library"
+    if layer in ("model", "program"):
+        return layer, "loom_library"
     return "motif", "loom_motif_library"
 
 
 def _check_scoped_readmes(repository_root: Path) -> list[str]:
     violations: list[str] = []
     checked_directories: set[Path] = set()
-    for root_name in ("kernel", "model", "motif", "target"):
+    for root_name in ("kernel", "model", "motif", "program", "target"):
         source_root = repository_root / root_name
         if not source_root.is_dir():
             continue
@@ -89,18 +108,14 @@ def _check_scoped_readmes(repository_root: Path) -> list[str]:
 
 
 def check_repository(repository_root: Path) -> list[str]:
-    """Returns architecture-policy violations in a kernel-library checkout."""
+    """Returns architecture-policy violations in a library checkout."""
     violations = _check_scoped_readmes(repository_root)
-    for layer in ("model", "target"):
-        layer_root = repository_root / layer
-        if not layer_root.is_dir():
-            continue
-        for source_path in sorted(layer_root.rglob("*.loom")):
-            violations.append(
-                f"{source_path.relative_to(repository_root)}: source-bearing "
-                f"{layer} packages require a repository admission rule"
-            )
-    for layer in ("kernel", "motif"):
+    for source_path in sorted((repository_root / "target").rglob("*.loom")):
+        violations.append(
+            f"{source_path.relative_to(repository_root)}: source-bearing "
+            "target packages require a repository admission rule"
+        )
+    for layer in ("kernel", "model", "motif", "program"):
         layer_root = repository_root / layer
         if not layer_root.is_dir():
             continue
@@ -128,7 +143,7 @@ def check_repository(repository_root: Path) -> list[str]:
                 )
             if UPSTREAM_RULES_LABEL in build_text:
                 violations.append(
-                    f"{build_path.relative_to(repository_root)}: kernel-library "
+                    f"{build_path.relative_to(repository_root)}: library "
                     "packages cannot bypass repository policy wrappers"
                 )
             if not re.search(rf"\b{rule_name}\s*\(", build_text):
@@ -144,12 +159,47 @@ def check_repository(repository_root: Path) -> list[str]:
                         f"{build_path.relative_to(repository_root)}: "
                         f"{source_path.name} is not explicitly declared"
                     )
+    for card_path in sorted((repository_root / "model").rglob("model.json")):
+        relative_directory = card_path.parent.relative_to(repository_root)
+        build_path = card_path.with_name("BUILD.bazel")
+        if not build_path.is_file():
+            violations.append(
+                f"{relative_directory}: model card requires adjacent BUILD.bazel"
+            )
+            continue
+        build_text = _starlark_without_line_comments(build_path.read_text())
+        if LOCAL_RULES_LABEL not in build_text or UPSTREAM_RULES_LABEL in build_text:
+            violations.append(
+                f"{build_path.relative_to(repository_root)}: model cards use "
+                "repository rules from //build_tools/bazel:defs.bzl"
+            )
+        has_model = re.search(r"\bloom_model\s*\(", build_text)
+        has_reference = re.search(r"\bloom_model_documentation\s*\(", build_text)
+        if not (has_model or has_reference) or '"model.json"' not in build_text:
+            violations.append(
+                f"{build_path.relative_to(repository_root)}: model card must be "
+                "explicitly declared by loom_model or loom_model_documentation"
+            )
+        has_providers = any(
+            re.search(
+                r"\bloom_library\s*\(",
+                _starlark_without_line_comments(provider_build.read_text()),
+            )
+            for provider_build in card_path.parent.rglob("BUILD.bazel")
+        )
+        if not has_model and has_providers:
+            violations.append(
+                f"{build_path.relative_to(repository_root)}: model programs require "
+                "loom_model; a generated reference does not qualify executable providers"
+            )
     return violations
 
 
 def _create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--layer", choices=["kernel", "motif", "test"])
+    parser.add_argument(
+        "--layer", choices=["kernel", "model", "motif", "program", "test"]
+    )
     parser.add_argument("--repository-root", type=Path)
     parser.add_argument("sources", metavar="SOURCE", nargs="*")
     return parser

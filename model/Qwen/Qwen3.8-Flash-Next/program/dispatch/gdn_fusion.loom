@@ -1,0 +1,59 @@
+// Flash-Next gdn fusion command composition.
+// The prepared stage supplies capacities and parameter bindings; these
+// commands own intermediate buffers and ordered device launches.
+
+config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+command.program.decl @flash_next_capture_inputs(%neural_enabled: i1, %prefix_bytes: offset, %row_bytes: offset) launch(%epoch: buffer, %input: buffer, %capture: buffer)
+
+command.program.decl @flash_next_gdn_finish(%layer: index, %state_origin: offset) launch(%parameters: buffer, %epoch: buffer, %rows: buffer, %convolved: buffer, %inverse_norm: buffer, %z: buffer, %alpha: buffer, %beta: buffer, %arena: buffer, %output: buffer)
+
+kernel.decl @gdn_fused_boundary() launch(%epoch_arg: buffer, %rows_arg: buffer, %history_origin: offset, %halo_arg: buffer, %weight_arg: buffer, %arena_arg: buffer, %output_arg: buffer, %norm_arg: buffer)
+
+kernel.decl @gdn_fused_projection() launch(%epoch_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %conv_arg: buffer, %halo_arg: buffer, %output_arg: buffer, %norm_arg: buffer, %capture_arg: buffer, %capture_origin: offset)
+
+// Each head/session owner resolves its prefix against retained history before
+// publishing the next history. The complete raw projection plane stays in LDS;
+// six rows per tile/span intersection are sufficient for boundary resolution.
+command.program.def public @flash_next_gdn_fused_state(%layer: index, %state_origin: offset) launch(%parameters: buffer, %epoch: buffer, %rows: buffer, %input: buffer, %z: buffer, %alpha: buffer, %beta: buffer, %arena: buffer, %output: buffer, %capture: buffer) where [range(%layer, 0, 47)] {
+  %neural_enabled = scalar.constant true : i1
+  %tokens = config.get @flash_next.token_count : index
+  %spans = config.get @flash_next.span_capacity : index
+  %layer_group_size = index.constant 4 : index
+  %prior_qsa = index.div %layer, %layer_group_size : index
+  %ordinal = index.sub %layer, %prior_qsa : index
+  %transition_bytes = index.constant 20864 : offset
+  %prefix = index.scale %ordinal, %transition_bytes : index, offset -> offset
+  %capture_origin = index.scale %tokens, %prefix : index, offset -> offset
+  %qkv_row_bytes = index.constant 20480 : offset
+  %gate_extent = index.constant 192 : offset
+  %alpha_prefix = index.add %prefix, %qkv_row_bytes : offset
+  %beta_prefix = index.add %alpha_prefix, %gate_extent : offset
+  command.program.launch @flash_next_capture_inputs[%neural_enabled, %alpha_prefix, %gate_extent](%epoch, %alpha, %capture) : [i1, offset, offset](buffer, buffer, buffer)
+  command.program.launch @flash_next_capture_inputs[%neural_enabled, %beta_prefix, %gate_extent](%epoch, %beta, %capture) : [i1, offset, offset](buffer, buffer, buffer)
+  %tile = index.constant 128 : index
+  %rounding = index.constant 127 : index
+  %c1 = index.constant 1 : index
+  %padded = index.add %tokens, %rounding : index
+  %tiles = index.div %padded, %tile : index
+  %slots_with_tail = index.add %tiles, %spans : index
+  %slots = index.sub %slots_with_tail, %c1 : index
+  %halo_stride = index.constant 122880 : offset
+  %halo_bytes = index.scale %slots, %halo_stride : index, offset -> offset
+  %qkv_bytes = index.scale %tokens, %qkv_row_bytes : index, offset -> offset
+  %norm_row_bytes = index.constant 128 : offset
+  %norm_bytes = index.scale %tokens, %norm_row_bytes : index, offset -> offset
+  %state_bytes = index.constant 3145728 : offset
+  %history_origin = index.add %state_origin, %state_bytes : offset
+  %halo = buffer.alloca<global> align(256) %halo_bytes : buffer
+  %convolved = buffer.alloca<global> align(256) %qkv_bytes : buffer
+  %inverse_norm = buffer.alloca<global> align(256) %norm_bytes : buffer
+  %weight = command.parameter %parameters, "blk.{}.attn_qkv.weight"[%layer] : view<10240x80x34xi8>
+  %conv_weight = command.parameter %parameters, "blk.{}.ssm_conv1d.weight"[%layer] : view<10240x4xf32>
+  kernel.launch @gdn_fused_projection(%epoch, %input, %weight, %conv_weight, %halo, %convolved, %inverse_norm, %capture, %capture_origin) : (buffer, buffer, view<10240x80x34xi8>, view<10240x4xf32>, buffer, buffer, buffer, buffer, offset)
+  kernel.launch @gdn_fused_boundary(%epoch, %rows, %history_origin, %halo, %conv_weight, %arena, %convolved, %inverse_norm) : (buffer, buffer, offset, buffer, view<10240x4xf32>, buffer, buffer, buffer)
+  command.program.launch @flash_next_gdn_finish[%layer, %state_origin](%parameters, %epoch, %rows, %convolved, %inverse_norm, %z, %alpha, %beta, %arena, %output) : [index, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}

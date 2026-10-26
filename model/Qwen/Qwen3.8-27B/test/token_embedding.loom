@@ -1,0 +1,51 @@
+// Independent scalar physical-layout decoder for the differential check.
+kernel.def @qwen38_token_embedding_fix_differential_headers() {
+  %c1 = index.constant 1 : index
+  %vocabulary_size = index.constant 4 : index
+  %workgroup_size = index.constant 64 : index
+  kernel.launch.config workgroups(%vocabulary_size, %c1, %c1) workgroup_size(%workgroup_size, %c1, %c1) : index
+} launch(%weight: buffer) {
+  %row = kernel.workgroup.id<x> : index
+  %workitem0 = kernel.workitem.id<x> : index
+  %block_count = index.constant 20 : index
+  %valid_block = index.cmp ult, %workitem0, %block_count : index
+  scf.if %valid_block {
+    %block = index.assume %workitem0 [range(%workitem0, 0, 19)] : index
+    %row_bytes = index.constant 3520 : offset
+    %block_bytes = index.constant 176 : offset
+    %row_byte_base = index.scale %row, %row_bytes : index, offset -> offset
+    %block_byte_add = index.scale %block, %block_bytes : index, offset -> offset
+    %block_byte_base = index.add %row_byte_base, %block_byte_add : offset
+    %half_view = buffer.view %weight[%block_byte_base] : buffer -> view<2xf16>
+    %d = scalar.constant 0.125 : f32
+    %dmin = scalar.constant 0.03125 : f32
+    %d_f16 = scalar.fptrunc %d : f32 to f16
+    %dmin_f16 = scalar.fptrunc %dmin : f32 to f16
+    view.store %d_f16, %half_view[0] : f16, view<2xf16>
+    view.store %dmin_f16, %half_view[1] : f16, view<2xf16>
+  }
+  kernel.return
+}
+
+kernel.decl @qwen38_input_embedding_f32(%token_count0: index) launch(%mixed_inputs: index, %token_ids: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_token_embedding_q5k_f32_reference(%dispatch_token_count0: index) launch(%token_count0: index, %token_ids: buffer, %weight: buffer, %output: buffer)
+
+// Numerical checks for token embedding.
+// Production kernels come from the model library; independent reference
+// kernels and fixture data belong only to this test root.
+check.case public @qwen38_token_embedding_q5k_f32_differential_case {
+  %token_count = check.literal value(2) : index
+  %token_ids = check.generate.iota offset(2) step(-2) : tensor<2xi32>
+  %weight = check.generate.iota offset(-127) step(17) period(15) : tensor<4x20x176xi8>
+  %expected = check.generate.fill value(0.0) : tensor<2x5120xf32>
+  %actual = check.generate.fill value(0.0) : tensor<2x5120xf32>
+  kernel.launch @qwen38_token_embedding_fix_differential_headers(%weight) : (tensor<4x20x176xi8>)
+  kernel.launch @qwen38_token_embedding_q5k_f32_reference[%token_count](%token_count, %token_ids, %weight, %expected) : [index](index, tensor<2xi32>, tensor<4x20x176xi8>, tensor<2x5120xf32>)
+  %ordinary = check.literal value(0) : index
+  kernel.launch @qwen38_input_embedding_f32[%token_count](%ordinary, %token_ids, %weight, %actual) : [index](index, tensor<2xi32>, tensor<4x20x176xi8>, tensor<2x5120xf32>)
+  check.expect.close actual(%actual) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<2x5120xf32>
+  check.return
+}
+
+check.benchmark<@qwen38_token_embedding_q5k_f32_differential_case> @qwen38_token_embedding_q5k_f32_small

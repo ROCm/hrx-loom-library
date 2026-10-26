@@ -1,0 +1,143 @@
+// Packed Q8 dot projections and GDN gate projections. Q8 codes are shared
+// across four tokens without changing each token's reduction tree; large gate
+// projections explicitly select their coefficient conversion.
+
+func.decl @flash_next_alpha_beta_matrix(%capacity: index, %epoch: buffer, %input: buffer, %alpha_weight: buffer, %beta_weight: buffer, %alpha: buffer, %beta: buffer)
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+amdgpu.target<gfx11-generic> @flash_next_projection_wave32 {subgroup_size = 32}
+
+func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
+
+func.decl @flash_next_q8_batch_partial(%width: index, %group_size: index, %batch_size: index, %first: index, %end: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (vector<[%group_size]xf32>)
+
+// A subgroup contracts one output column for four packed tokens. Reusing the
+// original Q8 codes reduces weight traffic without repacking, extra activation
+// quantization, shared memory, or a batch-dependent reduction order.
+kernel.def target(@flash_next_projection_wave32) @flash_next_linear_q8(%neural_enabled: i1, %output_width: index) {
+  %outputs = index.assume %output_width [range(%output_width, 4, 262144), multiple_of(%output_width, 4)] : index
+  %c4 = index.constant 4 : index
+  %groups = index.div %outputs, %c4 : index
+  %tokens = config.get @flash_next.token_count : index
+  %c3 = index.constant 3 : index
+  %padded = index.add %tokens, %c3 : index
+  %batches = index.div %padded, %c4 : index
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %batches, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input_width: index, %output_width: index, %span_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
+  %span, %input, %weight, %output = buffer.assume.noalias %span_arg, %input_arg, %weight_arg, %output_arg : buffer, buffer, buffer, buffer
+  %inputs = index.assume %input_width [range(%input_width, 32, 10240), multiple_of(%input_width, 32)] : index
+  %outputs = index.assume %output_width [range(%output_width, 4, 262144), multiple_of(%output_width, 4)] : index
+  %tokens = config.get @flash_next.token_count : index
+  %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
+  %batch = kernel.workgroup.id<y> : index
+  %c4 = index.constant 4 : index
+  %first = index.mul %batch, %c4 : index
+  %active = index.cmp ult, %first, %end : index
+  scf.if %active {
+    %group = kernel.workgroup.id<x> : index
+    %wave = kernel.subgroup.id : index
+    %lane = kernel.subgroup.lane.id : index
+    %c1 = index.constant 1 : index
+    %stride = index.constant 32 : index
+    %c0 = index.constant 0 : index
+    %row = index.madd %group, %c4, %wave : index
+    %valid = index.cmp ult, %row, %outputs : index
+    scf.if %valid {
+      %partial = func.call @flash_next_q8_batch_partial(%inputs, %c4, %c4, %first, %end, %row, %lane, %stride, %input, %weight) : (index, index, index, index, index, index, index, index, buffer, buffer) -> (vector<[%c4]xf32>)
+      %sums = kernel.subgroup.reduce<addf> %partial : vector<[%c4]xf32>
+      %leader = index.cmp eq, %lane, %c0 : index
+      scf.if %leader {
+        %origin = index.constant 0 : offset
+        %view = buffer.view %output[%origin] : buffer -> view<[%tokens]x[%outputs]xbf16>
+        scf.for %ordinal = [%c0 to %c4 step %c1] unroll schedule(linear) {
+          %token = index.add %first, %ordinal : index
+          %live = index.cmp ult, %token, %end : index
+          scf.if %live {
+            %sum = vector.extract %sums[%ordinal] : vector<[%c4]xf32> -> f32
+            %packed = scalar.fptrunc %sum : f32 to bf16
+            view.store %packed, %view[%token, %row] : bf16, view<[%tokens]x[%outputs]xbf16>
+          }
+        }
+      }
+    }
+  }
+  kernel.return
+}
+
+// Wide alpha/beta projections share BF16 coefficient panels across 128 tokens.
+// Narrow batches use the original F32 coefficients directly. Both accumulate
+// and publish F32 values.
+kernel.def target(@flash_next_projection_wave32) @gdn_project_alpha_beta() {
+  %tokens = config.get @flash_next.token_count : index
+  %threshold = index.constant 2048 : index
+  %matrix = index.cmp uge, %tokens, %threshold : index
+  %c1 = index.constant 1 : index
+  %c12 = index.constant 12 : index
+  %rounding = index.constant 127 : index
+  %panel_height = index.constant 128 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %rounded = index.add %tokens, %rounding : index
+  %batches = index.div %rounded, %panel_height : index
+  %groups = scf.select %matrix, %c1, %c12 : index
+  %rows = scf.select %matrix, %batches, %tokens : index
+  %threads = scf.select %matrix, %c256, %c128 : index
+  kernel.launch.config workgroups(%groups, %rows, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%span_arg: buffer, %input_arg: buffer, %alpha_weight_arg: buffer, %beta_weight_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer) {
+  %capacity = config.get @flash_next.token_count : index
+  %threshold = index.constant 2048 : index
+  %matrix = index.cmp uge, %capacity, %threshold : index
+  scf.if %matrix {
+    func.call @flash_next_alpha_beta_matrix(%capacity, %span_arg, %input_arg, %alpha_weight_arg, %beta_weight_arg, %alpha_arg, %beta_arg) : (index, buffer, buffer, buffer, buffer, buffer, buffer)
+  } else {
+    %span, %input, %alpha_weight, %beta_weight, %alpha, %beta = buffer.assume.noalias %span_arg, %input_arg, %alpha_weight_arg, %beta_weight_arg, %alpha_arg, %beta_arg : buffer, buffer, buffer, buffer, buffer, buffer
+    %tokens = config.get @flash_next.token_count : index
+    %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
+    %token = kernel.workgroup.id<y> : index
+    %active = index.cmp ult, %token, %end : index
+    scf.if %active {
+      %group = kernel.workgroup.id<x> : index
+      %wave = kernel.subgroup.id : index
+      %lane = kernel.subgroup.lane.id : index
+      %c0_index = index.constant 0 : index
+      %c4 = index.constant 4 : index
+      %c8 = index.constant 8 : index
+      %stride = index.constant 256 : index
+      %width = index.constant 2560 : index
+      %head = index.madd %group, %c4, %wave : index
+      %first = index.mul %lane, %c8 : index
+      %origin = index.constant 0 : offset
+      %input_view = buffer.view %input[%origin] : buffer -> view<[%tokens]x2560xbf16>
+      %alpha_weight_view = buffer.view %alpha_weight[%origin] : buffer -> view<48x2560xf32>
+      %beta_weight_view = buffer.view %beta_weight[%origin] : buffer -> view<48x2560xf32>
+      %alpha_view = buffer.view %alpha[%origin] : buffer -> view<[%tokens]x48xf32>
+      %beta_view = buffer.view %beta[%origin] : buffer -> view<[%tokens]x48xf32>
+      %c0 = scalar.constant 0.0 : f32
+      %c0v = vector.constant 0.0 : vector<8xf32>
+      %alpha_partial, %beta_partial = scf.for %channel = [%first to %width step %stride](%alpha_acc = %c0v : vector<8xf32>, %beta_acc = %c0v : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>) {
+        %packed = vector.load %input_view[%token, %channel] : view<[%tokens]x2560xbf16> -> vector<8xbf16>
+        %values = vector.extf %packed : vector<8xbf16> to vector<8xf32>
+        %alpha_values = vector.load %alpha_weight_view[%head, %channel] : view<48x2560xf32> -> vector<8xf32>
+        %beta_values = vector.load %beta_weight_view[%head, %channel] : view<48x2560xf32> -> vector<8xf32>
+        %next_alpha = vector.fmaf %values, %alpha_values, %alpha_acc : vector<8xf32>
+        %next_beta = vector.fmaf %values, %beta_values, %beta_acc : vector<8xf32>
+        scf.yield %next_alpha, %next_beta : vector<8xf32>, vector<8xf32>
+      }
+      %alpha_lane = vector.reduce<addf> %alpha_partial, %c0 : vector<8xf32>, f32
+      %beta_lane = vector.reduce<addf> %beta_partial, %c0 : vector<8xf32>, f32
+      %alpha_result = kernel.subgroup.reduce<addf> %alpha_lane : f32
+      %beta_result = kernel.subgroup.reduce<addf> %beta_lane : f32
+      %leader = index.cmp eq, %lane, %c0_index : index
+      scf.if %leader {
+        view.store %alpha_result, %alpha_view[%token, %head] : f32, view<[%tokens]x48xf32>
+        view.store %beta_result, %beta_view[%token, %head] : f32, view<[%tokens]x48xf32>
+      }
+    }
+  }
+  kernel.return
+}

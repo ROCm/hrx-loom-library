@@ -1,0 +1,374 @@
+// Compact route records for one immutable routing epoch. Each record contains
+// an expert index, a live-route count, and a caller-selected number of route IDs.
+// Route identity is the original token*10+slot. The record count precedes the
+// table. Records are expert-major; atomic rank reservation leaves route order
+// free. Dispatch dependencies publish every record, not just reservations.
+// Both contractions reuse this table without repacking or host readback.
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+amdgpu.target<gfx11-generic> @flash_next_expert_bucket_wave32 {subgroup_size = 32}
+
+func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
+
+func.decl @expert_swiglu(%gate: f32, %up: f32) -> (bf16)
+
+func.decl @flash_next_qk_pair_rows_partial(%q5: i1, %width: index, %rows: vector<4xi32>, %live: index, %row: index, %lane: index, %stride: index, %input: buffer, %gate_weight: buffer, %up_weight: buffer) -> (vector<4xf32>, vector<4xf32>)
+
+func.decl @flash_next_q51_output_pair_partial(%width: index, %rows: vector<4xi32>, %live: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (vector<4xf32>, vector<4xf32>)
+
+func.decl @flash_next_q8_rows_partial(%width: index, %rows: vector<4xi32>, %live: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (vector<4xf32>)
+
+// A table has at most one record per route and at most one partial record
+// per expert in addition to floor(routes/rows) complete records. This bound
+// keeps large tiles compact even when expert populations are highly skewed.
+// Allocation, production, and consumption share the same logical extent.
+func.def public pure inline @expert_record_extent(%capacity: index, %record_rows: index) -> (index, index, offset) {
+  %routes_per_token = index.constant 10 : index
+  %header_fields = index.constant 2 : index
+  %experts = index.constant 512 : index
+  %word_bytes = index.constant 4 : offset
+  %routes = index.mul %capacity, %routes_per_token : index
+  %full_records = index.div %routes, %record_rows : index
+  %population_bound = index.add %full_records, %experts : index
+  %route_bound_is_smaller = index.cmp ult, %routes, %population_bound : index
+  %records = scf.select %route_bound_is_smaller, %routes, %population_bound : index
+  %fields = index.add %record_rows, %header_fields : index
+  %record_bytes = index.scale %fields, %word_bytes : index, offset -> offset
+  %table_bytes = index.scale %records, %record_bytes : index, offset -> offset
+  %bytes = index.add %table_bytes, %word_bytes : offset
+  func.return %records, %fields, %bytes : index, index, offset
+}
+
+kernel.def target(@flash_next_expert_bucket_wave32) @expert_routes(%neural_enabled: i1) {
+  %c1_index = index.constant 1 : index
+  %threads = index.constant 512 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %c1_index, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
+} launch(%record_rows_arg: index, %epoch_arg: buffer, %ids_arg: buffer, %ranks_arg: buffer, %tasks_arg: buffer) {
+  %record_rows = index.assume %record_rows_arg [range(%record_rows_arg, 4, 256)] : index
+  %epoch, %ids, %ranks, %tasks = buffer.assume.noalias %epoch_arg, %ids_arg, %ranks_arg, %tasks_arg : buffer, buffer, buffer, buffer
+  %capacity = config.get @flash_next.token_count : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %record_capacity, %record_fields, %record_bytes = func.call pure @expert_record_extent(%capacity, %record_rows) : (index, index) -> (index, index, offset)
+  %c10 = index.constant 10 : index
+  %expert_count = index.constant 512 : index
+  %last_expert = index.constant 511 : index
+  %origin = index.constant 0 : offset
+  %record_origin = index.constant 4 : offset
+  %local_bytes = index.constant 2048 : offset
+  %c0_word = scalar.constant 0 : i32
+  %c1_word = scalar.constant 1 : i32
+  %padding = index.sub %record_rows, %c1 : index
+  %padding_word = index.cast %padding : index to i32
+  %rows_word = index.cast %record_rows : index to i32
+  %thread = kernel.workitem.id<x> : index
+  %route_capacity = index.mul %capacity, %c10 : index
+  %last_route = index.sub %route_capacity, %c1 : index
+  %tokens = func.call @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
+  %routes = index.mul %tokens, %c10 : index
+  %selections = buffer.view %ids[%origin] : buffer -> view<[%route_capacity]xi32>
+  %rank_view = buffer.view %ranks[%origin] : buffer -> view<[%route_capacity]xi32>
+  %records = buffer.view %tasks[%record_origin] : buffer -> view<[%record_capacity]x[%record_fields]xi32>
+  %header = buffer.view %tasks[%origin] : buffer -> view<1xi32>
+  %counter_storage = buffer.alloca<workgroup> align(16) %local_bytes : buffer
+  %offset_storage = buffer.alloca<workgroup> align(16) %local_bytes : buffer
+  %counters = buffer.view %counter_storage[%origin] : buffer -> view<512xi32>
+  %offsets = buffer.view %offset_storage[%origin] : buffer -> view<512xi32>
+  view.store %c0_word, %counters[%thread] : i32, view<512xi32>
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+  // Rank tickets are private to the route that reserves them. Re-reading a
+  // ticket in the same invocation requires no cross-thread global fence.
+  scf.for %route = [%thread to %routes step %expert_count] {
+    %expert_word = view.load %selections[%route] : view<[%route_capacity]xi32> -> i32
+    %expert_value = index.cast %expert_word : i32 to index
+    %expert = index.assume %expert_value [range(%expert_value, 0, 511)] : index
+    %rank = view.atomic.rmw<addi> %c1_word, %counters[%expert] {ordering = relaxed, scope = workgroup} : i32, view<512xi32> -> i32
+    view.store %rank, %rank_view[%route] : i32, view<[%route_capacity]xi32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+  %population_word = view.load %counters[%thread] : view<512xi32> -> i32
+  %rounded = scalar.addi %population_word, %padding_word : i32
+  %tile_word = scalar.divui %rounded, %rows_word : i32
+  %first_word = kernel.workgroup.scan<addi> %tile_word {direction = forward, mode = exclusive} : i32
+  view.store %first_word, %offsets[%thread] : i32, view<512xi32>
+  %last = index.cmp eq, %thread, %last_expert : index
+  scf.if %last {
+    %total = scalar.addi %first_word, %tile_word : i32
+    view.store %total, %header[0] : i32, view<1xi32>
+  }
+  %tiles = index.cast %tile_word : i32 to index
+  %first = index.cast %first_word : i32 to index
+  %population = index.cast %population_word : i32 to index
+  %expert_word = index.cast %thread : index to i32
+  scf.for %tile = [%c0 to %tiles step %c1] {
+    %task_value = index.add %first, %tile : index
+    %task = index.assume %task_value [ge(%task_value, 0), lt(%task_value, %record_capacity)] : index
+    %consumed = index.mul %tile, %record_rows : index
+    %remaining = index.sub %population, %consumed : index
+    %partial = index.cmp ult, %remaining, %record_rows : index
+    %live_value = scf.select %partial, %remaining, %record_rows : index
+    %live = index.assume %live_value [range(%live_value, 1, %record_rows)] : index
+    %live_word = index.cast %live : index to i32
+    view.store %expert_word, %records[%task, 0] : i32, view<[%record_capacity]x[%record_fields]xi32>
+    view.store %live_word, %records[%task, 1] : i32, view<[%record_capacity]x[%record_fields]xi32>
+    // Only tail fields are initialized. Scatter owns the disjoint live fields.
+    scf.for %ordinal = [%live to %record_rows step %c1] {
+      %field = index.add %ordinal, %c2 : index
+      view.store %c0_word, %records[%task, %field] : i32, view<[%record_capacity]x[%record_fields]xi32>
+    }
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  scf.for %route = [%thread to %routes step %expert_count] {
+    %expert_word = view.load %selections[%route] : view<[%route_capacity]xi32> -> i32
+    %expert_value = index.cast %expert_word : i32 to index
+    %expert = index.assume %expert_value [range(%expert_value, 0, 511)] : index
+    %rank_word = view.load %rank_view[%route] : view<[%route_capacity]xi32> -> i32
+    %rank_value = index.cast %rank_word : i32 to index
+    %rank = index.assume %rank_value [range(%rank_value, 0, %last_route)] : index
+    %first_word = view.load %offsets[%expert] : view<512xi32> -> i32
+    %first = index.cast %first_word : i32 to index
+    %tile = index.div %rank, %record_rows : index
+    %ordinal_value = index.rem %rank, %record_rows : index
+    %ordinal = index.assume %ordinal_value [ge(%ordinal_value, 0), lt(%ordinal_value, %record_rows)] : index
+    %field = index.add %ordinal, %c2 : index
+    %task_value = index.add %first, %tile : index
+    %task = index.assume %task_value [ge(%task_value, 0), lt(%task_value, %record_capacity)] : index
+    %route_word = index.cast %route : index to i32
+    view.store %route_word, %records[%task, %field] : i32, view<[%record_capacity]x[%record_fields]xi32>
+  }
+  kernel.return
+}
+
+// A finite pool walks the product of live records and output groups. Four
+// waves own four output features; each wave reuses weights over four routes.
+// Dispatch completion publishes the producer's entire table, and the owning
+// command keeps it immutable through gate/up and down. The count is an extent,
+// not a readiness flag for a concurrently running producer.
+func.def inline @expert_bucket_gate_body(%q8: i1, %q5: i1, %input_arg: buffer, %tasks_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer) {
+  %input, %tasks, %gate_weight, %up_weight, %output = buffer.assume.noalias %input_arg, %tasks_arg, %gate_weight_arg, %up_weight_arg, %output_arg : buffer, buffer, buffer, buffer, buffer
+  %tokens = config.get @flash_next.token_count : index
+  %features = index.constant 640 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c10 = index.constant 10 : index
+  %workers = index.constant 1280 : index
+  %width = index.constant 2560 : index
+  %stride = index.constant 32 : index
+  %origin = index.constant 0 : offset
+  %record_origin = index.constant 4 : offset
+  %route_capacity = index.mul %tokens, %c10 : index
+  %last_route = index.sub %route_capacity, %c1 : index
+  %record_capacity, %record_fields, %record_bytes = func.call pure @expert_record_extent(%tokens, %c4) : (index, index) -> (index, index, offset)
+  %groups = index.div %features, %c4 : index
+  %header = buffer.view %tasks[%origin] : buffer -> view<1xi32>
+  %records = buffer.view %tasks[%record_origin] : buffer -> view<[%record_capacity]x6xi32>
+  %result = buffer.view %output[%origin] : buffer -> view<[%route_capacity]x[%features]xbf16>
+  %count_word = view.load %header[0] : view<1xi32> -> i32
+  %count_value = index.cast %count_word : i32 to index
+  %count = index.assume %count_value [range(%count_value, 0, %record_capacity)] : index
+  %work_count = index.mul %count, %groups : index
+  %worker = kernel.workgroup.id<x> : index
+  %wave = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %leader = index.cmp eq, %lane, %c0 : index
+  scf.for %work = [%worker to %work_count step %workers] {
+    %task = index.div %work, %groups : index
+    %group = index.rem %work, %groups : index
+    %feature = index.madd %group, %c4, %wave : index
+    %expert_word = view.load %records[%task, 0] : view<[%record_capacity]x6xi32> -> i32
+    %expert_value = index.cast %expert_word : i32 to index
+    %expert = index.assume %expert_value [range(%expert_value, 0, 511)] : index
+    %live_word = view.load %records[%task, 1] : view<[%record_capacity]x6xi32> -> i32
+    %live_value = index.cast %live_word : i32 to index
+    %live = index.assume %live_value [range(%live_value, 1, 4)] : index
+    %routes = vector.load %records[%task, 2] : view<[%record_capacity]x6xi32> -> vector<4xi32>
+    %row = index.madd %expert, %features, %feature : index
+    %slot_count = vector.constant 10 : vector<4xi32>
+    %rows = vector.divui %routes, %slot_count : vector<4xi32>
+    %gate_partial, %up_partial = scf.if %q8 -> (vector<4xf32>, vector<4xf32>) {
+      %gate = func.call @flash_next_q8_rows_partial(%width, %rows, %live, %row, %lane, %stride, %input, %gate_weight) : (index, vector<4xi32>, index, index, index, index, buffer, buffer) -> (vector<4xf32>)
+      %up = func.call @flash_next_q8_rows_partial(%width, %rows, %live, %row, %lane, %stride, %input, %up_weight) : (index, vector<4xi32>, index, index, index, index, buffer, buffer) -> (vector<4xf32>)
+      scf.yield %gate, %up : vector<4xf32>, vector<4xf32>
+    } else {
+      %gate, %up = func.call @flash_next_qk_pair_rows_partial(%q5, %width, %rows, %live, %row, %lane, %stride, %input, %gate_weight, %up_weight) : (i1, index, vector<4xi32>, index, index, index, index, buffer, buffer, buffer) -> (vector<4xf32>, vector<4xf32>)
+      scf.yield %gate, %up : vector<4xf32>, vector<4xf32>
+    }
+    %gate_sums = kernel.subgroup.reduce<addf> %gate_partial : vector<4xf32>
+    %up_sums = kernel.subgroup.reduce<addf> %up_partial : vector<4xf32>
+    scf.if %leader {
+      scf.for %ordinal = [%c0 to %c4 step %c1] unroll schedule(linear) {
+        %active = index.cmp ult, %ordinal, %live : index
+        scf.if %active {
+          %route_word = vector.extract %routes[%ordinal] : vector<4xi32> -> i32
+          %route_value = index.cast %route_word : i32 to index
+          %route = index.assume %route_value [range(%route_value, 0, %last_route)] : index
+          %gate = vector.extract %gate_sums[%ordinal] : vector<4xf32> -> f32
+          %up = vector.extract %up_sums[%ordinal] : vector<4xf32> -> f32
+          %packed = func.call @expert_swiglu(%gate, %up) : (f32, f32) -> (bf16)
+          view.store %packed, %result[%route, %feature] : bf16, view<[%route_capacity]x[%features]xbf16>
+        }
+      }
+    }
+  }
+  func.return
+}
+
+kernel.def target(@flash_next_expert_bucket_wave32) @expert_bucket_gate_up_q4k(%neural_enabled: i1) {
+  %workers = index.constant 1280 : index
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input_arg: buffer, %tasks_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer) {
+  %q8 = scalar.constant false : i1
+  %q5 = scalar.constant false : i1
+  func.call @expert_bucket_gate_body(%q8, %q5, %input_arg, %tasks_arg, %gate_weight_arg, %up_weight_arg, %output_arg) : (i1, i1, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@flash_next_expert_bucket_wave32) @expert_bucket_gate_up_q5k(%neural_enabled: i1) {
+  %workers = index.constant 1280 : index
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input_arg: buffer, %tasks_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer) {
+  %q8 = scalar.constant false : i1
+  %q5 = scalar.constant true : i1
+  func.call @expert_bucket_gate_body(%q8, %q5, %input_arg, %tasks_arg, %gate_weight_arg, %up_weight_arg, %output_arg) : (i1, i1, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@flash_next_expert_bucket_wave32) @expert_bucket_gate_up_q8(%neural_enabled: i1) {
+  %workers = index.constant 1280 : index
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input_arg: buffer, %tasks_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer) {
+  %q8 = scalar.constant true : i1
+  %q5 = scalar.constant false : i1
+  func.call @expert_bucket_gate_body(%q8, %q5, %input_arg, %tasks_arg, %gate_weight_arg, %up_weight_arg, %output_arg) : (i1, i1, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+func.def inline @expert_bucket_down_body(%q8: i1, %input_arg: buffer, %tasks_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
+  %input, %tasks, %weight, %output = buffer.assume.noalias %input_arg, %tasks_arg, %weight_arg, %output_arg : buffer, buffer, buffer, buffer
+  %tokens = config.get @flash_next.token_count : index
+  %features = index.constant 2560 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c2 = index.constant 2 : index
+  // Q5_1 shares activation loads and affine input sums across adjacent outputs.
+  // The format is a specialization constant; Q8 retains its single-output wave.
+  %outputs_per_wave = scf.select %q8, %c1, %c2 : index
+  %outputs_per_group = index.mul %c4, %outputs_per_wave : index
+  %multiple_outputs = index.cmp eq, %outputs_per_wave, %c2 : index
+  %c10 = index.constant 10 : index
+  %workers = index.constant 1280 : index
+  %width = index.constant 640 : index
+  %stride = index.constant 32 : index
+  %origin = index.constant 0 : offset
+  %record_origin = index.constant 4 : offset
+  %route_capacity = index.mul %tokens, %c10 : index
+  %last_route = index.sub %route_capacity, %c1 : index
+  %record_capacity, %record_fields, %record_bytes = func.call pure @expert_record_extent(%tokens, %c4) : (index, index) -> (index, index, offset)
+  %groups = index.div %features, %outputs_per_group : index
+  %header = buffer.view %tasks[%origin] : buffer -> view<1xi32>
+  %records = buffer.view %tasks[%record_origin] : buffer -> view<[%record_capacity]x6xi32>
+  %result = buffer.view %output[%origin] : buffer -> view<[%route_capacity]x[%features]xbf16>
+  %count_word = view.load %header[0] : view<1xi32> -> i32
+  %count_value = index.cast %count_word : i32 to index
+  %count = index.assume %count_value [range(%count_value, 0, %record_capacity)] : index
+  %work_count = index.mul %count, %groups : index
+  %worker = kernel.workgroup.id<x> : index
+  %wave = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %leader = index.cmp eq, %lane, %c0 : index
+  scf.for %work = [%worker to %work_count step %workers] {
+    %task = index.div %work, %groups : index
+    %group = index.rem %work, %groups : index
+    %wave_output = index.mul %wave, %outputs_per_wave : index
+    %feature = index.madd %group, %outputs_per_group, %wave_output : index
+    %expert_word = view.load %records[%task, 0] : view<[%record_capacity]x6xi32> -> i32
+    %expert_value = index.cast %expert_word : i32 to index
+    %expert = index.assume %expert_value [range(%expert_value, 0, 511)] : index
+    %live_word = view.load %records[%task, 1] : view<[%record_capacity]x6xi32> -> i32
+    %live_value = index.cast %live_word : i32 to index
+    %live = index.assume %live_value [range(%live_value, 1, 4)] : index
+    %routes = vector.load %records[%task, 2] : view<[%record_capacity]x6xi32> -> vector<4xi32>
+    %row = index.madd %expert, %features, %feature : index
+    %partial, %partial_next = scf.if %q8 -> (vector<4xf32>, vector<4xf32>) {
+      %value = func.call @flash_next_q8_rows_partial(%width, %routes, %live, %row, %lane, %stride, %input, %weight) : (index, vector<4xi32>, index, index, index, index, buffer, buffer) -> (vector<4xf32>)
+      %c0_4xf32 = vector.constant 0.0 : vector<4xf32>
+      scf.yield %value, %c0_4xf32 : vector<4xf32>, vector<4xf32>
+    } else {
+      %value, %next_value = func.call @flash_next_q51_output_pair_partial(%width, %routes, %live, %row, %lane, %stride, %input, %weight) : (index, vector<4xi32>, index, index, index, index, buffer, buffer) -> (vector<4xf32>, vector<4xf32>)
+      scf.yield %value, %next_value : vector<4xf32>, vector<4xf32>
+    }
+    %sums = kernel.subgroup.reduce<addf> %partial : vector<4xf32>
+    %sums_next = scf.if %multiple_outputs -> (vector<4xf32>) {
+      %value = kernel.subgroup.reduce<addf> %partial_next : vector<4xf32>
+      scf.yield %value : vector<4xf32>
+    } else {
+      %c0_4xf32_2 = vector.constant 0.0 : vector<4xf32>
+      scf.yield %c0_4xf32_2 : vector<4xf32>
+    }
+    scf.if %leader {
+      scf.for %ordinal = [%c0 to %c4 step %c1] unroll schedule(linear) {
+        %active = index.cmp ult, %ordinal, %live : index
+        scf.if %active {
+          %route_word = vector.extract %routes[%ordinal] : vector<4xi32> -> i32
+          %route_value = index.cast %route_word : i32 to index
+          %route = index.assume %route_value [range(%route_value, 0, %last_route)] : index
+          %sum = vector.extract %sums[%ordinal] : vector<4xf32> -> f32
+          %packed = scalar.fptrunc %sum : f32 to bf16
+          view.store %packed, %result[%route, %feature] : bf16, view<[%route_capacity]x[%features]xbf16>
+          scf.if %multiple_outputs {
+            %next_feature = index.add %feature, %c1 : index
+            %next_sum = vector.extract %sums_next[%ordinal] : vector<4xf32> -> f32
+            %next_packed = scalar.fptrunc %next_sum : f32 to bf16
+            view.store %next_packed, %result[%route, %next_feature] : bf16, view<[%route_capacity]x[%features]xbf16>
+          }
+        }
+      }
+    }
+  }
+  func.return
+}
+
+kernel.def target(@flash_next_expert_bucket_wave32) @expert_bucket_down_q51(%neural_enabled: i1) {
+  %workers = index.constant 1280 : index
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input_arg: buffer, %tasks_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
+  %q8 = scalar.constant false : i1
+  func.call @expert_bucket_down_body(%q8, %input_arg, %tasks_arg, %weight_arg, %output_arg) : (i1, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@flash_next_expert_bucket_wave32) @expert_bucket_down_q8(%neural_enabled: i1) {
+  %workers = index.constant 1280 : index
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input_arg: buffer, %tasks_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
+  %q8 = scalar.constant true : i1
+  func.call @expert_bucket_down_body(%q8, %input_arg, %tasks_arg, %weight_arg, %output_arg) : (i1, buffer, buffer, buffer, buffer)
+  kernel.return
+}

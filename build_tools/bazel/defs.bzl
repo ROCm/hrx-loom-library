@@ -5,6 +5,9 @@ load(
     "@hrx//loom/build_tools/bazel:defs.bzl",
     _loom_kernel_library = "loom_kernel_library",
     _loom_library = "loom_library",
+    _loom_model = "loom_model",
+    _loom_model_documentation = "loom_model_documentation",
+    _loom_module = "loom_module",
     _loom_test = "loom_test",
 )
 
@@ -12,6 +15,10 @@ _BENCHMARK_MODULE_TAG = "loom-benchmark-module"
 _BENCHMARK_MODULE_SUFFIX = "_benchmark_module"
 _MOTIF_ADMISSION_TAG = "loom-admission-motif"
 _MOTIF_ADMISSION_SUFFIX = "_admission_motif"
+
+loom_model_documentation = _loom_model_documentation
+# Final linked products compose providers admitted by their owning source rule.
+loom_module = _loom_module
 
 def _is_package_or_subpackage(package, root):
     return package == root or package.startswith(root + "/")
@@ -27,10 +34,13 @@ def _label_package(label, current_package):
 def _validate_motif_dependencies(package, deps):
     for dep in deps:
         dep_package = _label_package(dep, package)
-        if dep_package != None and _is_package_or_subpackage(dep_package, "kernel"):
+        if dep_package != None and any([
+            _is_package_or_subpackage(dep_package, layer)
+            for layer in ["kernel", "program", "model"]
+        ]):
             fail(
                 (
-                    "//%s is a motif package and cannot depend on kernel package %s; " +
+                    "//%s is a motif package and cannot depend on launch/composition package %s; " +
                     "move the reusable representation or algorithm into motif/"
                 ) % (package, dep),
             )
@@ -55,6 +65,15 @@ def _validate_kernel_dependencies(package, deps):
                     "//%s is a kernel package and can depend only on motif/ " +
                     "libraries, got %s"
                 ) % (package, dep),
+            )
+
+def _validate_program_dependencies(package, deps):
+    for dep in deps:
+        dep_package = _label_package(dep, package)
+        if dep_package != None and _is_package_or_subpackage(dep_package, "model"):
+            fail(
+                "//%s is a shared program and cannot depend on model package %s; " % (package, dep) +
+                "supply model identity and preparation from the model composition",
             )
 
 def _declare_source_policy_test(name, layer, srcs, tags):
@@ -99,6 +118,75 @@ def _validate_kernel_qualification(name, targets, execution_profiles):
     if not targets:
         fail("%s requires at least one target profile" % name)
     _validate_execution_profiles(name, execution_profiles)
+
+def loom_library(
+        name,
+        srcs = [],
+        deps = [],
+        data = [],
+        input_format = "",
+        inputopts = [],
+        tags = [],
+        visibility = None,
+        target_compatible_with = []):
+    """Declares shared or model-owned programs with explicit linker dependencies."""
+    package = native.package_name()
+    shared = _is_package_or_subpackage(package, "program")
+    model = _is_package_or_subpackage(package, "model")
+    if not (shared or model) or "test" in package.split("/"):
+        fail("loom_library is for program/ or model/ production programs, got //%s" % package)
+    if shared:
+        _validate_program_dependencies(package, deps)
+    _loom_library(
+        name = name,
+        srcs = srcs,
+        deps = deps,
+        data = data,
+        input_format = input_format,
+        inputopts = inputopts,
+        tags = tags,
+        visibility = visibility,
+        target_compatible_with = target_compatible_with,
+    )
+    text_sources = [source for source in srcs if str(source).endswith(".loom")]
+    if text_sources:
+        _declare_source_policy_test(name, "program" if shared else "model", text_sources, tags)
+
+def loom_model(
+        name,
+        card,
+        preset,
+        model_name,
+        files,
+        lockfile = None,
+        assets = {},
+        data = {},
+        programs = "",
+        partition = "",
+        encoding = "bc",
+        tags = [],
+        visibility = None,
+        target_compatible_with = []):
+    """Selects a model card and publishes its declared native serving closure."""
+    package = native.package_name()
+    if not _is_package_or_subpackage(package, "model"):
+        fail("loom_model must be declared below model/, got //%s" % package)
+    _loom_model(
+        name = name,
+        card = card,
+        lockfile = lockfile,
+        preset = preset,
+        model_name = model_name,
+        files = files,
+        assets = assets,
+        data = data,
+        programs = programs,
+        partition = partition,
+        encoding = encoding,
+        tags = tags,
+        visibility = visibility,
+        target_compatible_with = target_compatible_with,
+    )
 
 def loom_motif_library(
         name,
@@ -157,7 +245,9 @@ def loom_test(
         srcs,
         deps = [],
         args = [],
-        execution_profile = None,
+        configs = {},
+        variants = None,
+        execution_profiles = [],
         size = "small",
         tags = [],
         visibility = None):
@@ -170,14 +260,17 @@ def loom_test(
         )
     if _is_package_or_subpackage(package, "motif"):
         _validate_motif_dependencies(package, deps)
-    if execution_profile == None:
-        fail("%s requires an execution profile" % name)
+    if _is_package_or_subpackage(package, "program"):
+        _validate_program_dependencies(package, deps)
+    _validate_execution_profiles(name, execution_profiles)
     _loom_test(
         name = name,
         srcs = srcs,
         args = args,
+        configs = configs,
+        variants = variants,
         deps = deps,
-        execution_profile = execution_profile,
+        execution_profiles = execution_profiles,
         size = size,
         tags = tags,
         visibility = visibility,

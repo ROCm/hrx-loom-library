@@ -1,0 +1,1445 @@
+// Cohort specialization checks for packed GGML projections.
+//
+// Model composition fixes a row-bank extent before JIT compilation. These
+// private leaves exercise that boundary on both supported subgroup widths,
+// with the same launch geometry and argument ABI as the model leaves.
+// reference.loom supplies independent scalar-byte/F64 oracles and constructors.
+
+config.decl @cohort.rows : %value: index where [range(%value, 1, 8)]
+
+amdgpu.target<gfx11-generic> @cohort_wave32 {subgroup_size = 32}
+
+amdgpu.target<gfx11-generic> @cohort_wave64 {subgroup_size = 64}
+
+func.decl @ggml_linear_q5k_q8_1_cohort(%rows: index, %weight_channels: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @ggml_linear_q6k_q8_1_cohort(%rows: index, %block_lanes: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @ggml_linear_q6k_f32_cohort(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @initialize_affine(%uniform: i1, %fifth_bit: i1, %tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
+
+func.decl @initialize_q6(%uniform: i1, %quantized: i1, %tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
+
+func.decl @q5_channels1_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @q5_channels8_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @q6_q8_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @q6_f32_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @q5_uniform_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @q6_uniform_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+// The fixture reserves eight rows for every specialization, matching a
+// model arena reused by smaller cohorts. Guards bound the full allocation.
+func.def @cohort_row_count() -> (index) {
+  %rows = config.get @cohort.rows : index
+  func.return %rows : index
+}
+
+func.def @cohort_q5_channels1_reference(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  func.call @q5_channels1_reference(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @cohort_q5_channels8_reference(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  func.call @q5_channels8_reference(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @cohort_q5_uniform_reference(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  func.call @q5_uniform_reference(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @cohort_q6_f32_reference(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  func.call @q6_f32_reference(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @cohort_q6_q8_reference(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  func.call @q6_q8_reference(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @cohort_q6_uniform_reference(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  func.call @q6_uniform_reference(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+kernel.def target(@cohort_wave32) @cohort_q5_raw_wave32(%configured_inputs: index, %configured_outputs: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %channels = index.constant 8 : index
+  %padding = index.constant 7 : index
+  %padded = index.add %configured_outputs, %padding : index
+  %groups = index.div %padded, %channels : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  %setting = index.constant 1 : index
+  func.call @ggml_linear_q5k_q8_1_cohort(%rows, %setting, %inputs, %outputs, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+check.scenario public @cohort_q5_raw_wave32_single_block_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(1) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(16) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x288xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<176xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x288xi8>, tensor<176xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x1xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(48) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_raw_wave32, @cohort_q5_channels1_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x288xi8>, tensor<176xi8>, tensor<[%rows]x1xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x288xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<176xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_raw_wave32_single_block_case> @cohort_q5_raw_wave32_single_block
+
+check.scenario public @cohort_q5_raw_wave32_three_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(9) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(80) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x864xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<4752xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x864xi8>, tensor<4752xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x9xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(304) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_raw_wave32, @cohort_q5_channels1_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x864xi8>, tensor<4752xi8>, tensor<[%rows]x9xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<4752xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_raw_wave32_three_block_tail_case> @cohort_q5_raw_wave32_three_block_tail
+
+check.scenario public @cohort_q5_raw_wave32_five_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(1280) : index
+    %outputs = check.literal value(17) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(144) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x1440xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<14960xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x1440xi8>, tensor<14960xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x17xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(560) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_raw_wave32, @cohort_q5_channels1_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x1440xi8>, tensor<14960xi8>, tensor<[%rows]x17xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x1440xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<14960xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_raw_wave32_five_block_tail_case> @cohort_q5_raw_wave32_five_block_tail
+
+check.scenario public @cohort_q5_raw_wave32_full_reduction_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(32768) : index
+    %outputs = check.literal value(64) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(520) : index
+    %uniform = check.literal value(true) : i1
+    %format = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%rows]x36864xi8>
+    %weight = check.generate.fill value(17) : tensor<1441792xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x36864xi8>, tensor<1441792xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x64xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(2064) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_raw_wave32, @cohort_q5_uniform_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x36864xi8>, tensor<1441792xi8>, tensor<[%rows]x64xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0) rtol(0.0) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x36864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1441792xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_raw_wave32_full_reduction_case> @cohort_q5_raw_wave32_full_reduction
+
+kernel.def target(@cohort_wave32) @cohort_q5_channel8_wave32(%configured_inputs: index, %configured_outputs: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %channels = index.constant 8 : index
+  %padding = index.constant 7 : index
+  %padded = index.add %configured_outputs, %padding : index
+  %groups = index.div %padded, %channels : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  %setting = index.constant 8 : index
+  func.call @ggml_linear_q5k_q8_1_cohort(%rows, %setting, %inputs, %outputs, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+check.scenario public @cohort_q5_channel8_wave32_single_block_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(8) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(72) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x288xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<1408xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x288xi8>, tensor<1408xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x8xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(272) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_channel8_wave32, @cohort_q5_channels8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x288xi8>, tensor<1408xi8>, tensor<[%rows]x8xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x288xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1408xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_channel8_wave32_single_block_case> @cohort_q5_channel8_wave32_single_block
+
+check.scenario public @cohort_q5_channel8_wave32_three_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(16) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(136) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x864xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<8448xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x864xi8>, tensor<8448xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x16xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(528) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_channel8_wave32, @cohort_q5_channels8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x864xi8>, tensor<8448xi8>, tensor<[%rows]x16xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<8448xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_channel8_wave32_three_block_tail_case> @cohort_q5_channel8_wave32_three_block_tail
+
+check.scenario public @cohort_q5_channel8_wave32_five_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(1280) : index
+    %outputs = check.literal value(24) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(200) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x1440xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<21120xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x1440xi8>, tensor<21120xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x24xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(784) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_channel8_wave32, @cohort_q5_channels8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x1440xi8>, tensor<21120xi8>, tensor<[%rows]x24xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x1440xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<21120xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_channel8_wave32_five_block_tail_case> @cohort_q5_channel8_wave32_five_block_tail
+
+check.scenario public @cohort_q5_channel8_wave32_full_reduction_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(32768) : index
+    %outputs = check.literal value(64) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(520) : index
+    %uniform = check.literal value(true) : i1
+    %format = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%rows]x36864xi8>
+    %weight = check.generate.fill value(17) : tensor<1441792xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x36864xi8>, tensor<1441792xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x64xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(2064) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_channel8_wave32, @cohort_q5_uniform_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x36864xi8>, tensor<1441792xi8>, tensor<[%rows]x64xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0) rtol(0.0) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x36864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1441792xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_channel8_wave32_full_reduction_case> @cohort_q5_channel8_wave32_full_reduction
+
+kernel.def target(@cohort_wave32) @cohort_q6_block16_wave32(%configured_inputs: index, %configured_outputs: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %channels = index.constant 8 : index
+  %padding = index.constant 7 : index
+  %padded = index.add %configured_outputs, %padding : index
+  %groups = index.div %padded, %channels : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  %setting = index.constant 16 : index
+  func.call @ggml_linear_q6k_q8_1_cohort(%rows, %setting, %inputs, %outputs, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+check.scenario public @cohort_q6_block16_wave32_single_block_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(1) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(16) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x288xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<210xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x288xi8>, tensor<210xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x1xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(48) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block16_wave32, @cohort_q6_q8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x288xi8>, tensor<210xi8>, tensor<[%rows]x1xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x288xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<210xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block16_wave32_single_block_case> @cohort_q6_block16_wave32_single_block
+
+check.scenario public @cohort_q6_block16_wave32_three_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(9) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(80) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x864xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<5670xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x864xi8>, tensor<5670xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x9xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(304) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block16_wave32, @cohort_q6_q8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x864xi8>, tensor<5670xi8>, tensor<[%rows]x9xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<5670xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block16_wave32_three_block_tail_case> @cohort_q6_block16_wave32_three_block_tail
+
+check.scenario public @cohort_q6_block16_wave32_five_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(1280) : index
+    %outputs = check.literal value(17) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(144) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x1440xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<17850xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x1440xi8>, tensor<17850xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x17xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(560) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block16_wave32, @cohort_q6_q8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x1440xi8>, tensor<17850xi8>, tensor<[%rows]x17xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x1440xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<17850xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block16_wave32_five_block_tail_case> @cohort_q6_block16_wave32_five_block_tail
+
+check.scenario public @cohort_q6_block16_wave32_full_reduction_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(32768) : index
+    %outputs = check.literal value(64) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(520) : index
+    %uniform = check.literal value(true) : i1
+    %format = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%rows]x36864xi8>
+    %weight = check.generate.fill value(17) : tensor<1720320xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x36864xi8>, tensor<1720320xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x64xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(2064) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block16_wave32, @cohort_q6_uniform_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x36864xi8>, tensor<1720320xi8>, tensor<[%rows]x64xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0) rtol(0.0) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x36864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1720320xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block16_wave32_full_reduction_case> @cohort_q6_block16_wave32_full_reduction
+
+kernel.def target(@cohort_wave32) @cohort_q6_block32_wave32(%configured_inputs: index, %configured_outputs: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %channels = index.constant 8 : index
+  %padding = index.constant 7 : index
+  %padded = index.add %configured_outputs, %padding : index
+  %groups = index.div %padded, %channels : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  %setting = index.constant 32 : index
+  func.call @ggml_linear_q6k_q8_1_cohort(%rows, %setting, %inputs, %outputs, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+check.scenario public @cohort_q6_block32_wave32_single_block_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(1) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(16) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x288xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<210xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x288xi8>, tensor<210xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x1xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(48) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block32_wave32, @cohort_q6_q8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x288xi8>, tensor<210xi8>, tensor<[%rows]x1xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x288xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<210xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block32_wave32_single_block_case> @cohort_q6_block32_wave32_single_block
+
+check.scenario public @cohort_q6_block32_wave32_three_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(9) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(80) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x864xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<5670xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x864xi8>, tensor<5670xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x9xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(304) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block32_wave32, @cohort_q6_q8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x864xi8>, tensor<5670xi8>, tensor<[%rows]x9xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<5670xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block32_wave32_three_block_tail_case> @cohort_q6_block32_wave32_three_block_tail
+
+check.scenario public @cohort_q6_block32_wave32_five_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(1280) : index
+    %outputs = check.literal value(17) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(144) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x1440xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<17850xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x1440xi8>, tensor<17850xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x17xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(560) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block32_wave32, @cohort_q6_q8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x1440xi8>, tensor<17850xi8>, tensor<[%rows]x17xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x1440xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<17850xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block32_wave32_five_block_tail_case> @cohort_q6_block32_wave32_five_block_tail
+
+check.scenario public @cohort_q6_block32_wave32_full_reduction_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(32768) : index
+    %outputs = check.literal value(64) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(520) : index
+    %uniform = check.literal value(true) : i1
+    %format = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%rows]x36864xi8>
+    %weight = check.generate.fill value(17) : tensor<1720320xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x36864xi8>, tensor<1720320xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x64xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(2064) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block32_wave32, @cohort_q6_uniform_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x36864xi8>, tensor<1720320xi8>, tensor<[%rows]x64xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0) rtol(0.0) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x36864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1720320xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block32_wave32_full_reduction_case> @cohort_q6_block32_wave32_full_reduction
+
+kernel.def target(@cohort_wave32) @cohort_q6_f32_wave32(%configured_inputs: index, %configured_outputs: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 32 : index
+  %channels = index.constant 2 : index
+  %padding = index.constant 1 : index
+  %padded = index.add %configured_outputs, %padding : index
+  %groups = index.div %padded, %channels : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  func.call @ggml_linear_q6k_f32_cohort(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+check.scenario public @cohort_q6_f32_wave32_single_block_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(1) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(16) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(false) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0 to 1.0) : tensor<[%rows]x256xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<210xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x256xf32>, tensor<210xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x1xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(48) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_f32_wave32, @cohort_q6_f32_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x256xf32>, tensor<210xi8>, tensor<[%rows]x1xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x256xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<210xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_f32_wave32_single_block_case> @cohort_q6_f32_wave32_single_block
+
+check.scenario public @cohort_q6_f32_wave32_three_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(9) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(80) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(false) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0 to 1.0) : tensor<[%rows]x768xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<5670xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x768xf32>, tensor<5670xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x9xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(304) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_f32_wave32, @cohort_q6_f32_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x768xf32>, tensor<5670xi8>, tensor<[%rows]x9xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x768xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<5670xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_f32_wave32_three_block_tail_case> @cohort_q6_f32_wave32_three_block_tail
+
+check.scenario public @cohort_q6_f32_wave32_five_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(1280) : index
+    %outputs = check.literal value(17) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(144) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(false) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0 to 1.0) : tensor<[%rows]x1280xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<17850xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x1280xf32>, tensor<17850xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x17xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(560) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_f32_wave32, @cohort_q6_f32_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x1280xf32>, tensor<17850xi8>, tensor<[%rows]x17xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x1280xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<17850xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_f32_wave32_five_block_tail_case> @cohort_q6_f32_wave32_five_block_tail
+
+check.scenario public @cohort_q6_f32_wave32_full_reduction_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(32768) : index
+    %outputs = check.literal value(64) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(520) : index
+    %uniform = check.literal value(true) : i1
+    %format = check.literal value(false) : i1
+    %input = check.generate.fill value(0.5) : tensor<[%rows]x32768xf32>
+    %weight = check.generate.fill value(17) : tensor<1720320xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x32768xf32>, tensor<1720320xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x64xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(2064) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_f32_wave32, @cohort_q6_uniform_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x32768xf32>, tensor<1720320xi8>, tensor<[%rows]x64xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0) rtol(0.0) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x32768xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1720320xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_f32_wave32_full_reduction_case> @cohort_q6_f32_wave32_full_reduction
+
+kernel.def target(@cohort_wave64) @cohort_q5_raw_wave64(%configured_inputs: index, %configured_outputs: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %channels = index.constant 4 : index
+  %padding = index.constant 3 : index
+  %padded = index.add %configured_outputs, %padding : index
+  %groups = index.div %padded, %channels : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  %setting = index.constant 1 : index
+  func.call @ggml_linear_q5k_q8_1_cohort(%rows, %setting, %inputs, %outputs, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+check.scenario public @cohort_q5_raw_wave64_single_block_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(1) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(16) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x288xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<176xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x288xi8>, tensor<176xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x1xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(48) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_raw_wave64, @cohort_q5_channels1_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x288xi8>, tensor<176xi8>, tensor<[%rows]x1xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x288xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<176xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_raw_wave64_single_block_case> @cohort_q5_raw_wave64_single_block
+
+check.scenario public @cohort_q5_raw_wave64_three_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(9) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(80) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x864xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<4752xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x864xi8>, tensor<4752xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x9xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(304) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_raw_wave64, @cohort_q5_channels1_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x864xi8>, tensor<4752xi8>, tensor<[%rows]x9xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<4752xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_raw_wave64_three_block_tail_case> @cohort_q5_raw_wave64_three_block_tail
+
+check.scenario public @cohort_q5_raw_wave64_five_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(1280) : index
+    %outputs = check.literal value(17) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(144) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x1440xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<14960xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x1440xi8>, tensor<14960xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x17xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(560) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_raw_wave64, @cohort_q5_channels1_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x1440xi8>, tensor<14960xi8>, tensor<[%rows]x17xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x1440xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<14960xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_raw_wave64_five_block_tail_case> @cohort_q5_raw_wave64_five_block_tail
+
+check.scenario public @cohort_q5_raw_wave64_full_reduction_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(32768) : index
+    %outputs = check.literal value(64) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(520) : index
+    %uniform = check.literal value(true) : i1
+    %format = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%rows]x36864xi8>
+    %weight = check.generate.fill value(17) : tensor<1441792xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x36864xi8>, tensor<1441792xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x64xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(2064) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_raw_wave64, @cohort_q5_uniform_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x36864xi8>, tensor<1441792xi8>, tensor<[%rows]x64xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0) rtol(0.0) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x36864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1441792xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_raw_wave64_full_reduction_case> @cohort_q5_raw_wave64_full_reduction
+
+kernel.def target(@cohort_wave64) @cohort_q5_channel8_wave64(%configured_inputs: index, %configured_outputs: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %channels = index.constant 4 : index
+  %padding = index.constant 3 : index
+  %padded = index.add %configured_outputs, %padding : index
+  %groups = index.div %padded, %channels : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  %setting = index.constant 8 : index
+  func.call @ggml_linear_q5k_q8_1_cohort(%rows, %setting, %inputs, %outputs, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+check.scenario public @cohort_q5_channel8_wave64_single_block_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(8) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(72) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x288xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<1408xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x288xi8>, tensor<1408xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x8xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(272) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_channel8_wave64, @cohort_q5_channels8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x288xi8>, tensor<1408xi8>, tensor<[%rows]x8xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x288xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1408xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_channel8_wave64_single_block_case> @cohort_q5_channel8_wave64_single_block
+
+check.scenario public @cohort_q5_channel8_wave64_three_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(16) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(136) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x864xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<8448xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x864xi8>, tensor<8448xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x16xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(528) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_channel8_wave64, @cohort_q5_channels8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x864xi8>, tensor<8448xi8>, tensor<[%rows]x16xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<8448xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_channel8_wave64_three_block_tail_case> @cohort_q5_channel8_wave64_three_block_tail
+
+check.scenario public @cohort_q5_channel8_wave64_five_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(1280) : index
+    %outputs = check.literal value(24) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(200) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x1440xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<21120xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x1440xi8>, tensor<21120xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x24xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(784) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_channel8_wave64, @cohort_q5_channels8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x1440xi8>, tensor<21120xi8>, tensor<[%rows]x24xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x1440xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<21120xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_channel8_wave64_five_block_tail_case> @cohort_q5_channel8_wave64_five_block_tail
+
+check.scenario public @cohort_q5_channel8_wave64_full_reduction_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(32768) : index
+    %outputs = check.literal value(64) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(520) : index
+    %uniform = check.literal value(true) : i1
+    %format = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%rows]x36864xi8>
+    %weight = check.generate.fill value(17) : tensor<1441792xi8>
+    check.generate<@initialize_affine>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x36864xi8>, tensor<1441792xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x64xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(2064) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q5_channel8_wave64, @cohort_q5_uniform_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x36864xi8>, tensor<1441792xi8>, tensor<[%rows]x64xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0) rtol(0.0) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x36864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1441792xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q5_channel8_wave64_full_reduction_case> @cohort_q5_channel8_wave64_full_reduction
+
+kernel.def target(@cohort_wave64) @cohort_q6_block16_wave64(%configured_inputs: index, %configured_outputs: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %channels = index.constant 4 : index
+  %padding = index.constant 3 : index
+  %padded = index.add %configured_outputs, %padding : index
+  %groups = index.div %padded, %channels : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  %setting = index.constant 16 : index
+  func.call @ggml_linear_q6k_q8_1_cohort(%rows, %setting, %inputs, %outputs, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+check.scenario public @cohort_q6_block16_wave64_single_block_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(1) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(16) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x288xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<210xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x288xi8>, tensor<210xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x1xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(48) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block16_wave64, @cohort_q6_q8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x288xi8>, tensor<210xi8>, tensor<[%rows]x1xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x288xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<210xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block16_wave64_single_block_case> @cohort_q6_block16_wave64_single_block
+
+check.scenario public @cohort_q6_block16_wave64_three_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(9) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(80) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x864xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<5670xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x864xi8>, tensor<5670xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x9xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(304) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block16_wave64, @cohort_q6_q8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x864xi8>, tensor<5670xi8>, tensor<[%rows]x9xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<5670xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block16_wave64_three_block_tail_case> @cohort_q6_block16_wave64_three_block_tail
+
+check.scenario public @cohort_q6_block16_wave64_five_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(1280) : index
+    %outputs = check.literal value(17) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(144) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x1440xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<17850xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x1440xi8>, tensor<17850xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x17xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(560) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block16_wave64, @cohort_q6_q8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x1440xi8>, tensor<17850xi8>, tensor<[%rows]x17xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x1440xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<17850xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block16_wave64_five_block_tail_case> @cohort_q6_block16_wave64_five_block_tail
+
+check.scenario public @cohort_q6_block16_wave64_full_reduction_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(32768) : index
+    %outputs = check.literal value(64) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(520) : index
+    %uniform = check.literal value(true) : i1
+    %format = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%rows]x36864xi8>
+    %weight = check.generate.fill value(17) : tensor<1720320xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x36864xi8>, tensor<1720320xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x64xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(2064) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block16_wave64, @cohort_q6_uniform_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x36864xi8>, tensor<1720320xi8>, tensor<[%rows]x64xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0) rtol(0.0) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x36864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1720320xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block16_wave64_full_reduction_case> @cohort_q6_block16_wave64_full_reduction
+
+kernel.def target(@cohort_wave64) @cohort_q6_block32_wave64(%configured_inputs: index, %configured_outputs: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %channels = index.constant 4 : index
+  %padding = index.constant 3 : index
+  %padded = index.add %configured_outputs, %padding : index
+  %groups = index.div %padded, %channels : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  %setting = index.constant 32 : index
+  func.call @ggml_linear_q6k_q8_1_cohort(%rows, %setting, %inputs, %outputs, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+check.scenario public @cohort_q6_block32_wave64_single_block_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(1) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(16) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x288xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<210xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x288xi8>, tensor<210xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x1xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(48) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block32_wave64, @cohort_q6_q8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x288xi8>, tensor<210xi8>, tensor<[%rows]x1xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x288xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<210xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block32_wave64_single_block_case> @cohort_q6_block32_wave64_single_block
+
+check.scenario public @cohort_q6_block32_wave64_three_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(9) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(80) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x864xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<5670xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x864xi8>, tensor<5670xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x9xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(304) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block32_wave64, @cohort_q6_q8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x864xi8>, tensor<5670xi8>, tensor<[%rows]x9xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<5670xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block32_wave64_three_block_tail_case> @cohort_q6_block32_wave64_three_block_tail
+
+check.scenario public @cohort_q6_block32_wave64_five_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(1280) : index
+    %outputs = check.literal value(17) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(144) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(true) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%rows]x1440xi8>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<17850xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x1440xi8>, tensor<17850xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x17xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(560) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block32_wave64, @cohort_q6_q8_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x1440xi8>, tensor<17850xi8>, tensor<[%rows]x17xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x1440xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<17850xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block32_wave64_five_block_tail_case> @cohort_q6_block32_wave64_five_block_tail
+
+check.scenario public @cohort_q6_block32_wave64_full_reduction_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(32768) : index
+    %outputs = check.literal value(64) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(520) : index
+    %uniform = check.literal value(true) : i1
+    %format = check.literal value(true) : i1
+    %input = check.generate.fill value(1) : tensor<[%rows]x36864xi8>
+    %weight = check.generate.fill value(17) : tensor<1720320xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x36864xi8>, tensor<1720320xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x64xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(2064) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_block32_wave64, @cohort_q6_uniform_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x36864xi8>, tensor<1720320xi8>, tensor<[%rows]x64xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0) rtol(0.0) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x36864xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1720320xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_block32_wave64_full_reduction_case> @cohort_q6_block32_wave64_full_reduction
+
+kernel.def target(@cohort_wave64) @cohort_q6_f32_wave64(%configured_inputs: index, %configured_outputs: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 64 : index
+  %channels = index.constant 2 : index
+  %padding = index.constant 1 : index
+  %padded = index.add %configured_outputs, %padding : index
+  %groups = index.div %padded, %channels : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @cohort.rows : index
+  func.call @ggml_linear_q6k_f32_cohort(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+check.scenario public @cohort_q6_f32_wave64_single_block_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(1) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(16) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(false) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0 to 1.0) : tensor<[%rows]x256xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<210xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x256xf32>, tensor<210xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x1xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(48) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_f32_wave64, @cohort_q6_f32_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x256xf32>, tensor<210xi8>, tensor<[%rows]x1xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x256xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<210xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_f32_wave64_single_block_case> @cohort_q6_f32_wave64_single_block
+
+check.scenario public @cohort_q6_f32_wave64_three_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(9) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(80) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(false) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0 to 1.0) : tensor<[%rows]x768xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<5670xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x768xf32>, tensor<5670xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x9xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(304) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_f32_wave64, @cohort_q6_f32_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x768xf32>, tensor<5670xi8>, tensor<[%rows]x9xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x768xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<5670xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_f32_wave64_three_block_tail_case> @cohort_q6_f32_wave64_three_block_tail
+
+check.scenario public @cohort_q6_f32_wave64_five_block_tail_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(1280) : index
+    %outputs = check.literal value(17) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(144) : index
+    %uniform = check.literal value(false) : i1
+    %format = check.literal value(false) : i1
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0 to 1.0) : tensor<[%rows]x1280xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<17850xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x1280xf32>, tensor<17850xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x17xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(560) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_f32_wave64, @cohort_q6_f32_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x1280xf32>, tensor<17850xi8>, tensor<[%rows]x17xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x1280xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<17850xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_f32_wave64_five_block_tail_case> @cohort_q6_f32_wave64_five_block_tail
+
+check.scenario public @cohort_q6_f32_wave64_full_reduction_case {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %inputs = check.literal value(32768) : index
+    %outputs = check.literal value(64) : index
+    %rows = check.generate<@cohort_row_count>() : () -> (index)
+    %storage_extent = check.literal value(520) : index
+    %uniform = check.literal value(true) : i1
+    %format = check.literal value(false) : i1
+    %input = check.generate.fill value(0.5) : tensor<[%rows]x32768xf32>
+    %weight = check.generate.fill value(17) : tensor<1720320xi8>
+    check.generate<@initialize_q6>(%uniform, %format, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x32768xf32>, tensor<1720320xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_extent]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_extent]xf32> -> tensor<[%rows]x64xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(2064) : tensor<[%storage_extent]xf32> -> tensor<4xf32>
+    check.compare<@cohort_q6_f32_wave64, @cohort_q6_uniform_reference>[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%rows]x32768xf32>, tensor<1720320xi8>, tensor<[%rows]x64xf32>) -> () {
+      check.expect.close actual(%storage) expected(%storage) atol(0.0) rtol(0.0) nan(different) : tensor<[%storage_extent]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x32768xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1720320xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@cohort_q6_f32_wave64_full_reduction_case> @cohort_q6_f32_wave64_full_reduction

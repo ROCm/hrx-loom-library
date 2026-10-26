@@ -1,0 +1,158 @@
+// Recursive MTP proposals and optional second-epoch continuation. Private
+// predictor history advances during proposal; committed carry changes only
+// after target acceptance and catch-up.
+
+kernel.decl @flash_next_lookup_query() launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer)
+
+kernel.decl @flash_next_lookup_scan() launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer)
+
+kernel.decl @flash_next_lookup_select() launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer, %output: buffer)
+
+kernel.decl @flash_next_lookup_parameters(%round: index) launch(%round_value: index, %epoch: buffer, %draft: buffer, %origins: buffer, %target_tokens: buffer, %parameters: buffer)
+
+kernel.decl @flash_next_lookup_publish(%round: index) launch(%round_value: index, %rows: buffer, %cache: buffer, %parameters: buffer, %selected: buffer, %draft: buffer, %origins: buffer, %ids: buffer, %plan: buffer, %target_tokens: buffer, %moves: buffer, %count_buffer: buffer)
+
+kernel.decl @flash_next_lookup_hidden(%count_buffer: buffer) launch(%moves: buffer, %hidden: buffer, %compacted: buffer)
+
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
+// Recursive proposals specialize independently of the target verification
+// width, which includes one additional pending anchor.
+config.decl @flash_next.draft_depth : %value: index where [range(%value, 1, 7)]
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+// The allocation holds two target planes. This extent is independent of the
+// compact draft batch and of either target epoch's selected execution shape.
+config.decl @flash_next.epoch_capacity : %value: index where [range(%value, 1, 32768)]
+
+config.decl @flash_next.pool_capacity : %value: index where [range(%value, 64, 4194304), multiple_of(%value, 64)]
+
+config.decl @flash_next.context_capacity : %value: index where [range(%value, 64, 262144), multiple_of(%value, 64)]
+
+func.decl pure @flash_next_draft_mode_origin(%capacity: index) -> (offset)
+
+kernel.decl @qwen38_mtp_proposal_prepare() launch(%mixed_inputs: index, %target_capacity: index, %draft_capacity: index, %epoch: buffer, %target_tokens: buffer, %draft: buffer, %origins: buffer, %draft_tokens: buffer)
+
+kernel.decl @qwen38_mtp_proposal_advance(%round: index) launch(%mixed_inputs: index, %round_value: index, %target_capacity: index, %draft_capacity: index, %draft: buffer, %origins: buffer, %predictions: buffer, %draft_tokens: buffer, %target_tokens: buffer)
+
+kernel.decl @flash_next_map_tokens(%neural_enabled: i1) launch(%epoch: buffer, %mapping: buffer)
+
+kernel.decl @flash_next_mtp_restore() launch(%epoch: buffer, %rows: buffer, %carry: buffer, %cache: buffer, %hidden: buffer)
+
+kernel.decl @flash_next_draft_plan() launch(%epoch: buffer, %ids: buffer, %carry: buffer, %plan: buffer)
+
+kernel.decl @flash_next_draft_sample(%neural_enabled: i1) launch(%epoch: buffer, %plan: buffer, %carry: buffer, %logits: buffer, %output: buffer)
+
+kernel.decl @qwen38_continue_dispatch() launch(%mixed_inputs: index, %context: index, %capacity: index, %epoch: buffer, %tokens: buffer, %results: buffer)
+
+command.program.decl @flash_next_mtp_input(%neural_enabled: i1) launch(%parameters: buffer, %target_parameters: buffer, %epoch: buffer, %ids: buffer, %hidden: buffer, %residual: buffer)
+
+command.program.decl @flash_next_qsa_residual(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %residual: buffer, %rows: buffer, %arena: buffer, %output: buffer, %capture: buffer)
+
+command.program.decl @flash_next_ffn_residual(%neural_enabled: i1, %layer: index) launch(%parameters: buffer, %span: buffer, %residual: buffer, %output: buffer)
+
+command.program.decl @flash_next_draft_head(%neural_enabled: i1) launch(%parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %plan: buffer, %carry: buffer, %residual: buffer, %logits: buffer)
+
+// Recursive proposals use private working history. Committed carry is
+// read once and remains immutable until accepted target inputs warm the cache.
+// The raw four-stream output, before the final head mixer, is recursive hidden.
+command.program.def public @flash_next_mtp_propose() launch(%parameters: buffer, %embedding_parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %target_tokens: buffer, %rows: buffer, %cache: buffer, %carry: buffer) {
+  %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
+  %tokens = config.get @flash_next.token_count : index
+  %target_capacity = config.get @flash_next.epoch_capacity : index
+  %pool = config.get @flash_next.pool_capacity : index
+  %hidden_stride = index.constant 20480 : offset
+  %logit_stride = index.constant 993280 : offset
+  %mapping_stride = index.constant 16 : offset
+  %hidden_bytes = index.scale %tokens, %hidden_stride : index, offset -> offset
+  %logit_bytes = index.scale %tokens, %logit_stride : index, offset -> offset
+  %mapping_bytes = index.scale %tokens, %mapping_stride : index, offset -> offset
+  %header_bytes = index.constant 12 : offset
+  %descriptor_stride = index.constant 24 : offset
+  %descriptor_bytes = index.scale %tokens, %descriptor_stride : index, offset -> offset
+  %control_bytes = index.add %header_bytes, %descriptor_bytes : offset
+  %token_stride = index.constant 4 : offset
+  %token_bytes = index.scale %tokens, %token_stride : index, offset -> offset
+  %origin_stride = index.constant 8 : offset
+  %origin_bytes = index.scale %tokens, %origin_stride : index, offset -> offset
+  %draft = buffer.alloca<global> align(16) %control_bytes : buffer
+  %mode_origin = func.call pure @flash_next_draft_mode_origin(%tokens) : (index) -> (offset)
+  %plan_bytes = index.add %mode_origin, %token_bytes : offset
+  %plan = buffer.alloca<global> align(16) %plan_bytes : buffer
+  %origins = buffer.alloca<global> align(16) %origin_bytes : buffer
+  %ids = buffer.alloca<global> align(16) %token_bytes : buffer
+  %predictions = buffer.alloca<global> align(16) %token_bytes : buffer
+  %mapping = buffer.alloca<global> align(16) %mapping_bytes : buffer
+  %hidden = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %residual = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %attention = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %logits = buffer.alloca<global> align(256) %logit_bytes : buffer
+  kernel.launch @qwen38_mtp_proposal_prepare(%mixed_inputs, %target_capacity, %tokens, %epoch, %target_tokens, %draft, %origins, %ids) : (index, index, index, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_mtp_restore(%draft, %rows, %carry, %cache, %hidden) : (buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_draft_plan(%draft, %ids, %carry, %plan) : (buffer, buffer, buffer, buffer)
+  %lookup_count_bytes = index.constant 4 : offset
+  %lookup_gate = buffer.alloca<global> align(16) %lookup_count_bytes : buffer
+  %lookup_moves = buffer.alloca<global> align(16) %token_bytes : buffer
+  %lookup_parameter_stride = index.constant 64 : offset
+  %lookup_query_stride = index.constant 260 : offset
+  %lookup_selection_stride = index.constant 8 : offset
+  %lookup_parameter_bytes = index.scale %tokens, %lookup_parameter_stride : index, offset -> offset
+  %lookup_query_bytes = index.scale %tokens, %lookup_query_stride : index, offset -> offset
+  %lookup_selection_bytes = index.scale %tokens, %lookup_selection_stride : index, offset -> offset
+  %lookup_context = config.get @flash_next.context_capacity : index
+  %lookup_block = index.constant 1024 : index
+  %lookup_tail = index.constant 1023 : index
+  %lookup_rounded = index.add %lookup_context, %lookup_tail : index
+  %lookup_groups = index.div %lookup_rounded, %lookup_block : index
+  %lookup_group_words = index.constant 128 : offset
+  %lookup_summary_word = index.constant 4 : offset
+  %lookup_bit_stride = index.scale %lookup_groups, %lookup_group_words : index, offset -> offset
+  %lookup_summary_stride = index.scale %lookup_groups, %lookup_summary_word : index, offset -> offset
+  %lookup_bit_bytes = index.scale %tokens, %lookup_bit_stride : index, offset -> offset
+  %lookup_summary_bytes = index.scale %tokens, %lookup_summary_stride : index, offset -> offset
+  %lookup_parameters = buffer.alloca<global> align(16) %lookup_parameter_bytes : buffer
+  %lookup_query = buffer.alloca<global> align(16) %lookup_query_bytes : buffer
+  %lookup_bits = buffer.alloca<global> align(16) %lookup_bit_bytes : buffer
+  %lookup_summaries = buffer.alloca<global> align(16) %lookup_summary_bytes : buffer
+  %lookup_selected = buffer.alloca<global> align(16) %lookup_selection_bytes : buffer
+  %layer = index.constant 48 : index
+  %key_origin = index.constant 0 : offset
+  %tail_origin = index.constant 0 : offset
+  %main_stride = index.constant 1024 : offset
+  %value_origin = index.scale %pool, %main_stride : index, offset -> offset
+  %index_origin = index.add %value_origin, %value_origin : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %depth = config.get @flash_next.draft_depth : index
+  scf.for %round = [%c0 to %depth step %c1] unroll {
+    kernel.launch @flash_next_lookup_parameters[%round](%round, %epoch, %draft, %origins, %target_tokens, %lookup_parameters) : [index](index, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_lookup_query(%rows, %cache, %lookup_parameters, %lookup_query) : (buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_lookup_scan(%rows, %cache, %lookup_parameters, %lookup_query, %lookup_bits, %lookup_summaries) : (buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_lookup_select(%rows, %cache, %lookup_parameters, %lookup_query, %lookup_bits, %lookup_summaries, %lookup_selected) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_lookup_publish[%round](%round, %rows, %cache, %lookup_parameters, %lookup_selected, %draft, %origins, %ids, %plan, %target_tokens, %lookup_moves, %lookup_gate) : [index](index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    // One GPU observation controls every neural launch in this round.
+    %lookup_origin = index.constant 0 : offset
+    %lookup_counts = buffer.view %lookup_gate[%lookup_origin] : buffer -> view<1xi32>
+    %lookup_count = view.load %lookup_counts[0] : view<1xi32> -> i32
+    %lookup_zero = scalar.constant 0 : i32
+    %neural_enabled = scalar.cmpi ne, %lookup_count, %lookup_zero : i32
+    kernel.launch @flash_next_lookup_hidden[%lookup_gate](%lookup_moves, %hidden, %attention) : [buffer](buffer, buffer, buffer)
+    kernel.launch @flash_next_map_tokens[%neural_enabled](%draft, %mapping) : [i1](buffer, buffer)
+    command.program.launch @flash_next_mtp_input[%neural_enabled](%parameters, %embedding_parameters, %draft, %ids, %attention, %residual) : [i1](buffer, buffer, buffer, buffer, buffer, buffer)
+    command.program.launch @flash_next_qsa_residual[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %draft, %mapping, %residual, %rows, %cache, %attention, %hidden) : [i1, index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    command.program.launch @flash_next_ffn_residual[%neural_enabled, %layer](%parameters, %draft, %attention, %hidden) : [i1, index](buffer, buffer, buffer, buffer)
+    command.program.launch @flash_next_draft_head[%neural_enabled](%parameters, %vocabulary_parameters, %draft, %plan, %carry, %hidden, %logits) : [i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_draft_sample[%neural_enabled](%draft, %plan, %carry, %logits, %predictions) : [i1](buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @qwen38_mtp_proposal_advance[%round](%mixed_inputs, %round, %target_capacity, %tokens, %draft, %origins, %predictions, %ids, %target_tokens) : [index](index, index, index, index, buffer, buffer, buffer, buffer, buffer)
+  }
+  command.return
+}
+
+command.program.def public @flash_next_continue() launch(%epoch: buffer, %tokens: buffer, %results: buffer) {
+  %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
+  %context = config.get @flash_next.context_capacity : index
+  %capacity = config.get @flash_next.epoch_capacity : index
+  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, buffer, buffer, buffer)
+  command.return
+}

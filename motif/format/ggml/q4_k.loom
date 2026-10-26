@@ -8,21 +8,40 @@
 //
 // One 144-byte Q4_K block stores 256 unsigned four-bit codes in eight
 // 32-value groups. Its 12-byte metadata carrier packs one unsigned six-bit
-// scale and minimum for each group. These functions operate on already-loaded
-// carriers so callers retain control of addressing, memory placement, packet
-// reuse, floating-point materialization, contraction, and launch geometry.
-// Selects one nibble plane from 16 consecutive packed-code bytes. `nibble` is
+// scale and minimum for each group. Carrier functions accept already-loaded
+// packets; buffer accessors add explicit row/block addressing and affine
+// coefficients. Callers retain control of memory placement, packet reuse,
+// floating-point materialization, contraction, and launch geometry.
+// Selects one nibble plane from four consecutive packed-code bytes. `nibble` is
 // zero for the low plane and one for the high plane.
-func.def public inline @ggml_q4_k_unpack_codes16(%packed_codes: vector<4xi32>, %nibble: index) -> (vector<16xi8>) {
+func.def public inline @ggml_q4_k_unpack_codes4(%packed_codes: vector<1xi32>, %nibble: index) -> (vector<4xi8>) {
   %bounded_nibble = index.assume %nibble [range(%nibble, 0, 1)] : index
   %c4 = index.constant 4 : index
-  %nibble_mask = vector.constant 252645135 : vector<4xi32>
+  %nibble_mask = vector.constant 252645135 : vector<1xi32>
   %shift_index = index.mul %bounded_nibble, %c4 : index
   %shift_i32 = index.cast %shift_index : index to i32
-  %shift = vector.splat %shift_i32 : vector<4xi32>
-  %shifted_codes = vector.shrui %packed_codes, %shift : vector<4xi32>
-  %masked_codes = vector.andi %shifted_codes, %nibble_mask : vector<4xi32>
-  %codes = vector.bitcast %masked_codes : vector<4xi32> to vector<16xi8>
+  %shift = vector.splat %shift_i32 : vector<1xi32>
+  %shifted_codes = vector.shrui %packed_codes, %shift : vector<1xi32>
+  %masked_codes = vector.andi %shifted_codes, %nibble_mask : vector<1xi32>
+  %codes = vector.bitcast %masked_codes : vector<1xi32> to vector<4xi8>
+  func.return %codes : vector<4xi8>
+}
+
+// Applies the same four-code carrier interpretation to four retained words.
+func.def public inline @ggml_q4_k_unpack_codes16(%packed_codes: vector<4xi32>, %nibble: index) -> (vector<16xi8>) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %words = index.constant 4 : index
+  %initial = vector.constant 0 : vector<4xi32>
+  %unpacked = scf.for %word = [%begin to %words step %step](%current = %initial : vector<4xi32>) -> (vector<4xi32>) unroll {
+    %low = vector.slice %packed_codes[%word] : vector<4xi32> -> vector<1xi32>
+    %codes = func.call @ggml_q4_k_unpack_codes4(%low, %nibble) : (vector<1xi32>, index) -> (vector<4xi8>)
+    %packed = vector.bitcast %codes : vector<4xi8> to vector<1xi32>
+    %value = vector.extract %packed[0] : vector<1xi32> -> i32
+    %next = vector.insert %value into %current[%word] : i32, vector<4xi32>
+    scf.yield %next : vector<4xi32>
+  }
+  %codes = vector.bitcast %unpacked : vector<4xi32> to vector<16xi8>
   func.return %codes : vector<16xi8>
 }
 
@@ -61,4 +80,84 @@ func.def public inline @ggml_q4_k_unpack_scale_minimum(%packed_scales: vector<3x
   %minimum_high = scalar.andi %minimum_high_shifted, %c48_i32 : i32
   %minimum = scalar.ori %minimum_low, %minimum_high : i32
   func.return %scale, %minimum : i32, i32
+}
+
+// Materializes the affine coefficients of one 32-value group from a retained
+// 16-byte Q4_K or Q5_K header. The first word holds F16 (d, dmin); the other
+// three words are the shared packed metadata carrier. A value is d*scale*code
+// minus dmin*minimum. Callers may reuse one loaded header across many groups.
+func.def public inline @ggml_q4_k_scaled_metadata(%header: vector<4xi32>, %group: index) -> (f32, f32) {
+  %halves = vector.bitcast %header : vector<4xi32> to vector<8xf16>
+  %d_half = vector.extract %halves[0] : vector<8xf16> -> f16
+  %minimum_half = vector.extract %halves[1] : vector<8xf16> -> f16
+  %d = scalar.extf %d_half : f16 to f32
+  %dmin = scalar.extf %minimum_half : f16 to f32
+  %first = vector.extract %header[1] : vector<4xi32> -> i32
+  %second = vector.extract %header[2] : vector<4xi32> -> i32
+  %third = vector.extract %header[3] : vector<4xi32> -> i32
+  %packed = vector.from_elements %first, %second, %third : vector<3xi32>
+  %scale, %minimum = func.call @ggml_q4_k_unpack_scale_minimum(%packed, %group) : (vector<3xi32>, index) -> (i32, i32)
+  %scale_float = scalar.uitofp %scale : i32 to f32
+  %minimum_float = scalar.uitofp %minimum : i32 to f32
+  %scaled = scalar.mulf %d, %scale_float : f32
+  %minimum_scaled = scalar.mulf %dmin, %minimum_float : f32
+  func.return %scaled, %minimum_scaled : f32, f32
+}
+
+// Loads exactly the shared 16-byte metadata header at a block's byte origin.
+// Group is in [0, 7]; the caller provides a readable, naturally aligned header.
+func.def public inline @ggml_q4_k_load_scale_minimum(%weight: buffer, %block_origin: offset, %group: index) -> (f32, f32) {
+  %header_view = buffer.view %weight[%block_origin] : buffer -> view<4xi32>
+  %header = vector.load %header_view[0] : view<4xi32> -> vector<4xi32>
+  %scale, %minimum = func.call @ggml_q4_k_scaled_metadata(%header, %group) : (vector<4xi32>, index) -> (f32, f32)
+  func.return %scale, %minimum : f32, f32
+}
+
+// Loads four unsigned codes as F32, leaving affine scaling to the caller.
+// Row origin is in bytes; block selects a complete 144-byte record in that
+// row. Group and packet are both in [0, 7]. Only one four-byte payload word
+// is read, so adjacent matrix lanes can retain their own packets independently.
+func.def public inline @ggml_q4_k_load_codes4(%weight: buffer, %row_origin: offset, %block: index, %group_value: index, %packet_value: index) -> (vector<4xf32>) {
+  %group = index.assume %group_value [range(%group_value, 0, 7)] : index
+  %packet = index.assume %packet_value [range(%packet_value, 0, 7)] : index
+  %groups_per_page = index.constant 2 : index
+  %words_per_page = index.constant 8 : index
+  %block_bytes = index.constant 144 : offset
+  %header_bytes = index.constant 16 : offset
+  %block_add = index.scale %block, %block_bytes : index, offset -> offset
+  %block_origin = index.add %row_origin, %block_add : offset
+  %payload_origin = index.add %block_origin, %header_bytes : offset
+  %page = index.div %group, %groups_per_page : index
+  %word = index.madd %page, %words_per_page, %packet : index
+  %nibble = index.rem %group, %groups_per_page : index
+  %words = buffer.view %weight[%payload_origin] : buffer -> view<32xi32>
+  %packed = vector.load %words[%word] : view<32xi32> -> vector<1xi32>
+  %bytes = func.call @ggml_q4_k_unpack_codes4(%packed, %nibble) : (vector<1xi32>, index) -> (vector<4xi8>)
+  %values = vector.uitofp %bytes : vector<4xi8> to vector<4xf32>
+  func.return %values : vector<4xf32>
+}
+
+// Loads one 16-value half-group and its affine coefficients. Row origin is
+// in bytes; block selects a complete 144-byte record. Group is in [0, 7] and
+// half in [0, 1]. The code packet and header each require one 16-byte load.
+func.def public inline @ggml_q4_k_load_chunk16(%weight: buffer, %row_origin: offset, %block: index, %group_value: index, %half_value: index) -> (vector<16xi8>, f32, f32) {
+  %group = index.assume %group_value [range(%group_value, 0, 7)] : index
+  %half = index.assume %half_value [range(%half_value, 0, 1)] : index
+  %groups_per_page = index.constant 2 : index
+  %words_per_half = index.constant 4 : index
+  %words_per_page = index.constant 8 : index
+  %block_bytes = index.constant 144 : offset
+  %header_bytes = index.constant 16 : offset
+  %block_add = index.scale %block, %block_bytes : index, offset -> offset
+  %block_origin = index.add %row_origin, %block_add : offset
+  %payload_origin = index.add %block_origin, %header_bytes : offset
+  %page = index.div %group, %groups_per_page : index
+  %within = index.mul %half, %words_per_half : index
+  %word = index.madd %page, %words_per_page, %within : index
+  %nibble = index.rem %group, %groups_per_page : index
+  %words = buffer.view %weight[%payload_origin] : buffer -> view<32xi32>
+  %packed = vector.load %words[%word] : view<32xi32> -> vector<4xi32>
+  %codes = func.call @ggml_q4_k_unpack_codes16(%packed, %nibble) : (vector<4xi32>, index) -> (vector<16xi8>)
+  %scale, %minimum = func.call @ggml_q4_k_load_scale_minimum(%weight, %block_origin, %group) : (buffer, offset, index) -> (f32, f32)
+  func.return %codes, %scale, %minimum : vector<16xi8>, f32, f32
 }

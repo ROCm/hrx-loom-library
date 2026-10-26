@@ -1,0 +1,59 @@
+amdgpu.target<gfx11-generic> @q8_reference_wave64 {subgroup_size = 64}
+
+// Independent reference and observation kernels for model checks.
+// These kernels are owned by test roots and are not model providers.
+kernel.def target(@q8_reference_wave64) @qwen38_linear_q8_0_f32_reference(%token_count0: index, %input_size0: index, %output_size0: index) {
+  %token_count = index.assume %token_count0 [range(%token_count0, 1, 512)] : index
+  %output_size = index.assume %output_size0 [range(%output_size0, 1, 32768)] : index
+  %c1 = index.constant 1 : index
+  %c64 = index.constant 64 : index
+  kernel.launch.config workgroups(%output_size, %token_count, %c1) workgroup_size(%c64, %c1, %c1) : index
+} launch(%token_count0: index, %input_size0: index, %output_size0: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %token_count = index.assume %token_count0 [range(%token_count0, 1, 512)] : index
+  %input_size = index.assume %input_size0 [range(%input_size0, 256, 32768), multiple_of(%input_size0, 256)] : index
+  %output_size = index.assume %output_size0 [range(%output_size0, 1, 32768)] : index
+  %token0 = kernel.workgroup.id<y> : index
+  %token = index.assume %token0 [lt(%token0, %token_count)] : index
+  %channel0 = kernel.workgroup.id<x> : index
+  %channel = index.assume %channel0 [lt(%channel0, %output_size)] : index
+  %lane = kernel.subgroup.lane.id : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2_bytes = index.constant 2 : offset
+  %c32 = index.constant 32 : index
+  %c34_bytes = index.constant 34 : offset
+  %c64 = index.constant 64 : index
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c0_offset = index.constant 0 : offset
+  %block_count = index.div %input_size, %c32 : index
+  %weight_row_bytes = index.scale %block_count, %c34_bytes : index, offset -> offset
+  %weight_row_byte_base = index.scale %channel, %weight_row_bytes : index, offset -> offset
+  %input_view = buffer.view %input[%c0_offset] : buffer -> view<[%token_count]x[%input_size]xf32>
+  %output_view = buffer.view %output[%c0_offset] : buffer -> view<[%token_count]x[%output_size]xf32>
+  %lane_sum = scf.for %element = [%lane to %input_size step %c64](%sum = %c0_f32 : f32) -> (f32) {
+    %block = index.div %element, %c32 : index
+    %block_element = index.rem %element, %c32 : index
+    %block_byte_add = index.scale %block, %c34_bytes : index, offset -> offset
+    %block_byte_base = index.add %weight_row_byte_base, %block_byte_add : offset
+    %payload_byte_base = index.add %block_byte_base, %c2_bytes : offset
+    %element_byte_add = index.cast %block_element : index to offset
+    %element_byte_base = index.add %payload_byte_base, %element_byte_add : offset
+    %scale_view = buffer.view %weight[%block_byte_base] : buffer -> view<1xf16>
+    %code_view = buffer.view %weight[%element_byte_base] : buffer -> view<1xi8>
+    %scale_f16 = view.load %scale_view[0] : view<1xf16> -> f16
+    %scale = scalar.extf %scale_f16 : f16 to f32
+    %code = view.load %code_view[0] : view<1xi8> -> i8
+    %code_f32 = scalar.sitofp %code : i8 to f32
+    %weight_value = scalar.mulf %code_f32, %scale : f32
+    %input_value = view.load %input_view[%token, %element] : view<[%token_count]x[%input_size]xf32> -> f32
+    %product = scalar.mulf %input_value, %weight_value : f32
+    %next = scalar.addf %sum, %product : f32
+    scf.yield %next : f32
+  }
+  %result = kernel.subgroup.reduce<addf> %lane_sum : f32
+  %is_lane_zero = index.cmp eq, %lane, %c0 : index
+  scf.if %is_lane_zero {
+    view.store %result, %output_view[%token, %channel] : f32, view<[%token_count]x[%output_size]xf32>
+  }
+  kernel.return
+}

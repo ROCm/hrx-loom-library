@@ -5,8 +5,8 @@ This package owns the repository-local Python tooling reached through the root
 test artifacts stay below this package rather than turning the repository root
 into an application package.
 
-`hrx_loom_kernels/cli.py` discovers modules in
-`hrx_loom_kernels/commands/` and asks each module to register its command. A
+`hrx_loom_library/cli.py` discovers modules in
+`hrx_loom_library/commands/` and asks each module to register its command. A
 command owns its complete parser and handler, so adding or changing a tool does
 not require editing the dispatcher or root thunk. Files ending in `_test.py`
 are paired command tests and are excluded from command discovery.

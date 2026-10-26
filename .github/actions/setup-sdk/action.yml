@@ -1,0 +1,66 @@
+# Copyright 2026 AMD ROCm™ Software
+# SPDX-License-Identifier: MIT
+
+name: Install the pinned Loom SDK
+description: Select a qualified Release wheel and the matching public Bazel rules.
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: "3.12"
+
+    - name: Read SDK pin
+      id: sdk
+      shell: bash
+      run: |
+        # runner.temp is a host path; Bazel runs inside the job container.
+        echo "cache=$RUNNER_TEMP/loom-bazel-cache" >> "$GITHUB_OUTPUT"
+        python -B - <<'PY' >> "$GITHUB_OUTPUT"
+        import json
+        import pathlib
+        import re
+        pin = json.loads(pathlib.Path("build_tools/ci/sdk.json").read_text())
+        commits = re.findall(r'commit\s*=\s*"([0-9a-f]{40})"', pathlib.Path("MODULE.bazel").read_text())
+        if commits != [pin["revision"]]:
+            raise SystemExit("The SDK and MODULE.bazel must select the same HRX revision")
+        for key in ("repository", "run_id", "artifact_id", "wheel", "sha256"):
+            print(f"{key}={pin[key]}")
+        PY
+
+    - name: Download qualified SDK artifact
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+      with:
+        repository: ${{ steps.sdk.outputs.repository }}
+        run-id: ${{ steps.sdk.outputs.run_id }}
+        artifact-ids: ${{ steps.sdk.outputs.artifact_id }}
+        github-token: ${{ github.token }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/loom-sdk-wheel
+
+    - name: Verify and install SDK
+      shell: bash
+      env:
+        WHEEL: ${{ steps.sdk.outputs.wheel }}
+        SHA256: ${{ steps.sdk.outputs.sha256 }}
+      run: |
+        echo "$SHA256  $RUNNER_TEMP/loom-sdk-wheel/$WHEEL" | sha256sum --check
+        python -m venv "$RUNNER_TEMP/loom-sdk-venv"
+        "$RUNNER_TEMP/loom-sdk-venv/bin/python" -m pip install \
+          --no-deps --no-index --no-compile "$RUNNER_TEMP/loom-sdk-wheel/$WHEEL"
+
+    - name: Set up Bazel
+      uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
+      with:
+        bazelisk-cache: true
+        bazelisk-version: "1.29.0"
+        repository-cache: true
+        cache-save: ${{ github.event_name == 'push' }}
+        bazelrc: |
+          build --disk_cache=${{ steps.sdk.outputs.cache }}
+
+    - name: Select installed toolchain
+      shell: bash
+      run: python dev.py setup --sdk="$RUNNER_TEMP/loom-sdk-venv/bin/python"

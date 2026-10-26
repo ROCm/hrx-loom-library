@@ -1,0 +1,112 @@
+// Native AIE2P BFP16EBS8 packing of complete 64-element BF16 blocks.
+// Each block occupies 72 bytes: eight records of one exponent followed by
+// eight signed mantissas. Origins are bytes in caller-owned local storage;
+// input, output, and the residual encoder's 8x8 BF16 identity are disjoint.
+// Callers bind the core target and own storage, placement, and synchronization.
+//
+// The nonnegative count is measured in complete 64-element blocks. Input has
+// count*128 bytes. The output payload has count*72 bytes, with accessible
+// capacity max(128, align_up(count*72, 64)) for FIFO initialization and stores.
+// All origins are 64-byte aligned. Bytes outside the payload are preserved,
+// including for count zero. The identity occupies 128 bytes in row-major order.
+//
+// Operands and F32 intermediates are finite; subnormals flush to zero. Each
+// eight-value group uses a biased binary exponent and signed mantissas rounded
+// to nearest, ties to even. Positive carry raises the exponent, while -128
+// remains representable. The residual stream encodes input minus decoded high;
+// both streams use the same record layout. The core must support AIE2P FIFO
+// conversion and native BFP16EBS8 8x8 matrix multiplication.
+
+target.decl @bfp16ebs8.core
+
+low.func.def inline target<amd.xdna.aie2p.core>(@bfp16ebs8.core) @pack_bf16_native(%storage: reg<aie2p.ep>, %input_offset: reg<aie2p.er>, %output_offset: reg<aie2p.er>, %count: reg<aie2p.er>) asm {
+  %input_storage = copy %storage : reg<aie2p.ep> -> reg<aie2p.ep>
+  %input_modifier = mov.modifier %input_offset
+  %input = padda.modifier %input_storage, %input_modifier
+  %output_storage = copy %storage : reg<aie2p.ep> -> reg<aie2p.ep>
+  %output_modifier = mov.modifier %output_offset
+  %output = padda.modifier %output_storage, %output_modifier
+  %pointer = mov.store-fifo.pointer %output
+  %low = vlda.store-fifo.low512 %output, 0
+  %fifo = vlda.store-fifo.high512 %output, %low, 64
+  %position = mova.fifo.store.position 0
+  %zero = mov.short 0
+  %one = mov.short 1
+  %step = mov.i32 128
+  set.rounding 12
+  low.br ^pack(%zero: reg<aie2p.er>, %input: reg<aie2p.ep>, %pointer: reg<aie2p.mpfs>, %fifo: reg<aie2p.mstfifo>, %position: reg<aie2p.mr26_fifo_st>)
+^pack(%index: reg<aie2p.er>, %source: reg<aie2p.ep>, %destination: reg<aie2p.mpfs>, %state: reg<aie2p.mstfifo>, %offset: reg<aie2p.mr26_fifo_st>):
+  %condition = lt %index, %count
+  low.cond_br %condition, ^update, ^finish : reg<aie2p.er>
+^update:
+  %lower = vlda.convert.bf16x32.to.f32x32 %source, 0
+  %upper = vlda.convert.bf16x32.to.f32x32 %source, 64
+  %values = concat(%lower, %upper) : (reg<aie2p.mbms x2>, reg<aie2p.mbms x2>) -> reg<aie2p.mbms x4>
+  %pushed, %next_destination, %next_offset = vst.push.bfp16ebs8.from.fp32 %state, %values, %destination, %offset
+  %flushed, %final_destination, %final_offset = vst.flush.convert.512 %pushed, %next_destination, %next_offset
+  %base = mov.address-to-scalar %source
+  %next_address = add.rr %base, %step
+  %next_source = mov.scalar-to-address %next_address
+  %next_index = add.rr %index, %one
+  low.br ^pack(%next_index: reg<aie2p.er>, %next_source: reg<aie2p.ep>, %final_destination: reg<aie2p.mpfs>, %flushed: reg<aie2p.mstfifo>, %final_offset: reg<aie2p.mr26_fifo_st>)
+^finish:
+  return
+}
+
+// Write the leading representation, retaining the caller's surrounding bytes.
+func.def public inline @bfp16ebs8.pack_bf16_aie2p(%storage: buffer, %input: offset, %output: offset, %count: i32) {
+  low.invoke @pack_bf16_native(%storage, %input, %output, %count) : (buffer, offset, offset, i32)
+  func.return
+}
+
+low.func.def inline target<amd.xdna.aie2p.core>(@bfp16ebs8.core) @pack_bf16_residual_native(%storage: reg<aie2p.ep>, %input_offset: reg<aie2p.er>, %output_offset: reg<aie2p.er>, %identity_offset: reg<aie2p.er>, %count: reg<aie2p.er>) asm {
+  %input_storage = copy %storage : reg<aie2p.ep> -> reg<aie2p.ep>
+  %input_modifier = mov.modifier %input_offset
+  %input = padda.modifier %input_storage, %input_modifier
+  %output_storage = copy %storage : reg<aie2p.ep> -> reg<aie2p.ep>
+  %output_modifier = mov.modifier %output_offset
+  %output = padda.modifier %output_storage, %output_modifier
+  %pointer = mov.store-fifo.pointer %output
+  %low = vlda.store-fifo.low512 %output, 0
+  %fifo = vlda.store-fifo.high512 %output, %low, 64
+  %position = mova.fifo.store.position 0
+  %zero = mov.short 0
+  %one = mov.short 1
+  %step = mov.i32 128
+  set.rounding 12
+  %identity_modifier = mov.modifier %identity_offset
+  %identity = padda.modifier %storage, %identity_modifier
+  %identity_lower = vlda.convert.bf16x32.to.f32x32 %identity, 0
+  %identity_upper = vlda.convert.bf16x32.to.f32x32 %identity, 64
+  %identity_values = concat(%identity_lower, %identity_upper) : (reg<aie2p.mbms x2>, reg<aie2p.mbms x2>) -> reg<aie2p.mbms x4>
+  %identity_encoded = vconv.bfp16ebs8.fp32 %identity_values
+  %matrix_control = mova.i32 780
+  %subtract_control = mova.i32 60
+  low.br ^pack(%zero: reg<aie2p.er>, %input: reg<aie2p.ep>, %pointer: reg<aie2p.mpfs>, %fifo: reg<aie2p.mstfifo>, %position: reg<aie2p.mr26_fifo_st>)
+^pack(%index: reg<aie2p.er>, %source: reg<aie2p.ep>, %destination: reg<aie2p.mpfs>, %state: reg<aie2p.mstfifo>, %offset: reg<aie2p.mr26_fifo_st>):
+  %condition = lt %index, %count
+  low.cond_br %condition, ^update, ^finish : reg<aie2p.er>
+^update:
+  %lower = vlda.convert.bf16x32.to.f32x32 %source, 0
+  %upper = vlda.convert.bf16x32.to.f32x32 %source, 64
+  %values = concat(%lower, %upper) : (reg<aie2p.mbms x2>, reg<aie2p.mbms x2>) -> reg<aie2p.mbms x4>
+  %encoded_high = vconv.bfp16ebs8.fp32 %values
+  %decoded_high = mmul.bfp16ebs8.m8n8k8 %encoded_high, %identity_encoded, %matrix_control
+  %residual = vsub.f32x64 %values, %decoded_high, %subtract_control
+  %pushed, %next_destination, %next_offset = vst.push.bfp16ebs8.from.fp32 %state, %residual, %destination, %offset
+  %flushed, %final_destination, %final_offset = vst.flush.convert.512 %pushed, %next_destination, %next_offset
+  %base = mov.address-to-scalar %source
+  %next_address = add.rr %base, %step
+  %next_source = mov.scalar-to-address %next_address
+  %next_index = add.rr %index, %one
+  low.br ^pack(%next_index: reg<aie2p.er>, %next_source: reg<aie2p.ep>, %final_destination: reg<aie2p.mpfs>, %flushed: reg<aie2p.mstfifo>, %final_offset: reg<aie2p.mr26_fifo_st>)
+^finish:
+  return
+}
+
+// Decode the leading representation with the supplied identity, then encode
+// its residual. Identity and source bytes remain unchanged.
+func.def public inline @bfp16ebs8.pack_bf16_residual_aie2p(%storage: buffer, %input: offset, %output: offset, %identity: offset, %count: i32) {
+  low.invoke @pack_bf16_residual_native(%storage, %input, %output, %identity, %count) : (buffer, offset, offset, offset, i32)
+  func.return
+}

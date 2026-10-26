@@ -1,0 +1,161 @@
+// Twelve-layer BF16 mixing with explicit row/channel ownership. Active values
+// and arithmetic remain finite; input and coefficient storage is naturally
+// aligned. The caller owns positive extents, in-range coordinates, and output
+// publication in storage separate from every input. The single-bank helper
+// consumes F32 factors and skips them for either signed-zero strength. The
+// multi-bank helper consumes prepared BF16 factors through explicit offset
+// and strength views; its contract follows the single-bank definitions.
+
+template.decl @projection.gather_12_bf16(%rows: index, %width: index, %row: index, %channel: index, %input: buffer) -> (vector<12xf32>)
+
+template.decl @projection.dot_12_storage_bf16(%outputs: index, %row: index, %weight_is_bf16: i1, %values: vector<12xf32>, %weight: buffer) -> (bf16)
+
+template.decl @projection.layer_mix_12_bf16(%rows: index, %width: index, %rank: index, %row: index, %channel: index, %adapted: i1, %weight_is_bf16: i1, %input: buffer, %weight: buffer, %down: buffer, %up: buffer, %strength: buffer) -> (bf16)
+
+// A lane owns one channel of one token. Layers are strided, but adjacent lanes
+// gather adjacent channels. The twelve inputs remain in registers for all
+// low-rank contractions; neither a transpose nor a rank tensor is required.
+template.def<@projection.gather_12_bf16> device @gather_12_bf16(%rows: index, %width: index, %row: index, %channel: index, %input: buffer) -> (vector<12xf32>) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %layers = index.constant 12 : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x12x[%width]xbf16>
+  %c0_0 = vector.constant 0.0 : vector<12xf32>
+  %values = scf.for %layer = [%c0 to %layers step %c1](%current = %c0_0 : vector<12xf32>) -> (vector<12xf32>) unroll {
+    %stored = view.load %input_view[%row, %layer, %channel] : view<[%rows]x12x[%width]xbf16> -> bf16
+    %value = scalar.extf %stored : bf16 to f32
+    %next = vector.insert %value into %current[%layer] : f32, vector<12xf32>
+    scf.yield %next : vector<12xf32>
+  }
+  template.return %values : vector<12xf32>
+}
+
+// Checkpoint coefficients round to BF16 before the F32 reduction. Its result
+// rounds once to BF16, including when consumed immediately by another dot.
+template.def<@projection.dot_12_storage_bf16> device @dot_12_storage_bf16(%outputs: index, %row: index, %weight_is_bf16: i1, %values: vector<12xf32>, %weight: buffer) -> (bf16) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %layers = index.constant 12 : index
+  %initial = scalar.constant 0.0 : f32
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<[%outputs]x12xf32>
+  %sum = scf.for %layer = [%c0 to %layers step %c1](%accumulator = %initial : f32) -> (f32) unroll {
+    %rounded = scf.if %weight_is_bf16 -> (bf16) {
+      %view = buffer.view %weight[%origin] : buffer -> view<[%outputs]x12xbf16>
+      %value = view.load %view[%row, %layer] : view<[%outputs]x12xbf16> -> bf16
+      scf.yield %value : bf16
+    } else {
+      %stored = view.load %weight_view[%row, %layer] : view<[%outputs]x12xf32> -> f32
+      %value = scalar.fptrunc %stored : f32 to bf16
+      scf.yield %value : bf16
+    }
+    %coefficient = scalar.extf %rounded : bf16 to f32
+    %value = vector.extract %values[%layer] : vector<12xf32> -> f32
+    %next = scalar.fmaf %value, %coefficient, %accumulator : f32
+    scf.yield %next : f32
+  }
+  %result = scalar.fptrunc %sum : f32 to bf16
+  template.return %result : bf16
+}
+
+// Input and output layouts differ; callers provide distinct output storage.
+// Each A result rounds before contributing to B, then B and scaling round
+// before the final addition. Zero strength preserves the base bit pattern.
+template.def<@projection.layer_mix_12_bf16> device @layer_mix_12_bf16(%rows: index, %width: index, %rank: index, %row: index, %channel: index, %adapted: i1, %weight_is_bf16: i1, %input: buffer, %weight: buffer, %down: buffer, %up: buffer, %strength: buffer) -> (bf16) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %initial = scalar.constant 0.0 : f32
+  %values = template.apply<@projection.gather_12_bf16>(%rows, %width, %row, %channel, %input) : (index, index, index, index, buffer) -> (vector<12xf32>)
+  %base = template.apply<@projection.dot_12_storage_bf16>(%c1, %c0, %weight_is_bf16, %values, %weight) : (index, index, i1, vector<12xf32>, buffer) -> (bf16)
+  %result = scf.if %adapted -> (bf16) {
+    %strength_view = buffer.view %strength[%origin] : buffer -> view<1xf32>
+    %scale = view.load %strength_view[%c0] : view<1xf32> -> f32
+    %disabled = scalar.cmpf oeq, %scale, %initial : f32
+    %combined = scf.if %disabled -> (bf16) {
+      scf.yield %base : bf16
+    } else {
+      %adapter_is_bf16 = scalar.constant false : i1
+      %up_view = buffer.view %up[%origin] : buffer -> view<[%rank]xf32>
+      %sum = scf.for %element = [%c0 to %rank step %c1](%accumulator = %initial : f32) -> (f32) {
+        %low = template.apply<@projection.dot_12_storage_bf16>(%rank, %element, %adapter_is_bf16, %values, %down) : (index, index, i1, vector<12xf32>, buffer) -> (bf16)
+        %value = scalar.extf %low : bf16 to f32
+        %stored = view.load %up_view[%element] : view<[%rank]xf32> -> f32
+        %rounded = scalar.fptrunc %stored : f32 to bf16
+        %coefficient = scalar.extf %rounded : bf16 to f32
+        %next = scalar.fmaf %value, %coefficient, %accumulator : f32
+        scf.yield %next : f32
+      }
+      %delta_bf16 = scalar.fptrunc %sum : f32 to bf16
+      %delta = scalar.extf %delta_bf16 : bf16 to f32
+      %scaled_f32 = scalar.mulf %delta, %scale : f32
+      %scaled_bf16 = scalar.fptrunc %scaled_f32 : f32 to bf16
+      %scaled = scalar.extf %scaled_bf16 : bf16 to f32
+      %base_f32 = scalar.extf %base : bf16 to f32
+      %total = scalar.addf %base_f32, %scaled : f32
+      %output = scalar.fptrunc %total : f32 to bf16
+      scf.yield %output : bf16
+    }
+    scf.yield %combined : bf16
+  } else {
+    scf.yield %base : bf16
+  }
+  template.return %result : bf16
+}
+
+// Multiple prepared BF16 banks share the same twelve gathered input values.
+// Per-bank down products include their F32 strength before BF16 rounding;
+// all up products accumulate in F32 before adding the rounded base once.
+// Offsets are nonnegative byte positions in both factor bases. Duplicate
+// offsets preserve independent strengths and declaration order. The caller
+// owns finite values, complete factors, valid coordinates, and result storage.
+template.decl @projection.dot_12_bf16_f32(%rank: index, %row: index, %values: vector<12xf32>, %weight: buffer, %bank_offset: offset) -> (f32)
+
+template.decl @projection.adapter_layer_mix_12_bf16(%rows: index, %width: index, %rank: index, %row: index, %channel: index, %weight_is_bf16: i1, %input: buffer, %weight: buffer, %down: buffer, %up: buffer, %count: index, %offset_layout: encoding<layout>, %strength_layout: encoding<layout>, %offsets: view<[%count]xi64, %offset_layout>, %strengths: view<[%count]xf32, %strength_layout>) -> (bf16)
+
+template.def<@projection.dot_12_bf16_f32> device @dot_12_bf16_f32(%rank: index, %row: index, %values: vector<12xf32>, %weight: buffer, %bank_offset: offset) -> (f32) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %layers = index.constant 12 : index
+  %initial = scalar.constant 0.0 : f32
+  %weights = buffer.view %weight[%bank_offset] : buffer -> view<[%rank]x12xbf16>
+  %sum = scf.for %layer = [%c0 to %layers step %c1](%accumulator = %initial : f32) -> (f32) unroll {
+    %stored = view.load %weights[%row, %layer] : view<[%rank]x12xbf16> -> bf16
+    %coefficient = scalar.extf %stored : bf16 to f32
+    %value = vector.extract %values[%layer] : vector<12xf32> -> f32
+    %next = scalar.fmaf %value, %coefficient, %accumulator : f32
+    scf.yield %next : f32
+  }
+  template.return %sum : f32
+}
+
+template.def<@projection.adapter_layer_mix_12_bf16> device @adapter_layer_mix_12_bf16(%rows: index, %width: index, %rank: index, %row: index, %channel: index, %weight_is_bf16: i1, %input: buffer, %weight: buffer, %down: buffer, %up: buffer, %count: index, %offset_layout: encoding<layout>, %strength_layout: encoding<layout>, %offsets: view<[%count]xi64, %offset_layout>, %strengths: view<[%count]xf32, %strength_layout>) -> (bf16) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %initial = scalar.constant 0.0 : f32
+  %values = template.apply<@projection.gather_12_bf16>(%rows, %width, %row, %channel, %input) : (index, index, index, index, buffer) -> (vector<12xf32>)
+  %base = template.apply<@projection.dot_12_storage_bf16>(%c1, %c0, %weight_is_bf16, %values, %weight) : (index, index, i1, vector<12xf32>, buffer) -> (bf16)
+  %sum = scf.for %adapter = [%c0 to %count step %c1](%accumulator = %initial : f32) -> (f32) {
+    %address = view.load %offsets[%adapter] : view<[%count]xi64, %offset_layout> -> i64
+    %address_nonnegative = scalar.assume %address [range(%address, 0, 9223372036854775807)] : i64
+    %bank_offset = index.cast %address_nonnegative : i64 to offset
+    %scale = view.load %strengths[%adapter] : view<[%count]xf32, %strength_layout> -> f32
+    %up_view = buffer.view %up[%bank_offset] : buffer -> view<[%rank]xbf16>
+    %combined = scf.for %element = [%c0 to %rank step %c1](%partial = %accumulator : f32) -> (f32) {
+      %dot = template.apply<@projection.dot_12_bf16_f32>(%rank, %element, %values, %down, %bank_offset) : (index, index, vector<12xf32>, buffer, offset) -> (f32)
+      %scaled = scalar.mulf %dot, %scale : f32
+      %low = scalar.fptrunc %scaled : f32 to bf16
+      %value = scalar.extf %low : bf16 to f32
+      %stored = view.load %up_view[%element] : view<[%rank]xbf16> -> bf16
+      %coefficient = scalar.extf %stored : bf16 to f32
+      %next = scalar.fmaf %value, %coefficient, %partial : f32
+      scf.yield %next : f32
+    }
+    scf.yield %combined : f32
+  }
+  %base_value = scalar.extf %base : bf16 to f32
+  %combined = scalar.addf %base_value, %sum : f32
+  %result = scalar.fptrunc %combined : f32 to bf16
+  template.return %result : bf16
+}

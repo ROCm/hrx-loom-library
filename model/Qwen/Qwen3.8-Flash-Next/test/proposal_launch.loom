@@ -1,0 +1,119 @@
+// Proposal commands forward a sampled device predicate through the real Q8
+// projection template. False rounds preserve output storage; a later write
+// cannot change an earlier observation. Unit weights and inputs sum to 32.
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+template.decl @flash_next.project_dense_q8(%neural_enabled: i1, %inputs: index, %outputs: index, %blocks: index, %span: buffer, %input: buffer, %weight: view<[%outputs]x[%blocks]x34xi8>, %output: buffer)
+
+kernel.def @publish_count() {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%value: i32, %control: buffer) {
+  %origin = index.constant 0 : offset
+  %counts = buffer.view %control[%origin] : buffer -> view<1xi32>
+  view.store %value, %counts[0] : i32, view<1xi32>
+  kernel.return
+}
+
+command.program.def @project(%enabled: i1, %inputs: index, %outputs: index, %blocks: index, %weight: view<[%outputs]x[%blocks]x34xi8>) launch(%epoch: buffer, %input: buffer, %output: buffer) {
+  template.apply<@flash_next.project_dense_q8>(%enabled, %inputs, %outputs, %blocks, %epoch, %input, %weight, %output) : (i1, index, index, index, buffer, buffer, view<[%outputs]x[%blocks]x34xi8>, buffer)
+  command.return
+}
+
+command.program.def @proposal_rounds() launch(%epoch: buffer, %input: buffer, %weight: buffer, %skipped_first: buffer, %active_first: buffer, %skipped_later: buffer, %active_later: buffer, %ordinary: buffer) {
+  %bytes = index.constant 4 : offset
+  %control = buffer.alloca<global> align(16) %bytes : buffer
+  %origin = index.constant 0 : offset
+  %inputs = index.constant 32 : index
+  %outputs = index.constant 1024 : index
+  %blocks = index.constant 1 : index
+  %weights = buffer.view %weight[%origin] : buffer -> view<[%outputs]x[%blocks]x34xi8>
+  %counts = buffer.view %control[%origin] : buffer -> view<1xi32>
+  %c0 = scalar.constant 0 : i32
+  %c1 = scalar.constant 1 : i32
+  %c8 = scalar.constant 8 : i32
+  %always = scalar.constant true : i1
+  kernel.launch @publish_count(%c0, %control) : (i32, buffer)
+  %first_count = view.load %counts[0] : view<1xi32> -> i32
+  %first_enabled = scalar.cmpi ne, %first_count, %c0 : i32
+  kernel.launch @publish_count(%c8, %control) : (i32, buffer)
+  command.program.launch @project[%first_enabled, %inputs, %outputs, %blocks, %weights](%epoch, %input, %skipped_first) : [i1, index, index, index, view<[%outputs]x[%blocks]x34xi8>](buffer, buffer, buffer)
+  kernel.launch @publish_count(%c1, %control) : (i32, buffer)
+  %active_count = view.load %counts[0] : view<1xi32> -> i32
+  %active_enabled = scalar.cmpi ne, %active_count, %c0 : i32
+  command.program.launch @project[%active_enabled, %inputs, %outputs, %blocks, %weights](%epoch, %input, %active_first) : [i1, index, index, index, view<[%outputs]x[%blocks]x34xi8>](buffer, buffer, buffer)
+  kernel.launch @publish_count(%c0, %control) : (i32, buffer)
+  %skipped_count = view.load %counts[0] : view<1xi32> -> i32
+  %skipped_enabled = scalar.cmpi ne, %skipped_count, %c0 : i32
+  command.program.launch @project[%skipped_enabled, %inputs, %outputs, %blocks, %weights](%epoch, %input, %skipped_later) : [i1, index, index, index, view<[%outputs]x[%blocks]x34xi8>](buffer, buffer, buffer)
+  kernel.launch @publish_count(%c8, %control) : (i32, buffer)
+  %later_count = view.load %counts[0] : view<1xi32> -> i32
+  %later_enabled = scalar.cmpi ne, %later_count, %c0 : i32
+  command.program.launch @project[%later_enabled, %inputs, %outputs, %blocks, %weights](%epoch, %input, %active_later) : [i1, index, index, index, view<[%outputs]x[%blocks]x34xi8>](buffer, buffer, buffer)
+  command.program.launch @project[%always, %inputs, %outputs, %blocks, %weights](%epoch, %input, %ordinary) : [i1, index, index, index, view<[%outputs]x[%blocks]x34xi8>](buffer, buffer, buffer)
+  command.return
+}
+
+func.def @fixture(%epoch: buffer, %weight: buffer) -> (index) {
+  %capacity = config.get @flash_next.token_count : index
+  %origin = index.constant 0 : offset
+  %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %count = index.cast %capacity : index to i32
+  view.store %count, %header[0] : i32, view<3xi32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %rows = index.constant 1024 : index
+  %block_bytes = index.constant 34 : offset
+  %scale = scalar.constant 1.0 : f16
+  scf.for %row = [%c0 to %rows step %c1] {
+    %offset = index.scale %row, %block_bytes : index, offset -> offset
+    %header = buffer.view %weight[%offset] : buffer -> view<1xf16>
+    view.store %scale, %header[0] : f16, view<1xf16>
+  }
+  func.return %capacity : index
+}
+
+func.def @expected(%epoch: buffer, %input: buffer, %weight: buffer, %skipped_first: buffer, %active_first: buffer, %skipped_later: buffer, %active_later: buffer, %ordinary: buffer) {
+  %capacity = config.get @flash_next.token_count : index
+  %origin = index.constant 0 : offset
+  %first = buffer.view %active_first[%origin] : buffer -> view<[%capacity]x1024xbf16>
+  %later = buffer.view %active_later[%origin] : buffer -> view<[%capacity]x1024xbf16>
+  %plain = buffer.view %ordinary[%origin] : buffer -> view<[%capacity]x1024xbf16>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %columns = index.constant 1024 : index
+  %result = scalar.constant 32.0 : bf16
+  scf.for %row = [%c0 to %capacity step %c1] {
+    scf.for %column = [%c0 to %columns step %c1] {
+      view.store %result, %first[%row, %column] : bf16, view<[%capacity]x1024xbf16>
+      view.store %result, %later[%row, %column] : bf16, view<[%capacity]x1024xbf16>
+      view.store %result, %plain[%row, %column] : bf16, view<[%capacity]x1024xbf16>
+    }
+  }
+  func.return
+}
+
+check.scenario public @proposal_predicates {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %epoch = check.generate.fill value(0) : tensor<3xi32>
+    %weight = check.generate.fill value(1) : tensor<1024x1x34xi8>
+    %capacity = check.generate<@fixture>(%epoch, %weight) : (tensor<3xi32>, tensor<1024x1x34xi8>) -> (index)
+    %input = check.generate.fill value(1.0) : tensor<[%capacity]x32xbf16>
+    %skipped_first = check.generate.fill value(7.0) : tensor<[%capacity]x1024xbf16>
+    %active_first = check.generate.fill value(7.0) : tensor<[%capacity]x1024xbf16>
+    %skipped_later = check.generate.fill value(7.0) : tensor<[%capacity]x1024xbf16>
+    %active_later = check.generate.fill value(7.0) : tensor<[%capacity]x1024xbf16>
+    %ordinary = check.generate.fill value(7.0) : tensor<[%capacity]x1024xbf16>
+    check.compare<@proposal_rounds, @expected>(%epoch, %input, %weight, %skipped_first, %active_first, %skipped_later, %active_later, %ordinary) : (tensor<3xi32>, tensor<[%capacity]x32xbf16>, tensor<1024x1x34xi8>, tensor<[%capacity]x1024xbf16>, tensor<[%capacity]x1024xbf16>, tensor<[%capacity]x1024xbf16>, tensor<[%capacity]x1024xbf16>, tensor<[%capacity]x1024xbf16>) -> () {
+      check.expect.bitwise actual(%skipped_first) expected(%skipped_first) : tensor<[%capacity]x1024xbf16>
+      check.expect.bitwise actual(%active_first) expected(%active_first) : tensor<[%capacity]x1024xbf16>
+      check.expect.bitwise actual(%skipped_later) expected(%skipped_later) : tensor<[%capacity]x1024xbf16>
+      check.expect.bitwise actual(%active_later) expected(%active_later) : tensor<[%capacity]x1024xbf16>
+      check.expect.bitwise actual(%ordinary) expected(%ordinary) : tensor<[%capacity]x1024xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@proposal_predicates> @proposal_predicates_benchmark

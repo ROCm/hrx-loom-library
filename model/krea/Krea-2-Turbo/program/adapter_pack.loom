@@ -1,0 +1,43 @@
+// Runtime preparation rounds original F32 factors into one immutable BF16
+// bank. Native residency retains and shares that bank across requests.
+
+// Preparation converts a bank before first capture; native residency can
+// prepare it again after eviction without changing the source checkpoint.
+config.decl @adapter.elements : i64
+
+config.decl @adapter.input_offset : i64
+
+kernel.def @adapter.pack_factor() {
+  %elements64 = config.get @adapter.elements : i64
+  %elements = index.cast %elements64 : i64 to index
+  %c1_index = index.constant 1 : index
+  %tile = index.constant 256 : index
+  %tail = index.constant 255 : index
+  %rounded = index.add %elements, %tail : index
+  %groups = index.div %rounded, %tile : index
+  kernel.launch.config workgroups(%groups, %c1_index, %c1_index) workgroup_size(%tile, %c1_index, %c1_index) : index
+} launch(%output: buffer, %input: buffer) {
+  %elements64 = config.get @adapter.elements : i64
+  %elements = index.cast %elements64 : i64 to index
+  %tile = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %element = index.madd %group, %tile, %lane : index
+  %live = index.cmp ult, %element, %elements : index
+  scf.if %live {
+    %origin = index.constant 0 : offset
+    %input64 = config.get @adapter.input_offset : i64
+    %input_offset = index.cast %input64 : i64 to offset
+    %source = buffer.view %input[%input_offset] : buffer -> view<[%elements]xf32>
+    %target = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
+    %value = view.load %source[%element] : view<[%elements]xf32> -> f32
+    %packed = scalar.fptrunc %value : f32 to bf16
+    view.store %packed, %target[%element] : bf16, view<[%elements]xbf16>
+  }
+  kernel.return
+}
+
+command.program.def public @adapter.pack() launch(%output: buffer, %input: buffer) {
+  kernel.launch @adapter.pack_factor(%output, %input) : (buffer, buffer)
+  command.return
+}

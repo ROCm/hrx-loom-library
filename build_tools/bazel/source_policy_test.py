@@ -37,20 +37,91 @@ class SourcePolicyTest(unittest.TestCase):
             ["bad.loom: motif sources cannot declare kernel.def"],
         )
 
-    def test_motif_rejects_configuration_declaration(self):
-        violations = source_policy.check_sources(
-            "motif",
-            [
-                (
-                    "bad.loom",
-                    "config.decl @workgroup_size : %value: index\n"
-                    "// config.decl @commented_out\n",
+    def test_motif_rejects_configuration_operations(self):
+        for operation, source in (
+            ("config.decl", "config.decl @workgroup_size : index\n"),
+            ("config.def", "config.def @workgroup_size = 64 : index\n"),
+            (
+                "config.get",
+                "func.def @workgroup_size() -> (index) {\n"
+                "  %size = config.get @workgroup_size : index\n"
+                "  func.return %size : index\n}\n",
+            ),
+        ):
+            with self.subTest(operation=operation):
+                self.assertEqual(
+                    source_policy.check_sources("motif", [("bad.loom", source)]),
+                    [
+                        f"bad.loom: motif sources cannot use {operation}; "
+                        "pass configuration values from a composition leaf"
+                    ],
                 )
-            ],
+                for layer in ("model", "program", "test"):
+                    self.assertEqual(
+                        source_policy.check_sources(layer, [("leaf.loom", source)]),
+                        [],
+                    )
+
+    def test_motif_rejects_concrete_target_records(self):
+        for operation, selector in (
+            ("aie2p.target", "array"),
+            ("amdgpu.target", "gfx1100"),
+            ("spirv.target", "vulkan1_3"),
+            ("test.target", "low_core"),
+            ("vm.target", "core"),
+            ("wasm.target", "simd128"),
+            ("x86.target", "avx512"),
+            ("target.generic", "reference"),
+        ):
+            with self.subTest(operation=operation):
+                source = f"{operation}<{selector}> @selected\n"
+                self.assertEqual(
+                    source_policy.check_sources("motif", [("bad.loom", source)]),
+                    [
+                        f"bad.loom: motif sources cannot declare {operation}; "
+                        "define concrete targets at a composition leaf"
+                    ],
+                )
+                self.assertEqual(
+                    source_policy.check_sources("test", [("leaf.loom", source)]), []
+                )
+
+    def test_motif_accepts_external_targets_and_contextual_queries(self):
+        source = (
+            "target.decl @external_target\n"
+            "func.def @subgroup_size() -> (index) {\n"
+            "  %size = target.subgroup.size : index\n"
+            "  func.return %size : index\n}\n"
         )
         self.assertEqual(
-            violations,
-            ["bad.loom: motif sources cannot declare config.decl"],
+            source_policy.check_sources("motif", [("motif.loom", source)]), []
+        )
+
+    def test_operation_names_in_literals_comments_and_symbols_are_not_code(self):
+        source = (
+            "// kernel.def @commented_out\n"
+            "test.decl @example(%values: test.array<i32, "
+            'metadata = {label = "config.get // kernel.def\\""}>)\n'
+            "func.decl @config.decl()\n"
+            "func.decl @amdgpu.target()\n"
+            "func.def @call() { func.call @config.decl() : () func.return }\n"
+        )
+        self.assertEqual(
+            source_policy.check_sources("motif", [("motif.loom", source)]), []
+        )
+        self.assertEqual(
+            source_policy.check_sources("kernel", [("empty.loom", source)]),
+            ["kernel package has no kernel.def declaration: empty.loom"],
+        )
+
+    def test_inline_operations_retain_their_layer_contract(self):
+        source = "target.decl @target kernel.def @entry() {} launch() { kernel.return }"
+        self.assertEqual(
+            source_policy.check_sources("motif", [("bad.loom", source)]),
+            ["bad.loom: motif sources cannot declare kernel.def"],
+        )
+        self.assertEqual(
+            source_policy.check_sources("kernel", [("leaf.loom", source)]), []
         )
 
     def test_test_package_accepts_configuration_declaration(self):
@@ -66,10 +137,7 @@ class SourcePolicyTest(unittest.TestCase):
             [
                 (
                     "wrapper.loom",
-                    "kernel.def @wrapper() {\n"
-                    "} launch() {\n"
-                    "  kernel.return\n"
-                    "}\n",
+                    "kernel.def @wrapper() {\n} launch() {\n  kernel.return\n}\n",
                 )
             ],
         )
@@ -210,7 +278,7 @@ class SourcePolicyTest(unittest.TestCase):
                 [
                     "kernel/ggml/quantize/BUILD.bazel: load repository rules "
                     "from //build_tools/bazel:defs.bzl",
-                    "kernel/ggml/quantize/BUILD.bazel: kernel-library packages "
+                    "kernel/ggml/quantize/BUILD.bazel: library packages "
                     "cannot bypass repository policy wrappers",
                     "kernel/ggml/quantize/BUILD.bazel: q3.loom is not explicitly "
                     "declared",
@@ -238,10 +306,179 @@ class SourcePolicyTest(unittest.TestCase):
                 ],
             )
 
-    def test_repository_rejects_source_in_layers_without_admission_rules(self):
+    def test_model_accepts_host_commands_kernels_and_configuration(self):
+        self.assertEqual(
+            source_policy.check_sources(
+                "model",
+                [
+                    (
+                        "program.loom",
+                        "config.decl @layers : %value: index\n"
+                        "func.def public @prepare() { func.return }\n"
+                        "command.program.def public @decode() launch() { command.return }\n"
+                        "kernel.def @project() {} launch() { kernel.return }\n",
+                    )
+                ],
+            ),
+            [],
+        )
+
+    def test_repository_accepts_model_card_programs_and_test_leaf(self):
         with TemporaryDirectory() as temporary_directory:
             repository_root = Path(temporary_directory)
-            for layer in ("model", "target"):
+            model_root = repository_root / "model" / "publisher" / "recognizer"
+            program_root = model_root / "program"
+            test_root = model_root / "test"
+            program_root.mkdir(parents=True)
+            test_root.mkdir()
+            for directory in (
+                repository_root / "model",
+                repository_root / "model" / "publisher",
+                model_root,
+                program_root,
+                test_root,
+            ):
+                (directory / "README.md").write_text("# Scope\n")
+            (model_root / "model.json").write_text("{}\n")
+            (model_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_model")\n'
+                'loom_model(name = "source", card = "model.json")\n'
+            )
+            (program_root / "control.loom").write_text(
+                "func.def public @prepare() { func.return }\n"
+            )
+            (program_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_library")\n'
+                'loom_library(name = "control", srcs = ["control.loom"])\n'
+            )
+            (test_root / "cases.loom").write_text(
+                "check.case public @case { check.return }\n"
+            )
+            (test_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_test")\n'
+                'loom_test(name = "cases", srcs = ["cases.loom"])\n'
+            )
+            self.assertEqual(source_policy.check_repository(repository_root), [])
+
+            (program_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_model")\n'
+                'exports_files(["control.loom"])\n'
+            )
+            self.assertEqual(
+                source_policy.check_repository(repository_root),
+                [
+                    "model/publisher/recognizer/program/BUILD.bazel: "
+                    "model packages must declare loom_library"
+                ],
+            )
+
+    def test_shared_program_requires_its_own_source_and_test_admission(self):
+        with TemporaryDirectory() as temporary_directory:
+            repository_root = Path(temporary_directory)
+            program_root = repository_root / "program" / "text" / "example"
+            test_root = program_root / "test"
+            test_root.mkdir(parents=True)
+            for directory in (
+                repository_root / "program",
+                repository_root / "program" / "text",
+                program_root,
+                test_root,
+            ):
+                (directory / "README.md").write_text("# Scope\n")
+            (program_root / "control.loom").write_text(
+                'func.decl import("runner") @execute(%stage: i32) -> (i64)\n'
+            )
+            (program_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_library")\n'
+                'loom_library(name = "control", srcs = ["control.loom"])\n'
+            )
+            (test_root / "cases.loom").write_text(
+                "check.case public @case { check.return }\n"
+            )
+            (test_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_test")\n'
+                'loom_test(name = "cases", srcs = ["cases.loom"])\n'
+            )
+            self.assertEqual(source_policy.check_repository(repository_root), [])
+
+            (program_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_module")\n'
+                'loom_module(name = "control", srcs = ["control.loom"])\n'
+            )
+            self.assertEqual(
+                source_policy.check_repository(repository_root),
+                [
+                    "program/text/example/BUILD.bazel: "
+                    "program packages must declare loom_library"
+                ],
+            )
+
+    def test_repository_model_card_requires_publication_rule(self):
+        with TemporaryDirectory() as temporary_directory:
+            repository_root = Path(temporary_directory)
+            model_root = repository_root / "model" / "publisher" / "recognizer"
+            model_root.mkdir(parents=True)
+            (model_root / "model.json").write_text("{}\n")
+            self.assertEqual(
+                source_policy.check_repository(repository_root),
+                [
+                    "model/publisher/recognizer: model card requires adjacent BUILD.bazel"
+                ],
+            )
+            (model_root / "BUILD.bazel").write_text(
+                'load("@hrx//loom/build_tools/bazel:defs.bzl", "loom_model")\n'
+                'exports_files(["model.json"])\n'
+            )
+            self.assertEqual(
+                source_policy.check_repository(repository_root),
+                [
+                    "model/publisher/recognizer/BUILD.bazel: model cards use "
+                    "repository rules from //build_tools/bazel:defs.bzl",
+                    "model/publisher/recognizer/BUILD.bazel: model card must be "
+                    "explicitly declared by loom_model or loom_model_documentation",
+                ],
+            )
+
+    def test_repository_accepts_description_before_executable_port(self):
+        with TemporaryDirectory() as temporary_directory:
+            repository_root = Path(temporary_directory)
+            model_root = repository_root / "model" / "publisher" / "image"
+            model_root.mkdir(parents=True)
+            (model_root / "model.json").write_text("{}\n")
+            (model_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_model_documentation")\n'
+                'loom_model_documentation(name = "reference", card = "model.json")\n'
+            )
+            self.assertEqual(source_policy.check_repository(repository_root), [])
+
+            program_root = model_root / "program"
+            program_root.mkdir()
+            for directory in (
+                repository_root / "model",
+                model_root.parent,
+                model_root,
+                program_root,
+            ):
+                (directory / "README.md").write_text("# Scope\n")
+            (program_root / "control.loom").write_text(
+                "func.def public @image_control_v1() { func.return }\n"
+            )
+            (program_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_library")\n'
+                'loom_library(name = "control", srcs = ["control.loom"])\n'
+            )
+            self.assertEqual(
+                source_policy.check_repository(repository_root),
+                [
+                    "model/publisher/image/BUILD.bazel: model programs require "
+                    "loom_model; a generated reference does not qualify executable providers"
+                ],
+            )
+
+    def test_repository_rejects_target_source_without_admission_rule(self):
+        with TemporaryDirectory() as temporary_directory:
+            repository_root = Path(temporary_directory)
+            for layer in ("target",):
                 source_root = repository_root / layer / "example"
                 source_root.mkdir(parents=True)
                 (repository_root / layer / "README.md").write_text("# Scope\n")
@@ -253,8 +490,6 @@ class SourcePolicyTest(unittest.TestCase):
             self.assertEqual(
                 source_policy.check_repository(repository_root),
                 [
-                    "model/example/program.loom: source-bearing model packages "
-                    "require a repository admission rule",
                     "target/example/program.loom: source-bearing target packages "
                     "require a repository admission rule",
                 ],
