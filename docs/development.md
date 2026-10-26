@@ -103,6 +103,9 @@ composition through the same test-module contract. The [Bazel rule guide](../bui
 explains their declarations; the [public Loom build guide](https://rocm.github.io/hrx-system/loom/workflows/build-with-bazel/)
 owns the underlying toolchain and linker behavior.
 
+The [CI maintenance guide](ci.md) describes SDK pins, runner coverage, and
+cache ownership.
+
 ## Check a kernel and inspect its cost
 
 Build a quantization kernel together with its motif dependencies and test module:
@@ -185,8 +188,8 @@ python dev.py benchmark \
 Repeating the command is incremental. Bazel rebuilds only invalidated actions,
 and the sweep executes only roots whose closed benchmark `.loombc`, benchmark
 runner and its shared libraries, or invocation identity changed. A shared motif
-edit therefore reruns the exact consumers whose linked runner input changed; an edit that produces a
-byte-identical module is reported as potentially affected without repeating the
+edit therefore reruns the exact consumers whose linked runner input changed;
+an edit that produces a byte-identical module is reported as potentially affected without repeating the
 physical benchmark.
 `--rerun-all` deliberately captures fresh measurements for every selected
 module. A changed benchmark runner invalidates every module in the selected

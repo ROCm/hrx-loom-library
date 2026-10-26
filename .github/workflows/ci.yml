@@ -1,20 +1,20 @@
 # Copyright 2026 AMD ROCm™ Software
 # SPDX-License-Identifier: MIT
 
-name: CI
+name: Loom
 
 on:
   workflow_dispatch:
   pull_request:
   push:
-    branches:
-      - main
+    branches: [main]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
 
 defaults:
@@ -22,28 +22,23 @@ defaults:
     shell: bash
 
 jobs:
-  linux_bazel:
-    name: Linux / Bazel / Source Loom
+  host:
+    name: Library / Linux x86-64 / Release / Host
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
     container:
       image: ghcr.io/rocm/no_rocm_image_ubuntu24_04@sha256:4150afe4759d14822f0e3f8930e1124f26e11f68b5c7b91ec9a02b20b1ebbb98
-    env:
-      AR: ar
-      CC: clang
-      CXX: clang++
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Adjust git config
-        run: git config --global --add safe.directory "$PWD"
-
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          python-version: "3.12"
-
+          persist-credentials: false
+      - run: git config --global --add safe.directory "$PWD"
+      - uses: ./.github/actions/setup-sdk
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/loom-bazel-cache
+          key: loom-library-v1-linux-host-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: loom-library-v1-linux-host-
       - name: Check release candidate tree
         if: >-
           (github.event_name == 'pull_request' &&
@@ -51,196 +46,142 @@ jobs:
           (github.event_name == 'push' &&
            github.ref_name == github.event.repository.default_branch)
         run: python -B build_tools/ci/check_release_tree.py
-
-      - name: Set up Bazel
-        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
-        with:
-          bazelisk-cache: true
-          bazelisk-version: "1.29.0"
-          cache-save: ${{ github.event_name == 'push' }}
-          repository-cache: true
-
-      - name: Test libraries with source-built Loom tools
-        run: python dev.py test
-
-  linux_bazel_amdgpu_build:
-    name: Linux / Bazel / AMDGPU Build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    container:
-      image: rocm/dev-ubuntu-24.04@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054
-    env:
-      AR: /opt/rocm/llvm/bin/llvm-ar
-      CC: /opt/rocm/llvm/bin/clang
-      CXX: /opt/rocm/llvm/bin/clang++
-      LOOM_AMDGPU_EXECUTION_QUERY: 'attr(tags, "loom-execution-profile=amd_gpu_hardware", tests(//...)) except attr(tags, "manual", tests(//...))'
-    steps:
-      - name: Install source transport
+      - name: Check installed SDK build boundary
         run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install \
-            --yes --no-install-recommends git
-
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Adjust git config
-        run: git config --global --add safe.directory "$PWD"
-
-      - name: Set up Bazel
-        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
-        with:
-          bazelisk-cache: true
-          bazelisk-version: "1.29.0"
-          cache-save: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-          disk-cache: amdgpu-${{ github.run_id }}
-          repository-cache: true
-
-      - name: Build AMDGPU execution closure
-        run: |
-          mkdir -p "${RUNNER_TEMP}/bazel-profiles"
-          execution_query_output=$(
-            bazel query "${LOOM_AMDGPU_EXECUTION_QUERY}" --output=label
-          )
-          if [[ -z "${execution_query_output}" ]]; then
-            echo "No AMDGPU hardware execution targets were declared" >&2
+          bazel aquery --config=amdgpu --noinclude_commandline --noinclude_artifacts \
+            'mnemonic("CppCompile|CppLink", deps(//...))' > "$RUNNER_TEMP/native-actions.txt"
+          if [[ -s "$RUNNER_TEMP/native-actions.txt" ]]; then
+            cat "$RUNNER_TEMP/native-actions.txt"
+            echo "Installed SDK consumers must not rebuild native HRX tools" >&2
             exit 1
           fi
-          mapfile -t execution_targets < <(sort <<<"${execution_query_output}")
-          printf 'Building %s\n' "${execution_targets[@]}"
-          bazel build \
-            --config=amdgpu \
-            --profile="${RUNNER_TEMP}/bazel-profiles/amdgpu-build.profile.gz" \
-            "${execution_targets[@]}"
-
-      - name: Upload AMDGPU build profile
+      - name: Check library
+        run: |
+          python dev.py test -- \
+            --profile="$RUNNER_TEMP/library-host.profile.gz"
+      - name: Save action and test results
+        if: always() && !cancelled()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/loom-bazel-cache
+          key: loom-library-v1-linux-host-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload build profile
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bazel-profile-amdgpu-build-attempt-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/bazel-profiles/amdgpu-build.profile.gz
-          if-no-files-found: error
+          name: library-linux-host-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/library-host.profile.gz
+          if-no-files-found: ignore
           compression-level: 0
 
-  linux_bazel_amdgpu_execute:
-    name: ${{ matrix.name }}
+  hardware:
+    name: Library / Linux x86-64 / Release / ${{ matrix.name }}
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    needs: linux_bazel_amdgpu_build
-    runs-on: ${{ matrix.runner_label }}
-    continue-on-error: ${{ matrix.advisory }}
-    timeout-minutes: 20
-    container:
-      image: rocm/dev-ubuntu-24.04@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054
-      options: >-
-        --ipc host
-        --group-add video
-        --device /dev/kfd
-        --device /dev/dri
-        --group-add 993
-        --group-add 992
-        --group-add 110
-        --ulimit memlock=-1:-1
-        --security-opt seccomp=unconfined
-        --env-file /etc/podinfo/gha-gpu-isolation-settings
-        --user 0:0
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: Linux / AMDGPU / gfx942
-            advisory: true
-            processor_pattern: ^gfx942$
-            runner_label: linux-gfx942-1gpu-ccs-csp-ossci-rocm
-            target_name: gfx942
-          - name: Linux / AMDGPU / gfx110X
-            advisory: true
-            processor_pattern: ^gfx110[0-3]$
-            runner_label: linux-gfx110X-gpu-rocm
-            target_name: gfx110X
-          - name: Linux / AMDGPU / gfx1150
-            advisory: true
-            processor_pattern: ^gfx1150$
-            runner_label: linux-gfx1150-gpu-rocm
-            target_name: gfx1150
-          - name: Linux / AMDGPU / gfx1151
-            advisory: true
-            processor_pattern: ^gfx1151$
-            runner_label: linux-gfx1151-gpu-rocm
-            target_name: gfx1151
-          - name: Linux / AMDGPU / gfx120X
-            advisory: true
-            processor_pattern: ^gfx120[01]$
-            runner_label: linux-gfx120X-gpu-rocm
-            target_name: gfx120X
+          - name: AMD gfx942
+            id: gfx942
+            runner: linux-gfx942-1gpu-ccs-csp-ossci-rocm
+          - name: AMD gfx110x
+            id: gfx110x
+            runner: linux-gfx110X-gpu-rocm
+          - name: AMD gfx1150 GPU + NPU4
+            id: gfx1150-npu4
+            runner: linux-gfx1150-gpu-rocm-npu
+            npu: true
+          - name: AMD gfx1151
+            id: gfx1151
+            runner: linux-gfx1151-gpu-rocm
+          - name: AMD gfx120x
+            id: gfx120x
+            runner: linux-gfx120X-gpu-rocm
+    container:
+      image: ghcr.io/rocm/no_rocm_image_ubuntu24_04@sha256:4150afe4759d14822f0e3f8930e1124f26e11f68b5c7b91ec9a02b20b1ebbb98
+      options: >-
+        --ipc host --device /dev/kfd --device /dev/dri
+        --group-add video --group-add 993 --group-add 992 --group-add 110
+        --ulimit memlock=-1:-1 --security-opt seccomp=unconfined --user 0:0
+        ${{ !matrix.npu && '--env-file /etc/podinfo/gha-gpu-isolation-settings' || '' }}
+        ${{ matrix.npu && '--device /dev/accel/accel0' || '' }}
     env:
-      AR: /opt/rocm/llvm/bin/llvm-ar
-      CC: /opt/rocm/llvm/bin/clang
-      CXX: /opt/rocm/llvm/bin/clang++
-      LOOM_AMDGPU_EXECUTION_QUERY: 'attr(tags, "loom-execution-profile=amd_gpu_hardware", tests(//...)) except attr(tags, "manual", tests(//...))'
-      ROCR_VISIBLE_DEVICES: "0"
+      EXECUTION_PROFILES: ${{ matrix.npu && 'amd_gpu_hardware|xdna_hardware' || 'amd_gpu_hardware' }}
+      HARDWARE_ID: ${{ matrix.id }}
     steps:
-      - name: Install source transport
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install \
-            --yes --no-install-recommends git
-
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Adjust git config
-        run: git config --global --add safe.directory "$PWD"
-
-      - name: Set up Bazel
-        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          bazelisk-cache: true
-          bazelisk-version: "1.29.0"
-          cache-save: false
-          disk-cache: amdgpu-${{ github.run_id }}
-          repository-cache: true
-
-      - name: Validate physical device
-        env:
-          PROCESSOR_PATTERN: ${{ matrix.processor_pattern }}
+          persist-credentials: false
+      - run: git config --global --add safe.directory "$PWD"
+      - uses: ./.github/actions/setup-sdk
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/loom-bazel-cache
+          key: loom-library-v1-linux-${{ matrix.id }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: loom-library-v1-linux-${{ matrix.id }}-
+      - name: Identify hardware environment
         run: |
-          processor=$(
-            /opt/rocm/bin/rocminfo |
-              awk '$1 == "Name:" && $2 ~ /^gfx[0-9]+$/ { print $2; exit }'
-          )
-          if [[ -z "${processor}" ]]; then
-            echo "rocminfo did not report an AMDGPU processor" >&2
-            exit 1
+          "$RUNNER_TEMP/loom-sdk-venv/bin/loom-serve" --list_devices=amdgpu > "$RUNNER_TEMP/gpu.txt"
+          test -s "$RUNNER_TEMP/gpu.txt"
+          if [[ "$EXECUTION_PROFILES" == *xdna_hardware* ]]; then
+            "$RUNNER_TEMP/loom-sdk-venv/bin/loom-serve" --list_devices=xdna > "$RUNNER_TEMP/npu.txt"
+            test -s "$RUNNER_TEMP/npu.txt"
           fi
-          if [[ ! "${processor}" =~ ${PROCESSOR_PATTERN} ]]; then
-            echo "Expected ${PROCESSOR_PATTERN}, found ${processor}" >&2
-            exit 1
-          fi
-          echo "Physical device: ${processor}"
-
-      - name: Execute AMDGPU correctness tests
+          {
+            echo "$HARDWARE_ID"
+            uname -srv
+            cat "$RUNNER_TEMP/gpu.txt"
+            if [[ -f "$RUNNER_TEMP/npu.txt" ]]; then cat "$RUNNER_TEMP/npu.txt"; fi
+            for module in amdgpu amdxdna; do
+              for field in version srcversion; do
+                path="/sys/module/$module/$field"
+                if [[ -f "$path" ]]; then
+                  printf '%s=' "$path"
+                  cat "$path"
+                fi
+              done
+            done
+            for device in /sys/class/drm/card*/device /sys/class/accel/accel*/device; do
+              for path in "$device"/{vendor,device,revision,fw_version} "$device"/fw_version/*; do
+                if [[ -f "$path" ]]; then
+                  printf '%s=' "$path"
+                  cat "$path"
+                fi
+              done
+            done
+          } > "$RUNNER_TEMP/hardware.txt"
+          cat "$RUNNER_TEMP/hardware.txt"
+          echo "LOOM_TEST_PLATFORM=$(sha256sum "$RUNNER_TEMP/hardware.txt" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+      - name: Check hardware execution profiles
         run: |
-          mkdir -p "${RUNNER_TEMP}/bazel-profiles"
-          execution_query_output=$(
-            bazel query "${LOOM_AMDGPU_EXECUTION_QUERY}" --output=label
-          )
-          if [[ -z "${execution_query_output}" ]]; then
-            echo "No AMDGPU hardware execution targets were declared" >&2
+          query="attr(tags, 'loom-execution-profile=($EXECUTION_PROFILES)', tests(//...)) except attr(tags, 'manual', tests(//...))"
+          bazel query "$query" --output=label > "$RUNNER_TEMP/targets.txt"
+          if [[ ! -s "$RUNNER_TEMP/targets.txt" ]]; then
+            echo "No tests declared for $EXECUTION_PROFILES" >&2
             exit 1
           fi
-          mapfile -t execution_targets < <(sort <<<"${execution_query_output}")
-          printf 'Executing %s\n' "${execution_targets[@]}"
-          bazel test \
-            --config=amdgpu \
-            --nocache_test_results \
-            --profile="${RUNNER_TEMP}/bazel-profiles/amdgpu-execute.profile.gz" \
-            "${execution_targets[@]}"
-
-      - name: Upload AMDGPU execution profile
+          mapfile -t targets < "$RUNNER_TEMP/targets.txt"
+          bazel test --config=amdgpu --test_env="LOOM_TEST_PLATFORM=$LOOM_TEST_PLATFORM" \
+            --profile="$RUNNER_TEMP/library-hardware.profile.gz" "${targets[@]}"
+      - name: Save action and test results
+        if: always() && !cancelled()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/loom-bazel-cache
+          key: loom-library-v1-linux-${{ matrix.id }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload hardware evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bazel-profile-${{ matrix.target_name }}-attempt-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/bazel-profiles/amdgpu-execute.profile.gz
-          if-no-files-found: error
+          name: library-linux-${{ matrix.id }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/hardware.txt
+            ${{ runner.temp }}/gpu.txt
+            ${{ runner.temp }}/npu.txt
+            ${{ runner.temp }}/targets.txt
+            ${{ runner.temp }}/library-hardware.profile.gz
+          if-no-files-found: ignore
           compression-level: 0
