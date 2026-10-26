@@ -19,7 +19,9 @@ python dev.py setup --sdk
 that installation's native commands, shared libraries, and Python tools as
 declared inputs. Building a model with this toolchain does not rebuild HRX's
 native compiler or runtime. The HRX revision in `MODULE.bazel` still supplies
-the public Bazel rules and their Python build/test helpers.
+the public Bazel rules and their Python build/test helpers. SDK mode disables
+optional C++ toolchain discovery, so authoring Loom programs does not require
+a host C++ compiler.
 
 The wheel selects native optimization and instrumentation. An ASAN SDK uses
 the `+asan` wheel; `--config=asan` instruments tools built from source and does
