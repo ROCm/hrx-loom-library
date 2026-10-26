@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import context_check
 from loom_serve_testing.chat import request
 from loom_serve_testing.http_harness import control, running_server, wait_status
 from loom_serve_testing.model_staging import stage_model
@@ -273,6 +274,11 @@ def main():
         "--reference", type=Path, default=Path(__file__).with_name("reference.json")
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--native-context",
+        action="store_true",
+        help="check the full native context, retained forks, and cold replay",
+    )
     args = parser.parse_args()
     if args.assets is None:
         parser.error(
@@ -287,13 +293,20 @@ def main():
         parser.error("--output is required outside a Bazel test")
     card = args.model.absolute()
     model = json.loads(card.read_text())["model"]["id"]
-    reference = json.loads(args.reference.read_text())
-    assert reference["model"] == model, (reference["model"], model)
-    log = output / "serve.log"
+    reference = None
+    if not args.native_context:
+        reference = json.loads(args.reference.read_text())
+        assert reference["model"] == model, (reference["model"], model)
+    result = None
     with tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR")) as temporary:
         staged = stage_model(card, args.assets.absolute(), Path(temporary) / "model")
-        with running_server(
-            [
+        # A process restart makes the second history genuinely cold without
+        # changing the deployment's production prefix-cache policy.
+        for phase in (
+            ("context", "cold-replay") if args.native_context else ("service",)
+        ):
+            log = output / (phase + ".log")
+            command = [
                 str(args.server.absolute()),
                 "--model=" + str(staged),
                 "--device=" + args.device,
@@ -301,27 +314,39 @@ def main():
                 "--memory_bytes=" + str(args.memory_bytes),
                 "--workers=2",
                 "--listen=127.0.0.1:0",
-            ],
-            log,
-        ) as (process, bound):
-            if bound is None:
-                raise RuntimeError("server failed before readiness: " + log.read_text())
-            address = urlsplit("http://" + bound)
-            while True:
-                details = next(
-                    row["loom"]
-                    for row in control(address, "GET", "/v1/status", 200)["data"]
-                    if row["id"] == model
+            ]
+            with running_server(command, log) as (process, bound):
+                if bound is None:
+                    raise RuntimeError(
+                        "server failed before readiness: " + log.read_text()
+                    )
+                address = urlsplit("http://" + bound)
+                while True:
+                    details = next(
+                        row["loom"]
+                        for row in control(address, "GET", "/v1/status", 200)["data"]
+                        if row["id"] == model
+                    )
+                    if "error" in details:
+                        raise RuntimeError(details)
+                    if details["registration"] == "ready":
+                        break
+                if phase == "context":
+                    result = context_check.run(address, model)
+                elif phase == "cold-replay":
+                    result["cold_replay"] = context_check.replay(
+                        address, model, result, cold=True
+                    )
+                else:
+                    result = run(address, model, reference)
+                wait_status(
+                    address,
+                    model=model,
+                    phase="idle",
+                    queued_requests=0,
+                    active_requests=0,
                 )
-                if "error" in details:
-                    raise RuntimeError(details)
-                if details["registration"] == "ready":
-                    break
-            result = run(address, model, reference)
-            wait_status(
-                address, model=model, phase="idle", queued_requests=0, active_requests=0
-            )
-    assert process.returncode == 0, process.returncode
+            assert process.returncode == 0, process.returncode
     result.update(
         model=model, device=args.device, joined=True, returncode=process.returncode
     )

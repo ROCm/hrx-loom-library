@@ -1,5 +1,6 @@
 // Token mutation and rotary coordinates against direct ordinary/media records.
-// Selected records include both ends of the 512-record media packet.
+// Selected records are 0, 511, 512, and 32767: both packet ends and both
+// sides of the small-cohort boundary. Guard storage retains untouched values.
 
 amdgpu.target<gfx11-generic> @native
 
@@ -7,9 +8,9 @@ func.decl @qwen38_input_token(%mixed: index, %capacity: index, %input: buffer, %
 
 func.decl @qwen38_input_store_token(%mixed: index, %capacity: index, %input: buffer, %record: index, %id: i32)
 
-func.decl @qwen38_input_position(%mixed: index, %input: buffer, %record: index, %lane: index, %linear: i32) -> (i32)
+func.decl @qwen38_input_position(%mixed: index, %capacity: index, %input: buffer, %record: index, %lane: index, %linear: i32) -> (i32)
 
-global.rodata.def @selected_records = bytes("0000000001000000ff000000ff010000")
+global.rodata.def @selected_records = bytes("00000000ff01000000020000ff7f0000")
 
 func.def @exercise(%mixed: index, %input: buffer, %output: buffer) {
   %origin = index.constant 0 : offset
@@ -17,7 +18,7 @@ func.def @exercise(%mixed: index, %input: buffer, %output: buffer) {
   %begin = index.constant 0 : index
   %unit = index.constant 1 : index
   %selected_count = index.constant 4 : index
-  %capacity = index.constant 512 : index
+  %capacity = index.constant 32768 : index
   %lanes = index.constant 64 : index
   %position_field = index.constant 3 : index
   %id_base = scalar.constant 7000 : i32
@@ -28,7 +29,7 @@ func.def @exercise(%mixed: index, %input: buffer, %output: buffer) {
   scf.for %item = [%begin to %selected_count step %unit] {
     %record_word = view.load %selection[%item] : view<4xi32> -> i32
     %record_value = index.cast %record_word : i32 to index
-    %record = index.assume %record_value [range(%record_value, 0, 511)] : index
+    %record = index.assume %record_value [range(%record_value, 0, 32767)] : index
     %next_id = scalar.addi %id_base, %record_word : i32
     %linear = scalar.addi %linear_base, %record_word : i32
     %prior = func.call @qwen38_input_token(%mixed, %capacity, %input, %record) : (index, index, buffer, index) -> (i32)
@@ -38,7 +39,7 @@ func.def @exercise(%mixed: index, %input: buffer, %output: buffer) {
     view.store %updated, %results[%item, 1] : i32, view<4x67xi32>
     view.store %linear, %results[%item, 2] : i32, view<4x67xi32>
     scf.for %lane = [%begin to %lanes step %unit] {
-      %position = func.call @qwen38_input_position(%mixed, %input, %record, %lane, %linear) : (index, buffer, index, index, i32) -> (i32)
+      %position = func.call @qwen38_input_position(%mixed, %capacity, %input, %record, %lane, %linear) : (index, index, buffer, index, index, i32) -> (i32)
       %column = index.add %lane, %position_field : index
       view.store %position, %results[%item, %column] : i32, view<4x67xi32>
     }
@@ -61,23 +62,23 @@ func.def @reference(%mixed: index, %input: buffer, %output: buffer) {
   %linear_base = scalar.constant 900000 : i32
   %selected = global.load @selected_records : buffer
   %selection = buffer.view %selected[%origin] : buffer -> view<4xi32>
-  %ordinary = buffer.view %input[%origin] : buffer -> view<512xi32>
-  %media = buffer.view %input[%origin] : buffer -> view<512x8xi32>
+  %ordinary = buffer.view %input[%origin] : buffer -> view<32768xi32>
+  %media = buffer.view %input[%origin] : buffer -> view<32768x8xi32>
   %results = buffer.view %output[%output_origin] : buffer -> view<4x67xi32>
   %is_media = index.cmp ne, %mixed, %begin : index
   scf.for %item = [%begin to %selected_count step %unit] {
     %record_word = view.load %selection[%item] : view<4xi32> -> i32
     %record_value = index.cast %record_word : i32 to index
-    %record = index.assume %record_value [range(%record_value, 0, 511)] : index
+    %record = index.assume %record_value [range(%record_value, 0, 32767)] : index
     %next_id = scalar.addi %id_base, %record_word : i32
     %linear = scalar.addi %linear_base, %record_word : i32
     %prior = scf.if %is_media -> (i32) {
-      %id = view.load %media[%record, 0] : view<512x8xi32> -> i32
-      view.store %next_id, %media[%record, 0] : i32, view<512x8xi32>
+      %id = view.load %media[%record, 0] : view<32768x8xi32> -> i32
+      view.store %next_id, %media[%record, 0] : i32, view<32768x8xi32>
       scf.yield %id : i32
     } else {
-      %id = view.load %ordinary[%record] : view<512xi32> -> i32
-      view.store %next_id, %ordinary[%record] : i32, view<512xi32>
+      %id = view.load %ordinary[%record] : view<32768xi32> -> i32
+      view.store %next_id, %ordinary[%record] : i32, view<32768xi32>
       scf.yield %id : i32
     }
     view.store %prior, %results[%item, 0] : i32, view<4x67xi32>
@@ -93,7 +94,7 @@ func.def @reference(%mixed: index, %input: buffer, %output: buffer) {
         %axis_value = index.sub %pair, %used : index
         %axis = index.assume %axis_value [range(%axis_value, 0, 2)] : index
         %field = index.add %coordinate_field, %axis : index
-        %coordinate = view.load %media[%record, %field] : view<512x8xi32> -> i32
+        %coordinate = view.load %media[%record, %field] : view<32768x8xi32> -> i32
         scf.yield %coordinate : i32
       } else {
         scf.yield %linear : i32
@@ -124,10 +125,10 @@ check.scenario public @ordinary {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   check.trial[4](%trial: index, %entropy: check.entropy) {
     %seed = check.entropy.read %entropy[0] : check.entropy -> i64
-    %input = check.generate.random.uniform seed(%seed) range(0 to 65535) : tensor<4112xi32>
+    %input = check.generate.random.uniform seed(%seed) range(0 to 65535) : tensor<262160xi32>
     %output = check.generate.fill value(-99) : tensor<276xi32>
-    check.compare<@exercise_ordinary, @reference_ordinary>(%input, %output) : (tensor<4112xi32>, tensor<276xi32>) -> () {
-      check.expect.bitwise actual(%input) expected(%input) : tensor<4112xi32>
+    check.compare<@exercise_ordinary, @reference_ordinary>(%input, %output) : (tensor<262160xi32>, tensor<276xi32>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<262160xi32>
       check.expect.bitwise actual(%output) expected(%output) : tensor<276xi32>
     }
   }
@@ -155,10 +156,10 @@ check.scenario public @media {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   check.trial[4](%trial: index, %entropy: check.entropy) {
     %seed = check.entropy.read %entropy[0] : check.entropy -> i64
-    %input = check.generate.random.uniform seed(%seed) range(0 to 65535) : tensor<4112xi32>
+    %input = check.generate.random.uniform seed(%seed) range(0 to 65535) : tensor<262160xi32>
     %output = check.generate.fill value(-99) : tensor<276xi32>
-    check.compare<@exercise_media, @reference_media>(%input, %output) : (tensor<4112xi32>, tensor<276xi32>) -> () {
-      check.expect.bitwise actual(%input) expected(%input) : tensor<4112xi32>
+    check.compare<@exercise_media, @reference_media>(%input, %output) : (tensor<262160xi32>, tensor<276xi32>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<262160xi32>
       check.expect.bitwise actual(%output) expected(%output) : tensor<276xi32>
     }
   }

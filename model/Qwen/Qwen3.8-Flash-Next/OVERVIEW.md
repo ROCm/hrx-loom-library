@@ -87,7 +87,9 @@ feedback.
 The canonical chat configuration starts with four resident rows,
 16,384-position contexts, 32,768 pooled tokens, 16,384-token packed epochs,
 four checkpoints, and a 256-token default generation limit. `long-context` starts with eight rows,
-131,072-position contexts, 262,144 pooled tokens, and eight checkpoints.
+262,144-position contexts, 524,288 pooled tokens, and eight checkpoints.
+`long-context-mtp` uses those capacities with three predictor proposals.
+The context limit includes both input and output tokens.
 Context capacity must be divisible by 64, an epoch holds at most 32,768 tokens,
 and the composition requires pooled cache storage. Resident rows can grow
 without redeclaring stages or changing the prepared packet capacity; cache
