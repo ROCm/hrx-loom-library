@@ -49,7 +49,7 @@ func.def @equal_origins(%left: buffer, %right: buffer, %rows: index) -> (i1) {
   func.return %result : i1
 }
 
-func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64) -> (i1) {
+func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64, %context: i64, %pool: i64) -> (i1, i1) {
   %disabled = scalar.constant 0 : i32
   %enabled = scalar.cmpi ne, %draft_depth, %disabled : i32
   %origin = index.constant 0 : offset
@@ -57,8 +57,6 @@ func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64) -> (i1) {
   %intermediate_rows = scalar.constant 17 : i64
   %final_rows = scalar.constant 129 : i64
   %tokens = scalar.constant 128 : i64
-  %context = scalar.constant 256 : i64
-  %pool = scalar.constant 4096 : i64
   %packed = scalar.constant true : i1
   %dflash = config.get @storage_test.dflash : i1
   %state = func.call @qwen38.control_create(%tokens, %context, %pool, %initial_rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer)
@@ -117,19 +115,43 @@ func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64) -> (i1) {
   %cd = scalar.andi %c, %empty : i1
   %layouts_equal = scalar.andi %ab, %cd : i1
   %result = scalar.andi %layouts_equal, %feedback_equal : i1
-  func.return %result : i1
+  %initial_origins = buffer.view %target[%origin] : buffer -> view<4x5xi64>
+  %first_payload = view.load %initial_origins[0, 0] : view<4x5xi64> -> i64
+  %maximum_32_bit_offset = scalar.constant 4294967295 : i64
+  %wide_payload = scalar.cmpi ugt, %first_payload, %maximum_32_bit_offset : i64
+  func.return %result, %wide_payload : i1, i1
 }
 
 check.case public @append_stable_resident_growth {
   %draft_depth = check.param.choice values([0, 1]) : i32
   %pins = check.param.choice values([0, 3]) : i64
-  %valid = func.call @grows_without_moving_payloads(%draft_depth, %pins) : (i32, i64) -> (i1)
+  %context = check.literal value(256) : i64
+  %pool = check.literal value(4096) : i64
+  %valid, %wide_payload = func.call @grows_without_moving_payloads(%draft_depth, %pins, %context, %pool) : (i32, i64, i64, i64) -> (i1, i1)
   %expected = check.literal value(true) : i1
   check.expect.equal actual(%valid) expected(%expected) : i1
   check.return
 }
 
 check.benchmark<@append_stable_resident_growth> @resize_resident_storage
+
+// Two native-length histories place recurrent payloads beyond 32-bit byte
+// offsets. Resident growth must preserve those addresses and cache geometry
+// while replacing its host-owned page directory. No KV payload is allocated
+// by this descriptor test.
+check.case public @native_context_resident_growth {
+  %draft_depth = check.param.choice values([0, 1]) : i32
+  %pins = check.param.choice values([0, 3]) : i64
+  %context = check.literal value(262144) : i64
+  %pool = check.literal value(524288) : i64
+  %valid, %wide_payload = func.call @grows_without_moving_payloads(%draft_depth, %pins, %context, %pool) : (i32, i64, i64, i64) -> (i1, i1)
+  %expected = check.literal value(true) : i1
+  check.expect.equal actual(%valid) expected(%expected) : i1
+  check.expect.equal actual(%wide_payload) expected(%expected) : i1
+  check.return
+}
+
+check.benchmark<@native_context_resident_growth> @resize_native_context_storage
 
 // Exercise the real model allocator's descriptor without materializing its
 // payload. Only one resident's small tables are allocated, even when the
