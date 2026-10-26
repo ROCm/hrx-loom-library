@@ -21,6 +21,23 @@ may differ in low bits across reduction orders. A separate packed-byte
 construction checks both schedules against the independent result `2.5`.
 Zero-workload output guards remain bitwise checks.
 
+The ordinary `q6_metadata` target checks code/scale staging, F32/F16 inputs,
+fused residuals, token tails, and inactive outputs. Full-width FFN and attention
+performance workloads live in the manual `q6_metadata_performance` target. They
+remain part of benchmark discovery and can be measured explicitly:
+
+```sh
+python dev.py benchmark \
+  --target=//model/Qwen/Qwen3.8-27B/test:q6_metadata_performance \
+  --config=amdgpu --device=amdgpu://0 \
+  --output-dir=.reports/benchmark/q6-metadata
+```
+
+The selected SDK or source configuration supplies the tools. Performance runs
+use the Release SDK or canonical optimized source configuration and an idle,
+qualified measurement device, as described in the
+[benchmark workflow](../../../../docs/development.md#sweep-repository-benchmarks).
+
 Test-only reference kernels remain root-owned. Checks of private convolution
 or coefficient helpers include the unchanged implementation source as a test
 root, preserving the production export boundary. Shared Philox, GGML carrier,
