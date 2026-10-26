@@ -82,11 +82,14 @@ kernel.def @packed_sessions() {
   kernel.return
 }
 
-// Every code in a channel is (channel % 23 - 11); each K32 scale is
-// (block % 5 + channel % 3 + 1)/1024. An input row is constant across K:
-// (token % 17 - 8)/16. Summing 80 blocks gives the exact raw projection
-// input * code * (3 + channel % 3) * 2.5 before BF16 publication. This
-// closed-form oracle has no matrix fragments, preparation layout, or K loop.
+// Let base = channel % 23 - 11 and j = K % 32. A code is base + j - 15;
+// its scale is (block % 5 + channel % 3 + 1)/1024. Input values are
+// activation * (j + 1)/32, where activation = (token % 9 - 4)/16.
+// Summing one block gives 16 * (33 * base + 187) before input scaling;
+// summing 80 block scales gives the exact projection below. All products
+// and F32 partial sums are exact dyadic values before BF16 publication.
+// This closed-form oracle varies K without sharing matrix fragments,
+// preparation layout, or a contraction loop with the implementation.
 kernel.def @projection_fixture() {
   %groups = index.constant 80 : index
   %threads = index.constant 128 : index
@@ -100,19 +103,25 @@ kernel.def @projection_fixture() {
   %c1 = index.constant 1 : index
   %c3 = index.constant 3 : index
   %c5 = index.constant 5 : index
-  %c17 = index.constant 17 : index
+  %c9 = index.constant 9 : index
   %c23 = index.constant 23 : index
+  %c32 = index.constant 32 : index
   %c80 = index.constant 80 : index
   %c128 = index.constant 128 : index
-  %capacity = index.constant 384 : index
+  %capacity = index.constant 4096 : index
+  %c2 = index.constant 2 : index
+  %capture_capacity = index.add %capacity, %c2 : index
   %inputs = index.constant 2560 : index
   %channel = index.madd %group, %c128, %thread : index
   %code_index = index.rem %channel, %c23 : index
   %code_word = index.cast %code_index : index to i32
   %bias = scalar.constant 11 : i32
   %code = scalar.subi %code_word, %bias : i32
-  %code_byte = scalar.trunci %code : i32 to i8
-  %codes = vector.splat %code_byte : vector<32xi8>
+  %code_bias = scalar.constant 15 : i32
+  %code_start = scalar.subi %code, %code_bias : i32
+  %code_step = scalar.constant 1 : i32
+  %code_words = vector.iota %code_start step %code_step : vector<32xi32>
+  %codes = vector.trunci %code_words : vector<32xi32> to vector<32xi8>
   %scale_index = index.rem %channel, %c3 : index
   %block_bytes = index.constant 34 : offset
   %scale_bytes = index.constant 2 : offset
@@ -133,18 +142,28 @@ kernel.def @projection_fixture() {
     view.store %packed_scale, %header[0] : f16, view<1xf16>
     vector.store %codes, %bytes[0] : vector<32xi8>, view<32xi8>
   }
-  %input_view = buffer.view %input[%origin] : buffer -> view<384x2560xbf16>
-  %raw_view = buffer.view %raw[%origin] : buffer -> view<384x10240xbf16>
-  %capture_view = buffer.view %capture[%origin] : buffer -> view<386x10240xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%capacity]x2560xbf16>
+  %raw_view = buffer.view %raw[%origin] : buffer -> view<[%capacity]x10240xbf16>
+  %capture_view = buffer.view %capture[%origin] : buffer -> view<[%capture_capacity]x10240xbf16>
   %input_owner = index.cmp ult, %channel, %inputs : index
   %safe_input_column = scf.select %input_owner, %channel, %c0 : index
   %code_value = scalar.sitofp %code : i32 to f32
   %scale_sum = index.add %scale_index, %c3 : index
   %scale_sum_word = index.cast %scale_sum : index to i32
   %scale_sum_value = scalar.uitofp %scale_sum_word : i32 to f32
-  %factor = scalar.constant 2.5 : f32
+  %factor = scalar.constant 0.0390625 : f32
   %coefficient = scalar.mulf %scale_sum_value, %factor : f32
-  %input_bias = scalar.constant 8.0 : f32
+  %code_slope = scalar.constant 33.0 : f32
+  %code_offset = scalar.constant 187.0 : f32
+  %code_product = scalar.mulf %code_value, %code_slope : f32
+  %code_sum = scalar.addf %code_product, %code_offset : f32
+  %input_k = index.rem %channel, %c32 : index
+  %input_numerator = index.add %input_k, %c1 : index
+  %input_word = index.cast %input_numerator : index to i32
+  %input_value = scalar.uitofp %input_word : i32 to f32
+  %input_fraction = scalar.constant 0.03125 : f32
+  %input_factor = scalar.mulf %input_value, %input_fraction : f32
+  %input_bias = scalar.constant 4.0 : f32
   %input_scale = scalar.constant 0.0625 : f32
   %c0_f32 = scalar.constant 0.0 : f32
   %nan_bits = scalar.constant 32705 : i16
@@ -152,28 +171,29 @@ kernel.def @projection_fixture() {
   %speculative_begin = index.constant 252 : index
   %capture_padding = index.constant 1 : index
   scf.for %token = [%c0 to %capacity step %c1] {
-    %remainder = index.rem %token, %c17 : index
+    %remainder = index.rem %token, %c9 : index
     %word = index.cast %remainder : index to i32
     %value = scalar.uitofp %word : i32 to f32
     %centered = scalar.subf %value, %input_bias : f32
     %activation = scalar.mulf %centered, %input_scale : f32
-    %packed_input = scalar.fptrunc %activation : f32 to bf16
+    %input_element = scalar.mulf %activation, %input_factor : f32
+    %packed_input = scalar.fptrunc %input_element : f32 to bf16
     %live = index.cmp ult, %token, %count : index
     %published_input = scf.select %live, %packed_input, %nan : bf16
     scf.if %input_owner {
-      view.store %published_input, %input_view[%token, %safe_input_column] : bf16, view<384x2560xbf16>
+      view.store %published_input, %input_view[%token, %safe_input_column] : bf16, view<[%capacity]x2560xbf16>
     }
     scf.if %live {
-      %product = scalar.mulf %activation, %code_value : f32
+      %product = scalar.mulf %activation, %code_sum : f32
       %projection = scalar.mulf %product, %coefficient : f32
       // The matrix sum starts at positive zero, including for zero products.
       %summed = scalar.addf %projection, %c0_f32 : f32
       %packed = scalar.fptrunc %summed : f32 to bf16
-      view.store %packed, %raw_view[%token, %channel] : bf16, view<384x10240xbf16>
+      view.store %packed, %raw_view[%token, %channel] : bf16, view<[%capacity]x10240xbf16>
       %speculative = index.cmp uge, %token, %speculative_begin : index
       scf.if %speculative {
         %row = index.add %capture_padding, %token : index
-        view.store %packed, %capture_view[%row, %channel] : bf16, view<386x10240xbf16>
+        view.store %packed, %capture_view[%row, %channel] : bf16, view<[%capture_capacity]x10240xbf16>
       }
     }
   }
@@ -183,38 +203,42 @@ kernel.def @projection_fixture() {
 // The ordinary convolution consumes analytical raw projections. The candidate
 // must produce the same published values and history while writing only the
 // speculative capture slots. Full-buffer comparisons retain inactive canaries.
+// Both schedules use the same retained 4096-row backing: the 384-capacity
+// schedule must also preserve every row beyond its compiled extent.
 check.case public @packed_projection_convolution {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %capacity = check.literal value(4096) : index
+  %capture_capacity = check.literal value(4098) : index
   %count = check.param.choice values([0, 260]) name("active") : index
   %seed = check.literal value(711261) : i64
   %epoch = check.generate.fill value(0) : tensor<10762xi32>
   %rows = check.generate.fill value(0) : tensor<16x5xi64>
   kernel.launch @packed_sessions(%count, %epoch, %rows) : (index, tensor<10762xi32>, tensor<16x5xi64>)
-  %input = check.generate.fill value(0.0) : tensor<384x2560xbf16>
+  %input = check.generate.fill value(0.0) : tensor<[%capacity]x2560xbf16>
   %weight = check.generate.fill value(0) : tensor<10240x80x34xi8>
-  %raw = check.generate.fill value(-17.0) : tensor<384x10240xbf16>
-  %expected_capture = check.generate.fill value(-23.0) : tensor<386x10240xbf16>
-  kernel.launch @projection_fixture(%count, %input, %weight, %raw, %expected_capture) : (index, tensor<384x2560xbf16>, tensor<10240x80x34xi8>, tensor<384x10240xbf16>, tensor<386x10240xbf16>)
+  %raw = check.generate.fill value(-17.0) : tensor<[%capacity]x10240xbf16>
+  %expected_capture = check.generate.fill value(-23.0) : tensor<[%capture_capacity]x10240xbf16>
+  kernel.launch @projection_fixture(%count, %input, %weight, %raw, %expected_capture) : (index, tensor<[%capacity]x2560xbf16>, tensor<10240x80x34xi8>, tensor<[%capacity]x10240xbf16>, tensor<[%capture_capacity]x10240xbf16>)
   %width = check.literal value(10240) : index
   kernel.launch @flash_next_prepare_qkv_channels[%width](%weight) : [index](tensor<10240x80x34xi8>)
   %conv = check.generate.random.uniform seed(%seed) range(-0.02 to 0.02) : tensor<10240x4xf32>
   %arena = check.generate.random.uniform seed(%seed) range(-0.125 to 0.125) : tensor<16x8x10240xbf16>
   %expected_arena = check.generate.random.uniform seed(%seed) range(-0.125 to 0.125) : tensor<16x8x10240xbf16>
-  %output = check.generate.fill value(-17.0) : tensor<384x10240xbf16>
-  %expected = check.generate.fill value(-17.0) : tensor<384x10240xbf16>
-  %norm = check.generate.fill value(-17.0) : tensor<384x32xf32>
-  %expected_norm = check.generate.fill value(-17.0) : tensor<384x32xf32>
+  %output = check.generate.fill value(-17.0) : tensor<[%capacity]x10240xbf16>
+  %expected = check.generate.fill value(-17.0) : tensor<[%capacity]x10240xbf16>
+  %norm = check.generate.fill value(-17.0) : tensor<[%capacity]x32xf32>
+  %expected_norm = check.generate.fill value(-17.0) : tensor<[%capacity]x32xf32>
   %halo = check.generate.fill value(-19.0) : tensor<18x6x10240xbf16>
-  %capture = check.generate.fill value(-23.0) : tensor<386x10240xbf16>
+  %capture = check.generate.fill value(-23.0) : tensor<[%capture_capacity]x10240xbf16>
   %history_origin = check.literal value(0) : offset
   %capture_origin = check.literal value(20480) : offset
-  kernel.launch @gdn_convolve(%epoch, %rows, %history_origin, %raw, %conv, %expected_arena, %expected, %expected_norm) : (tensor<10762xi32>, tensor<16x5xi64>, offset, tensor<384x10240xbf16>, tensor<10240x4xf32>, tensor<16x8x10240xbf16>, tensor<384x10240xbf16>, tensor<384x32xf32>)
-  kernel.launch @gdn_fused_projection(%epoch, %input, %weight, %conv, %halo, %output, %norm, %capture, %capture_origin) : (tensor<10762xi32>, tensor<384x2560xbf16>, tensor<10240x80x34xi8>, tensor<10240x4xf32>, tensor<18x6x10240xbf16>, tensor<384x10240xbf16>, tensor<384x32xf32>, tensor<386x10240xbf16>, offset)
-  kernel.launch @gdn_fused_boundary(%epoch, %rows, %history_origin, %halo, %conv, %arena, %output, %norm) : (tensor<10762xi32>, tensor<16x5xi64>, offset, tensor<18x6x10240xbf16>, tensor<10240x4xf32>, tensor<16x8x10240xbf16>, tensor<384x10240xbf16>, tensor<384x32xf32>)
-  check.expect.bitwise actual(%output) expected(%expected) : tensor<384x10240xbf16>
-  check.expect.bitwise actual(%norm) expected(%expected_norm) : tensor<384x32xf32>
+  kernel.launch @gdn_convolve(%epoch, %rows, %history_origin, %raw, %conv, %expected_arena, %expected, %expected_norm) : (tensor<10762xi32>, tensor<16x5xi64>, offset, tensor<[%capacity]x10240xbf16>, tensor<10240x4xf32>, tensor<16x8x10240xbf16>, tensor<[%capacity]x10240xbf16>, tensor<[%capacity]x32xf32>)
+  kernel.launch @gdn_fused_projection(%epoch, %input, %weight, %conv, %halo, %output, %norm, %capture, %capture_origin) : (tensor<10762xi32>, tensor<[%capacity]x2560xbf16>, tensor<10240x80x34xi8>, tensor<10240x4xf32>, tensor<18x6x10240xbf16>, tensor<[%capacity]x10240xbf16>, tensor<[%capacity]x32xf32>, tensor<[%capture_capacity]x10240xbf16>, offset)
+  kernel.launch @gdn_fused_boundary(%epoch, %rows, %history_origin, %halo, %conv, %arena, %output, %norm) : (tensor<10762xi32>, tensor<16x5xi64>, offset, tensor<18x6x10240xbf16>, tensor<10240x4xf32>, tensor<16x8x10240xbf16>, tensor<[%capacity]x10240xbf16>, tensor<[%capacity]x32xf32>)
+  check.expect.bitwise actual(%output) expected(%expected) : tensor<[%capacity]x10240xbf16>
+  check.expect.bitwise actual(%norm) expected(%expected_norm) : tensor<[%capacity]x32xf32>
   check.expect.bitwise actual(%arena) expected(%expected_arena) : tensor<16x8x10240xbf16>
-  check.expect.bitwise actual(%capture) expected(%expected_capture) : tensor<386x10240xbf16>
+  check.expect.bitwise actual(%capture) expected(%expected_capture) : tensor<[%capture_capacity]x10240xbf16>
   check.return
 }
 
