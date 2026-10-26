@@ -20,6 +20,10 @@ func.decl import("prepare") @parameter(%stage: i32, %binding: i32, %input: i32, 
 
 func.decl @qwen38.packet_capacity(%shapes: buffer, %shape_count: i64, %prefill: i64) -> (i64)
 
+func.decl @qwen38.allocation(%records: buffer, %slot: index, %bytes: i64, %initial_zero_bytes: i64)
+
+func.decl @qwen38.row_view(%records: buffer, %row_count: index, %row: index, %slot: index, %offset: i64, %length: i64)
+
 func.decl @qwen38_packet_bytes(%capacity: index) -> (offset)
 
 func.decl @qwen38.control_create(%packet_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer)
@@ -123,29 +127,6 @@ func.def @declare_stage(%root: buffer, %tokens: i64, %spans: i64, %context: i64,
   func.return %stage : i32
 }
 
-func.def @allocation(%records: buffer, %slot: index, %bytes: i64, %private_bytes: i64) {
-  %origin = index.constant 0 : offset
-  %bounded_slot = index.assume %slot [range(%slot, 0, 10)] : index
-  %view = buffer.view %records[%origin] : buffer -> view<11x3xi64>
-  %alignment = scalar.constant 256 : i64
-  view.store %bytes, %view[%bounded_slot, 0] : i64, view<11x3xi64>
-  view.store %alignment, %view[%bounded_slot, 1] : i64, view<11x3xi64>
-  view.store %private_bytes, %view[%bounded_slot, 2] : i64, view<11x3xi64>
-  func.return
-}
-
-// Private arena views are {byte_offset, byte_length}, in control/attention/
-// input/progress order. Recurrent slots have an independent geometry record.
-func.def @row_view(%records: buffer, %row_count: index, %row: index, %slot: index, %offset: i64, %length: i64) {
-  %origin = index.constant 0 : offset
-  %bounded_row = index.assume %row [range(%row, 0, 2147483647), lt(%row, %row_count)] : index
-  %bounded_slot = index.assume %slot [range(%slot, 0, 3)] : index
-  %view = buffer.view %records[%origin] : buffer -> view<[%row_count]x4x2xi64>
-  view.store %offset, %view[%bounded_row, %bounded_slot, 0] : i64, view<[%row_count]x4x2xi64>
-  view.store %length, %view[%bounded_row, %bounded_slot, 1] : i64, view<[%row_count]x4x2xi64>
-  func.return
-}
-
 // Target and draft cache planes form fixed prefixes. Private state follows
 // those planes, so adding residents preserves every existing payload address.
 // Fresh kernels synthesize empty state; these arenas need no initial fill.
@@ -206,14 +187,14 @@ func.def @qwen38.storage(%tokens: i64, %context: i64, %pool: i64, %rows_arg: i64
   %allocation_bytes = index.constant 264 : offset
   %allocations = buffer.alloca<private> align(8) %allocation_bytes : buffer
   scf.for %slot = [%c0 to %c11 step %c1] {
-    func.call @allocation(%allocations, %slot, %c0_i64, %c0_i64) : (buffer, index, i64, i64)
+    func.call @qwen38.allocation(%allocations, %slot, %c0_i64, %c0_i64) : (buffer, index, i64, i64)
   }
-  func.call @allocation(%allocations, %c0, %residual_bytes, %c0_i64) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c1, %arena_bytes, %c0_i64) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c2, %metadata_bytes, %c0_i64) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c3, %table_bytes, %c0_i64) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c4, %cohort_input_bytes, %c0_i64) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c5, %output_bytes, %c0_i64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c0, %residual_bytes, %c0_i64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c1, %arena_bytes, %c0_i64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c2, %metadata_bytes, %c0_i64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c3, %table_bytes, %c0_i64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c4, %cohort_input_bytes, %c0_i64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c5, %output_bytes, %c0_i64) : (buffer, index, i64, i64)
   %carry_record = scalar.constant 44032 : i64
   %carry_stride = scf.select %enabled, %carry_record, %c0_i64 : i64
   %carry_bytes = scalar.muli %owners, %carry_stride : i64
@@ -222,7 +203,7 @@ func.def @qwen38.storage(%tokens: i64, %context: i64, %pool: i64, %rows_arg: i64
   %draft_token_bytes = scalar.constant 2116 : i64
   %draft_cache_bytes = scalar.muli %pool, %draft_token_bytes : i64
   %draft_bytes = scalar.addi %tail_bytes, %draft_cache_bytes : i64
-  func.call @allocation(%allocations, %c6, %carry_bytes, %c0_i64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c6, %carry_bytes, %c0_i64) : (buffer, index, i64, i64)
   scf.if %enabled {
     %descriptor_stride = scalar.constant 24 : i64
     %descriptor_header = scalar.constant 12 : i64
@@ -230,10 +211,10 @@ func.def @qwen38.storage(%tokens: i64, %context: i64, %pool: i64, %rows_arg: i64
     %committed_bytes = scalar.addi %descriptor_bytes, %descriptor_header : i64
     %feedback_stride = scalar.constant 84 : i64
     %result_bytes = scalar.muli %packet_capacity, %feedback_stride : i64
-    func.call @allocation(%allocations, %c7, %committed_bytes, %c0_i64) : (buffer, index, i64, i64)
-    func.call @allocation(%allocations, %c8, %result_bytes, %c0_i64) : (buffer, index, i64, i64)
-    func.call @allocation(%allocations, %c9, %draft_bytes, %c0_i64) : (buffer, index, i64, i64)
-    func.call @allocation(%allocations, %c10, %table_bytes, %c0_i64) : (buffer, index, i64, i64)
+    func.call @qwen38.allocation(%allocations, %c7, %committed_bytes, %c0_i64) : (buffer, index, i64, i64)
+    func.call @qwen38.allocation(%allocations, %c8, %result_bytes, %c0_i64) : (buffer, index, i64, i64)
+    func.call @qwen38.allocation(%allocations, %c9, %draft_bytes, %c0_i64) : (buffer, index, i64, i64)
+    func.call @qwen38.allocation(%allocations, %c10, %table_bytes, %c0_i64) : (buffer, index, i64, i64)
   }
   %row_count = index.cast %rows : i64 to index
   %view_stride = index.constant 64 : offset
@@ -253,10 +234,10 @@ func.def @qwen38.storage(%tokens: i64, %context: i64, %pool: i64, %rows_arg: i64
     %recurrent_base = scalar.addi %base, %recurrent_origin : i64
     %input_base = scalar.addi %base, %input_origin : i64
     %progress_base = scalar.addi %base, %progress_origin : i64
-    func.call @row_view(%views, %row_count, %i, %c0, %base, %control_bytes) : (buffer, index, index, index, i64, i64)
-    func.call @row_view(%views, %row_count, %i, %c1, %input_base, %c0_i64) : (buffer, index, index, index, i64, i64)
-    func.call @row_view(%views, %row_count, %i, %c2, %input_base, %input_bytes) : (buffer, index, index, index, i64, i64)
-    func.call @row_view(%views, %row_count, %i, %c3, %progress_base, %progress_bytes) : (buffer, index, index, index, i64, i64)
+    func.call @qwen38.row_view(%views, %row_count, %i, %c0, %base, %control_bytes) : (buffer, index, index, index, i64, i64)
+    func.call @qwen38.row_view(%views, %row_count, %i, %c1, %input_base, %c0_i64) : (buffer, index, index, index, i64, i64)
+    func.call @qwen38.row_view(%views, %row_count, %i, %c2, %input_base, %input_bytes) : (buffer, index, index, index, i64, i64)
+    func.call @qwen38.row_view(%views, %row_count, %i, %c3, %progress_base, %progress_bytes) : (buffer, index, index, index, i64, i64)
     view.store %recurrent_base, %target[%i, 0] : i64, view<[%row_count]x5xi64>
     view.store %recurrent_base, %target[%i, 1] : i64, view<[%row_count]x5xi64>
     view.store %c0_i64, %target[%i, 2] : i64, view<[%row_count]x5xi64>

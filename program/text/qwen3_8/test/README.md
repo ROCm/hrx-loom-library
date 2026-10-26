@@ -28,3 +28,10 @@ zeroing extents, including both sides of 2 GiB and the maximum supported token
 capacity. Only the small descriptor tables are created; represented model
 storage is never materialized. These cases and their VM benchmarks need no
 weights or device.
+
+`storage_records.loom` checks the shared record writers directly against literal
+I64 tables. Guarded, nonzero-origin subviews cover first/interior/last records,
+all four view roles, partial and full zeroing extents, empty attention views,
+64-bit byte quantities, reordered stores, and replacement of an existing record.
+Separate VM case benchmarks exercise the same writers and exact comparisons.
+The largest allocation is 296 bytes; no represented payload is materialized.
