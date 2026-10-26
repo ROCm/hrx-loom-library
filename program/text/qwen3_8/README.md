@@ -20,16 +20,21 @@ carries length, causal and source positions, resident row, known-input range,
 flags, output credit, and continuation owner.
 Encoding builds the source's packed descriptors and selected-row mapping.
 It returns fourteen explicit upload ranges; unused capacity remains untouched
-and is not uploaded. The retained control allocation contains an 8-word stage
-header, one 24-byte sampling record per resident identity, and fourteen 40-byte
-transfer records. The composition's preparation provider owns this allocation.
+and is not uploaded. The retained control allocation contains a 10-word stage
+header, one 24-byte sampling record per resident identity, a 64-byte layout
+recipe, and fourteen 40-byte transfer records. The composition's preparation
+provider owns this allocation.
 Encoding gathers the current cohort's sampling records; output identities name
 their first-cohort policy ordinal, not their resident state ID. Reordered
 continuations preserve that policy ordinal through their first-result tags.
 
 Runner imports enqueue target, proposal, verification, catch-up, and feedback
-work. The returned completion edge covers work using mutable state; feedback
-has its own transfer edge, which the owner joins before publishing progress.
+work. Proposal variants cover power-of-two cohort capacities, and the live span
+count selects the smallest sufficient variant. Ordinary and mixed-input
+catalogs retain explicit proposal and catch-up origins. Every variant uses the
+same parameter domain and fixed packet layout; growing resident storage
+preserves the stage handles. The returned completion edge covers mutable work;
+feedback has its own transfer edge, which the owner joins before publishing progress.
 Publication consumes completed immutable feedback and reports consumed inputs,
 known inputs, output IDs, verification counts, and the next source position.
 Continuation flags are indexed by first-cohort ordinal, independently of the

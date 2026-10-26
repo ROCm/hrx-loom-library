@@ -22,6 +22,8 @@ func.decl @qwen38.control_create(%packet_capacity: i64, %context: i64, %pool: i6
 
 func.decl @qwen38.control_resize(%state: buffer, %rows: i64) -> (buffer, i64, i64, i64, i64, i1, i1, i1)
 
+func.decl @qwen38.proposal_level(%count: i32) -> (i32)
+
 func.def public @text_resize_state_v1(%state: buffer, %rows: i64) -> (buffer, buffer, buffer, buffer, buffer, buffer) {
   %grown, %packet_capacity, %context, %pool, %pins, %packed, %enabled, %dflash = func.call @qwen38.control_resize(%state, %rows) : (buffer, i64) -> (buffer, i64, i64, i64, i64, i1, i1, i1)
   %allocations, %views, %target, %draft, %geometry = func.call @qwen38.storage(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
@@ -420,19 +422,35 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
     %proposals = scf.select %more, %fitting, %prior_proposals : i64
     scf.yield %next, %proposals : i64, i64
   }
-  %proposal = scf.if %enabled -> (i32) {
+  %proposal, %warm_first = scf.if %enabled -> (i32, i32) {
     %proposal_root = global.load @proposal_root : buffer
-    %proposal = func.call @declare_stage(%proposal_root, %proposal_capacity, %proposal_capacity, %context, %pool, %model_source, %draft_source, %one_root, %two_roots, %c0_i64, %packet_capacity) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64) -> (i32)
     %draft_depth_key = global.load @draft_depth_key : buffer
-    func.call @config_i64(%proposal, %draft_depth_key, %depth) : (i32, buffer, i64)
     %epoch_capacity_key = global.load @epoch_capacity_key : buffer
-    func.call @config_i64(%proposal, %epoch_capacity_key, %packet_capacity) : (i32, buffer, i64)
+    %capacity_word = scalar.trunci %proposal_capacity : i64 to i32
+    %last_level = func.call @qwen38.proposal_level(%capacity_word) : (i32) -> (i32)
+    %last_index = index.cast %last_level : i32 to index
+    %levels = index.add %last_index, %c1 : index
+    // Cohort geometry changes launch work, not the retained packet layout or
+    // parameter domain. Small requests never execute the maximum-capacity grid.
+    %proposal = scf.for %level = [%c0 to %levels step %c1](%first = %c0_i32 : i32) -> (i32) {
+      %shift = index.cast %level : index to i64
+      %capacity = scalar.shli %anchor, %shift : i64
+      %stage = func.call @declare_stage(%proposal_root, %capacity, %capacity, %context, %pool, %model_source, %draft_source, %one_root, %two_roots, %c0_i64, %packet_capacity) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64) -> (i32)
+      func.call @config_i64(%stage, %draft_depth_key, %depth) : (i32, buffer, i64)
+      func.call @config_i64(%stage, %epoch_capacity_key, %packet_capacity) : (i32, buffer, i64)
+      %initial = index.cmp eq, %level, %c0 : index
+      %origin = scf.select %initial, %stage, %first : i32
+      scf.yield %origin : i32
+    }
     %warm_root = global.load @warm_root : buffer
     %verify_root = global.load @verify_root : buffer
-    scf.for %i = [%c0 to %count step %c1] {
+    %warm_first = scf.for %i = [%c0 to %count step %c1](%first = %c0_i32 : i32) -> (i32) {
       %tokens = view.load %view[%i, 0] : view<[%count]x2xi64> -> i64
       %spans = view.load %view[%i, 1] : view<[%count]x2xi64> -> i64
       %warm = func.call @declare_stage(%warm_root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %three_roots, %one_root, %c0_i64, %packet_capacity) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64) -> (i32)
+      %initial = index.cmp eq, %i, %c0 : index
+      %origin = scf.select %initial, %warm, %first : i32
+      scf.yield %origin : i32
     }
     scf.for %i = [%c0 to %count step %c1] {
       %tokens = view.load %view[%i, 0] : view<[%count]x2xi64> -> i64
@@ -446,19 +464,19 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
     %context_key = global.load @context_key : buffer
     func.call @config_i64(%continuation, %context_key, %context) : (i32, buffer, i64)
     func.call @config_i64(%continuation, %epoch_capacity_key, %packet_capacity) : (i32, buffer, i64)
-    scf.yield %proposal : i32
+    scf.yield %proposal, %warm_first : i32, i32
   } else {
-    scf.yield %c0_i32 : i32
+    scf.yield %c0_i32, %c0_i32 : i32, i32
   }
   %shared = scalar.trunci %shape_count : i64 to i32
-  // The shared Qwen controller uses six words: isolated prefill/decode stages,
-  // shape count, draft origin/kind, and target shape origin. Sampling starts at
-  // byte 32. Packed target stages begin at zero; predictor stages follow them.
+  // Target stages begin at zero. The shared header retains separate proposal
+  // and warm origins; sampling follows its ten words at byte 40.
   %dflash = scalar.constant false : i1
   %state = func.call @qwen38.control_create(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer)
-  %state_view = buffer.view %state[%origin] : buffer -> view<6xi32>
-  view.store %shared, %state_view[2] : i32, view<6xi32>
-  view.store %proposal, %state_view[3] : i32, view<6xi32>
+  %state_view = buffer.view %state[%origin] : buffer -> view<10xi32>
+  view.store %shared, %state_view[2] : i32, view<10xi32>
+  view.store %proposal, %state_view[3] : i32, view<10xi32>
+  view.store %warm_first, %state_view[8] : i32, view<10xi32>
   %less = scalar.cmpi ult, %maximum, %prefill : i64
   %effective = scf.select %less, %maximum, %prefill : i64
   %terminal = global.load @terminal : buffer

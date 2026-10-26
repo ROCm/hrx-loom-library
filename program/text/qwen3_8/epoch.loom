@@ -1,6 +1,6 @@
 // Qwen3.8 text-service v1 epoch publication and asynchronous stage dispatch.
 // A validated I32 plan stores consecutive first and continuation cohorts.
-// Source-owned control storage contains a 32-byte stage catalog header, one
+// Source-owned control storage contains a 40-byte stage catalog header, one
 // 24-byte sampling record per resident, and fourteen 40-byte upload descriptors.
 // Encoding retains all storage and returns only live upload ranges. The caller
 // holds that storage until its upload/feedback completion edges retire.
@@ -25,6 +25,8 @@ func.decl @qwen38_packet_identity_origin(%capacity: index) -> (offset)
 func.decl @qwen38_packet_shape_origin(%capacity: index) -> (offset)
 
 func.decl @qwen38.tagged_feedback_bytes(%state: buffer) -> (i64)
+
+func.decl @qwen38.proposal_level(%count: i32) -> (i32)
 
 func.decl import("runner") @execute_3(%stage: i32, %b0: hal.buffer, %b1: hal.buffer, %b2: hal.buffer) -> (i64)
 
@@ -189,7 +191,7 @@ func.def public @text_encode_epoch_v1(%control_state: buffer, %plan: buffer, %in
   %token_bytes = buffer.length %tokens
   %metadata_bytes = buffer.length %metadata
   %capacity = func.call @qwen38_packet_capacity(%metadata_bytes) : (offset) -> (index)
-  %policy_source = index.constant 32 : offset
+  %policy_source = index.constant 40 : offset
   %policy_target = func.call @qwen38_packet_policy_origin(%capacity) : (index) -> (offset)
   %policy_stride = index.constant 24 : offset
   %first_bounded = scalar.assume %first_count [range(%first_count, 1, 2147483647)] : i32
@@ -392,9 +394,9 @@ func.def public @text_publish_epoch_v1(%plan: buffer, %media_plan: buffer, %coun
 // The program is shared; all request state arrives as buffer bindings.
 func.def public @text_step_v1(%state: buffer, %initialize: i32, %source_position: i32, %input_count: i32, %residual: hal.buffer, %control: hal.buffer, %gdn: hal.buffer, %attention: hal.buffer, %tokens: hal.buffer, %progress: hal.buffer) -> (i64, i32) {
   %origin = index.constant 0 : offset
-  %view = buffer.view %state[%origin] : buffer -> view<8xi32>
-  %prefill = view.load %view[0] : view<8xi32> -> i32
-  %decode = view.load %view[1] : view<8xi32> -> i32
+  %view = buffer.view %state[%origin] : buffer -> view<10xi32>
+  %prefill = view.load %view[0] : view<10xi32> -> i32
+  %decode = view.load %view[1] : view<10xi32> -> i32
   %c0 = scalar.constant 0 : i32
   %is_prefill = scalar.cmpi ne, %initialize, %c0 : i32
   %stage = scf.select %is_prefill, %prefill, %decode : i32
@@ -412,14 +414,17 @@ func.def public @text_step_v1(%state: buffer, %initialize: i32, %source_position
 // before advancing host frontiers.
 func.def @epoch_once(%control_state: buffer, %mixed: i1, %shape: i32, %proposes: i32, %verifies: i32, %span_count: i32, %output_count: i32, %feedback_slot: i32, %residual: hal.buffer, %metadata: hal.buffer, %origins: hal.buffer, %state: hal.buffer, %tokens: hal.buffer, %outputs: hal.buffer, %carry: hal.buffer, %committed: hal.buffer, %results: hal.buffer, %draft_cache: hal.buffer, %draft_origins: hal.buffer) -> (i64) {
   %origin = index.constant 0 : offset
-  %view = buffer.view %control_state[%origin] : buffer -> view<8xi32>
-  %shape_count = view.load %view[2] : view<8xi32> -> i32
-  %ordinary_draft_first = view.load %view[3] : view<8xi32> -> i32
-  %mixed_draft_first = view.load %view[7] : view<8xi32> -> i32
+  %view = buffer.view %control_state[%origin] : buffer -> view<10xi32>
+  %shape_count = view.load %view[2] : view<10xi32> -> i32
+  %ordinary_draft_first = view.load %view[3] : view<10xi32> -> i32
+  %mixed_draft_first = view.load %view[7] : view<10xi32> -> i32
   %draft_first = scf.select %mixed, %mixed_draft_first, %ordinary_draft_first : i32
-  %draft_kind = view.load %view[4] : view<8xi32> -> i32
-  %ordinary_target_first = view.load %view[5] : view<8xi32> -> i32
-  %mixed_target_first = view.load %view[6] : view<8xi32> -> i32
+  %ordinary_warm_first = view.load %view[8] : view<10xi32> -> i32
+  %mixed_warm_first = view.load %view[9] : view<10xi32> -> i32
+  %warm_first = scf.select %mixed, %mixed_warm_first, %ordinary_warm_first : i32
+  %draft_kind = view.load %view[4] : view<10xi32> -> i32
+  %ordinary_target_first = view.load %view[5] : view<10xi32> -> i32
+  %mixed_target_first = view.load %view[6] : view<10xi32> -> i32
   %target_first = scf.select %mixed, %mixed_target_first, %ordinary_target_first : i32
   %c0 = scalar.constant 0 : i32
   %c1 = scalar.constant 1 : i32
@@ -429,13 +434,19 @@ func.def @epoch_once(%control_state: buffer, %mixed: i1, %shape: i32, %proposes:
   %verify = scalar.cmpi ne, %verifies, %c0 : i32
   %dflash = scalar.cmpi ne, %draft_kind, %c0 : i32
   scf.if %propose {
+    // Live spans bound the proposing subset, including mixed prefill/decode.
+    // The final variant covers the largest cohort admitted by target shapes.
+    %variants = scalar.subi %warm_first, %draft_first : i32
+    %last = scalar.subi %variants, %c1 : i32
+    %level = func.call @qwen38.proposal_level(%span_count) : (i32) -> (i32)
+    %selected = scalar.minui %level, %last : i32
+    %draft_stage = scalar.addi %draft_first, %selected : i32
     scf.if %dflash {
-      %proposal = func.call @execute_4(%draft_first, %metadata, %tokens, %draft_origins, %draft_cache) : (i32, hal.buffer, hal.buffer, hal.buffer, hal.buffer) -> (i64)
+      %proposal = func.call @execute_4(%draft_stage, %metadata, %tokens, %draft_origins, %draft_cache) : (i32, hal.buffer, hal.buffer, hal.buffer, hal.buffer) -> (i64)
     } else {
-      %proposal = func.call @execute_5(%draft_first, %metadata, %tokens, %draft_origins, %draft_cache, %carry) : (i32, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer) -> (i64)
+      %proposal = func.call @execute_5(%draft_stage, %metadata, %tokens, %draft_origins, %draft_cache, %carry) : (i32, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer) -> (i64)
     }
   }
-  %warm_first = scalar.addi %draft_first, %c1 : i32
   %warm_stage = scalar.addi %warm_first, %shape : i32
   %target = scf.if %verify -> (i64) {
     %verify_stage = scalar.addi %warm_stage, %shape_count : i32
@@ -500,14 +511,13 @@ func.def public @text_epoch_v1(%control_state: buffer, %shape: i32, %proposes: i
   %continues = scalar.cmpi eq, %epoch_count, %c2 : i32
   %completion = scf.if %continues -> (i64) {
     %origin = index.constant 0 : offset
-    %view = buffer.view %control_state[%origin] : buffer -> view<8xi32>
-    %shape_count = view.load %view[2] : view<8xi32> -> i32
-    %ordinary_proposal = view.load %view[3] : view<8xi32> -> i32
-    %mixed_proposal = view.load %view[7] : view<8xi32> -> i32
-    %proposal = scf.select %mixed, %mixed_proposal, %ordinary_proposal : i32
+    %view = buffer.view %control_state[%origin] : buffer -> view<10xi32>
+    %shape_count = view.load %view[2] : view<10xi32> -> i32
+    %ordinary_warm = view.load %view[8] : view<10xi32> -> i32
+    %mixed_warm = view.load %view[9] : view<10xi32> -> i32
+    %warm = scf.select %mixed, %mixed_warm, %ordinary_warm : i32
     %shapes = scalar.muli %shape_count, %c2 : i32
-    %after_shapes = scalar.addi %proposal, %shapes : i32
-    %continuation = scalar.addi %after_shapes, %c1 : i32
+    %continuation = scalar.addi %warm, %shapes : i32
     %ready = func.call @execute_3(%continuation, %metadata, %tokens, %results) : (i32, hal.buffer, hal.buffer, hal.buffer) -> (i64)
     %next = func.call @epoch_once(%control_state, %mixed, %continuation_shape, %continuation_proposes, %c1, %span_count, %c0, %c2, %residual, %metadata, %origins, %state, %tokens, %outputs, %carry, %committed, %next_results, %draft_cache, %draft_origins) : (buffer, i1, i32, i32, i32, i32, i32, i32, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer) -> (i64)
     scf.yield %next : i64
@@ -518,7 +528,7 @@ func.def public @text_epoch_v1(%control_state: buffer, %shape: i32, %proposes: i
 }
 
 // Fourteen ordered, disjoint placements describe the live packet fields.
-// The retained table follows the 32-byte control header and resident sampling
+// The retained table follows the 40-byte control header and resident sampling
 // directory. Empty placements carry zero length; they upload no bytes.
 func.def @qwen38.epoch_transfer(%state: buffer, %slot: index, %binding: i64, %begin: i64, %length: i64) {
   %state_bytes = buffer.length %state
