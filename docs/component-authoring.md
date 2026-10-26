@@ -107,9 +107,9 @@ all contribute to that cost.
 
 A complete change includes the shared implementation, actual callers, focused
 checks, package documentation, and explicit provider dependencies. Model source
-maps and acquisition locks must describe the changed program closure. Existing
-source, archive, and mixed packages should still link through those providers;
-their builds do not fetch weights.
+maps describe the changed program closure; asset locks change only when their
+asset dependencies change. Existing source, archive, and mixed packages should
+still link through those providers; their builds do not fetch weights.
 
 For a pure extraction, compare the actual emitted products as well as numerical
 outputs. Identical executable bytes provide strong evidence that a new source

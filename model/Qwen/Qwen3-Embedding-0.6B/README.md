@@ -78,5 +78,6 @@ Tests trust that provisioned assets match the checked-in acquisition lock.
 The card, lock, built providers, server, checker, and test configuration determine
 Bazel cache identity. A cache hit reads no model weights. Changing a parameter
 file without updating its lock intentionally permits a cached result.
-The authored lock covers source files; a publication of newly built bytecode
-needs its own lock for those output bytes.
+The authored lock covers assets; editing source programs requires no checksum
+update. An immutable bytecode publication can additionally seal its output
+bytes with a generated `--lock-scope=all` lock outside the source tree.

@@ -18,9 +18,10 @@ loom-serve --model="$HOME/models/qwen3.8-flash-next/model.json" \
   --device=amdgpu://0
 ```
 
-The source card and acquisition lock identify the exact providers, ordered
-checkpoint shards, and tokenizer. Fetching resolves the selected preset and
-reuses cached checkpoint files; serving loads the resulting local card.
+The source card selects the programs and orders the checkpoint shards; the
+acquisition lock records checkpoint and tokenizer identities. Fetching resolves
+the selected preset, copies editable programs, and reuses cached checkpoint
+files; serving loads the resulting local card.
 The source programs, numerical checks, and model service tests are available
 in the [library model package](https://github.com/ROCm/hrx-loom-library/tree/main/model/Qwen/Qwen3.8-Flash-Next).
 

@@ -52,11 +52,11 @@ loom-fetch model/krea/Krea-2-Turbo/model.json \
   --preset=image --output=../krea2
 ```
 
-The authored lock covers both checkpoint variants with the source providers.
-Shared motifs use an immutable library origin. `--origin=library="$PWD"` selects
-the current checkout while iterating; its bytes must match the lock unless an
-explicit development lock mode is selected. Bazel builds the current declared
-sources using the pinned SDK or the local HRX override.
+The authored lock covers both checkpoint variants and the tokenizer. Shared
+motifs use a pinned library origin. `--origin=library="$PWD"` selects the current
+checkout while iterating, with no program checksums to update and full asset
+verification retained. Bazel builds the current declared sources using the
+pinned SDK or the local HRX override.
 
 Geometry, numerical, and tile tests require no learned weights:
 
@@ -120,7 +120,7 @@ actual output bytes and are generated outside Bazel:
 ```sh
 mkdir -p .reports/krea2
 PROGRAMS="$(realpath bazel-bin/model/krea/Krea-2-Turbo/mixed)"
-loom-fetch "$PROGRAMS/model.json" --offline --update-lock \
+loom-fetch "$PROGRAMS/model.json" --offline --update-lock --lock-scope=all \
   --lockfile="$PWD/.reports/krea2/mixed.lock.json" \
   --output="$PWD/.reports/krea2/mixed"
 loom-serve --device=amdgpu --model=./.reports/krea2/mixed/model.json

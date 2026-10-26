@@ -28,8 +28,8 @@ loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/mo
 loom-serve --model=./moonshine/model.json --device=amdgpu --listen=127.0.0.1:8080
 ```
 
-No repository clone or Bazel build is needed. Fetch installs the selected
-programs and assets, verifies their lock, and reuses cached weights. The SDK
+No repository clone or Bazel build is needed. Fetch copies the selected
+programs, verifies locked assets, and reuses cached weights. The SDK
 compiles the programs when serving. AMD device access uses libamdf and the
 operating-system driver; it does not require a ROCm SDK installation.
 

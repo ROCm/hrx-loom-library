@@ -34,6 +34,8 @@ Source-bearing `target/` packages still require their own admission rule. Model 
 
 Model identity follows the original publisher and base model under `model/<publisher>/<model>/`. Source, bytecode, and mixed inputs are program representations within a card, not separate model identities. Quantized checkpoints and services are selected through the card. Physical placement remains deployment input; request-time adapters do not become base-model parameters. Model-specific code composes shared programs, kernels, and motifs. Shared programs own service policy and multi-stage execution; kernels own individual launch contracts; motifs own reusable representations and algorithms. These layers cannot depend back on a model, and motifs cannot depend on a program or kernel.
 
+Authored `model.json.lock` files use version 2 asset scope. Program and auxiliary files, including shared library providers, follow the source checkout or declared origin revision without per-file checksum maintenance. Generated publication locks may cover complete executable bytes; those belong with their published artifacts. The [model-authoring guide](docs/model-authoring.md) describes editing, asset updates, and publication.
+
 ## Branch-local incubation
 
 Long-running ports and kernel searches may live below `experimental/` on

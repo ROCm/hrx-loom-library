@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -371,6 +372,33 @@ class SourcePolicyTest(unittest.TestCase):
                     "model packages must declare loom_library"
                 ],
             )
+
+    def test_repository_keeps_complete_locks_out_of_authored_models(self):
+        with TemporaryDirectory() as temporary_directory:
+            repository_root = Path(temporary_directory)
+            model_root = repository_root / "model" / "publisher" / "recognizer"
+            model_root.mkdir(parents=True)
+            (model_root / "model.json").write_text("{}\n")
+            (model_root / "BUILD.bazel").write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_model")\n'
+                'loom_model(name = "source", card = "model.json")\n'
+            )
+            for coverage in (
+                {"schema_version": 1},
+                {"schema_version": 2, "scope": "all"},
+                {"schema_version": 2, "scope": "assets"},
+            ):
+                with self.subTest(coverage=coverage):
+                    (model_root / "model.json.lock").write_text(
+                        json.dumps({**coverage, "origins": {}, "files": []})
+                    )
+                    violations = source_policy.check_repository(repository_root)
+                    if coverage.get("scope") == "assets":
+                        self.assertEqual(violations, [])
+                    else:
+                        self.assertEqual(len(violations), 1)
+                        self.assertIn("model.json.lock: authored locks", violations[0])
+                        self.assertIn("version 2 asset scope", violations[0])
 
     def test_shared_program_requires_its_own_source_and_test_admission(self):
         with TemporaryDirectory() as temporary_directory:
