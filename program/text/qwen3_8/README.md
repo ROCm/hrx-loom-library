@@ -28,6 +28,14 @@ Encoding gathers the current cohort's sampling records; output identities name
 their first-cohort policy ordinal, not their resident state ID. Reordered
 continuations preserve that policy ordinal through their first-result tags.
 
+`storage.loom` owns the shared control recipe and capacity policy. Packet
+capacity covers isolated prefill and the largest prepared token bucket,
+rounded upward to an even value. Resident growth preserves that capacity,
+stage handles, and existing sampling policies; new residents start with empty
+policies. The packet-capacity checks use literal small catalogs, and each
+model's storage checks exercise its real allocation evaluator through growth.
+Both paths have VM benchmarks without model parameters or device execution.
+
 Runner imports enqueue target, proposal, verification, catch-up, and feedback
 work. Proposal variants cover power-of-two cohort capacities, and the live span
 count selects the smallest sufficient variant. Ordinary and mixed-input
