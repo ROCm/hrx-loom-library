@@ -82,7 +82,7 @@ Correctness admission and performance claims are separate. Shared CI establishes
 ## Local admission sequence
 
 ```shell
-python dev.py setup --release
+python dev.py setup --sdk
 python dev.py format --check
 python dev.py lint
 python dev.py test

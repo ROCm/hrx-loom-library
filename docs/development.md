@@ -189,8 +189,8 @@ Repeating the command is incremental. Bazel rebuilds only invalidated actions,
 and the sweep executes only roots whose closed benchmark `.loombc`, benchmark
 runner and its shared libraries, or invocation identity changed. A shared motif
 edit therefore reruns the exact consumers whose linked runner input changed;
-an edit that produces a byte-identical module is reported as potentially affected without repeating the
-physical benchmark.
+an edit that produces a byte-identical module is reported as potentially affected
+without repeating the physical benchmark.
 `--rerun-all` deliberately captures fresh measurements for every selected
 module. A changed benchmark runner invalidates every module in the selected
 scope, so compiler development can use a narrow target pattern while ordinary
@@ -333,8 +333,8 @@ Cross-compile the module closure and retain a detailed report as an
 optimization baseline:
 
 ```shell
-LOOM_COMPILE_TOOL="@hrx//loom/src/loom/tools/loom-compile"
-LOOM_REPORT_TOOL="@hrx//loom/py/loom/tools:loom-compile-report"
+LOOM_COMPILE_TOOL="@loom_sdk//:loom-compile"
+LOOM_REPORT_TOOL="@loom_sdk//:loom-compile-report"
 
 bazelisk run --config=opt "$LOOM_COMPILE_TOOL" -- \
   "$LOOM_MODULE" \
