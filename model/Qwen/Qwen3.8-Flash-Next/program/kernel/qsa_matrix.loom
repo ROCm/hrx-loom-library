@@ -268,9 +268,12 @@ kernel.def target(@qsa_matrix_wave32) @qsa_cohort_attention(%neural_enabled: i1)
     %alpha_offset = index.constant 27648 : offset
     %sum_offset = index.constant 27840 : offset
     %shared = buffer.alloca<workgroup> align(16) %shared_bytes : buffer
-    %scores = buffer.view %shared[%origin] : buffer -> view<3x8x32x8xf32>
-    %highs = buffer.view %shared[%high_offset] : buffer -> view<3x16x16xbf16>
-    %lows = buffer.view %shared[%low_offset] : buffer -> view<3x16x16xbf16>
+    // Each 128-bit exchange walks a four-word lane pitch instead of skipping
+    // over the second half of an eight-word record. Separate planes preserve
+    // the original lane order, coefficient values, and reduction order.
+    %scores = buffer.view %shared[%origin] : buffer -> view<3x8x2x32x4xf32>
+    %highs = buffer.view %shared[%high_offset] : buffer -> view<3x2x16x8xbf16>
+    %lows = buffer.view %shared[%low_offset] : buffer -> view<3x2x16x8xbf16>
     %alphas = buffer.view %shared[%alpha_offset] : buffer -> view<3x16xf32>
     %sums = buffer.view %shared[%sum_offset] : buffer -> view<3x16xf32>
     %query_view = buffer.view %queries[%origin] : buffer -> view<[%tokens]x24x256xbf16>
@@ -438,17 +441,26 @@ kernel.def target(@qsa_matrix_wave32) @qsa_cohort_attention(%neural_enabled: i1)
 
       %remote_score0 = index.cmp ne, %wave, %fragment0 : index
       scf.if %remote_score0 {
-        vector.store %score0, %scores[%fragment0, %wave, %lane, %c0] : vector<8xf32>, view<3x8x32x8xf32>
+        %score_first0 = vector.slice %score0[0] : vector<8xf32> -> vector<4xf32>
+        %score_second0 = vector.slice %score0[4] : vector<8xf32> -> vector<4xf32>
+        vector.store %score_first0, %scores[%fragment0, %wave, %c0, %lane, %c0] : vector<4xf32>, view<3x8x2x32x4xf32>
+        vector.store %score_second0, %scores[%fragment0, %wave, %c1, %lane, %c0] : vector<4xf32>, view<3x8x2x32x4xf32>
       }
 
       %remote_score1 = index.cmp ne, %wave, %fragment1 : index
       scf.if %remote_score1 {
-        vector.store %score1, %scores[%fragment1, %wave, %lane, %c0] : vector<8xf32>, view<3x8x32x8xf32>
+        %score_first1 = vector.slice %score1[0] : vector<8xf32> -> vector<4xf32>
+        %score_second1 = vector.slice %score1[4] : vector<8xf32> -> vector<4xf32>
+        vector.store %score_first1, %scores[%fragment1, %wave, %c0, %lane, %c0] : vector<4xf32>, view<3x8x2x32x4xf32>
+        vector.store %score_second1, %scores[%fragment1, %wave, %c1, %lane, %c0] : vector<4xf32>, view<3x8x2x32x4xf32>
       }
 
       %remote_score2 = index.cmp ne, %wave, %fragment2 : index
       scf.if %remote_score2 {
-        vector.store %score2, %scores[%fragment2, %wave, %lane, %c0] : vector<8xf32>, view<3x8x32x8xf32>
+        %score_first2 = vector.slice %score2[0] : vector<8xf32> -> vector<4xf32>
+        %score_second2 = vector.slice %score2[4] : vector<8xf32> -> vector<4xf32>
+        vector.store %score_first2, %scores[%fragment2, %wave, %c0, %lane, %c0] : vector<4xf32>, view<3x8x2x32x4xf32>
+        vector.store %score_second2, %scores[%fragment2, %wave, %c1, %lane, %c0] : vector<4xf32>, view<3x8x2x32x4xf32>
       }
 
       kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
@@ -463,7 +475,9 @@ kernel.def target(@qsa_matrix_wave32) @qsa_cohort_attention(%neural_enabled: i1)
           %part = scf.if %local -> (vector<8xf32>) {
             scf.yield %own_score : vector<8xf32>
           } else {
-            %part = vector.load %scores[%owner, %peer, %lane, %c0] : view<3x8x32x8xf32> -> vector<8xf32>
+            %part_first = vector.load %scores[%owner, %peer, %c0, %lane, %c0] : view<3x8x2x32x4xf32> -> vector<4xf32>
+            %part_second = vector.load %scores[%owner, %peer, %c1, %lane, %c0] : view<3x8x2x32x4xf32> -> vector<4xf32>
+            %part = vector.concat<0> %part_first, %part_second : vector<4xf32>, vector<4xf32> -> vector<8xf32>
             scf.yield %part : vector<8xf32>
           }
           %added = vector.addf %running, %part : vector<8xf32>
@@ -473,8 +487,14 @@ kernel.def target(@qsa_matrix_wave32) @qsa_cohort_attention(%neural_enabled: i1)
         %own_query = index.div %own_head, %c12 : index
         %m, %l, %alpha, %high, %low = func.call @qsa_cohort_softmax(%raw, %records, %own_query, %parity, %maximum, %sum) : (vector<8xf32>, vector<4xi32>, index, index, f32, f32) -> (f32, f32, f32, vector<16xbf16>, vector<16xbf16>)
         scf.if %publisher {
-          vector.store %high, %highs[%owner, %r, %c0] : vector<16xbf16>, view<3x16x16xbf16>
-          vector.store %low, %lows[%owner, %r, %c0] : vector<16xbf16>, view<3x16x16xbf16>
+          %high_first = vector.slice %high[0] : vector<16xbf16> -> vector<8xbf16>
+          %high_second = vector.slice %high[8] : vector<16xbf16> -> vector<8xbf16>
+          vector.store %high_first, %highs[%owner, %c0, %r, %c0] : vector<8xbf16>, view<3x2x16x8xbf16>
+          vector.store %high_second, %highs[%owner, %c1, %r, %c0] : vector<8xbf16>, view<3x2x16x8xbf16>
+          %low_first = vector.slice %low[0] : vector<16xbf16> -> vector<8xbf16>
+          %low_second = vector.slice %low[8] : vector<16xbf16> -> vector<8xbf16>
+          vector.store %low_first, %lows[%owner, %c0, %r, %c0] : vector<8xbf16>, view<3x2x16x8xbf16>
+          vector.store %low_second, %lows[%owner, %c1, %r, %c0] : vector<8xbf16>, view<3x2x16x8xbf16>
           view.store %alpha, %alphas[%owner, %r] : f32, view<3x16xf32>
         }
         scf.yield %m, %l : f32, f32
@@ -502,8 +522,12 @@ kernel.def target(@qsa_matrix_wave32) @qsa_cohort_attention(%neural_enabled: i1)
 
       %alpha0 = view.load %alphas[%fragment0, %r] : view<3x16xf32> -> f32
       %scale0 = vector.splat %alpha0 : vector<8xf32>
-      %high_values0 = vector.load %highs[%fragment0, %r, %c0] : view<3x16x16xbf16> -> vector<16xbf16>
-      %low_values0 = vector.load %lows[%fragment0, %r, %c0] : view<3x16x16xbf16> -> vector<16xbf16>
+      %high_first0 = vector.load %highs[%fragment0, %c0, %r, %c0] : view<3x2x16x8xbf16> -> vector<8xbf16>
+      %high_second0 = vector.load %highs[%fragment0, %c1, %r, %c0] : view<3x2x16x8xbf16> -> vector<8xbf16>
+      %high_values0 = vector.concat<0> %high_first0, %high_second0 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
+      %low_first0 = vector.load %lows[%fragment0, %c0, %r, %c0] : view<3x2x16x8xbf16> -> vector<8xbf16>
+      %low_second0 = vector.load %lows[%fragment0, %c1, %r, %c0] : view<3x2x16x8xbf16> -> vector<8xbf16>
+      %low_values0 = vector.concat<0> %low_first0, %low_second0 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
       %high0 = vector.fragment<rhs> %high_values0 shape [%tile, %tile] : vector<16xbf16>
       %low0 = vector.fragment<rhs> %low_values0 shape [%tile, %tile] : vector<16xbf16>
 
@@ -517,8 +541,12 @@ kernel.def target(@qsa_matrix_wave32) @qsa_cohort_attention(%neural_enabled: i1)
 
       %alpha1 = view.load %alphas[%fragment1, %r] : view<3x16xf32> -> f32
       %scale1 = vector.splat %alpha1 : vector<8xf32>
-      %high_values1 = vector.load %highs[%fragment1, %r, %c0] : view<3x16x16xbf16> -> vector<16xbf16>
-      %low_values1 = vector.load %lows[%fragment1, %r, %c0] : view<3x16x16xbf16> -> vector<16xbf16>
+      %high_first1 = vector.load %highs[%fragment1, %c0, %r, %c0] : view<3x2x16x8xbf16> -> vector<8xbf16>
+      %high_second1 = vector.load %highs[%fragment1, %c1, %r, %c0] : view<3x2x16x8xbf16> -> vector<8xbf16>
+      %high_values1 = vector.concat<0> %high_first1, %high_second1 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
+      %low_first1 = vector.load %lows[%fragment1, %c0, %r, %c0] : view<3x2x16x8xbf16> -> vector<8xbf16>
+      %low_second1 = vector.load %lows[%fragment1, %c1, %r, %c0] : view<3x2x16x8xbf16> -> vector<8xbf16>
+      %low_values1 = vector.concat<0> %low_first1, %low_second1 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
       %high1 = vector.fragment<rhs> %high_values1 shape [%tile, %tile] : vector<16xbf16>
       %low1 = vector.fragment<rhs> %low_values1 shape [%tile, %tile] : vector<16xbf16>
 
@@ -532,8 +560,12 @@ kernel.def target(@qsa_matrix_wave32) @qsa_cohort_attention(%neural_enabled: i1)
 
       %alpha2 = view.load %alphas[%fragment2, %r] : view<3x16xf32> -> f32
       %scale2 = vector.splat %alpha2 : vector<8xf32>
-      %high_values2 = vector.load %highs[%fragment2, %r, %c0] : view<3x16x16xbf16> -> vector<16xbf16>
-      %low_values2 = vector.load %lows[%fragment2, %r, %c0] : view<3x16x16xbf16> -> vector<16xbf16>
+      %high_first2 = vector.load %highs[%fragment2, %c0, %r, %c0] : view<3x2x16x8xbf16> -> vector<8xbf16>
+      %high_second2 = vector.load %highs[%fragment2, %c1, %r, %c0] : view<3x2x16x8xbf16> -> vector<8xbf16>
+      %high_values2 = vector.concat<0> %high_first2, %high_second2 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
+      %low_first2 = vector.load %lows[%fragment2, %c0, %r, %c0] : view<3x2x16x8xbf16> -> vector<8xbf16>
+      %low_second2 = vector.load %lows[%fragment2, %c1, %r, %c0] : view<3x2x16x8xbf16> -> vector<8xbf16>
+      %low_values2 = vector.concat<0> %low_first2, %low_second2 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
       %high2 = vector.fragment<rhs> %high_values2 shape [%tile, %tile] : vector<16xbf16>
       %low2 = vector.fragment<rhs> %low_values2 shape [%tile, %tile] : vector<16xbf16>
 
