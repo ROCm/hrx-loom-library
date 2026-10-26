@@ -11,9 +11,9 @@ a target or configuration.
 eight-word media record. The composition supplies the layout choice. Media
 records retain temporal, height, and width coordinates in words 2–4; the
 32 rotary pairs interleave those axes with counts 11, 11, and 10, and both
-halves use the same coordinate. Position lookup accepts records 0–511 and
-lanes 0–63. Token lookup and mutation instead use the caller's positive
-capacity and preserve every other record field.
+halves use the same coordinate. The caller selects which lanes undergo
+rotation. Position lookup, token lookup, and mutation use the caller's positive
+record capacity; token mutation preserves every other record field.
 
 `span.loom` interprets the three-word epoch header and six-word descriptors:
 length, causal position, packed-token begin, resident identity, source position,
