@@ -39,3 +39,13 @@ batches, every proposal round, large ordinary planes, non-vector tails,
 retirement boundaries, and overlapping mixed-media records. Whole-buffer
 comparisons detect writes outside the owned output. The shared text-program
 tests additionally exercise continuation after real image-packet encoding.
+
+Acceptance uses sixteen frontier trials: widths one through eight in each
+input layout. Multi-span fixtures mix speculative, known, and hidden spans,
+with separate EOS and credit-limited rows; one trial covers a single span.
+EOS reaches its selected middle or final position without an earlier injected
+mismatch; output credit includes zero.
+Two empty epochs and five wide cohorts independently cover empty publication
+and span counts beyond ordinary packing boundaries. These explicit combinations
+retain complete output and immutable-input checks without multiplying every
+width, capacity, span count, and stopping position together.

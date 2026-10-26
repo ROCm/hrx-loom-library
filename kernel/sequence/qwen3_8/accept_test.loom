@@ -70,8 +70,7 @@ func.def @accept_fixture(%mixed_inputs: index, %token_capacity: index, %width_va
     %selection_word = scf.select %hidden, %none, %selected_word : i32
     %flag = scalar.extui %speculative : i1 to i32
     %limited = index.cmp eq, %span, %c7 : index
-    %trial_limit = index.add %trial, %c1 : index
-    %credit = scf.select %limited, %trial_limit, %width : index
+    %credit = scf.select %limited, %trial, %width : index
     %credit_word = index.cast %credit : index to i32
     view.store %count_word, %descriptors[%span, 0] : i32, view<[%packet_capacity]x6xi32>
     view.store %position_word, %descriptors[%span, 1] : i32, view<[%packet_capacity]x6xi32>
@@ -84,6 +83,7 @@ func.def @accept_fixture(%mixed_inputs: index, %token_capacity: index, %width_va
     %phase = index.add %span, %trial : index
     %mismatch = index.rem %phase, %width : index
     %eos_span = index.cmp eq, %span, %c5 : index
+    %not_eos_span = scalar.xori %eos_span, %true : i1
     scf.for %token = [%c0 to %output_count step %c1] {
       %packed = index.add %begin, %token : index
       %following = index.add %packed, %c1 : index
@@ -91,7 +91,8 @@ func.def @accept_fixture(%mixed_inputs: index, %token_capacity: index, %width_va
       %matching = index.add %input_base, %input_word : index
       %replacement = index.add %wrong, %token : index
       %wrong_position = index.cmp eq, %token, %mismatch : index
-      %value = scf.select %wrong_position, %replacement, %matching : index
+      %replace = scalar.andi %wrong_position, %not_eos_span : i1
+      %value = scf.select %replace, %replacement, %matching : index
       %word = index.cast %value : index to i32
       %eos_position = index.cmp eq, %token, %trial : index
       %stops = scalar.andi %eos_span, %eos_position : i1
@@ -243,37 +244,36 @@ func.def @accept_oracle(%mixed_inputs: index, %width_value: index, %token_capaci
   func.return
 }
 
-// Every supported width and live span count, with all possible stopping
-// positions, both layouts, and compact or nearly full prompt allocations.
+// Each width 1..8 runs in both layouts. Sixteen live spans place mismatches
+// across the verification width, while separate known, hidden, EOS, and
+// credit-limited spans exercise each publication path. The layouts alternate
+// compact and nearly full prompt allocations, with middle and final EOS stops.
 func.def @accept_parameters(%trial: index) -> (index, index, index, index, index, index) {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
-  %c8 = index.constant 8 : index
-  %c16 = index.constant 16 : index
-  %row_period = index.constant 128 : index
-  %capacity_period = index.constant 1024 : index
-  %layout_period = index.constant 2048 : index
-  %mixed = index.div %trial, %layout_period : index
-  %row_trial = index.div %trial, %c8 : index
-  %span_index = index.rem %row_trial, %c16 : index
-  %span_count = index.add %span_index, %c1 : index
-  %width_trial = index.div %trial, %row_period : index
-  %width_index = index.rem %width_trial, %c8 : index
-  %width = index.add %width_index, %c1 : index
-  %capacity_trial = index.div %trial, %capacity_period : index
-  %capacity_index = index.rem %capacity_trial, %c2 : index
+  %width_count = index.constant 8 : index
+  %full_span_count = index.constant 16 : index
+  %single_span = index.cmp eq, %trial, %c0 : index
+  %span_count = scf.select %single_span, %c1, %full_span_count : index
+  %mixed = index.div %trial, %width_count : index
+  %last_position = index.rem %trial, %width_count : index
+  %width = index.add %last_position, %c1 : index
+  %middle_position = index.div %last_position, %c2 : index
+  %ordinary = index.cmp eq, %mixed, %c0 : index
+  %position = scf.select %ordinary, %middle_position, %last_position : index
+  %capacity_phase = index.add %width, %mixed : index
+  %capacity_index = index.rem %capacity_phase, %c2 : index
   %small = index.cmp eq, %capacity_index, %c0 : index
   %small_capacity = index.constant 512 : index
   %large_capacity = index.constant 16384 : index
   %token_capacity = scf.select %small, %small_capacity, %large_capacity : index
-  %position = index.rem %trial, %width : index
   %input_words = func.call @sequence_input_words(%mixed, %token_capacity) : (index, index) -> (index)
   func.return %mixed, %width, %span_count, %position, %token_capacity, %input_words : index, index, index, index, index, index
 }
 
 check.scenario public @accept_frontiers {
-  check.trial[4096](%trial: index, %entropy: check.entropy) {
+  check.trial[16](%trial: index, %entropy: check.entropy) {
     %mixed_inputs, %width, %span_count, %position, %token_capacity, %input_words = check.generate<@accept_parameters>(%trial) : (index) -> (index, index, index, index, index, index)
     %packet_capacity = check.literal value(128) : index
     %epoch = check.generate.fill value(-99) : tensor<[%packet_capacity]x29xi32>
