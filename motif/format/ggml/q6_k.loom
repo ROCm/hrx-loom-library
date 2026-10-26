@@ -9,9 +9,11 @@
 // One 210-byte Q6_K block stores 256 six-bit codes in separate low four-bit
 // and high two-bit planes. The encoded values have a zero point of 32. Sixteen
 // signed group scales and one F16 block scale accompany those codes. The
-// carrier accessor leaves scaling to its caller; the buffered F16 reader
-// applies it to one four-value packet for matrix staging. Both use the same
+// carrier and F32 code accessors leave scaling to their callers, which may
+// retain the coefficient pairs independently. The buffered F16 reader applies
+// scaling to one four-value packet for matrix staging. These forms share the
 // signed code interpretation without owning a contraction or launch schedule.
+//
 // Merges four selected low/high fields and converts each biased six-bit code
 // to a signed i8 value in [-32, 31]. `low_nibble` selects the low or high
 // nibble of each byte; `high_pair` selects one of four two-bit fields.
@@ -50,6 +52,84 @@ func.def public inline @ggml_q6_k_unpack_codes4(%low_word: vector<1xi32>, %high_
   %signed_word = vector.ori %low5, %sign_extension : vector<1xi32>
   %codes = vector.bitcast %signed_word : vector<1xi32> to vector<4xi8>
   func.return %codes : vector<4xi8>
+}
+
+// Returns the two F32 coefficients for one 32-value group. Each coefficient
+// multiplies a signed 16-value group scale by the F16 block factor. A caller
+// retaining this pair can reuse it across the group's eight four-code packets;
+// the first four packets use lane zero and the remaining four use lane one.
+// Row origin is in bytes, block selects a complete record, and group is [0, 7].
+func.def public inline @ggml_q6_k_load_scale_pair(%weight: buffer, %row_origin: offset, %block: index, %group: index) -> (vector<2xf32>) {
+  %scales_per_group = index.constant 2 : index
+  %block_bytes = index.constant 210 : offset
+  %scale_byte_add = index.constant 192 : offset
+  %factor_displacement = index.constant 208 : offset
+  %block_byte_add = index.scale %block, %block_bytes : index, offset -> offset
+  %block_byte_base = index.add %row_origin, %block_byte_add : offset
+  %scale_byte_base = index.add %block_byte_base, %scale_byte_add : offset
+  %factor_origin = index.add %block_byte_base, %factor_displacement : offset
+  %scale_pair_add = index.mul %group, %scales_per_group : index
+  %scale_view = buffer.view %weight[%scale_byte_base] : buffer -> view<16xi8>
+  %factor_view = buffer.view %weight[%factor_origin] : buffer -> view<1xf16>
+  %scale_i8 = vector.load %scale_view[%scale_pair_add] : view<16xi8> -> vector<2xi8>
+  %scale = vector.sitofp %scale_i8 : vector<2xi8> to vector<2xf32>
+  %factor_half = view.load %factor_view[0] : view<1xf16> -> f16
+  %factor = scalar.extf %factor_half : f16 to f32
+  %factor_pair = vector.splat %factor : vector<2xf32>
+  %combined = vector.mulf %scale, %factor_pair : vector<2xf32>
+  func.return %combined : vector<2xf32>
+}
+
+// Loads four consecutive signed codes as exact F32 values in [-32, 31].
+// Row origin is in bytes, block selects a complete 210-byte record, group is
+// in [0, 7], and packet is in [0, 7]. Coefficients remain separate so matrix
+// consumers can retain metadata without reloading it for every code packet.
+func.def public inline @ggml_q6_k_load_codes4(%weight: buffer, %row_origin: offset, %block: index, %group: index, %packet: index) -> (vector<4xf32>) {
+  %scales_per_group = index.constant 2 : index
+  %groups_per_half = index.constant 4 : index
+  %packets_per_group = index.constant 8 : index
+  %words_per_half = index.constant 16 : index
+  %block_bytes = index.constant 210 : offset
+  %high_displacement = index.constant 128 : offset
+  %low_bits = vector.constant 4 : vector<1xi32>
+  %nibble_mask = vector.constant 252645135 : vector<1xi32>
+  %high_mask = vector.constant 50529027 : vector<1xi32>
+  %zero_point = vector.constant 32.0 : vector<4xf32>
+  %bounded_group = index.assume %group [range(%group, 0, 7)] : index
+  %bounded_packet = index.assume %packet [range(%packet, 0, 7)] : index
+  %block_byte_add = index.scale %block, %block_bytes : index, offset -> offset
+  %block_byte_base = index.add %row_origin, %block_byte_add : offset
+  %high_origin = index.add %block_byte_base, %high_displacement : offset
+  %low_view = buffer.view %weight[%block_byte_base] : buffer -> view<32xi32>
+  %high_view = buffer.view %weight[%high_origin] : buffer -> view<16xi32>
+  %group_in_half = index.rem %bounded_group, %groups_per_half : index
+  %half = index.div %bounded_group, %groups_per_half : index
+  %low_side = index.rem %group_in_half, %scales_per_group : index
+  %low_half_word_base = index.mul %half, %words_per_half : index
+  %low_side_word_add = index.mul %low_side, %packets_per_group : index
+  %low_word_base = index.add %low_half_word_base, %low_side_word_add : index
+  %low_word_index = index.add %low_word_base, %bounded_packet : index
+  %high_half_word_base = index.mul %half, %packets_per_group : index
+  %high_word_index = index.add %high_half_word_base, %bounded_packet : index
+  %nibble = index.div %group_in_half, %scales_per_group : index
+  %nibble_shift_index = index.mul %nibble, %groups_per_half : index
+  %nibble_shift_i32 = index.cast %nibble_shift_index : index to i32
+  %nibble_shift = vector.splat %nibble_shift_i32 : vector<1xi32>
+  %high_shift_index = index.mul %group_in_half, %scales_per_group : index
+  %high_shift_i32 = index.cast %high_shift_index : index to i32
+  %high_shift = vector.splat %high_shift_i32 : vector<1xi32>
+  %low_word = vector.load %low_view[%low_word_index] : view<32xi32> -> vector<1xi32>
+  %high_word = vector.load %high_view[%high_word_index] : view<16xi32> -> vector<1xi32>
+  %low_shifted = vector.shrui %low_word, %nibble_shift : vector<1xi32>
+  %low = vector.andi %low_shifted, %nibble_mask : vector<1xi32>
+  %high_shifted = vector.shrui %high_word, %high_shift : vector<1xi32>
+  %high_low = vector.andi %high_shifted, %high_mask : vector<1xi32>
+  %high = vector.shli %high_low, %low_bits : vector<1xi32>
+  %code = vector.ori %low, %high : vector<1xi32>
+  %code_i8 = vector.bitcast %code : vector<1xi32> to vector<4xi8>
+  %code_f32 = vector.uitofp %code_i8 : vector<4xi8> to vector<4xf32>
+  %centered = vector.subf %code_f32, %zero_point : vector<4xf32>
+  func.return %centered : vector<4xf32>
 }
 
 // Materializes four consecutive values from one complete 210-byte record.
