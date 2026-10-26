@@ -27,7 +27,7 @@ kernel.def @qwen38_token_embedding_fix_differential_headers() {
   kernel.return
 }
 
-kernel.decl @qwen38_input_embedding_f32(%token_count0: index) launch(%mixed_inputs: index, %token_ids: buffer, %weight: buffer, %output: buffer)
+kernel.decl @qwen38_input_embedding_f32(%token_count0: index) launch(%mixed_inputs: index, %control: buffer, %token_ids: buffer, %weight: buffer, %output: buffer)
 
 kernel.decl @qwen38_token_embedding_q5k_f32_reference(%dispatch_token_count0: index) launch(%token_count0: index, %token_ids: buffer, %weight: buffer, %output: buffer)
 
@@ -36,15 +36,28 @@ kernel.decl @qwen38_token_embedding_q5k_f32_reference(%dispatch_token_count0: in
 // kernels and fixture data belong only to this test root.
 check.case public @qwen38_token_embedding_q5k_f32_differential_case {
   %token_count = check.literal value(2) : index
-  %token_ids = check.generate.iota offset(2) step(-2) : tensor<2xi32>
+  %dispatch_count = check.literal value(4) : index
+  %control = check.generate.fill value(2) : tensor<3xi32>
+  // Inactive IDs are negative, not valid padded embedding rows.
+  %token_ids = check.generate.iota offset(2) step(-2) : tensor<4xi32>
   %weight = check.generate.iota offset(-127) step(17) period(15) : tensor<4x20x176xi8>
   %expected = check.generate.fill value(0.0) : tensor<2x5120xf32>
-  %actual = check.generate.fill value(0.0) : tensor<2x5120xf32>
+  %actual = check.generate.fill value(9.0) : tensor<4x5120xf32>
   kernel.launch @qwen38_token_embedding_fix_differential_headers(%weight) : (tensor<4x20x176xi8>)
-  kernel.launch @qwen38_token_embedding_q5k_f32_reference[%token_count](%token_count, %token_ids, %weight, %expected) : [index](index, tensor<2xi32>, tensor<4x20x176xi8>, tensor<2x5120xf32>)
+  kernel.launch @qwen38_token_embedding_q5k_f32_reference[%token_count](%token_count, %token_ids, %weight, %expected) : [index](index, tensor<4xi32>, tensor<4x20x176xi8>, tensor<2x5120xf32>)
   %ordinary = check.literal value(0) : index
-  kernel.launch @qwen38_input_embedding_f32[%token_count](%ordinary, %token_ids, %weight, %actual) : [index](index, tensor<2xi32>, tensor<4x20x176xi8>, tensor<2x5120xf32>)
-  check.expect.close actual(%actual) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<2x5120xf32>
+  kernel.launch @qwen38_input_embedding_f32[%dispatch_count](%ordinary, %control, %token_ids, %weight, %actual) : [index](index, tensor<3xi32>, tensor<4xi32>, tensor<4x20x176xi8>, tensor<4x5120xf32>)
+  %live = check.tensor.view %actual offset(0) : tensor<4x5120xf32> -> tensor<2x5120xf32>
+  %padding = check.tensor.view %actual offset(40960) : tensor<4x5120xf32> -> tensor<2x5120xf32>
+  %zero = check.generate.fill value(0.0) : tensor<2x5120xf32>
+  check.expect.close actual(%live) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<2x5120xf32>
+  check.expect.bitwise actual(%padding) expected(%zero) : tensor<2x5120xf32>
+  // An empty compact draft can still use a nonempty dispatch bucket.
+  %empty_control = check.generate.fill value(0) : tensor<3xi32>
+  %empty = check.generate.fill value(9.0) : tensor<4x5120xf32>
+  %all_zero = check.generate.fill value(0.0) : tensor<4x5120xf32>
+  kernel.launch @qwen38_input_embedding_f32[%dispatch_count](%ordinary, %empty_control, %token_ids, %weight, %empty) : [index](index, tensor<3xi32>, tensor<4xi32>, tensor<4x20x176xi8>, tensor<4x5120xf32>)
+  check.expect.bitwise actual(%empty) expected(%all_zero) : tensor<4x5120xf32>
   check.return
 }
 

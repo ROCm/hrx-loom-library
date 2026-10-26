@@ -2,7 +2,7 @@ kernel.decl @qwen38_token_embedding_fix_differential_headers() launch(%weight: b
 
 kernel.decl @qwen38_token_embedding_q5k_f32_reference(%dispatch_token_count: index) launch(%token_count: index, %token_ids: buffer, %weight: buffer, %output: buffer)
 
-kernel.decl @qwen38_input_embedding_f32(%token_count: index) launch(%mixed_inputs: index, %token_ids: buffer, %weight: buffer, %output: buffer)
+kernel.decl @qwen38_input_embedding_f32(%token_count: index) launch(%mixed_inputs: index, %control: buffer, %token_ids: buffer, %weight: buffer, %output: buffer)
 
 // The image-pad ID is valid in the trained vocabulary but outside this tiny
 // embedding table. Access-sanitized execution detects any image-ID gather.
@@ -11,19 +11,28 @@ kernel.def @mixed_embedding_records() {
   kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
 } launch(%packet: buffer) {
   %origin = index.constant 0 : offset
-  %record_bytes = index.constant 128 : offset
+  %record_bytes = index.constant 256 : offset
   %c0 = scalar.constant 0 : i32
   buffer.fill %c0, %packet[%origin], %record_bytes : i32
-  %records = buffer.view %packet[%origin] : buffer -> view<4x8xi32>
+  %records = buffer.view %packet[%origin] : buffer -> view<8x8xi32>
   %c2 = scalar.constant 2 : i32
   %image_pad = scalar.constant 248056 : i32
-  %first_feature = scalar.constant 128 : i32
-  %second_feature = scalar.constant 20608 : i32
-  view.store %c2, %records[0, 0] : i32, view<4x8xi32>
-  view.store %image_pad, %records[1, 0] : i32, view<4x8xi32>
-  view.store %first_feature, %records[1, 1] : i32, view<4x8xi32>
-  view.store %image_pad, %records[3, 0] : i32, view<4x8xi32>
-  view.store %second_feature, %records[3, 1] : i32, view<4x8xi32>
+  %first_feature = scalar.constant 256 : i32
+  %second_feature = scalar.constant 20736 : i32
+  view.store %c2, %records[0, 0] : i32, view<8x8xi32>
+  view.store %image_pad, %records[1, 0] : i32, view<8x8xi32>
+  view.store %first_feature, %records[1, 1] : i32, view<8x8xi32>
+  view.store %image_pad, %records[3, 0] : i32, view<8x8xi32>
+  view.store %second_feature, %records[3, 1] : i32, view<8x8xi32>
+  // Stale bucket records must never become IDs or feature addresses.
+  %poison = scalar.constant 2147483647 : i32
+  %begin = index.constant 4 : index
+  %end = index.constant 8 : index
+  %step = index.constant 1 : index
+  scf.for %token = [%begin to %end step %step] {
+    view.store %poison, %records[%token, 0] : i32, view<8x8xi32>
+    view.store %poison, %records[%token, 1] : i32, view<8x8xi32>
+  }
   kernel.return
 }
 
@@ -31,27 +40,36 @@ check.case public @mixed_embedding_uses_device_rows {
   %ordinary_count = check.literal value(2) : index
   %mixed_count = check.literal value(4) : index
   %mixed = check.literal value(1) : index
+  %control = check.generate.fill value(4) : tensor<3xi32>
   %ids = check.generate.iota offset(2) step(-2) : tensor<2xi32>
   %weight = check.generate.iota offset(-127) step(17) period(15) : tensor<4x20x176xi8>
-  %packet = check.generate.iota offset(-2.0) step(0.001) : tensor<10272xf32>
+  %packet = check.generate.iota offset(-2.0) step(0.001) : tensor<10304xf32>
   %expected = check.generate.fill value(0.0) : tensor<2x5120xf32>
   %actual = check.generate.fill value(9.0) : tensor<4x5120xf32>
   kernel.launch @qwen38_token_embedding_fix_differential_headers(%weight) : (tensor<4x20x176xi8>)
-  kernel.launch @mixed_embedding_records(%packet) : (tensor<10272xf32>)
+  kernel.launch @mixed_embedding_records(%packet) : (tensor<10304xf32>)
   kernel.launch @qwen38_token_embedding_q5k_f32_reference[%ordinary_count](%ordinary_count, %ids, %weight, %expected) : [index](index, tensor<2xi32>, tensor<4x20x176xi8>, tensor<2x5120xf32>)
-  kernel.launch @qwen38_input_embedding_f32[%mixed_count](%mixed, %packet, %weight, %actual) : [index](index, tensor<10272xf32>, tensor<4x20x176xi8>, tensor<4x5120xf32>)
+  kernel.launch @qwen38_input_embedding_f32[%mixed_count](%mixed, %control, %packet, %weight, %actual) : [index](index, tensor<3xi32>, tensor<10304xf32>, tensor<4x20x176xi8>, tensor<4x5120xf32>)
   %text0 = check.tensor.view %actual offset(0) : tensor<4x5120xf32> -> tensor<5120xf32>
   %text1 = check.tensor.view %actual offset(40960) : tensor<4x5120xf32> -> tensor<5120xf32>
   %image0 = check.tensor.view %actual offset(20480) : tensor<4x5120xf32> -> tensor<5120xf32>
   %image1 = check.tensor.view %actual offset(61440) : tensor<4x5120xf32> -> tensor<5120xf32>
   %expected_text0 = check.tensor.view %expected offset(0) : tensor<2x5120xf32> -> tensor<5120xf32>
   %expected_text1 = check.tensor.view %expected offset(20480) : tensor<2x5120xf32> -> tensor<5120xf32>
-  %expected_image0 = check.tensor.view %packet offset(128) : tensor<10272xf32> -> tensor<5120xf32>
-  %expected_image1 = check.tensor.view %packet offset(20608) : tensor<10272xf32> -> tensor<5120xf32>
+  %expected_image0 = check.tensor.view %packet offset(256) : tensor<10304xf32> -> tensor<5120xf32>
+  %expected_image1 = check.tensor.view %packet offset(20736) : tensor<10304xf32> -> tensor<5120xf32>
   check.expect.bitwise actual(%text0) expected(%expected_text0) : tensor<5120xf32>
   check.expect.bitwise actual(%text1) expected(%expected_text1) : tensor<5120xf32>
   check.expect.bitwise actual(%image0) expected(%expected_image0) : tensor<5120xf32>
   check.expect.bitwise actual(%image1) expected(%expected_image1) : tensor<5120xf32>
+  %bucket_count = check.literal value(8) : index
+  %bucket = check.generate.fill value(9.0) : tensor<8x5120xf32>
+  kernel.launch @qwen38_input_embedding_f32[%bucket_count](%mixed, %control, %packet, %weight, %bucket) : [index](index, tensor<3xi32>, tensor<10304xf32>, tensor<4x20x176xi8>, tensor<8x5120xf32>)
+  %live = check.tensor.view %bucket offset(0) : tensor<8x5120xf32> -> tensor<4x5120xf32>
+  %padding = check.tensor.view %bucket offset(81920) : tensor<8x5120xf32> -> tensor<4x5120xf32>
+  %zero = check.generate.fill value(0.0) : tensor<4x5120xf32>
+  check.expect.bitwise actual(%live) expected(%actual) : tensor<4x5120xf32>
+  check.expect.bitwise actual(%padding) expected(%zero) : tensor<4x5120xf32>
   check.return
 }
 
