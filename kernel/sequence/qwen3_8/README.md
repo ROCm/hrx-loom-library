@@ -49,3 +49,10 @@ Two empty epochs and five wide cohorts independently cover empty publication
 and span counts beyond ordinary packing boundaries. These explicit combinations
 retain complete output and immutable-input checks without multiplying every
 width, capacity, span count, and stopping position together.
+
+Proposal preparation has twelve explicit combinations covering empty, sparse,
+and full drafts, minimum storage, each four-wide clear tail, high mask bits,
+and mask wrap at 32 and 64 spans. Publication covers every round in each input
+layout, followed by three- and seven-round chains. The thirty total samples
+check complete descriptor, origin, input, and target buffers against the
+independent fixture; a full 65-row draft exercises the last allocated slot.
