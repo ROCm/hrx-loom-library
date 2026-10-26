@@ -44,7 +44,7 @@ activation, or joined server shutdown.
 
 The `serve_source_test`, `serve_archive_test`, and `serve_mixed_test` targets
 run the installed service contract with each built representation. The same
-checks have `_mtp`, `_mtp_continuation`, and `_long_context` forms, for example
+checks have `_mtp`, `_mtp_continuation`, `_long_context`, and `_long_context_mtp` forms, for example
 `serve_archive_mtp_test`. These manual targets require a provisioned asset
 installation containing the card-relative parameter and tokenizer paths:
 
@@ -69,3 +69,16 @@ and reloading weights without recompiling, recovery after a reset streaming
 connection, and joined server shutdown. A preset check establishes these
 service and allocation contracts at its configured capacities; short requests
 do not establish quality or performance at the maximum context length.
+
+The separate `serve_source_long_context_native_test` and
+`serve_archive_long_context_mtp_native_test` targets exercise native context
+with target-only and speculative execution. Each prefills over 262,000 tokens,
+retrieves three facts placed at different depths through retained branches,
+and generates to exactly 262,144 total positions with both one- and eight-token
+output budgets. A fresh session also checks automatic prefix reuse. The checker
+then joins the server, starts it again, and replays the complete history with
+zero cached positions. This separates cold replay from retained correctness
+without changing production cache policy. These checks use the same externally
+provisioned assets and current built providers as the shorter service checks;
+they require two complete long prefills and do not measure broad long-context
+task quality or isolated throughput.

@@ -23,7 +23,8 @@ The target bank occupies approximately 103.68 GiB before request state, compiler
 | `chat` | `ud-q4-k-xl` | Four execution rows and 16,384-position contexts. |
 | `mtp` | `ud-q4-k-xl-mtp` | The same capacities with three recursive predictor proposals. |
 | `mtp-continuation` | `ud-q4-k-xl-mtp` | Three proposals and two-epoch continuation. |
-| `long-context` | `ud-q4-k-xl` | Eight rows and 131,072-position contexts. |
+| `long-context` | `ud-q4-k-xl` | Eight rows and 262,144-position contexts. |
+| `long-context-mtp` | `ud-q4-k-xl-mtp` | The same native-context capacities with three predictor proposals. |
 
 MTP remains part of the text service. The model card selects the predictor parameter scope and JIT configuration; deployment decides devices, process memory, and request admission. Request-time sampling remains a service option. These capacities are configuration contracts, not throughput or peak-memory estimates.
 
@@ -39,6 +40,6 @@ bazel test --config=asan --config=amdgpu \
   //model/Qwen/Qwen3.8-Flash-Next/test/...
 ```
 
-Each representation also has `_mtp`, `_mtp_continuation`, and `_long_context` targets. For example, `:archive_mtp` builds the compiled provider package selected by the `mtp` preset. Bazel builds program artifacts and records the card and asset lock as regression inputs; checkpoint bytes stay outside its graph. Editing programs or shared providers requires no lock update. An immutable publication can additionally seal its built program bytes with `loom-fetch --update-lock --lock-scope=all`; that generated lock stays with the published artifacts.
+Each representation also has `_mtp`, `_mtp_continuation`, `_long_context`, and `_long_context_mtp` targets. For example, `:archive_mtp` builds the compiled provider package selected by the `mtp` preset. Bazel builds program artifacts and records the card and asset lock as regression inputs; checkpoint bytes stay outside its graph. Editing programs or shared providers requires no lock update. An immutable publication can additionally seal its built program bytes with `loom-fetch --update-lock --lock-scope=all`; that generated lock stays with the published artifacts.
 
 The manual learned service tests accept a provisioned installation through `LOOM_MODEL_ASSETS` or `--assets`. They compare independent original-model responses, simultaneous checkpoint forks, continuation across a page boundary, fresh-history replay, weight deactivation/reactivation, client disconnect recovery, and joined shutdown. The [test guide](test/README.md) distinguishes those checks from the small numerical fixtures. The [program guide](program/README.md) describes preparation, recurrent ownership, sparse attention, and speculative publication.
