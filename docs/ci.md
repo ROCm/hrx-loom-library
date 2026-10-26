@@ -76,6 +76,11 @@ driver, device, and firmware identity also enters the Bazel test environment,
 so changing that environment invalidates execution results. Test caching remains
 enabled; run identity is not a test input.
 
+CI uses `--nobuild_runfile_links` to defer runfiles-tree creation until execution.
+Cached tests need no filesystem tree of interpreter, SDK, and data symlinks.
+Bazel still tracks the complete runfiles manifest and creates the execution
+environment for cache misses and `bazel run`.
+
 Bazel hashes individual SDK inputs, linked modules, cards, acquisition locks,
 and test/oracle inputs. Replacing a wheel does not invalidate a test merely
 because its archive checksum changed. Native tests still JIT their modules, so
