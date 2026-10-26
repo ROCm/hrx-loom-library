@@ -15,3 +15,8 @@ header documents the exact upstream reference and ABI, its `check.case`
 declarations exercise correctness, and its `check.benchmark` declarations name
 representative workloads. BUILD declarations add linkage and target
 qualification without moving shape configuration into package-global state.
+
+The [quantization checks](test/) add exact byte-level oracles for rounding,
+scale/sum metadata, and physical ordering through the production launch ABI.
+Small guarded fixtures exercise native, access, and race execution without
+model parameters.
