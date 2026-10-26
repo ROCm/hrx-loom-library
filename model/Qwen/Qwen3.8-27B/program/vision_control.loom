@@ -14,6 +14,66 @@ func.decl @qwen38_vision_pixel_packet(%request: buffer) -> (buffer)
 
 func.decl @qwen38_vision_stage(%height: i64, %width: i64, %count: i64) -> (i32)
 
+// Forecast the complete request before decoding pixels or activating weights.
+// Descriptors contain native image headers and chat metadata, not pixel planes.
+// Equal selected geometry permits sharing a cohort with up to three peers, so
+// retained storage includes their rows even when this request owns one image.
+func.def public @qwen38_vision_forecast_memory(%state: buffer, %ranges: buffer, %descriptors: buffer) -> (i64, i64, i64) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %zero64 = scalar.constant 0 : i64
+  %range_stride = scalar.constant 16 : i64
+  %range_bytes = buffer.length %ranges
+  %range_length = index.cast %range_bytes : offset to i64
+  %count_value = scalar.divui %range_length, %range_stride : i64
+  %count64 = scalar.assume %count_value [range(%count_value, 1, 4)] : i64
+  %count = index.cast %count64 : i64 to index
+  %records = buffer.view %ranges[%origin] : buffer -> view<[%count]x2xi64>
+  %total_rows, %largest_rows = scf.for %i = [%c0 to %count step %c1](%total = %zero64 : i64, %largest = %zero64 : i64) -> (i64, i64) {
+    %offset_value = view.load %records[%i, 0] : view<[%count]x2xi64> -> i64
+    %bounded_offset = scalar.assume %offset_value [range(%offset_value, 0, 9223372036854775807)] : i64
+    %offset = index.cast %bounded_offset : i64 to offset
+    %header = buffer.view %descriptors[%offset] : buffer -> view<16xi32>
+    %rows32 = view.load %header[7] : view<16xi32> -> i32
+    %rows = scalar.extui %rows32 : i32 to i64
+    %next_total = scalar.addi %total, %rows : i64
+    %larger = scalar.cmpi ugt, %rows, %largest : i64
+    %next_largest = scf.select %larger, %rows, %largest : i64
+    scf.yield %next_total, %next_largest : i64, i64
+  }
+  // The command reuses one workspace across images: four patch rows per
+  // feature, each with 4608 residual, 8 statistics, and 8608 activation bytes.
+  // Residuals are already 256-byte aligned; the other two buffers round up.
+  %residual_per_feature = scalar.constant 18432 : i64
+  %statistics_per_feature = scalar.constant 32 : i64
+  %activation_per_feature = scalar.constant 34432 : i64
+  %alignment_padding = scalar.constant 255 : i64
+  %alignment_mask = scalar.constant -256 : i64
+  %residual = scalar.muli %largest_rows, %residual_per_feature : i64
+  %statistics = scalar.muli %largest_rows, %statistics_per_feature : i64
+  %activation = scalar.muli %largest_rows, %activation_per_feature : i64
+  %statistics_padded = scalar.addi %statistics, %alignment_padding : i64
+  %activation_padded = scalar.addi %activation, %alignment_padding : i64
+  %statistics_aligned = scalar.andi %statistics_padded, %alignment_mask : i64
+  %activation_aligned = scalar.andi %activation_padded, %alignment_mask : i64
+  %intermediates = scalar.addi %statistics_aligned, %activation_aligned : i64
+  %workspace = scalar.addi %residual, %intermediates : i64
+  // The F16/F32 projector bank occupies 927592448 bytes; round to 1 GiB.
+  // Its direct-import policy needs no preparation staging. Peer images may
+  // have larger original pixel planes, so use the full prepared upload cap.
+  %parameter_capacity = scalar.constant 1073741824 : i64
+  %upload_capacity = scalar.constant 269746752 : i64
+  %fixed = scalar.addi %parameter_capacity, %upload_capacity : i64
+  %private_peak = scalar.addi %fixed, %workspace : i64
+  %feature_bytes = scalar.constant 20480 : i64
+  %cohort_capacity = scalar.constant 4 : i64
+  // F32 feature rows are already multiples of the 16-byte gather alignment.
+  %expanded = scalar.muli %total_rows, %feature_bytes : i64
+  %retained = scalar.muli %expanded, %cohort_capacity : i64
+  func.return %private_peak, %retained, %expanded : i64, i64, i64
+}
+
 // Chat policy owns the selected geometry. Native admission owns codec bounds;
 // only images with the same selected shape share a projection cohort.
 func.def public @text_image_prepare_request_v1(%state: buffer, %request: buffer) -> (buffer, i64, i64) {

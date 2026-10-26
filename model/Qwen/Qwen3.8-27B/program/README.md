@@ -59,6 +59,15 @@ feature ranges. Each 32×32 output pixel block becomes one 5120-element F32 row.
 prepare host; the runner owns device execution and storage. There is no second
 cohort-sized pixel copy.
 
+Cold preparation registers a descriptor-only memory forecast for bounded
+serving. It accounts for the projector bank, the upload ceiling, and the largest
+image's shared private workspace. Retained output estimates include a full
+four-image cohort for each image in the request because peer requests can share
+the allocation. Expanded feature storage counts only this request's rows.
+The forecast needs neither decoded pixels nor activated weights; it lets the
+text consumer check projection and continuation against the configured memory
+budget before either phase runs.
+
 The [tests](../test/README.md) check coefficient values, cohort feature plans,
 all eight display orientations, and RGB/RGBA device filtering independently of
 learned weights. The complete text and image-projector composition is described
