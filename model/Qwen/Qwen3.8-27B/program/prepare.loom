@@ -16,6 +16,14 @@ func.decl import("prepare") @parameter(%stage: i32, %binding: i32, %input: i32, 
 
 config.decl @qwen38.draft_kind : %value: i32 where [range(%value, 0, 1)]
 
+func.decl @qwen38.packet_capacity(%shapes: buffer, %shape_count: i64, %prefill: i64) -> (i64)
+
+func.decl @qwen38.allocation(%records: buffer, %slot: index, %bytes: i64, %initial_zero_bytes: i64)
+
+func.decl @qwen38.row_view(%records: buffer, %row_count: index, %row: index, %slot: index, %offset: i64, %length: i64)
+
+func.decl @qwen38_packet_bytes(%capacity: index) -> (offset)
+
 func.decl @qwen38.control_create(%packet_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer)
 
 func.decl @qwen38.proposal_level(%count: i32) -> (i32)
@@ -105,27 +113,6 @@ global.rodata.def @pool_key = bytes("7177656e33382e617474656e74696f6e2e706f6f6c5
 // runner.qwen38.mixed_inputs
 global.rodata.def @mixed_key = bytes("72756e6e65722e7177656e33382e6d697865645f696e70757473")
 
-// Packet storage follows prepared token shapes, independently of residents.
-func.def @packet_capacity(%shapes: buffer, %shape_count: i64, %prefill: i64) -> (i64) {
-  %origin = index.constant 0 : offset
-  %c0 = index.constant 0 : index
-  %c1 = index.constant 1 : index
-  %count_word = scalar.assume %shape_count [range(%shape_count, 0, 2147483647)] : i64
-  %count = index.cast %count_word : i64 to index
-  %records = buffer.view %shapes[%origin] : buffer -> view<[%count]x2xi64>
-  %maximum = scf.for %i = [%c0 to %count step %c1](%largest = %prefill : i64) -> (i64) {
-    %tokens = view.load %records[%i, 0] : view<[%count]x2xi64> -> i64
-    %next = scalar.maxui %tokens, %largest : i64
-    scf.yield %next : i64
-  }
-  %alignment = scalar.constant 2 : i64
-  %bias = scalar.constant 1 : i64
-  %padded = scalar.addi %maximum, %bias : i64
-  %units = scalar.divui %padded, %alignment : i64
-  %capacity = scalar.muli %units, %alignment : i64
-  func.return %capacity : i64
-}
-
 // qwen38.packet_capacity
 global.rodata.def @packet_capacity_key = bytes("7177656e33382e7061636b65745f6361706163697479")
 
@@ -155,32 +142,6 @@ func.def @declare_stage(%root: buffer, %tokens: i64, %spans: i64, %context: i64,
     func.call @parameter(%stage, %binding, %source, %model_source, %policy) : (i32, i32, i32, i32, buffer)
   }
   func.return %stage : i32
-}
-
-// Cold allocation records contain {bytes, alignment, initial_zero_bytes}.
-// The materializer owns the allocations and their completion frontiers;
-// model geometry and initialization extents belong to this source program.
-func.def @allocation(%records: buffer, %slot: index, %bytes: i64, %clear: i64) {
-  %origin = index.constant 0 : offset
-  %bounded_slot = index.assume %slot [range(%slot, 0, 10)] : index
-  %view = buffer.view %records[%origin] : buffer -> view<11x3xi64>
-  %alignment = scalar.constant 256 : i64
-  view.store %bytes, %view[%bounded_slot, 0] : i64, view<11x3xi64>
-  view.store %alignment, %view[%bounded_slot, 1] : i64, view<11x3xi64>
-  view.store %clear, %view[%bounded_slot, 2] : i64, view<11x3xi64>
-  func.return
-}
-
-// Private arena views are {byte_offset, byte_length}, in control/attention/
-// input/progress order. Recurrent slots have an independent geometry record.
-func.def @row_view(%records: buffer, %row_count: index, %row: index, %slot: index, %offset: i64, %length: i64) {
-  %origin = index.constant 0 : offset
-  %bounded_row = index.assume %row [range(%row, 0, 2147483647), lt(%row, %row_count)] : index
-  %bounded_slot = index.assume %slot [range(%slot, 0, 3)] : index
-  %view = buffer.view %records[%origin] : buffer -> view<[%row_count]x4x2xi64>
-  view.store %offset, %view[%bounded_row, %bounded_slot, 0] : i64, view<[%row_count]x4x2xi64>
-  view.store %length, %view[%bounded_row, %bounded_slot, 1] : i64, view<[%row_count]x4x2xi64>
-  func.return
 }
 
 // Fixed cache planes precede append-only private/recurrent slots. Increasing
@@ -227,10 +188,9 @@ func.def @qwen38.storage(%packet_capacity_arg: i64, %context: i64, %pool: i64, %
   %cohort_token_bytes = scalar.muli %packet_capacity, %two_plane_stride : i64
   %progress_bytes = scalar.constant 32 : i64
   %progress_extent = scalar.constant 256 : i64
-  %packet_stride = scalar.constant 112 : i64
-  %packet_overhead = scalar.constant 40 : i64
-  %packet_payload = scalar.muli %packet_capacity, %packet_stride : i64
-  %metadata_bytes = scalar.addi %packet_payload, %packet_overhead : i64
+  %packet_count = index.cast %packet_capacity : i64 to index
+  %packet_extent = func.call @qwen38_packet_bytes(%packet_count) : (index) -> (offset)
+  %metadata_bytes = index.cast %packet_extent : offset to i64
   %descriptor_stride = scalar.constant 24 : i64
   %descriptor_header = scalar.constant 12 : i64
   %descriptor_bytes = scalar.muli %packet_capacity, %descriptor_stride : i64
@@ -264,26 +224,26 @@ func.def @qwen38.storage(%packet_capacity_arg: i64, %context: i64, %pool: i64, %
   %draft_bytes = scf.select %pooled, %pooled_draft_bytes, %dense_draft_bytes : i64
   %allocation_bytes = index.constant 264 : offset
   %allocations = buffer.alloca<private> align(8) %allocation_bytes : buffer
-  func.call @allocation(%allocations, %c0, %residual_bytes, %residual_bytes) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c1, %arena_bytes, %zero64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c0, %residual_bytes, %residual_bytes) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c1, %arena_bytes, %zero64) : (buffer, index, i64, i64)
   %packed_metadata = scf.select %packed, %metadata_bytes, %zero64 : i64
   %packed_table = scf.select %packed, %table_bytes, %zero64 : i64
   %packed_tokens = scf.select %packed, %cohort_token_bytes, %zero64 : i64
   %packed_outputs = scf.select %packed, %output_bytes, %zero64 : i64
-  func.call @allocation(%allocations, %c2, %packed_metadata, %zero64) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c3, %packed_table, %zero64) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c4, %packed_tokens, %zero64) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c5, %packed_outputs, %zero64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c2, %packed_metadata, %zero64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c3, %packed_table, %zero64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c4, %packed_tokens, %zero64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c5, %packed_outputs, %zero64) : (buffer, index, i64, i64)
   %mtp_carry = scf.select %mtp, %carry_bytes, %zero64 : i64
   %draft_committed = scf.select %enabled, %committed_bytes, %zero64 : i64
   %draft_results = scf.select %enabled, %result_bytes, %zero64 : i64
   %draft_cache = scf.select %enabled, %draft_bytes, %zero64 : i64
   %draft_table = scf.select %enabled, %table_bytes, %zero64 : i64
-  func.call @allocation(%allocations, %c6, %mtp_carry, %mtp_carry) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c7, %draft_committed, %zero64) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c8, %draft_results, %zero64) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c9, %draft_cache, %zero64) : (buffer, index, i64, i64)
-  func.call @allocation(%allocations, %c10, %draft_table, %zero64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c6, %mtp_carry, %mtp_carry) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c7, %draft_committed, %zero64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c8, %draft_results, %zero64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c9, %draft_cache, %zero64) : (buffer, index, i64, i64)
+  func.call @qwen38.allocation(%allocations, %c10, %draft_table, %zero64) : (buffer, index, i64, i64)
   %row_count = index.cast %rows : i64 to index
   %view_stride = index.constant 64 : offset
   %view_bytes = index.scale %row_count, %view_stride : index, offset -> offset
@@ -313,10 +273,10 @@ func.def @qwen38.storage(%packet_capacity_arg: i64, %context: i64, %pool: i64, %
     %attention_base = scalar.addi %base, %attention_offset : i64
     %tokens_base = scalar.addi %base, %tokens_offset : i64
     %progress_base = scalar.addi %base, %progress_offset : i64
-    func.call @row_view(%views, %row_count, %i, %c0, %base, %control_bytes) : (buffer, index, index, index, i64, i64)
-    func.call @row_view(%views, %row_count, %i, %c1, %attention_base, %attention_bytes) : (buffer, index, index, index, i64, i64)
-    func.call @row_view(%views, %row_count, %i, %c2, %tokens_base, %token_bytes) : (buffer, index, index, index, i64, i64)
-    func.call @row_view(%views, %row_count, %i, %c3, %progress_base, %progress_bytes) : (buffer, index, index, index, i64, i64)
+    func.call @qwen38.row_view(%views, %row_count, %i, %c0, %base, %control_bytes) : (buffer, index, index, index, i64, i64)
+    func.call @qwen38.row_view(%views, %row_count, %i, %c1, %attention_base, %attention_bytes) : (buffer, index, index, index, i64, i64)
+    func.call @qwen38.row_view(%views, %row_count, %i, %c2, %tokens_base, %token_bytes) : (buffer, index, index, index, i64, i64)
+    func.call @qwen38.row_view(%views, %row_count, %i, %c3, %progress_base, %progress_bytes) : (buffer, index, index, index, i64, i64)
     %kv_base = scf.select %pooled, %zero64, %attention_base : i64
     view.store %gdn_base, %target[%i, 0] : i64, view<[%row_count]x5xi64>
     view.store %gdn_base, %target[%i, 1] : i64, view<[%row_count]x5xi64>
@@ -490,7 +450,7 @@ func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i6
 // Commands, specialization and their shared checkpoint identity are source
 // policy. Returned state is interpreted only by control.loom.
 func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %draft_depth: i32, %shapes: buffer, %shape_count: i64, %weights: buffer, %options: buffer) -> (i64, i32, buffer, buffer, buffer, buffer, buffer, buffer, buffer) {
-  %packet_capacity = func.call @packet_capacity(%shapes, %shape_count, %prefill) : (buffer, i64, i64) -> (i64)
+  %packet_capacity = func.call @qwen38.packet_capacity(%shapes, %shape_count, %prefill) : (buffer, i64, i64) -> (i64)
   %origin = index.constant 0 : offset
   %zero32 = scalar.constant 0 : i32
   %one32 = scalar.constant 1 : i32

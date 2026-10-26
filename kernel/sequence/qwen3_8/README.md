@@ -39,3 +39,28 @@ batches, every proposal round, large ordinary planes, non-vector tails,
 retirement boundaries, and overlapping mixed-media records. Whole-buffer
 comparisons detect writes outside the owned output. The shared text-program
 tests additionally exercise continuation after real image-packet encoding.
+
+Acceptance uses sixteen frontier trials: widths one through eight in each
+input layout. Multi-span fixtures mix speculative, known, and hidden spans,
+with separate EOS and credit-limited rows; one trial covers a single span.
+EOS reaches its selected middle or final position without an earlier injected
+mismatch; output credit includes zero.
+Two empty epochs and five wide cohorts independently cover empty publication
+and span counts beyond ordinary packing boundaries. These explicit combinations
+retain complete output and immutable-input checks without multiplying every
+width, capacity, span count, and stopping position together.
+
+Proposal preparation has twelve explicit combinations covering empty, sparse,
+and full drafts, minimum storage, each four-wide clear tail, high mask bits,
+and mask wrap at 32 and 64 spans. Publication covers every round in each input
+layout, followed by three- and seven-round chains. The thirty total samples
+check complete descriptor, origin, input, and target buffers against the
+independent fixture; a full 65-row draft exercises the last allocated slot.
+
+Continuation admission uses fifteen explicit cases. Every proposal width from
+two through eight fits exactly at its causal frontier with two outputs left;
+the reserved speculative width may exceed that remaining output credit.
+One-token-short contexts, exhausted context, zero/single-output credit, and EOS
+independently reject continuation. Each case supplies literal expected liveness
+and checks the complete active token plane and first-result identity tags.
+The large ordinary-plane and overlapping media-compaction checks remain separate.

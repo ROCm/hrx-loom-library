@@ -38,9 +38,16 @@ those carriers, including carriers already staged in shared memory. Both
 16-value halves can reuse the original header across several activation
 rows; consumers own the affine arithmetic and its rounding boundaries.
 
-Q6_K offers signed carrier unpacking and a buffered four-value F16 reader
-for matrix staging. It handles the format's alternating word alignment
-across 210-byte blocks. Q8_1 x4 readers expose a full 32-value block, a
+Q6_K offers signed I8 carrier unpacking, unscaled four-code F32 packets,
+retained pairs of F32 coefficients, and a buffered four-value F16 reader.
+A coefficient pair covers one 32-value group and can stay resident across
+its eight code packets. Consumers own metadata staging and coefficient
+application; the F16 reader owns its single rounding boundary. Buffer readers
+handle the alternating word alignment across 210-byte blocks. Small record
+tests check codes, coefficients, and rounded values independently against a
+scalar byte-level oracle, including row padding and output guards.
+
+Q8_1 x4 readers expose a full 32-value block, a
 16-value half-block, or one four-value word. Full and half-block readers
 return the original block scale and scaled sum; consumers own any affine
 minimum correction, including how paired half-blocks share that sum.

@@ -65,6 +65,10 @@ Canonical text and authoring policy are independent gates. `loom-format` parses,
 
 ## Correctness and benchmark programs
 
+The [component-authoring guide](docs/component-authoring.md) connects these
+requirements to production callers, bounded tests, and complete ownership
+changes using examples from the library.
+
 A `check.case` is an executable statement of behavior, not merely sample data. Cases cover the contracts most likely to be lost during specialization: signedness, byte and lane order, extrema, tails, non-power-of-two extents, dynamic dimensions, aliasing, and numerical tolerance. Expected values come from a transparent reference or independently established oracle.
 
 Keeping a production kernel and its cases in one `.loom` file is the shortest iteration loop: a reproducer can be formatted, planned, compiled, and executed without a build-system edit. Larger packages may split implementation and checks into separate source files in the same library. Motifs use test-only wrapper kernels only when no production kernel already exercises the same carrier; a second wrapper that duplicates an existing launch surface adds code without adding evidence.
