@@ -23,22 +23,22 @@ covers Linux and Windows prerequisites and SDK installation.
 With the SDK installed, fetch this model directly from its publication URL:
 
 ```sh
-loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/4317508bf5adb251a284ea8dc4e5a24a11bd1c17/model/moonshine-ai/moonshine-streaming-tiny/model.json --list
-loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/4317508bf5adb251a284ea8dc4e5a24a11bd1c17/model/moonshine-ai/moonshine-streaming-tiny/model.json --preset=streaming --output=./moonshine
+loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/moonshine-ai/moonshine-streaming-tiny/model.json --list
+loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/moonshine-ai/moonshine-streaming-tiny/model.json --preset=streaming --output=./moonshine
 ```
 
-These URLs pin one library revision. Fetch checks its adjacent acquisition
-lock, installs only the selected program and asset files, and shares available
+Replace `main` with a commit to select a specific library revision. Fetch checks
+the adjacent asset lock, copies the selected programs, and shares available
 cached weights. The resulting `moonshine/model.json` describes local files and
 needs no network access to run. A repository checkout can use its local
 `model/moonshine-ai/moonshine-streaming-tiny/model.json` with the same commands.
 Neither path requires a Bazel build.
 
-The checked-in lock covers the default `source` program set. The server JIT
-compiles those authored Loom programs with the SDK's compiler. Bytecode and
-mixed packages are produced separately by model publishers and use the same
-fetch-and-serve workflow. The `streaming` preset selects source here; its name
-does not imply a file format or a request transport.
+The checked-in lock covers assets independently of program representation. The
+server JIT compiles those authored Loom programs with the SDK's compiler.
+Bytecode and mixed packages are produced separately by model publishers and use
+the same fetch-and-serve workflow. The `streaming` preset selects source here;
+its name does not imply a file format or a request transport.
 
 The fetched card retains the selected preset, so it can be passed directly to
 `loom-serve`. Requests use the card's model ID,

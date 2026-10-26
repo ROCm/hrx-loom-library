@@ -17,13 +17,19 @@ separate execution profiles and can run with the Release SDK.
 | Job suffix | Work |
 | --- | --- |
 | `Host` | Source policy, formatting, linking, model-card checks, generated oracles, and CPU/VM tests. |
-| `AMD gfx942`, `AMD gfx110x`, `AMD gfx1151`, `AMD gfx120x` | Declared `amd_gpu_hardware` correctness and benchmark-smoke tests. |
-| `AMD gfx1150 GPU + NPU4` | The GPU checks plus declared `xdna_hardware` checks, with both device classes exposed. |
+| `AMD gfx942`, `AMD gfx110x`, `AMD gfx1151`, `AMD gfx120x` | Native AMD GPU correctness, instrumentation, and benchmark-smoke tests. |
+| `AMD gfx1150 GPU + NPU4` | The GPU checks plus native XDNA tests, with both device classes exposed. |
 
 Hardware jobs are advisory while the runner/model combinations are qualified.
-They select tests through public execution-profile tags. Adding a model or
-motif with an existing profile requires no workflow edit. A new device family
-needs an SDK containing its runtime, an appropriate runner, and its execution
+Jobs select tests through the public `iree-run-requirement` tags. Host runs
+tests without special resource requirements; GPU and NPU jobs run profiles
+whose required resources are all available, including instrumented profiles.
+Source and compile checks remain in Host. Explicit target selection
+preserves configured incompatibility skips, such as the source-only request
+API check described below.
+
+Adding a model or motif with an existing resource requires no workflow edit.
+A new device family needs an SDK containing its runtime, an appropriate runner, and its execution
 profile in the matrix. Full learned-model checks stay manual and use externally
 provisioned assets; no model weights are downloaded by these CI jobs.
 

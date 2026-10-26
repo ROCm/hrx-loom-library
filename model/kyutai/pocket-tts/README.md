@@ -99,7 +99,7 @@ output tree:
 ```sh
 mkdir -p .reports/pocket
 PROGRAMS="$(realpath bazel-bin/model/kyutai/pocket-tts/mixed)"
-loom-fetch "$PROGRAMS/model.json" --offline --update-lock \
+loom-fetch "$PROGRAMS/model.json" --offline --update-lock --lock-scope=all \
   --lockfile="$PWD/.reports/pocket/mixed.lock.json" \
   --output="$PWD/.reports/pocket/mixed"
 ```
@@ -152,14 +152,14 @@ Uploaded voices last until removal or model unloading; the original recordings
 in a card are registered again at startup. Recording licenses apply separately
 from the model checkpoint.
 
-After changing published assets or providers, replace the source lock with
-exactly the compatible source variants:
+After changing published assets, replace the asset lock with exactly the
+compatible variants. Program edits require no lock update:
 
 ```sh
 loom-fetch model/kyutai/pocket-tts/model.json \
-  --update-lock --all-variants --programs=source
+  --update-lock --all-variants
 ```
 
 The full checkpoint stays in the normal fetch cache. Origin overrides and
-`--offline` apply to this operation, and unchanged sources are acquired only
+`--offline` apply to this operation, and shared assets are acquired only
 once even when several variants share them.

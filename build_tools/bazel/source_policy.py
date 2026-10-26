@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from collections import defaultdict
@@ -161,6 +162,20 @@ def check_repository(repository_root: Path) -> list[str]:
                     )
     for card_path in sorted((repository_root / "model").rglob("model.json")):
         relative_directory = card_path.parent.relative_to(repository_root)
+        lock_path = card_path.with_name("model.json.lock")
+        if lock_path.is_file():
+            lock = json.loads(lock_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(lock, dict)
+                or lock.get("schema_version") != 2
+                or lock.get("scope") != "assets"
+            ):
+                violations.append(
+                    f"{lock_path.relative_to(repository_root)}: authored locks "
+                    "require version 2 asset scope; refresh with loom-fetch "
+                    "--update-lock --all-variants. Complete publication locks "
+                    "belong in generated outputs."
+                )
         build_path = card_path.with_name("BUILD.bazel")
         if not build_path.is_file():
             violations.append(

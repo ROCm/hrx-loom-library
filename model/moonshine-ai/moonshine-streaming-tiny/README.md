@@ -5,9 +5,10 @@ model behavior, and supported inputs. This page covers provider builds and
 independent execution checks from a library checkout.
 
 Running the default source model with installed `loom-fetch` and `loom-serve`
-requires no Bazel build. The checked-in `model.json.lock` covers that source
-selection. Serve the fetched `model.json` directly. Follow the
-overview for this user workflow; the commands below are for model development.
+requires no Bazel build. The checked-in `model.json.lock` covers the model's
+assets while programs remain editable. Serve the fetched `model.json` directly.
+Follow the overview for this user workflow; the commands below are for model
+development.
 
 ## Provider builds
 
@@ -66,10 +67,13 @@ The explicit lock lives outside `bazel-bin`; acquisition never writes beside a
 generated build input. Resolving the program directory immediately after its
 build keeps later Bazel invocations from redirecting it through a changed
 `bazel-bin` configuration symlink. `--update-lock` records the exact selected
-development inputs; subsequent fetches use the same `--lockfile` without `--update-lock` to
-check those identities. The installed `model.json` is published only after all
-selected files have been acquired successfully. Default shared materialization
-reuses cache files rather than making one weight copy per provider choice.
+asset identities; subsequent fetches use the same `--lockfile` without
+`--update-lock` to check those assets while preserving program edits. Add
+`--lock-scope=all` when generating an immutable publication that also seals
+the built program bytes. The installed `model.json` is published only after all
+selected files have been acquired successfully. Default materialization copies
+programs and shares assets rather than making one weight copy per provider
+choice.
 The installed card serves directly; its model ID is the request selector.
 Use `archive` and `mixed` to install the other representations independently.
 
