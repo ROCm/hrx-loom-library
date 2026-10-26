@@ -24,9 +24,14 @@ Hardware jobs are advisory while the runner/model combinations are qualified.
 Jobs select tests through the public `iree-run-requirement` tags. Host runs
 tests without special resource requirements; GPU and NPU jobs run profiles
 whose required resources are all available, including instrumented profiles.
-Source and compile checks remain in Host. Explicit target selection
-preserves configured incompatibility skips, such as the source-only request
-API check described below.
+Source and compile checks remain in Host. Each lane tests `//...` with
+`--build_tests_only` and one `--test_tag_filters` argument. The CI resource
+selector reads the actual query tags, excludes every unavailable resource,
+and includes hardware tests only
+when the lane declares hardware. The matrix lists available resources; adding
+a requirement cannot silently admit a test onto a runner missing that resource.
+Wildcard selection preserves configured incompatibility skips, such as the
+source-only request API check described below.
 
 Adding a model or motif with an existing resource requires no workflow edit.
 A new device family needs an SDK containing its runtime, an appropriate runner, and its execution
@@ -79,7 +84,7 @@ produce identical code. Removing that dependency requires separating the
 compiler action from execution and making its complete compiled product the
 test input; hiding a compiler dependency from the current JIT test is incorrect.
 
-Job artifacts retain Bazel profiles, selected target lists, and hardware
+Job artifacts retain Bazel profiles, selected resource filters, and hardware
 identity. Compare action execution with cache hits before attributing a job's
 wall time to compilation. Correctness benchmark-smoke timings are not isolated
 performance measurements; the [benchmark workflow](development.md#sweep-repository-benchmarks)
