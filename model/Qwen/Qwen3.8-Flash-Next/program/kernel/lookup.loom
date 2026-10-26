@@ -1,0 +1,365 @@
+// Paged accepted-history predictor. Query construction joins the committed
+// history with the pending proposal chain. A trigram bitset narrows candidates
+// to the newest sixteen matches; backward comparison chooses the longest
+// suffix, breaking ties toward the newest occurrence. Selection returns an
+// exclusive history end and a matched length, not a verified target token.
+// Cohort publication owns whether the complete remaining tail can be copied.
+// All scratch is overwritten by its producer; no buffer clear is required.
+
+amdgpu.target<gfx11-generic> @flash_next_lookup_wave32 {subgroup_size = 32}
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+config.decl @flash_next.context_capacity : %value: index where [range(%value, 64, 262144), multiple_of(%value, 64)]
+
+config.decl @flash_next.pool_capacity : %value: index where [range(%value, 64, 4194304), multiple_of(%value, 64)]
+
+func.decl @flash_next_physical_token(%rows: buffer, %row: index, %position: index) -> (index)
+
+func.decl @flash_next_lookup_history_origin(%rows: buffer, %row: index) -> (offset)
+
+func.def public inline @flash_next_lookup_id(%rows: buffer, %cache: buffer, %parameters: buffer, %slot: index, %position: index) -> (i32) {
+  %capacity = config.get @flash_next.token_count : index
+  %pool = config.get @flash_next.pool_capacity : index
+  %c0 = index.constant 0 : offset
+  %records = buffer.view %parameters[%c0] : buffer -> view<[%capacity]x16xi32>
+  %row_word = view.load %records[%slot, 7] : view<[%capacity]x16xi32> -> i32
+  %row_value = index.cast %row_word : i32 to index
+  %row = index.assume %row_value [range(%row_value, 0, 2147483647)] : index
+  %origin = func.call @flash_next_lookup_history_origin(%rows, %row) : (buffer, index) -> (offset)
+  %physical = func.call @flash_next_physical_token(%rows, %row, %position) : (buffer, index, index) -> (index)
+  %history = buffer.view %cache[%origin] : buffer -> view<[%pool]xi32>
+  %id = view.load %history[%physical] : view<[%pool]xi32> -> i32
+  func.return %id : i32
+}
+
+// Each 16-I32 query record contains committed and indexed frontiers, request
+// start and resume positions (-1 when absent), pending-tail length, minimum
+// match length, require-resume flag, resident row, and eight pending token IDs.
+// Only the committed frontier makes history readable; reserved pages can hold
+// rejected proposals. Queries contain 64 newest-first IDs and a length bound.
+kernel.def @flash_next_lookup_query() {
+  %rows = config.get @flash_next.token_count : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer) {
+  %rows = config.get @flash_next.token_count : index
+  %row = kernel.workgroup.id<x> : index
+  %thread = kernel.workitem.id<x> : index
+  %origin = index.constant 0 : offset
+  %records = buffer.view %parameters[%origin] : buffer -> view<[%rows]x16xi32>
+  %queries = buffer.view %query[%origin] : buffer -> view<[%rows]x65xi32>
+  %committed_word = view.load %records[%row, 0] : view<[%rows]x16xi32> -> i32
+  %tail_word = view.load %records[%row, 4] : view<[%rows]x16xi32> -> i32
+  %committed_value = index.cast %committed_word : i32 to index
+  %tail_value = index.cast %tail_word : i32 to index
+  %committed = index.assume %committed_value [range(%committed_value, 0, 262144)] : index
+  %tail = index.assume %tail_value [range(%tail_value, 0, 8)] : index
+  %context = index.add %committed, %tail : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %distance = index.add %thread, %c1 : index
+  %available = index.cmp ule, %distance, %context : index
+  %value = scf.if %available -> (i32) {
+    %position = index.sub %context, %distance : index
+    %in_history = index.cmp ult, %position, %committed : index
+    %token = scf.if %in_history -> (i32) {
+      %loaded = func.call @flash_next_lookup_id(%maps, %history, %parameters, %row, %position) : (buffer, buffer, buffer, index, index) -> (i32)
+      scf.yield %loaded : i32
+    } else {
+      %relative = index.sub %position, %committed : index
+      %c8 = index.constant 8 : index
+      %slot = index.add %relative, %c8 : index
+      %loaded = view.load %records[%row, %slot] : view<[%rows]x16xi32> -> i32
+      scf.yield %loaded : i32
+    }
+    scf.yield %token : i32
+  } else {
+    %unused = scalar.constant 0 : i32
+    scf.yield %unused : i32
+  }
+  view.store %value, %queries[%row, %thread] : i32, view<[%rows]x65xi32>
+  %leader = index.cmp eq, %thread, %c0 : index
+  scf.if %leader {
+    %start_word = view.load %records[%row, 2] : view<[%rows]x16xi32> -> i32
+    %resume = view.load %records[%row, 3] : view<[%rows]x16xi32> -> i32
+    %minimum = view.load %records[%row, 5] : view<[%rows]x16xi32> -> i32
+    %required = view.load %records[%row, 6] : view<[%rows]x16xi32> -> i32
+    %sentinel = scalar.constant -1 : i32
+    %c0_i32 = scalar.constant 0 : i32
+    %no_start = scalar.cmpi eq, %start_word, %sentinel : i32
+    %bounded_start = scf.select %no_start, %c0_i32, %start_word : i32
+    %start = index.cast %bounded_start : i32 to index
+    %clipped_start = index.min %start, %context : index
+    %generated = index.sub %context, %clipped_start : index
+    %c64 = index.constant 64 : index
+    %maximum = index.min %generated, %c64 : index
+    %maximum_word = index.cast %maximum : index to i32
+    %no_resume = scalar.cmpi eq, %resume, %sentinel : i32
+    %too_short = scalar.cmpi ult, %maximum_word, %minimum : i32
+    %unavailable = scalar.ori %no_resume, %too_short : i1
+    %required_flag = scalar.cmpi ne, %required, %c0_i32 : i32
+    %blocked = scalar.andi %required_flag, %unavailable : i1
+    %bound = scf.select %blocked, %c0_i32, %maximum_word : i32
+    view.store %bound, %queries[%row, 64] : i32, view<[%rows]x65xi32>
+  }
+  kernel.return
+}
+
+// One ID per lane plus three boundary-halo loads per wave. Each 1024-token
+// workgroup writes every owned bitset word and its 32-word summary, including
+// empty words. The bit index names a three-token window's first position.
+kernel.def target(@flash_next_lookup_wave32) @flash_next_lookup_scan() {
+  %capacity = config.get @flash_next.context_capacity : index
+  %rows = config.get @flash_next.token_count : index
+  %block = index.constant 1024 : index
+  %block_tail = index.constant 1023 : index
+  %rounded_capacity = index.add %capacity, %block_tail : index
+  %groups = index.div %rounded_capacity, %block : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%groups, %rows, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer) {
+  %capacity = config.get @flash_next.context_capacity : index
+  %rows = config.get @flash_next.token_count : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c32 = index.constant 32 : index
+  %block = index.constant 1024 : index
+  %threads = index.constant 128 : index
+  %block_tail = index.constant 1023 : index
+  %rounded_capacity = index.add %capacity, %block_tail : index
+  %groups = index.div %rounded_capacity, %block : index
+  %words = index.mul %groups, %c32 : index
+  %group = kernel.workgroup.id<x> : index
+  %row = kernel.workgroup.id<y> : index
+  %thread = kernel.workitem.id<x> : index
+  %lane = kernel.subgroup.lane.id : index
+  %origin = index.constant 0 : offset
+  %records = buffer.view %parameters[%origin] : buffer -> view<[%rows]x16xi32>
+  %queries = buffer.view %query[%origin] : buffer -> view<[%rows]x65xi32>
+  %bits = buffer.view %matches[%origin] : buffer -> view<[%rows]x[%words]xi32>
+  %summary = buffer.view %summaries[%origin] : buffer -> view<[%rows]x[%groups]xi32>
+  %indexed_word = view.load %records[%row, 1] : view<[%rows]x16xi32> -> i32
+  %indexed_value = index.cast %indexed_word : i32 to index
+  %indexed = index.assume %indexed_value [range(%indexed_value, 0, 262144), le(%indexed_value, %capacity)] : index
+  %key0 = view.load %queries[%row, 2] : view<[%rows]x65xi32> -> i32
+  %key1 = view.load %queries[%row, 1] : view<[%rows]x65xi32> -> i32
+  %key2 = view.load %queries[%row, 0] : view<[%rows]x65xi32> -> i32
+  %maximum = view.load %queries[%row, 64] : view<[%rows]x65xi32> -> i32
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %c2_i32 = scalar.constant 2 : i32
+  %c3_i32 = scalar.constant 3 : i32
+  %width_word = scalar.constant 32 : i32
+  %enough_query = scalar.cmpi uge, %maximum, %c3_i32 : i32
+  %base = index.mul %group, %block : index
+  %lane_leader = index.cmp eq, %lane, %c0 : index
+  %local_summary = scf.for %iteration = [%c0 to %block step %threads](%accumulated = %c0_i32 : i32) -> (i32) {
+    %local = index.add %iteration, %thread : index
+    %position = index.add %base, %local : index
+    %readable = index.cmp ult, %position, %indexed : index
+    %token = scf.if %readable -> (i32) {
+      %loaded = func.call @flash_next_lookup_id(%maps, %history, %parameters, %row, %position) : (buffer, buffer, buffer, index, index) -> (i32)
+      scf.yield %loaded : i32
+    } else {
+      scf.yield %c0_i32 : i32
+    }
+    %neighbor1, %valid1 = kernel.subgroup.shuffle<down> %token, %c1_i32, %width_word : i32, i32, i32
+    %neighbor2, %valid2 = kernel.subgroup.shuffle<down> %token, %c2_i32, %width_word : i32, i32, i32
+    %next1 = scf.if %valid1 -> (i32) {
+      scf.yield %neighbor1 : i32
+    } else {
+      %position1 = index.add %position, %c1 : index
+      %readable1 = index.cmp ult, %position1, %indexed : index
+      %halo1 = scf.if %readable1 -> (i32) {
+        %loaded = func.call @flash_next_lookup_id(%maps, %history, %parameters, %row, %position1) : (buffer, buffer, buffer, index, index) -> (i32)
+        scf.yield %loaded : i32
+      } else {
+        scf.yield %c0_i32 : i32
+      }
+      scf.yield %halo1 : i32
+    }
+    %next2 = scf.if %valid2 -> (i32) {
+      scf.yield %neighbor2 : i32
+    } else {
+      %position2 = index.add %position, %c2 : index
+      %readable2 = index.cmp ult, %position2, %indexed : index
+      %halo2 = scf.if %readable2 -> (i32) {
+        %loaded = func.call @flash_next_lookup_id(%maps, %history, %parameters, %row, %position2) : (buffer, buffer, buffer, index, index) -> (i32)
+        scf.yield %loaded : i32
+      } else {
+        scf.yield %c0_i32 : i32
+      }
+      scf.yield %halo2 : i32
+    }
+    %end = index.add %position, %c3 : index
+    %has_continuation = index.cmp ult, %end, %indexed : index
+    %eligible = scalar.andi %has_continuation, %enough_query : i1
+    %equal0 = scalar.cmpi eq, %token, %key0 : i32
+    %equal1 = scalar.cmpi eq, %next1, %key1 : i32
+    %equal2 = scalar.cmpi eq, %next2, %key2 : i32
+    %equal01 = scalar.andi %equal0, %equal1 : i1
+    %equal012 = scalar.andi %equal01, %equal2 : i1
+    %matched = scalar.andi %eligible, %equal012 : i1
+    %mask = kernel.subgroup.vote.ballot %matched : i1 -> i32
+    %local_word = index.div %local, %c32 : index
+    %word = index.div %position, %c32 : index
+    scf.if %lane_leader {
+      view.store %mask, %bits[%row, %word] : i32, view<[%rows]x[%words]xi32>
+    }
+    %shift = index.cast %local_word : index to i32
+    %word_bit = scalar.shli %c1_i32, %shift : i32
+    %nonempty = scalar.cmpi ne, %mask, %c0_i32 : i32
+    %summary_bit = scf.select %nonempty, %word_bit, %c0_i32 : i32
+    %combined = scalar.ori %accumulated, %summary_bit : i32
+    scf.yield %combined : i32
+  }
+  %combined_summary = kernel.workgroup.reduce<ori> %local_summary : i32
+  %leader = index.cmp eq, %thread, %c0 : index
+  scf.if %leader {
+    view.store %combined_summary, %summary[%row, %group] : i32, view<[%rows]x[%groups]xi32>
+  }
+  kernel.return
+}
+
+// All lanes enumerate the same newest sixteen occurrences; one candidate
+// belongs to each of the first sixteen lanes. The backward match is parallel,
+// and the final score prefers longer matches, then the newest occurrence.
+kernel.def target(@flash_next_lookup_wave32) @flash_next_lookup_select() {
+  %rows = config.get @flash_next.token_count : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer, %output: buffer) {
+  %capacity = config.get @flash_next.context_capacity : index
+  %rows = config.get @flash_next.token_count : index
+  %row = kernel.workgroup.id<x> : index
+  %lane = kernel.subgroup.lane.id : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %block = index.constant 1024 : index
+  %block_tail = index.constant 1023 : index
+  %rounded_capacity = index.add %capacity, %block_tail : index
+  %groups = index.div %rounded_capacity, %block : index
+  %words = index.mul %groups, %c32 : index
+  %origin = index.constant 0 : offset
+  %records = buffer.view %parameters[%origin] : buffer -> view<[%rows]x16xi32>
+  %queries = buffer.view %query[%origin] : buffer -> view<[%rows]x65xi32>
+  %bits = buffer.view %matches[%origin] : buffer -> view<[%rows]x[%words]xi32>
+  %summary = buffer.view %summaries[%origin] : buffer -> view<[%rows]x[%groups]xi32>
+  %results = buffer.view %output[%origin] : buffer -> view<[%rows]x2xi32>
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %c31_i32 = scalar.constant 31 : i32
+  %all_bits = scalar.constant -1 : i32
+  %remaining_groups, %candidate_count, %selected_end = scf.while(%remaining = %groups : index, %count = %c0 : index, %selected = %c0 : index) -> (index, index, index) {
+    %has_group = index.cmp ugt, %remaining, %c0 : index
+    %has_slot = index.cmp ult, %count, %c16 : index
+    %continue = scalar.andi %has_group, %has_slot : i1
+    scf.condition %continue, %remaining, %count, %selected : i1, index, index, index
+  } do(%remaining: index, %count: index, %selected: index) {
+    %group = index.sub %remaining, %c1 : index
+    %initial_summary = view.load %summary[%row, %group] : view<[%rows]x[%groups]xi32> -> i32
+    %unused_summary, %word_count, %word_selected = scf.while(%word_mask = %initial_summary : i32, %before_count = %count : index, %before_selected = %selected : index) -> (i32, index, index) {
+      %has_word = scalar.cmpi ne, %word_mask, %c0_i32 : i32
+      %has_slot = index.cmp ult, %before_count, %c16 : index
+      %continue = scalar.andi %has_word, %has_slot : i1
+      scf.condition %continue, %word_mask, %before_count, %before_selected : i1, i32, index, index
+    } do(%word_mask: i32, %before_count: index, %before_selected: index) {
+      %leading = scalar.ctlzi %word_mask : i32
+      %word_bit = scalar.subi %c31_i32, %leading : i32
+      %word_index = index.cast %word_bit : i32 to index
+      %word = index.madd %group, %c32, %word_index : index
+      %initial_mask = view.load %bits[%row, %word] : view<[%rows]x[%words]xi32> -> i32
+      %unused_mask, %after_count, %after_selected = scf.while(%mask = %initial_mask : i32, %position_count = %before_count : index, %position_selected = %before_selected : index) -> (i32, index, index) {
+        %has_bit = scalar.cmpi ne, %mask, %c0_i32 : i32
+        %has_slot = index.cmp ult, %position_count, %c16 : index
+        %continue = scalar.andi %has_bit, %has_slot : i1
+        scf.condition %continue, %mask, %position_count, %position_selected : i1, i32, index, index
+      } do(%mask: i32, %position_count: index, %position_selected: index) {
+        %leading = scalar.ctlzi %mask : i32
+        %position_bit = scalar.subi %c31_i32, %leading : i32
+        %within = index.cast %position_bit : i32 to index
+        %position = index.madd %word, %c32, %within : index
+        %end = index.add %position, %c3 : index
+        %owns = index.cmp eq, %lane, %position_count : index
+        %next_selected = scf.select %owns, %end, %position_selected : index
+        %next_count = index.add %position_count, %c1 : index
+        %selected_bit = scalar.shli %c1_i32, %position_bit : i32
+        %keep_bits = scalar.xori %selected_bit, %all_bits : i32
+        %next_mask = scalar.andi %mask, %keep_bits : i32
+        scf.yield %next_mask, %next_count, %next_selected : i32, index, index
+      }
+      %selected_word = scalar.shli %c1_i32, %word_bit : i32
+      %keep_words = scalar.xori %selected_word, %all_bits : i32
+      %next_summary = scalar.andi %word_mask, %keep_words : i32
+      scf.yield %next_summary, %after_count, %after_selected : i32, index, index
+    }
+    scf.yield %group, %word_count, %word_selected : index, index, index
+  }
+  %maximum_word = view.load %queries[%row, 64] : view<[%rows]x65xi32> -> i32
+  %maximum_value = index.cast %maximum_word : i32 to index
+  %maximum = index.assume %maximum_value [range(%maximum_value, 0, 64)] : index
+  %true = scalar.constant true : i1
+  %length, %unused_equal = scf.while(%length = %c3 : index, %equal = %true : i1) -> (index, i1) {
+    %below_limit = index.cmp ult, %length, %maximum : index
+    %has_previous = index.cmp ugt, %selected_end, %length : index
+    %bounded = scalar.andi %below_limit, %has_previous : i1
+    %continue = scalar.andi %bounded, %equal : i1
+    scf.condition %continue, %length, %equal : i1, index, i1
+  } do(%length: index, %equal: i1) {
+    %bounded_length = index.assume %length [range(%length, 3, 63)] : index
+    %distance = index.add %bounded_length, %c1 : index
+    %position = index.sub %selected_end, %distance : index
+    %source = func.call @flash_next_lookup_id(%maps, %history, %parameters, %row, %position) : (buffer, buffer, buffer, index, index) -> (i32)
+    %query_value = view.load %queries[%row, %bounded_length] : view<[%rows]x65xi32> -> i32
+    %matches = scalar.cmpi eq, %source, %query_value : i32
+    %next_length = scf.select %matches, %distance, %bounded_length : index
+    scf.yield %next_length, %matches : index, i1
+  }
+  %resume = view.load %records[%row, 3] : view<[%rows]x16xi32> -> i32
+  %minimum = view.load %records[%row, 5] : view<[%rows]x16xi32> -> i32
+  %required = view.load %records[%row, 6] : view<[%rows]x16xi32> -> i32
+  %end_word = index.cast %selected_end : index to i32
+  %length_word = index.cast %length : index to i32
+  %c8 = scalar.constant 8 : i32
+  %c5 = scalar.constant 5 : i32
+  %window = scalar.constant 512 : i32
+  %end_with_back = scalar.addi %end_word, %c8 : i32
+  %resume_limit = scalar.addi %resume, %window : i32
+  %has_resume = scalar.cmpi ne, %resume, %all_bits : i32
+  %past_resume_begin = scalar.cmpi uge, %end_with_back, %resume : i32
+  %before_resume_end = scalar.cmpi ule, %end_word, %resume_limit : i32
+  %in_window = scalar.andi %past_resume_begin, %before_resume_end : i1
+  %resumes = scalar.andi %has_resume, %in_window : i1
+  %full_match = scalar.cmpi uge, %length_word, %minimum : i32
+  %short_match = scalar.cmpi uge, %length_word, %c5 : i32
+  %short_resume = scalar.andi %resumes, %short_match : i1
+  %ordinary_allowed = scalar.ori %full_match, %short_resume : i1
+  %strict_allowed = scalar.andi %resumes, %full_match : i1
+  %requires_resume = scalar.cmpi ne, %required, %c0_i32 : i32
+  %policy_allowed = scf.select %requires_resume, %strict_allowed, %ordinary_allowed : i1
+  %has_candidate = index.cmp ugt, %selected_end, %c0 : index
+  %allowed = scalar.andi %has_candidate, %policy_allowed : i1
+  %position_bits = scalar.constant 18 : i32
+  %length_score = scalar.shli %length_word, %position_bits : i32
+  %score = scalar.ori %length_score, %end_word : i32
+  %qualified_score = scf.select %allowed, %score, %c0_i32 : i32
+  %best_word = kernel.subgroup.reduce<maxui> %qualified_score : i32
+  %leader = index.cmp eq, %lane, %c0 : index
+  scf.if %leader {
+    %position_mask = scalar.constant 262143 : i32
+    %best_end_word = scalar.andi %best_word, %position_mask : i32
+    %best_length_word = scalar.shrui %best_word, %position_bits : i32
+    view.store %best_end_word, %results[%row, 0] : i32, view<[%rows]x2xi32>
+    view.store %best_length_word, %results[%row, 1] : i32, view<[%rows]x2xi32>
+  }
+  kernel.return
+}

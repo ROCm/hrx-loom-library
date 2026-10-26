@@ -12,6 +12,7 @@ workload can be planned, executed, and measured through the ordinary Loom tools.
 | GDN and fused convolution | Scalar channel traversal and per-value recurrence; a closed-form Q8 projection fixture tests tile boundaries, shared anchors, advancing writers, and speculative capture. |
 | Hyperconnection and residual fusion | Independent normalization and projection, explicit BF16 publication, and complete inactive-buffer comparisons. |
 | Sparse attention | Independent cache addressing, scalar score and attention references, stable selection, long contexts, causal tails, retained forks, and query-cohort visibility. |
+| Copied-history proposals | Closed-form repeated-token fixtures cross page and subgroup boundaries, choose the newest equal-length match, reject short or incomplete continuations, and compare complete compacted buffers. Empty, copied, neural, mixed, and sampled cohorts retain distinct resident, input, output, and policy identities. |
 | Experts and mixed quantization | Scalar decoding of each admitted block format, independent matrix references, route grouping, padded tasks, and routed/shared output composition. |
 | MTP, output, and vocabulary | Independent projection references and explicit expected state for accepted history, compact vocabularies, fallback selection, proposal rejection, and retained carry. |
 

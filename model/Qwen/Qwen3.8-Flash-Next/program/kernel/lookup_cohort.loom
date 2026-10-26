@@ -1,0 +1,243 @@
+// GPU-only proposal selection and cohort compaction. The target packet owns
+// request policy; paired origin records preserve its input and selected-output
+// coordinates through recursive rounds. Greedy requests may copy a complete
+// remaining tail from accepted history. Other requests retain neural drafting.
+// Target verification remains authoritative for either proposal source.
+// Publication compacts six-word spans, paired origins, IDs, and vocabulary
+// modes in ascending order. A movement map then gathers hidden state into a
+// separate buffer, while resident cache and carry remain in place.
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+config.decl @flash_next.epoch_capacity : %value: index where [range(%value, 1, 32768)]
+
+config.decl @flash_next.draft_depth : %value: index where [range(%value, 1, 7)]
+
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
+func.decl @qwen38_input_token(%mixed: index, %capacity: index, %inputs: buffer, %input: index) -> (i32)
+
+func.decl @qwen38_input_store_token(%mixed: index, %capacity: index, %inputs: buffer, %input: index, %id: i32)
+
+config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]
+
+func.decl @qwen38_packet_policy_origin(%capacity: index) -> (offset)
+
+func.decl @qwen38_packet_identity_origin(%capacity: index) -> (offset)
+
+func.decl pure @flash_next_draft_cohorts(%capacity: index) -> (index)
+
+func.decl pure @flash_next_draft_mode_origin(%capacity: index) -> (offset)
+
+func.decl @flash_next_lookup_id(%rows: buffer, %cache: buffer, %parameters: buffer, %slot: index, %position: index) -> (i32)
+
+// Every query is formed from the accepted frontier plus this round's pending
+// chain. Rejected bytes in reserved pages never contribute to a query.
+kernel.def @flash_next_lookup_parameters(%round: index) {
+  %rows = config.get @flash_next.token_count : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%round_value: index, %epoch: buffer, %draft: buffer, %origins: buffer, %target_tokens: buffer, %parameters: buffer) {
+  %capacity = config.get @flash_next.token_count : index
+  %target_capacity = config.get @flash_next.epoch_capacity : index
+  %mixed = config.get @runner.qwen38.mixed_inputs : index
+  %slot = kernel.workgroup.id<x> : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %origin = index.constant 0 : offset
+  %descriptor_origin = index.constant 12 : offset
+  %packet_capacity = config.get @qwen38.packet_capacity : index
+  %policy_origin = func.call @qwen38_packet_policy_origin(%packet_capacity) : (index) -> (offset)
+  %identity_origin = func.call @qwen38_packet_identity_origin(%packet_capacity) : (index) -> (offset)
+  %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
+  %spans = buffer.view %draft[%descriptor_origin] : buffer -> view<[%capacity]x6xi32>
+  %mapping = buffer.view %origins[%origin] : buffer -> view<[%capacity]x2xi32>
+  %records = buffer.view %parameters[%origin] : buffer -> view<[%capacity]x16xi32>
+  %policies = buffer.view %epoch[%policy_origin] : buffer -> view<[%packet_capacity]x6xf32>
+  %identities = buffer.view %epoch[%identity_origin] : buffer -> view<[%packet_capacity]x2xi32>
+  %count_word = view.load %header[1] : view<3xi32> -> i32
+  %count = index.cast %count_word : i32 to index
+  %active = index.cmp ult, %slot, %count : index
+  %c0_i32 = scalar.constant 0 : i32
+  %sentinel = scalar.constant -1 : i32
+  view.store %sentinel, %records[%slot, 2] : i32, view<[%capacity]x16xi32>
+  view.store %sentinel, %records[%slot, 3] : i32, view<[%capacity]x16xi32>
+  view.store %c0_i32, %records[%slot, 6] : i32, view<[%capacity]x16xi32>
+  scf.if %active {
+    %round = index.assume %round_value [range(%round_value, 0, 6)] : index
+    %position_word = view.load %spans[%slot, 1] : view<[%capacity]x6xi32> -> i32
+    %position = index.cast %position_word : i32 to index
+    %committed = index.sub %position, %round : index
+    %committed_word = index.cast %committed : index to i32
+    %row_word = view.load %spans[%slot, 3] : view<[%capacity]x6xi32> -> i32
+    // Original target output identity survives every draft compaction. Its
+    // policy owner is independent of both the resident row and draft slot.
+    %selection_word = view.load %mapping[%slot, 1] : view<[%capacity]x2xi32> -> i32
+    %selection_value = index.cast %selection_word : i32 to index
+    %selection = index.assume %selection_value [ge(%selection_value, 0), lt(%selection_value, %packet_capacity)] : index
+    %owner_word = view.load %identities[%selection, 0] : view<[%packet_capacity]x2xi32> -> i32
+    %owner_value = index.cast %owner_word : i32 to index
+    %owner = index.assume %owner_value [ge(%owner_value, 0), lt(%owner_value, %packet_capacity)] : index
+    %temperature = view.load %policies[%owner, 0] : view<[%packet_capacity]x6xf32> -> f32
+    %c0_f32 = scalar.constant 0.0 : f32
+    %greedy = scalar.cmpf oeq, %temperature, %c0_f32 : f32
+    %c12 = scalar.constant 12 : i32
+    %disabled = scalar.constant 65 : i32
+    %minimum = scf.select %greedy, %c12, %disabled : i32
+    %tail = index.add %round, %c1 : index
+    %tail_word = index.cast %tail : index to i32
+    view.store %committed_word, %records[%slot, 0] : i32, view<[%capacity]x16xi32>
+    view.store %committed_word, %records[%slot, 1] : i32, view<[%capacity]x16xi32>
+    view.store %tail_word, %records[%slot, 4] : i32, view<[%capacity]x16xi32>
+    view.store %minimum, %records[%slot, 5] : i32, view<[%capacity]x16xi32>
+    view.store %row_word, %records[%slot, 7] : i32, view<[%capacity]x16xi32>
+    %begin_word = view.load %mapping[%slot, 0] : view<[%capacity]x2xi32> -> i32
+    %begin = index.cast %begin_word : i32 to index
+    scf.for %relative = [%c0 to %tail step %c1] {
+      %input = index.add %begin, %relative : index
+      %id = func.call @qwen38_input_token(%mixed, %target_capacity, %target_tokens, %input) : (index, index, buffer, index) -> (i32)
+      %field = index.add %c8, %relative : index
+      view.store %id, %records[%slot, %field] : i32, view<[%capacity]x16xi32>
+    }
+  } else {
+    view.store %c0_i32, %records[%slot, 0] : i32, view<[%capacity]x16xi32>
+    view.store %c0_i32, %records[%slot, 1] : i32, view<[%capacity]x16xi32>
+    view.store %c0_i32, %records[%slot, 4] : i32, view<[%capacity]x16xi32>
+    %disabled = scalar.constant 65 : i32
+    view.store %disabled, %records[%slot, 5] : i32, view<[%capacity]x16xi32>
+    view.store %c0_i32, %records[%slot, 7] : i32, view<[%capacity]x16xi32>
+  }
+  kernel.return
+}
+
+// Copy a complete remaining tail or retain the row for neural drafting. Only
+// transient descriptors move; resident row and target reservation stay fixed.
+kernel.def @flash_next_lookup_publish(%round: index) {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%round_value: index, %rows: buffer, %cache: buffer, %parameters: buffer, %selected: buffer, %draft: buffer, %origins: buffer, %ids: buffer, %plan: buffer, %target_tokens: buffer, %moves: buffer, %count_buffer: buffer) {
+  %capacity = config.get @flash_next.token_count : index
+  %target_capacity = config.get @flash_next.epoch_capacity : index
+  %depth = config.get @flash_next.draft_depth : index
+  %mixed = config.get @runner.qwen38.mixed_inputs : index
+  %round = index.assume %round_value [range(%round_value, 0, 6)] : index
+  %remaining = index.sub %depth, %round : index
+  %origin = index.constant 0 : offset
+  %descriptor_origin = index.constant 12 : offset
+  %mode_origin = func.call pure @flash_next_draft_mode_origin(%capacity) : (index) -> (offset)
+  %cohort_count = func.call pure @flash_next_draft_cohorts(%capacity) : (index) -> (index)
+  %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
+  %spans = buffer.view %draft[%descriptor_origin] : buffer -> view<[%capacity]x6xi32>
+  %origins_view = buffer.view %origins[%origin] : buffer -> view<[%capacity]x2xi32>
+  %inputs = buffer.view %ids[%origin] : buffer -> view<[%capacity]xi32>
+  %records = buffer.view %parameters[%origin] : buffer -> view<[%capacity]x16xi32>
+  %selections = buffer.view %selected[%origin] : buffer -> view<[%capacity]x2xi32>
+  %modes = buffer.view %plan[%mode_origin] : buffer -> view<[%capacity]xi32>
+  %cohorts = buffer.view %plan[%origin] : buffer -> view<[%cohort_count]xi32>
+  %movement = buffer.view %moves[%origin] : buffer -> view<[%capacity]xi32>
+  %counts = buffer.view %count_buffer[%origin] : buffer -> view<1xi32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %count_word = view.load %header[1] : view<3xi32> -> i32
+  %count_value = index.cast %count_word : i32 to index
+  %count = index.assume %count_value [range(%count_value, 0, 32768), le(%count_value, %capacity)] : index
+  scf.for %cohort = [%c0 to %cohort_count step %c1] {
+    view.store %c0_i32, %cohorts[%cohort] : i32, view<[%cohort_count]xi32>
+  }
+  %remaining_count = scf.for %old = [%c0 to %count step %c1](%next = %c0 : index) -> (index) {
+    %end_word = view.load %selections[%old, 0] : view<[%capacity]x2xi32> -> i32
+    %end = index.cast %end_word : i32 to index
+    %committed_word = view.load %records[%old, 0] : view<[%capacity]x16xi32> -> i32
+    %committed = index.cast %committed_word : i32 to index
+    %source_limit = index.add %end, %remaining : index
+    %has_match = index.cmp ugt, %end, %c0 : index
+    %fits = index.cmp ule, %source_limit, %committed : index
+    %copied = scalar.andi %has_match, %fits : i1
+    %begin_word = view.load %origins_view[%old, 0] : view<[%capacity]x2xi32> -> i32
+    %begin = index.cast %begin_word : i32 to index
+    %new_count = scf.if %copied -> (index) {
+      %first = index.add %round, %c1 : index
+      scf.for %relative = [%c0 to %remaining step %c1] {
+        %position = index.add %end, %relative : index
+        %id = func.call @flash_next_lookup_id(%rows, %cache, %parameters, %old, %position) : (buffer, buffer, buffer, index, index) -> (i32)
+        %offset = index.add %first, %relative : index
+        %destination = index.add %begin, %offset : index
+        func.call @qwen38_input_store_token(%mixed, %target_capacity, %target_tokens, %destination, %id) : (index, index, buffer, index, i32)
+      }
+      scf.yield %next : index
+    } else {
+      %slot = index.assume %next [range(%next, 0, 32767), lt(%next, %capacity)] : index
+      %position = view.load %spans[%old, 1] : view<[%capacity]x6xi32> -> i32
+      %row = view.load %spans[%old, 3] : view<[%capacity]x6xi32> -> i32
+      %source_position = view.load %spans[%old, 4] : view<[%capacity]x6xi32> -> i32
+      %target_selection = view.load %origins_view[%old, 1] : view<[%capacity]x2xi32> -> i32
+      %slot_word = index.cast %slot : index to i32
+      %id = view.load %inputs[%old] : view<[%capacity]xi32> -> i32
+      %mode = view.load %modes[%old] : view<[%capacity]xi32> -> i32
+      %c1_i32 = scalar.constant 1 : i32
+      view.store %c1_i32, %spans[%slot, 0] : i32, view<[%capacity]x6xi32>
+      view.store %position, %spans[%slot, 1] : i32, view<[%capacity]x6xi32>
+      view.store %slot_word, %spans[%slot, 2] : i32, view<[%capacity]x6xi32>
+      view.store %row, %spans[%slot, 3] : i32, view<[%capacity]x6xi32>
+      view.store %source_position, %spans[%slot, 4] : i32, view<[%capacity]x6xi32>
+      view.store %slot_word, %spans[%slot, 5] : i32, view<[%capacity]x6xi32>
+      view.store %begin_word, %origins_view[%slot, 0] : i32, view<[%capacity]x2xi32>
+      view.store %target_selection, %origins_view[%slot, 1] : i32, view<[%capacity]x2xi32>
+      view.store %id, %inputs[%slot] : i32, view<[%capacity]xi32>
+      view.store %mode, %modes[%slot] : i32, view<[%capacity]xi32>
+      %cohort = index.div %slot, %c4 : index
+      %prior_mode = view.load %cohorts[%cohort] : view<[%cohort_count]xi32> -> i32
+      %combined = scalar.ori %prior_mode, %mode : i32
+      view.store %combined, %cohorts[%cohort] : i32, view<[%cohort_count]xi32>
+      %old_word = index.cast %old : index to i32
+      view.store %old_word, %movement[%slot] : i32, view<[%capacity]xi32>
+      %incremented = index.add %next, %c1 : index
+      scf.yield %incremented : index
+    }
+    scf.yield %new_count : index
+  }
+  %word = index.cast %remaining_count : index to i32
+  view.store %word, %header[0] : i32, view<3xi32>
+  view.store %word, %header[1] : i32, view<3xi32>
+  view.store %word, %header[2] : i32, view<3xi32>
+  view.store %word, %counts[0] : i32, view<1xi32>
+  kernel.return
+}
+
+// Hidden state follows compacted slots through a separate publication. This
+// avoids overlapping in-place copies and leaves each resident cache untouched.
+kernel.def @flash_next_lookup_hidden(%count_buffer: buffer) {
+  %capacity = config.get @flash_next.token_count : index
+  %origin = index.constant 0 : offset
+  %counts = buffer.view %count_buffer[%origin] : buffer -> view<1xi32>
+  %word = view.load %counts[0] : view<1xi32> -> i32
+  %bounded = scalar.assume %word [range(%word, 0, 32768)] : i32
+  %count_value = index.cast %bounded : i32 to index
+  %count = index.assume %count_value [range(%count_value, 0, 32768), le(%count_value, %capacity)] : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%count, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%moves: buffer, %hidden: buffer, %compacted: buffer) {
+  %capacity = config.get @flash_next.token_count : index
+  %slot_value = kernel.workgroup.id<x> : index
+  %slot = index.assume %slot_value [range(%slot_value, 0, 32767), lt(%slot_value, %capacity)] : index
+  %thread = kernel.workitem.id<x> : index
+  %origin = index.constant 0 : offset
+  %movement = buffer.view %moves[%origin] : buffer -> view<[%capacity]xi32>
+  %source = buffer.view %hidden[%origin] : buffer -> view<[%capacity]x1280x4xi32>
+  %output = buffer.view %compacted[%origin] : buffer -> view<[%capacity]x1280x4xi32>
+  %old_word = view.load %movement[%slot] : view<[%capacity]xi32> -> i32
+  %old_value = index.cast %old_word : i32 to index
+  %old = index.assume %old_value [range(%old_value, 0, 32767), lt(%old_value, %capacity)] : index
+  %c0 = index.constant 0 : index
+  %stride = index.constant 128 : index
+  %packets = index.constant 1280 : index
+  scf.for %packet = [%thread to %packets step %stride] {
+    %value = vector.load %source[%old, %packet, %c0] : view<[%capacity]x1280x4xi32> -> vector<4xi32>
+    vector.store %value, %output[%slot, %packet, %c0] : vector<4xi32>, view<[%capacity]x1280x4xi32>
+  }
+  kernel.return
+}

@@ -42,6 +42,22 @@ accepted prefix into non-page state. Catch-up uses accepted target hidden
 rows to advance predictor state. Draft vocabulary membership is learned from
 accepted tokens and is retained with the request.
 
+Greedy proposal rounds first search accepted token history. A trigram bitset
+locates the newest sixteen occurrences, and backward comparison selects the
+longest suffix, breaking ties toward the newest occurrence. A match of at least
+twelve tokens supplies the complete remaining proposal tail only when those
+IDs are already committed. The target still verifies every proposed token.
+Sampled requests retain neural drafting.
+
+The accepted-ID plane shares the draft KV page map and registered retention
+geometry, so forks, page reuse, and restoration move it with the cache. Pending
+proposal IDs join the query without advancing the accepted frontier. Copied
+rows leave the neural cohort; compaction preserves both original target input
+and selected-output coordinates, independently of resident row identity. A
+GPU-authored count controls every remaining neural launch without a host
+readback. Hidden state gathers into a separate transient buffer to keep
+cross-workgroup reads independent of compaction writes.
+
 Output-only stages at capacities of 128 tokens and above compact the final
 attention layer after every input row has been appended to its cache. Only
 selected query cohorts continue through attention and experts; results
