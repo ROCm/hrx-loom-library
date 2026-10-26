@@ -26,8 +26,15 @@ loom_tools_toolchains(
 
 def _sdk_repository_impl(ctx):
     python = ctx.getenv("LOOM_SDK_PYTHON", "")
+    ctx.file(
+        "config.bzl",
+        "SOURCE_INTEGRATION_COMPATIBLE_WITH = %r\n" % (
+            ["@platforms//:incompatible"] if python else [],
+        ),
+    )
     build = """load("@hrx//loom/build_tools/bazel:loom_toolchain.bzl", "loom_tools_toolchains")
 package(default_visibility = ["//visibility:public"])
+exports_files(["config.bzl"])
 """
     if python:
         result = ctx.execute([python, ctx.path(ctx.attr._probe)], quiet = True)

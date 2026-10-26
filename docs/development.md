@@ -89,6 +89,13 @@ limits formatting to those files. Direct `bazelisk test` invocations also retain
 the generated per-library checks. Hardware execution requires a matching device
 and runtime; a skipped hardware test supplies no execution evidence.
 
+The Qwen request-ownership integration check links HRX's native serving test
+API. Source mode includes it in the ordinary test suite; installed SDK mode
+marks it incompatible because that API is not a distributed tool. The shared
+Loom policy checks run in both modes, and the model service checks exercise
+the selected `loom-serve` through HTTP. This keeps internal API qualification
+available without rebuilding the compiler behind an installed SDK selection.
+
 `loom_motif_library` emits linkable bytecode and checks that its sources are
 non-launchable. `loom_kernel_library` adds concrete kernel products, test
 modules, target profiles, and compiler reports. `loom_test` exercises a private
@@ -113,7 +120,7 @@ Bazel configuration. Run every public correctness case on an AMD GPU:
 
 ```shell
 bazelisk run --config=asan --config=amdgpu \
-  @hrx//loom/src/loom/tools/iree-test-loom -- \
+  @loom_sdk//:loom-test -- \
   "$LOOM_TEST_MODULE" \
   --device=amdgpu://0 \
   --sanitizer=access
@@ -127,7 +134,7 @@ Benchmark a declared workload from the same module closure:
 
 ```shell
 bazelisk run --config=opt --config=amdgpu \
-  @hrx//loom/src/loom/tools/iree-benchmark-loom -- \
+  @loom_sdk//:loom-benchmark -- \
   "$LOOM_TEST_MODULE" \
   --device=amdgpu://0 \
   --benchmark=@ggml_quantize_q8_1_x4_f32_decode \
@@ -160,8 +167,8 @@ so its schemas and lifecycle remain independent. Benchmark sweep workspaces use
 
 `dev.py benchmark` discovers every kernel and test module admitted to the
 repository benchmark corpus, uses HRX's linked root-owned test module plus the
-public benchmark runner from the selected HRX revision, and maintains a local
-sweep workspace:
+public benchmark runner from the selected SDK or HRX source checkout, and
+maintains a local sweep workspace:
 
 ```shell
 SWEEP_ROOT=.reports/benchmark/gfx1100
@@ -177,8 +184,8 @@ python dev.py benchmark \
 
 Repeating the command is incremental. Bazel rebuilds only invalidated actions,
 and the sweep executes only roots whose closed benchmark `.loombc`, benchmark
-runner, or invocation identity changed. A shared motif edit therefore reruns
-the exact consumers whose linked runner input changed; an edit that produces a
+runner and its shared libraries, or invocation identity changed. A shared motif
+edit therefore reruns the exact consumers whose linked runner input changed; an edit that produces a
 byte-identical module is reported as potentially affected without repeating the
 physical benchmark.
 `--rerun-all` deliberately captures fresh measurements for every selected
@@ -206,7 +213,7 @@ jq '[
 ```
 
 Each invocation also writes an immutable manifest under `runs/`. Native
-`iree-benchmark-loom` bundles live below `artifacts/` and retain their public
+`loom-benchmark` bundles live below `artifacts/` and retain their public
 `results.json` or `results.jsonl` schema; unchanged modules point back to the
 matching earlier bundle instead of copying or reinterpreting it. The mutable
 `index.json` keeps prior module evidence available across targeted subsets.
@@ -229,7 +236,7 @@ python dev.py benchmark \
   --measure=dispatch_complete
 ```
 
-Arguments after `--` are passed directly to `iree-benchmark-loom`.
+Arguments after `--` are passed directly to `loom-benchmark`.
 
 These captures are comparable when they come from the same stable machine,
 software configuration, measurement policy, and exclusive-use discipline.

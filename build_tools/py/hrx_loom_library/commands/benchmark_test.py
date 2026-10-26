@@ -236,7 +236,8 @@ class BenchmarkCommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository_root = Path(temporary_directory)
             output_root = repository_root / "evidence" / "sweep"
-            runner = repository_root / "bazel-out/bin/iree-benchmark-loom"
+            runner = repository_root / "bazel-out/bin/loom-benchmark"
+            runtime = runner.with_name("libloomc.so")
             first_module = repository_root / "bazel-out/bin/first.loombc"
             second_module = repository_root / "bazel-out/bin/second.loombc"
             first_source = repository_root / "kernel/example/first.loom"
@@ -244,6 +245,7 @@ class BenchmarkCommandTest(unittest.TestCase):
             shared_source = repository_root / "motif/example/shared.loom"
             for path, contents in (
                 (runner, b"runner"),
+                (runtime, b"shared compiler"),
                 (first_module, b"first module"),
                 (second_module, b"second module"),
                 (first_source, b"first source"),
@@ -316,7 +318,26 @@ class BenchmarkCommandTest(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-            bazel = mock.Mock()
+            def bazel(arguments, *, capture_output=False):
+                if arguments[0] == "build":
+                    return ""
+                if arguments[0] == "info":
+                    return str(repository_root)
+                if arguments[0] == "cquery":
+                    return json.dumps(
+                        {
+                            "executable": str(runner.relative_to(repository_root)),
+                            "files": {
+                                path.name: [
+                                    str(path.relative_to(repository_root)),
+                                    False,
+                                ]
+                                for path in (runner, runtime)
+                            },
+                        }
+                    )
+                self.fail(f"Unexpected Bazel command: {arguments}")
+
             run = mock.Mock(side_effect=write_bundle)
             with (
                 mock.patch.object(
@@ -354,11 +375,6 @@ class BenchmarkCommandTest(unittest.TestCase):
                     benchmark,
                     "query_source_closures",
                     side_effect=resolve_selected_closures,
-                ),
-                mock.patch.object(
-                    benchmark,
-                    "resolve_runner",
-                    return_value=runner,
                 ),
             ):
                 benchmark.run(
@@ -476,7 +492,9 @@ class BenchmarkCommandTest(unittest.TestCase):
                 self.assertIn("module_changed", changed_module["reasons"])
                 self.assertTrue(changed_module["artifact_changed"])
 
-                runner.write_bytes(b"changed runner")
+                # A relinked shared compiler changes execution even when the
+                # benchmark executable and linked modules stay byte-identical.
+                runtime.write_bytes(b"changed shared compiler")
                 run.reset_mock()
                 benchmark.run(
                     args,

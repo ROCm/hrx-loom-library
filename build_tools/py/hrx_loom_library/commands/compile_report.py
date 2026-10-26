@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from ..bazel_tool import BazelTool, resolve_tool
 from ..context import RepositoryContext, UserError, format_command
 
 
@@ -29,11 +30,11 @@ CAPTURE_SCHEMA = "hrx-loom-kernels.compile-report-capture.v1"
 COMPARISON_SCHEMA = "hrx-loom-kernels.compile-report-comparison.v1"
 SOURCE_SCHEMA = "hrx-loom-kernels.compile-report-source.v1"
 WORKSPACE_SCHEMA = "hrx-loom-kernels.compile-report-workspace.v1"
-LOOM_REPORT_TARGET = "@hrx//loom/py/loom/tools:loom-compile-report"
+LOOM_REPORT_TARGET = "@loom_sdk//:loom-compile-report"
 _REPORTS_DIRECTORY = ".reports"
 _DEFAULT_OUTPUT_DIRECTORY = f"{_REPORTS_DIRECTORY}/compile"
 _LOOM_BINARY_PROVIDER_SUFFIX = "%LoomBinaryInfo"
-_LOOM_AMDGPU_TARGET_PROFILE_PROVIDER_SUFFIX = "%LoomAmdgpuTargetProfileInfo"
+_LOOM_TARGET_PROFILE_PROVIDER_SUFFIX = "%LoomTargetProfileInfo"
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40,64}")
 _BINARY_QUERY_EXPRESSION = (
     '"\\n".join(['
@@ -46,13 +47,14 @@ _BINARY_QUERY_EXPRESSION = (
     "[str(profile.label) for profile in provider.target_profiles]) "
     "for key, provider in providers(target).items() "
     f'if key.endswith("{_LOOM_BINARY_PROVIDER_SUFFIX}") '
-    'and provider.kind == "kernel"])'
+    "])"
 )
 _AMDGPU_TARGET_PROFILE_QUERY_EXPRESSION = (
     '"\\n".join(['
-    'str(target.label) + "\\t" + provider.target '
+    'str(target.label) + "\\t" + provider.selector '
     "for key, provider in providers(target).items() "
-    f'if key.endswith("{_LOOM_AMDGPU_TARGET_PROFILE_PROVIDER_SUFFIX}")])'
+    f'if key.endswith("{_LOOM_TARGET_PROFILE_PROVIDER_SUFFIX}") '
+    'and provider.family == "amdgpu"])'
 )
 
 
@@ -69,14 +71,6 @@ class Compilation:
     report_path: PurePosixPath
     backend: str
     target: str
-
-
-@dataclass(frozen=True)
-class ReportTool:
-    """The public report executable and its project-owned implementation identity."""
-
-    path: Path
-    sha256: str
 
 
 def _run_process(
@@ -544,98 +538,18 @@ def resolve_report_tool(
     repository_root: Path,
     bazel_options: list[str],
     bazel_executable: str,
-) -> ReportTool:
-    """Builds and resolves the public loom-compile-report executable."""
+) -> BazelTool:
+    """Builds and resolves the selected loom-compile-report executable."""
     _bazel(
         bazel_executable,
         repository_root,
         ["build", *bazel_options, LOOM_REPORT_TARGET],
     )
-    target_files = _bazel_output(
-        bazel_executable,
-        repository_root,
-        [
-            "cquery",
-            LOOM_REPORT_TARGET,
-            *bazel_options,
-            "--output=starlark",
-            "--starlark:expr="
-            '"executable\\t" + target.files_to_run.executable.path + "\\n" + '
-            '"\\n".join(["runfile\\t" + file.path '
-            "for file in target.default_runfiles.files.to_list()])",
-        ],
-    )
-    executable_paths = []
-    runfile_paths = []
-    for line in target_files.splitlines():
-        if not line.strip():
-            continue
-        kind, separator, value = line.partition("\t")
-        if not separator:
-            raise Error("The loom-compile-report target returned an invalid file row")
-        if kind == "executable":
-            executable_paths.append(_execution_path(value))
-        elif kind == "runfile":
-            runfile_paths.append(_execution_path(value))
-        else:
-            raise Error(f"Unknown loom-compile-report file row: {kind}")
-    if len(executable_paths) != 1:
-        raise Error("The loom-compile-report target did not resolve one executable")
-    relative_executable = executable_paths[0]
-    execution_root_text = _bazel_output(
-        bazel_executable,
-        repository_root,
-        ["info", *bazel_options, "execution_root"],
-    )
-    execution_root_lines = [
-        line.strip() for line in execution_root_text.splitlines() if line.strip()
-    ]
-    if len(execution_root_lines) != 1:
-        raise Error("Bazel did not report exactly one execution root")
-    execution_root = Path(execution_root_lines[0])
-    path = execution_root.joinpath(*relative_executable.parts)
-    if not path.is_file():
-        raise Error(f"Bazel did not materialize loom-compile-report: {path}")
-    executable_parts = relative_executable.parts
-    try:
-        external_index = executable_parts.index("external")
-        runfiles_workspace = executable_parts[external_index + 1]
-    except (ValueError, IndexError) as error:
-        raise Error(
-            "The loom-compile-report executable is not owned by an external "
-            f"Loom repository: {relative_executable}"
-        ) from error
-    implementation_files = []
-    for runfile_path in runfile_paths:
-        runfile_parts = runfile_path.parts
-        if (
-            len(runfile_parts) < 3
-            or runfile_parts[0] != "external"
-            or runfile_parts[1] != runfiles_workspace
-        ):
-            continue
-        relative_path = PurePosixPath(*runfile_parts[2:])
-        implementation_path = execution_root.joinpath(*runfile_path.parts)
-        if not implementation_path.is_file():
-            raise Error(
-                "Bazel did not materialize a Loom report-tool runfile: "
-                f"{implementation_path}"
-            )
-        implementation_files.append(
-            {
-                "path": relative_path.as_posix(),
-                "sha256": _sha256(implementation_path),
-            }
-        )
-    if not implementation_files:
-        raise Error("The loom-compile-report target has no project-owned runfiles")
-    identity = {
-        "executable_sha256": _sha256(path),
-        "implementation_files": sorted(
-            implementation_files, key=lambda file: file["path"]
-        ),
-    }
-    return ReportTool(path=path, sha256=_json_digest(identity))
+
+    def bazel(arguments: list[str], *, capture_output: bool) -> str:
+        return _bazel_output(bazel_executable, repository_root, arguments)
+
+    return resolve_tool(LOOM_REPORT_TARGET, bazel_options, bazel)
 
 
 def _resolve_commit(repository_root: Path, reference: str) -> str:
@@ -873,7 +787,7 @@ def materialize_base_source(
 
 
 def _show_report(
-    report_tool: ReportTool,
+    report_tool: BazelTool,
     report_path: Path,
     capture_root: Path,
 ) -> dict[str, Any]:
@@ -963,13 +877,13 @@ def capture_repository(
     source_identity: dict[str, Any],
     target_patterns: list[str],
     configs: list[str],
-    report_tool: ReportTool,
+    report_tool: BazelTool,
     bazel_executable: str,
 ) -> dict[str, Any]:
     """Builds and immutably captures one configured compilation corpus."""
     if any(not configuration for configuration in configs):
         raise Error("Compile-report Bazel configurations must not be empty")
-    bazel_options = ["-c", "opt", *[f"--config={value}" for value in configs]]
+    bazel_options = ["--config=opt", *[f"--config={value}" for value in configs]]
     compilations = discover_compilations(
         repository_root,
         target_patterns,
@@ -1141,7 +1055,7 @@ def _capture_entries(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def _run_report_tool(
-    report_tool: ReportTool,
+    report_tool: BazelTool,
     arguments: list[str],
     *,
     cwd: Path,
@@ -1340,7 +1254,7 @@ def compare_captures(
     output_root: Path,
     base_capture: dict[str, Any],
     candidate_capture: dict[str, Any],
-    report_tool: ReportTool,
+    report_tool: BazelTool,
 ) -> dict[str, Any]:
     """Compares two captures through the public report CLI."""
     base_capture_id = base_capture.get("capture_id")
@@ -1563,7 +1477,7 @@ def run(
     output_root = output_root.resolve()
     initialize_workspace(repository_root, output_root)
 
-    bazel_options = ["-c", "opt", *[f"--config={value}" for value in configs]]
+    bazel_options = ["--config=opt", *[f"--config={value}" for value in configs]]
     report_tool = resolve_report_tool(
         repository_root,
         bazel_options,

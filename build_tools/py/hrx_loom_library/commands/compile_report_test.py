@@ -208,7 +208,7 @@ class ProviderDiscoveryTest(unittest.TestCase):
             'set("@@hrx+//loom/target/amdgpu:gfx11-generic" '
             '"@@hrx+//loom/target/amdgpu:gfx12-generic")',
         )
-        self.assertIn("%LoomAmdgpuTargetProfileInfo", profile_query_arguments[-1])
+        self.assertIn("%LoomTargetProfileInfo", profile_query_arguments[-1])
 
     def test_rejects_kernel_product_with_multiple_compile_reports(self):
         row = (
@@ -267,54 +267,10 @@ class ProviderDiscoveryTest(unittest.TestCase):
 
 
 class ReportToolTest(unittest.TestCase):
-    def test_identity_covers_project_owned_implementation_runfiles(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            execution_root = Path(temporary_directory) / "execroot"
-            relative_executable = PurePosixPath(
-                "bazel-out/bin/external/hrx+/loom/tools/loom-compile-report"
-            )
-            executable = execution_root.joinpath(*relative_executable.parts)
-            implementation = execution_root.joinpath(
-                "external", "hrx+", "loom", "reporting", "report.py"
-            )
-            executable.parent.mkdir(parents=True)
-            implementation.parent.mkdir(parents=True)
-            executable.write_bytes(b"launcher")
-            implementation.write_bytes(b"implementation one")
-            target_files = (
-                f"executable\t{relative_executable}\n"
-                "runfile\texternal/hrx+/loom/reporting/report.py\n"
-                "runfile\texternal/python/runtime\n"
-            )
-
-            def bazel_output(unused_bazel, unused_root, arguments):
-                if arguments[0] == "cquery":
-                    return target_files
-                if arguments[0] == "info":
-                    return str(execution_root) + "\n"
-                self.fail(f"Unexpected Bazel arguments: {arguments}")
-
-            with (
-                mock.patch.object(compile_report, "_bazel"),
-                mock.patch.object(
-                    compile_report, "_bazel_output", side_effect=bazel_output
-                ),
-            ):
-                first = compile_report.resolve_report_tool(
-                    Path("/repository"), ["-c", "opt"], "bazelisk"
-                )
-                implementation.write_bytes(b"implementation two")
-                second = compile_report.resolve_report_tool(
-                    Path("/repository"), ["-c", "opt"], "bazelisk"
-                )
-
-        self.assertEqual(first.path, executable)
-        self.assertNotEqual(first.sha256, second.sha256)
-
     def test_show_view_uses_capture_relative_source_path(self):
         capture_root = Path("/evidence/captures/capture")
         report_path = capture_root / "reports/kernel/example.compile.json"
-        report_tool = compile_report.ReportTool(Path("/tools/report"), "identity")
+        report_tool = compile_report.BazelTool(Path("/tools/report"), "identity")
         with mock.patch.object(
             compile_report,
             "_command_output",
@@ -354,7 +310,7 @@ class CaptureTest(unittest.TestCase):
         self.report_path.write_text('{"report": 1}\n', encoding="utf-8")
         self.report_tool_path = temporary_root / "loom-compile-report"
         self.report_tool_path.write_bytes(b"report tool")
-        self.report_tool = compile_report.ReportTool(
+        self.report_tool = compile_report.BazelTool(
             path=self.report_tool_path,
             sha256=compile_report._sha256(self.report_tool_path),
         )
@@ -549,7 +505,7 @@ class ComparisonTest(unittest.TestCase):
         self.output_root = Path(self.temporary_directory.name)
         self.report_tool_path = self.output_root / "loom-compile-report"
         self.report_tool_path.write_bytes(b"report tool")
-        self.report_tool = compile_report.ReportTool(
+        self.report_tool = compile_report.BazelTool(
             path=self.report_tool_path,
             sha256=compile_report._sha256(self.report_tool_path),
         )

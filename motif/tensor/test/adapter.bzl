@@ -52,8 +52,8 @@ def adapter_tests(matrix_leaf, scalar_leaf):
             testonly = True,
             srcs = [leaf],
             outs = [name + ".loom"],
-            cmd = "$(location :generate_adapter_oracle) --output=$@ --leaf=$(location %s) --mode=%s --options='%s' %s && $(location @hrx//loom/src/loom/tools/loom-format) --in-place $@" % (leaf, mode, json.encode(options), "--exact" if exact else ""),
-            tools = [":generate_adapter_oracle", "@hrx//loom/src/loom/tools/loom-format"],
+            cmd = "$(location :generate_adapter_oracle) --output=$@ --leaf=$(location %s) --mode=%s --options='%s' %s && $(location @loom_sdk//:loom-format) --in-place $@" % (leaf, mode, json.encode(options), "--exact" if exact else ""),
+            tools = [":generate_adapter_oracle", "@loom_sdk//:loom-format"],
         )
         loom_test(
             name = name,

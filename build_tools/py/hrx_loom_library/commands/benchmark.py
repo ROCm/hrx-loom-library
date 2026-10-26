@@ -19,13 +19,12 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from ..bazel_tool import resolve_tool
 from ..context import RepositoryContext, UserError
 from ..qualification import benchmark_query_expression
 
 
-LOOM_BENCHMARK_TARGET = (
-    "@hrx//loom/src/loom/tools/iree-benchmark-loom:iree-benchmark-loom"
-)
+LOOM_BENCHMARK_TARGET = "@loom_sdk//:loom-benchmark"
 LOOM_BENCHMARK_TARGET_SUFFIX = "_benchmark_module"
 SWEEP_SCHEMA = "hrx-loom-kernels.benchmark-sweep.v2"
 _LEGACY_SWEEP_SCHEMAS = {"hrx-loom-kernels.benchmark-sweep.v1"}
@@ -211,29 +210,6 @@ def resolve_modules(
     if len(set(module_labels)) != len(module_labels):
         raise Error("Multiple benchmark selections resolved to the same module")
     return sorted(modules, key=lambda module: module.label)
-
-
-def resolve_runner(
-    repository_root: Path,
-    bazel_options: list[str],
-    bazel: BazelCommand,
-) -> Path:
-    output = bazel(
-        [
-            "cquery",
-            LOOM_BENCHMARK_TARGET,
-            *bazel_options,
-            "--output=files",
-        ],
-        capture_output=True,
-    )
-    paths = [line.strip() for line in output.splitlines() if line.strip()]
-    if len(paths) != 1:
-        raise Error("The iree-benchmark-loom target must emit exactly one executable")
-    runner_path = repository_root / paths[0]
-    if not runner_path.is_file():
-        raise Error(f"Bazel did not materialize the benchmark runner: {runner_path}")
-    return runner_path
 
 
 def _parse_source_closures(
@@ -682,15 +658,15 @@ def run(
 
     targets = resolve_target_patterns(repository_root, args.targets, bazel)
     bazel_options = [
-        "-c",
-        "opt",
+        "--config=opt",
         *[f"--config={configuration}" for configuration in args.configs],
     ]
     bazel(["build", *bazel_options, LOOM_BENCHMARK_TARGET, *targets])
     modules = resolve_modules(repository_root, targets, bazel_options, bazel)
     closures = query_source_closures(targets, bazel_options, bazel)
-    runner_path = resolve_runner(repository_root, bazel_options, bazel)
-    runner_sha256 = _sha256(runner_path)
+    runner = resolve_tool(LOOM_BENCHMARK_TARGET, bazel_options, bazel)
+    runner_path = runner.path
+    runner_sha256 = runner.sha256
     run_id, created_at = _new_run_identity()
 
     execution_invocation = {
@@ -922,7 +898,7 @@ def register(subparsers: Any) -> None:
     parser.add_argument(
         "--device",
         required=True,
-        help="Explicit iree-benchmark-loom device URI.",
+        help="Explicit loom-benchmark device URI.",
     )
     parser.add_argument(
         "--output-dir",
