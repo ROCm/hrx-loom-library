@@ -57,7 +57,15 @@ jobs:
           fi
       - name: Check library
         run: |
-          python dev.py test -- \
+          query='tests(//...) except attr(tags, "iree-run-requirement=|manual", tests(//...))'
+          bazel query "$query" --output=label > "$RUNNER_TEMP/targets.txt"
+          if [[ ! -s "$RUNNER_TEMP/targets.txt" ]]; then
+            echo "No host tests declared" >&2
+            exit 1
+          fi
+          mapfile -t targets < "$RUNNER_TEMP/targets.txt"
+          python dev.py test "${targets[@]/#/--target=}" -- \
+            --skip_incompatible_explicit_targets \
             --profile="$RUNNER_TEMP/library-host.profile.gz"
       - name: Save action and test results
         if: always() && !cancelled()
@@ -109,7 +117,7 @@ jobs:
         ${{ !matrix.npu && '--env-file /etc/podinfo/gha-gpu-isolation-settings' || '' }}
         ${{ matrix.npu && '--device /dev/accel/accel0' || '' }}
     env:
-      EXECUTION_PROFILES: ${{ matrix.npu && 'amd_gpu_hardware|xdna_hardware' || 'amd_gpu_hardware' }}
+      HARDWARE_RESOURCES: ${{ matrix.npu && 'amd_gpu|xdna' || 'amd_gpu' }}
       HARDWARE_ID: ${{ matrix.id }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -126,7 +134,7 @@ jobs:
         run: |
           "$RUNNER_TEMP/loom-sdk-venv/bin/loom-serve" --list_devices=amdgpu > "$RUNNER_TEMP/gpu.txt"
           test -s "$RUNNER_TEMP/gpu.txt"
-          if [[ "$EXECUTION_PROFILES" == *xdna_hardware* ]]; then
+          if [[ "$HARDWARE_RESOURCES" == *xdna* ]]; then
             "$RUNNER_TEMP/loom-sdk-venv/bin/loom-serve" --list_devices=xdna > "$RUNNER_TEMP/npu.txt"
             test -s "$RUNNER_TEMP/npu.txt"
           fi
@@ -157,10 +165,12 @@ jobs:
           echo "LOOM_TEST_PLATFORM=$(sha256sum "$RUNNER_TEMP/hardware.txt" | cut -d' ' -f1)" >> "$GITHUB_ENV"
       - name: Check hardware execution profiles
         run: |
-          query="attr(tags, 'loom-execution-profile=($EXECUTION_PROFILES)', tests(//...)) except attr(tags, 'manual', tests(//...))"
+          # Every required resource must be available, including mixed GPU/NPU tests.
+          unavailable="iree-run-requirement=(?!libamdf[.]resource[.]($HARDWARE_RESOURCES)(,|]))"
+          query="attr(tags, 'iree-run-requirement=', tests(//...)) except attr(tags, '$unavailable|manual', tests(//...))"
           bazel query "$query" --output=label > "$RUNNER_TEMP/targets.txt"
           if [[ ! -s "$RUNNER_TEMP/targets.txt" ]]; then
-            echo "No tests declared for $EXECUTION_PROFILES" >&2
+            echo "No tests declared for $HARDWARE_RESOURCES" >&2
             exit 1
           fi
           mapfile -t targets < "$RUNNER_TEMP/targets.txt"
