@@ -55,33 +55,12 @@ a run on one architecture does not qualify another architecture's entries.
 
 ## Image input
 
-These tests exercise the image service's input boundary without model weights.
-They use the production providers and independently authored expected values.
-
-| Program | Contract |
-| --- | --- |
-| [Shared pixel tests](../../../../program/text/qwen3_8/test/README.md) | Exact normalized cubic coefficients, clipped support, negative lobes, identity/reduced/magnified/degenerate axes, and independently rounded edges at a nonintegral 97/31 scale. |
-| `vision_control` | One-to-four-image cohort stage arguments, in-place directory construction, image ordering, physical feature ranges, and logical row counts. Only the native stage declaration sink is substituted. |
-| `vision_resize` | Complete RGB8 output from the production GPU filter. Thirty-two trials cover landscape/portrait orientation, RGB/RGBA input, identity filtering, and extreme scale changes. Analytical coordinate colors expose orientation mistakes; constant colors isolate filtering and alpha composition. |
-
-Each workload has a `check.benchmark` declaration. The coefficient and cohort
-checks run on the VM reference profile. Device filtering runs on native AMD GPU
-and access-instrumented profiles. Benchmark smoke verifies executable workload
-plans; performance comparisons require the normal exclusive measurement route.
-
-Coefficient tests include their implementation as a test root to inspect its
-private axis-plan helper. Cohort tests include the actual model and shared control sources
-with a test stage-declaration provider that observes its arguments. Production
-libraries retain private helpers and link the actual stage provider.
-
-```sh
-bazel test //model/Qwen/Qwen3.8-27B/test:all
-```
-
-The shared chat geometry contract remains in
-[`program/text/qwen3_8/test`](../../../../program/text/qwen3_8/test/README.md).
-These component checks qualify preprocessing and feature-plan construction;
-learned text and projector outputs require the complete model composition.
+Packet preparation, cohort plans, admission forecasts, and GPU filtering are
+qualified in the shared [text-program package](../../../../program/text/qwen3_8/test/README.md).
+Encoder numerical tests belong to the shared vision package linked above.
+These packages own independent references, type and shape variants, execution
+profiles, and benchmarks. Model tests retain complete service composition and
+learned outputs.
 
 ## Learned service checks
 

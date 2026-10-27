@@ -16,7 +16,6 @@ workload can be planned, executed, and measured through the ordinary Loom tools.
 | Copied-history proposals | Closed-form repeated-token fixtures cross page and subgroup boundaries, choose the newest equal-length match, reject short or incomplete continuations, and compare complete compacted buffers. Empty, copied, neural, mixed, and sampled cohorts retain distinct resident, input, output, and policy identities. |
 | Experts and mixed quantization | Scalar decoding of each admitted block format, independent matrix references, route grouping, padded tasks, and routed/shared output composition. |
 | MTP, output, and vocabulary | Independent projection references and explicit expected state for accepted history, compact vocabularies, fallback selection, proposal rejection, and retained carry. |
-| Image memory forecasts | The real 2560-wide image callbacks account for padded attention, both residual banks, private workspace reuse, and disjoint retained outputs at two geometries. |
 
 `retained`, `mtp_state`, and `speculation` run the same independent ordinary-ID
 oracles against ordinary and media input carriers. Media metadata differs from
@@ -112,6 +111,8 @@ Answers are checked for the task result rather than identical capitalization
 or whitespace across batch shapes and MTP. The pin seed has a canonical chat
 suffix, and a noncanonical leading-space response retains the service's pin
 rejection. These checks establish image/service ownership and simple visual
-grounding. The shared vision numerical tests and retained-position tests cover
-the arithmetic and speculative-state boundaries; color answers alone do not
-establish broad visual-language task quality.
+grounding. The shared [encoder](../../../../motif/vision/qwen3_8/test/README.md) and
+[image-protocol](../../../../program/text/qwen3_8/test/README.md) packages own
+numerical, preprocessing, and admission checks. Model-local retained-position
+tests cover sparse-attention and speculative-state boundaries; color answers
+alone do not establish broad visual-language task quality.

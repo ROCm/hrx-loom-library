@@ -1,0 +1,345 @@
+// Shared image-service packet, cohort, and admission contracts.
+// Codec descriptors and expected feature plans are independent of model roots.
+
+func.decl @qwen38_vision_prepare_batch(%columns: index, %ranges: buffer, %packed: buffer) -> (i32, buffer, buffer)
+
+func.decl @qwen38_vision_prepare_request(%request: buffer) -> (buffer, i64, i64)
+
+func.decl @qwen38_vision_forecast(%columns: index, %parameters: i64, %ranges: buffer, %descriptors: buffer) -> (i64, i64, i64)
+
+// Replace only the native declaration sink. The returned observation includes
+// every shape argument in separate bits, preserving their order.
+func.def @qwen38_vision_stage(%height: i64, %width: i64, %count: i64) -> (i32) {
+  %height_shift = scalar.constant 16 : i64
+  %width_shift = scalar.constant 3 : i64
+  %height_bits = scalar.shli %height, %height_shift : i64
+  %width_bits = scalar.shli %width, %width_shift : i64
+  %axes = scalar.ori %height_bits, %width_bits : i64
+  %value = scalar.ori %axes, %count : i64
+  %stage = scalar.trunci %value : i64 to i32
+  func.return %stage : i32
+}
+
+// Exercise each native cohort size with complete source packets. The plan's
+// logical request rows and physical feature ranges must agree independently.
+func.def @vision_cohort_observation(%count: index, %columns: index, %width: i32) -> (i32) where [range(%count, 1, 4)] {
+  %square = scalar.constant 256 : i32
+  %wide = scalar.constant 416 : i32
+  %short = scalar.constant 288 : i32
+  %is_square = scalar.cmpi eq, %width, %square : i32
+  %is_portrait = scalar.cmpi eq, %width, %short : i32
+  %rectangle_height = scf.select %is_portrait, %wide, %short : i32
+  %height = scf.select %is_square, %square, %rectangle_height : i32
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %native_header_bytes = index.constant 64 : offset
+  %pixel_offset = index.constant 80 : offset
+  %pixel_bytes = index.constant 196608 : offset
+  %native_request_bytes = index.constant 196688 : offset
+  %range_stride = index.constant 16 : offset
+  %range_bytes = index.scale %count, %range_stride : index, offset -> offset
+  %ranges = buffer.alloca<private> align(8) %range_bytes : buffer
+  %request = buffer.alloca<private> align(16) %native_request_bytes : buffer
+  %zero32 = scalar.constant 0 : i32
+  %one32 = scalar.constant 1 : i32
+  %rgb8 = scalar.constant 3 : i32
+  %geometry = scalar.constant 256 : i32
+  %pixels = scalar.muli %width, %height : i32
+  %token_pixels = scalar.constant 1024 : i32
+  %rows32 = scalar.divui %pixels, %token_pixels : i32
+  %image_row_count = index.cast %rows32 : i32 to index
+  %header32 = scalar.constant 64 : i32
+  %pixels32 = scalar.constant 196608 : i32
+  %metadata_bytes = scalar.constant 8 : i32
+  %pixel_offset32 = scalar.constant 80 : i32
+  buffer.fill %zero32, %request[%origin], %native_request_bytes : i32
+  %range_view = buffer.view %ranges[%origin] : buffer -> view<[%count]x2xi64>
+  %header = buffer.view %request[%origin] : buffer -> view<16xi32>
+  view.store %one32, %header[0] : i32, view<16xi32>
+  view.store %one32, %header[1] : i32, view<16xi32>
+  view.store %geometry, %header[2] : i32, view<16xi32>
+  view.store %geometry, %header[3] : i32, view<16xi32>
+  view.store %geometry, %header[4] : i32, view<16xi32>
+  view.store %geometry, %header[5] : i32, view<16xi32>
+  view.store %one32, %header[6] : i32, view<16xi32>
+  view.store %rows32, %header[7] : i32, view<16xi32>
+  view.store %header32, %header[8] : i32, view<16xi32>
+  view.store %metadata_bytes, %header[9] : i32, view<16xi32>
+  view.store %pixel_offset32, %header[10] : i32, view<16xi32>
+  view.store %pixels32, %header[11] : i32, view<16xi32>
+  view.store %rgb8, %header[12] : i32, view<16xi32>
+  %metadata = buffer.view %request[%native_header_bytes] : buffer -> view<2xi32>
+  view.store %width, %metadata[0] : i32, view<2xi32>
+  view.store %height, %metadata[1] : i32, view<2xi32>
+  %first_prepared, %first_units, %first_tag = func.call @qwen38_vision_prepare_request(%request) : (buffer) -> (buffer, i64, i64)
+  %packet_bytes = buffer.length %first_prepared
+  %packet64 = index.cast %packet_bytes : offset to i64
+  %input_bytes = index.scale %count, %packet_bytes : index, offset -> offset
+  %packed = buffer.alloca<private> align(16) %input_bytes : buffer
+  scf.for %i = [%c0 to %count step %c1] {
+    %offset = index.scale %i, %packet_bytes : index, offset -> offset
+    %offset64 = index.cast %offset : offset to i64
+    view.store %offset64, %range_view[%i, 0] : i64, view<[%count]x2xi64>
+    view.store %packet64, %range_view[%i, 1] : i64, view<[%count]x2xi64>
+    %color32 = index.cast %i : index to i32
+    %color = scalar.trunci %color32 : i32 to i8
+    buffer.fill %color, %request[%pixel_offset], %pixel_bytes : i8
+    %prepared, %units, %tag = func.call @qwen38_vision_prepare_request(%request) : (buffer) -> (buffer, i64, i64)
+    buffer.copy %prepared[%origin], %packed[%offset], %packet_bytes
+  }
+  // Snapshot before the in-place update: comparing payload with packed itself
+  // would accept arbitrary directory or pixel corruption through their alias.
+  %expected_payload = buffer.alloca<private> align(16) %input_bytes : buffer
+  buffer.copy %packed[%origin], %expected_payload[%origin], %input_bytes
+  %directory = buffer.view %expected_payload[%origin] : buffer -> view<4x2xi64>
+  %prefix = scalar.constant 64 : i64
+  %content_bytes = scalar.subi %packet64, %prefix : i64
+  %count64 = index.cast %count : index to i64
+  %image_rows = scalar.extui %rows32 : i32 to i64
+  %features = index.cast %columns : index to i64
+  %element_bytes = scalar.constant 4 : i64
+  %feature_bytes = scalar.muli %features, %element_bytes : i64
+  %rows64 = scalar.muli %count64, %image_rows : i64
+  %output_bytes = scalar.muli %rows64, %feature_bytes : i64
+  %request_base = index.constant 32 : offset
+  %request_stride = index.constant 24 : offset
+  %request_bytes = index.scale %count, %request_stride : index, offset -> offset
+  %row_base = index.add %request_base, %request_bytes : offset
+  %row_count = index.mul %count, %image_row_count : index
+  %row_bytes = index.scale %row_count, %range_stride : index, offset -> offset
+  %plan_bytes = index.add %row_base, %row_bytes : offset
+  %expected_plan = buffer.alloca<private> align(8) %plan_bytes : buffer
+  %plan_header = buffer.view %expected_plan[%origin] : buffer -> view<4xi64>
+  view.store %output_bytes, %plan_header[0] : i64, view<4xi64>
+  view.store %output_bytes, %plan_header[1] : i64, view<4xi64>
+  view.store %count64, %plan_header[2] : i64, view<4xi64>
+  view.store %rows64, %plan_header[3] : i64, view<4xi64>
+  %requests = buffer.view %expected_plan[%request_base] : buffer -> view<[%count]x3xi64>
+  scf.for %i = [%c0 to %count step %c1] {
+    %ordinal = index.cast %i : index to i64
+    %offset = scalar.muli %ordinal, %packet64 : i64
+    %header = scalar.addi %offset, %prefix : i64
+    view.store %header, %directory[%i, 0] : i64, view<4x2xi64>
+    view.store %content_bytes, %directory[%i, 1] : i64, view<4x2xi64>
+    %first = scalar.muli %ordinal, %image_rows : i64
+    view.store %first, %requests[%i, 0] : i64, view<[%count]x3xi64>
+    view.store %image_rows, %requests[%i, 1] : i64, view<[%count]x3xi64>
+    view.store %image_rows, %requests[%i, 2] : i64, view<[%count]x3xi64>
+  }
+  %rows = buffer.view %expected_plan[%row_base] : buffer -> view<[%row_count]x2xi64>
+  scf.for %i = [%c0 to %row_count step %c1] {
+    %ordinal = index.cast %i : index to i64
+    %offset = scalar.muli %ordinal, %feature_bytes : i64
+    view.store %offset, %rows[%i, 0] : i64, view<[%row_count]x2xi64>
+    view.store %features, %rows[%i, 1] : i64, view<[%row_count]x2xi64>
+  }
+  %stage, %payload, %plan = func.call @qwen38_vision_prepare_batch(%columns, %ranges, %packed) : (index, buffer, buffer) -> (i32, buffer, buffer)
+  %payload_length = buffer.length %payload
+  %plan_length = buffer.length %plan
+  %payload_length_valid = index.cmp eq, %payload_length, %input_bytes : offset
+  %plan_length_valid = index.cmp eq, %plan_length, %plan_bytes : offset
+  %lengths_valid = scalar.andi %payload_length_valid, %plan_length_valid : i1
+  %contents_valid = scf.if %lengths_valid -> (i1) {
+    %payload_order = buffer.compare %payload[%origin], %expected_payload[%origin], %input_bytes
+    %plan_order = buffer.compare %plan[%origin], %expected_plan[%origin], %plan_bytes
+    %payload_valid = scalar.cmpi eq, %payload_order, %zero32 : i32
+    %plan_valid = scalar.cmpi eq, %plan_order, %zero32 : i32
+    %valid = scalar.andi %payload_valid, %plan_valid : i1
+    scf.yield %valid : i1
+  } else {
+    %invalid = scalar.constant false : i1
+    scf.yield %invalid : i1
+  }
+  %height_shift = scalar.constant 16 : i32
+  %width_shift = scalar.constant 3 : i32
+  %height_bits = scalar.shli %height, %height_shift : i32
+  %width_bits = scalar.shli %width, %width_shift : i32
+  %axes = scalar.ori %height_bits, %width_bits : i32
+  %count32 = index.cast %count : index to i32
+  %expected_stage = scalar.ori %axes, %count32 : i32
+  %stage_valid = scalar.cmpi eq, %stage, %expected_stage : i32
+  %valid = scalar.andi %contents_valid, %stage_valid : i1
+  %result = scalar.extui %valid : i1 to i32
+  func.return %result : i32
+}
+
+check.case public @vision_cohort_plans {
+  %count = check.param.choice values([1, 2, 3, 4]) : index
+  %columns = check.param.choice values([2560, 5120]) : index
+  %width = check.param.choice values([256, 288, 416]) : i32
+  %actual = func.call @vision_cohort_observation(%count, %columns, %width) : (index, index, i32) -> (i32)
+  %expected = check.literal value(1) : i32
+  check.expect.equal actual(%actual) expected(%expected) : i32
+  check.return
+}
+
+check.benchmark<@vision_cohort_plans> @image_cohort_feature_planning
+
+// Production forecasting receives descriptors, not decoded pixel packets.
+// Keep only the native header and metadata, with aligned gaps between records.
+// A mixed-shape request must retain outputs across separate producer cohorts.
+func.def @vision_forecast_observation(%columns: index, %count: index, %first_width: i32, %first_height: i32, %other_width: i32, %other_height: i32) -> (i64, i64, i64) where [range(%count, 1, 4)] {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %descriptor_stride = index.constant 128 : offset
+  %descriptor_base = index.constant 16 : offset
+  %header_bytes = index.constant 64 : offset
+  %range_stride = index.constant 16 : offset
+  %range_bytes = index.scale %count, %range_stride : index, offset -> offset
+  %descriptor_bytes = index.scale %count, %descriptor_stride : index, offset -> offset
+  %ranges = buffer.alloca<private> align(8) %range_bytes : buffer
+  %descriptors = buffer.alloca<private> align(16) %descriptor_bytes : buffer
+  %zero32 = scalar.constant 0 : i32
+  %padding = scalar.constant -91 : i8
+  buffer.fill %padding, %descriptors[%origin], %descriptor_bytes : i8
+  %records = buffer.view %ranges[%origin] : buffer -> view<[%count]x2xi64>
+  %descriptor_length = scalar.constant 72 : i64
+  %one32 = scalar.constant 1 : i32
+  %rgb8 = scalar.constant 3 : i32
+  %feature_pixels = scalar.constant 1024 : i32
+  %metadata_offset = scalar.constant 64 : i32
+  %metadata_bytes = scalar.constant 8 : i32
+  %pixel_offset = scalar.constant 80 : i32
+  scf.for %i = [%c0 to %count step %c1] {
+    %first = index.cmp eq, %i, %c0 : index
+    %width = scf.select %first, %first_width, %other_width : i32
+    %height = scf.select %first, %first_height, %other_height : i32
+    %pixels = scalar.muli %width, %height : i32
+    %pixel_bytes = scalar.muli %pixels, %rgb8 : i32
+    %rows = scalar.divui %pixels, %feature_pixels : i32
+    %slot = index.scale %i, %descriptor_stride : index, offset -> offset
+    %offset = index.add %slot, %descriptor_base : offset
+    buffer.fill %zero32, %descriptors[%offset], %header_bytes : i32
+    %offset64 = index.cast %offset : offset to i64
+    view.store %offset64, %records[%i, 0] : i64, view<[%count]x2xi64>
+    view.store %descriptor_length, %records[%i, 1] : i64, view<[%count]x2xi64>
+    %header = buffer.view %descriptors[%offset] : buffer -> view<16xi32>
+    view.store %one32, %header[0] : i32, view<16xi32>
+    view.store %one32, %header[1] : i32, view<16xi32>
+    view.store %width, %header[2] : i32, view<16xi32>
+    view.store %height, %header[3] : i32, view<16xi32>
+    view.store %width, %header[4] : i32, view<16xi32>
+    view.store %height, %header[5] : i32, view<16xi32>
+    view.store %one32, %header[6] : i32, view<16xi32>
+    view.store %rows, %header[7] : i32, view<16xi32>
+    view.store %metadata_offset, %header[8] : i32, view<16xi32>
+    view.store %metadata_bytes, %header[9] : i32, view<16xi32>
+    view.store %pixel_offset, %header[10] : i32, view<16xi32>
+    view.store %pixel_bytes, %header[11] : i32, view<16xi32>
+    view.store %rgb8, %header[12] : i32, view<16xi32>
+    %metadata_base = index.add %offset, %header_bytes : offset
+    %metadata = buffer.view %descriptors[%metadata_base] : buffer -> view<2xi32>
+    view.store %width, %metadata[0] : i32, view<2xi32>
+    view.store %height, %metadata[1] : i32, view<2xi32>
+  }
+  %parameters = scalar.constant 1073741824 : i64
+  %private, %retained, %expanded = func.call @qwen38_vision_forecast(%columns, %parameters, %ranges, %descriptors) : (index, i64, buffer, buffer) -> (i64, i64, i64)
+  func.return %private, %retained, %expanded : i64, i64, i64
+}
+
+// Literal peaks include 1 GiB of parameters, the native upload cap, and the
+// largest image's workspace. The narrow output needs a second residual bank.
+// Cohort multiplicity increases retained rows but never private workspace.
+func.def @forecast_uniform_observation(%count: index, %columns: index, %width: i32) -> (i64, i64, i64, i64, i64, i64) {
+  %short = scalar.constant 288 : i32
+  %wide = scalar.constant 416 : i32
+  %maximum = scalar.constant 4096 : i32
+  %narrow_columns = index.constant 2560 : index
+  %rectangle = scalar.cmpi eq, %width, %short : i32
+  %largest = scalar.cmpi eq, %width, %maximum : i32
+  %narrow = index.cmp eq, %columns, %narrow_columns : index
+  %height = scf.select %rectangle, %wide, %width : i32
+  %private, %retained, %expanded = func.call @vision_forecast_observation(%columns, %count, %width, %height, %width, %height) : (index, index, i32, i32, i32, i32) -> (i64, i64, i64)
+  %square_wide = scalar.constant 1346873920 : i64
+  %square_narrow = scalar.constant 1348053568 : i64
+  %rectangle_wide = scalar.constant 1349677632 : i64
+  %rectangle_narrow = scalar.constant 1351834176 : i64
+  %maximum_wide = scalar.constant 2210136640 : i64
+  %maximum_narrow = scalar.constant 2512126528 : i64
+  %square_peak = scf.select %narrow, %square_narrow, %square_wide : i64
+  %rectangle_peak = scf.select %narrow, %rectangle_narrow, %rectangle_wide : i64
+  %maximum_peak = scf.select %narrow, %maximum_narrow, %maximum_wide : i64
+  %ordinary_peak = scf.select %rectangle, %rectangle_peak, %square_peak : i64
+  %expected_private = scf.select %largest, %maximum_peak, %ordinary_peak : i64
+  %square_rows = scalar.constant 64 : i64
+  %rectangle_rows = scalar.constant 117 : i64
+  %maximum_rows = scalar.constant 16384 : i64
+  %ordinary_rows = scf.select %rectangle, %rectangle_rows, %square_rows : i64
+  %rows = scf.select %largest, %maximum_rows, %ordinary_rows : i64
+  %count64 = index.cast %count : index to i64
+  %columns64 = index.cast %columns : index to i64
+  %c4 = scalar.constant 4 : i64
+  %total_rows = scalar.muli %rows, %count64 : i64
+  %elements = scalar.muli %total_rows, %columns64 : i64
+  %expected_expanded = scalar.muli %elements, %c4 : i64
+  %expected_retained = scalar.muli %expected_expanded, %c4 : i64
+  func.return %private, %retained, %expanded, %expected_private, %expected_retained, %expected_expanded : i64, i64, i64, i64, i64, i64
+}
+
+check.case public @vision_forecast_uniform {
+  %count = check.param.choice values([1, 4]) : index
+  %columns = check.param.choice values([2560, 5120]) : index
+  %width = check.param.choice values([256, 288, 4096]) : i32
+  %private, %retained, %expanded, %expected_private, %expected_retained, %expected_expanded = func.call @forecast_uniform_observation(%count, %columns, %width) : (index, index, i32) -> (i64, i64, i64, i64, i64, i64)
+  check.expect.equal actual(%private) expected(%expected_private) : i64
+  check.expect.equal actual(%retained) expected(%expected_retained) : i64
+  check.expect.equal actual(%expanded) expected(%expected_expanded) : i64
+  check.return
+}
+
+// Later, larger images set the peak; different geometries retain all their
+// rows across separate producer cohorts. Descriptor offsets are 16, 144, ...
+// with nonzero padding, so packed or zero-origin assumptions are observable.
+func.def @forecast_mixed_observation(%count: index, %columns: index, %other_width: i32) -> (i64, i64, i64, i64, i64, i64) {
+  %square = scalar.constant 256 : i32
+  %small_width = scalar.constant 320 : i32
+  %short = scalar.constant 288 : i32
+  %large = scalar.constant 1024 : i32
+  %narrow_columns = index.constant 2560 : index
+  %large_image = scalar.cmpi eq, %other_width, %large : i32
+  %narrow = index.cmp eq, %columns, %narrow_columns : index
+  %first_width = scf.select %large_image, %small_width, %square : i32
+  %other_height = scf.select %large_image, %large, %short : i32
+  %private, %retained, %expanded = func.call @vision_forecast_observation(%columns, %count, %first_width, %square, %other_width, %other_height) : (index, index, i32, i32, i32, i32) -> (i64, i64, i64)
+  %rectangle_wide = scalar.constant 1349677632 : i64
+  %rectangle_narrow = scalar.constant 1351834176 : i64
+  %large_wide = scalar.constant 1397654080 : i64
+  %large_narrow = scalar.constant 1416528448 : i64
+  %rectangle_peak = scf.select %narrow, %rectangle_narrow, %rectangle_wide : i64
+  %large_peak = scf.select %narrow, %large_narrow, %large_wide : i64
+  %expected_private = scf.select %large_image, %large_peak, %rectangle_peak : i64
+  %square_rows = scalar.constant 64 : i64
+  %small_rows = scalar.constant 80 : i64
+  %rectangle_rows = scalar.constant 117 : i64
+  %large_rows = scalar.constant 1024 : i64
+  %first_rows = scf.select %large_image, %small_rows, %square_rows : i64
+  %other_rows = scf.select %large_image, %large_rows, %rectangle_rows : i64
+  %c1 = scalar.constant 1 : i64
+  %c4 = scalar.constant 4 : i64
+  %count64 = index.cast %count : index to i64
+  %others = scalar.subi %count64, %c1 : i64
+  %later_rows = scalar.muli %others, %other_rows : i64
+  %total_rows = scalar.addi %first_rows, %later_rows : i64
+  %columns64 = index.cast %columns : index to i64
+  %elements = scalar.muli %total_rows, %columns64 : i64
+  %expected_expanded = scalar.muli %elements, %c4 : i64
+  %expected_retained = scalar.muli %expected_expanded, %c4 : i64
+  func.return %private, %retained, %expanded, %expected_private, %expected_retained, %expected_expanded : i64, i64, i64, i64, i64, i64
+}
+
+check.case public @vision_forecast_mixed {
+  %count = check.param.choice values([2, 3]) : index
+  %columns = check.param.choice values([2560, 5120]) : index
+  %other_width = check.param.choice values([416, 1024]) : i32
+  %private, %retained, %expanded, %expected_private, %expected_retained, %expected_expanded = func.call @forecast_mixed_observation(%count, %columns, %other_width) : (index, index, i32) -> (i64, i64, i64, i64, i64, i64)
+  check.expect.equal actual(%private) expected(%expected_private) : i64
+  check.expect.equal actual(%retained) expected(%expected_retained) : i64
+  check.expect.equal actual(%expanded) expected(%expected_expanded) : i64
+  check.return
+}
+
+check.benchmark<@vision_forecast_uniform> @image_cohort_memory_forecast
+
+check.benchmark<@vision_forecast_mixed> @image_mixed_memory_forecast
