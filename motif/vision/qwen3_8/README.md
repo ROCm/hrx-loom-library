@@ -5,6 +5,12 @@ contracts. The dense and MoE models use different matrix precision and final
 feature widths; checkpoint names, geometry selection, launches, and retained
 output ownership belong to their composition leaves.
 
+`resize.loom` consumes the shared image-service packet, resolving RGB/RGBA
+orientation and straight alpha while filtering. An 8×32×3 resident F32 panel
+reuses horizontal samples across sixteen output rows without an image-sized
+intermediate. The leaf supplies a wave32 launch and selects one cohort image;
+the host's exact coefficient plans and nearest-even byte output are preserved.
+
 `workspace.loom` defines the allocation lengths and aligned private peak used
 by both command composition and admission forecasting. A final feature width
 of at least 4608 can hold one temporary residual bank; narrower outputs need
