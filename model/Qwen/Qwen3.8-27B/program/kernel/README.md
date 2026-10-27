@@ -38,9 +38,15 @@ each image's output feature range.
 `vision_ffn.loom` specializes the [shared vision FFN](../../../../../motif/vision/qwen3_8/README.md)
 with image geometry and original F16 matrix storage. The motif owns normalized
 input staging, LDS permutations, read-ahead, and F32 matrix accumulation. The
-model leaf owns the wave32 launch and existing statistics/up/down buffer ABI.
+model leaf owns the wave32 launch and existing up/down buffer ABI.
 The motif's BF16 specialization uses the same schedule without converting
 checkpoints.
+
+`vision_normalization.loom` supplies the shared F32 position/statistics/apply
+algorithms with geometry and launches. Learned-position addition computes the
+first layer's moments while updating the residual; subsequent layers use the
+ordinary statistics entry. These algorithms retain the same eight-byte row
+record across the dense and MoE matrix representations.
 
 ### Pixel filtering
 

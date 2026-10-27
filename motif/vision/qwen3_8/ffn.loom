@@ -1,4 +1,4 @@
-// Qwen3.8 vision LayerNorm statistics and 1152 -> 4304 -> 1152 FFN.
+// Qwen3.8 vision 1152 -> 4304 -> 1152 feed-forward projection.
 //
 // Rows are 4..65536, divisible by four. All matrices are contiguous row-major:
 // residual [rows,1152] F32, statistics [rows,2] F32 (mean, inverse deviation),
@@ -8,7 +8,7 @@
 // the caller's compile-known bf16 value. Accumulation and residuals remain F32.
 // Buffers are disjoint within each call; down updates its residual in place.
 //
-// Statistics uses one 256-thread workgroup per row and epsilon 1e-6. Up uses
+// Statistics comes from the shared normalization motif with epsilon 1e-6. Up uses
 // ceil(rows/64) by 23 groups of 384 threads; down uses ceil(rows/64) by nine
 // groups of 256 threads. Matrix groups contain 32-lane subgroups with native
 // 16x16x16 half-input/F32-accumulator fragments. All Y/Z workitem extents and
@@ -156,50 +156,6 @@ func.def inline @qwen38_vision_ffn_gelu_fragment(%input: vector<8xf32>) -> (vect
   %half_input = vector.mulf %half, %input : vector<8xf32>
   %output = vector.mulf %half_input, %factor : vector<8xf32>
   func.return %output : vector<8xf32>
-}
-
-template.decl @qwen38.vision.statistics(%rows_value: index, %residual: buffer, %statistics: buffer)
-
-template.def<@qwen38.vision.statistics> device @qwen38_vision_statistics_body(%rows_value: index, %residual: buffer, %statistics: buffer) {
-  %origin = index.constant 0 : offset
-  %c0 = index.constant 0 : index
-  %c1 = index.constant 1 : index
-  %c16 = index.constant 16 : index
-  %c256 = index.constant 256 : index
-  %c1152 = index.constant 1152 : index
-  %c0_f32 = scalar.constant 0.0 : f32
-  %width = scalar.constant 1152.0 : f32
-  %epsilon = scalar.constant 9.9999999999999995e-07 : f32
-
-  %rows = index.assume %rows_value [range(%rows_value, 4, 65536), multiple_of(%rows_value, 4)] : index
-  %row0 = kernel.workgroup.id<x> : index
-  %row = index.assume %row0 [lt(%row0, %rows)] : index
-  %lane = kernel.workitem.id<x> : index
-
-  %residual_noalias, %statistics_noalias = buffer.assume.noalias %residual, %statistics : buffer, buffer
-  %residual_view = buffer.view %residual_noalias[%origin] : buffer -> view<[%rows]x1152xf32>
-  %statistics_view = buffer.view %statistics_noalias[%origin] : buffer -> view<[%rows]x2xf32>
-  %partial_sum, %partial_square_sum = scf.for %column = [%lane to %c1152 step %c256](%sum = %c0_f32 : f32, %square_sum = %c0_f32 : f32) -> (f32, f32) {
-    %value = view.load %residual_view[%row, %column] : view<[%rows]x1152xf32> -> f32
-    %next_sum = scalar.addf %sum, %value : f32
-    %square = scalar.mulf %value, %value : f32
-    %next_square_sum = scalar.addf %square_sum, %square : f32
-    scf.yield %next_sum, %next_square_sum : f32, f32
-  }
-  %sum = kernel.workgroup.reduce<addf> %partial_sum : f32
-  %square_sum = kernel.workgroup.reduce<addf> %partial_square_sum : f32
-  %mean = scalar.divf %sum, %width : f32
-  %square_mean = scalar.divf %square_sum, %width : f32
-  %mean_square = scalar.mulf %mean, %mean : f32
-  %variance = scalar.subf %square_mean, %mean_square : f32
-  %biased_variance = scalar.addf %variance, %epsilon : f32
-  %inverse = scalar.rsqrtf %biased_variance : f32
-  %leader = index.cmp eq, %lane, %c0 : index
-  scf.if %leader {
-    view.store %mean, %statistics_view[%row, %c0] : f32, view<[%rows]x2xf32>
-    view.store %inverse, %statistics_view[%row, %c1] : f32, view<[%rows]x2xf32>
-  }
-  template.return
 }
 
 template.decl @qwen38.vision.ffn_up(%rows_value: index, %bf16: i1, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %up_weight: buffer, %up_bias: buffer, %activation: buffer)

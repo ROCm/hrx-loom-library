@@ -23,6 +23,12 @@ residuals separately, with bitwise guards and unchanged weight buffers. F16
 executes the actual model leaf; a BF16 leaf selects the shared alternate
 precision. Both use native and access-instrumented execution profiles.
 
+Rectangular normalization uses a linear spatial field with alternating channel
+signs. Its interpolated values and population moments have a closed form, so
+the reference does not repeat the GPU interpolation or reduction. Both image
+orientations cover fractional positions, boundaries, and 2×2 merge-block order;
+residuals, statistics, and normalized output are checked separately.
+
 The full-width Q5 staging comparison uses weights on a `2^-10` lattice and
 inputs in `{-1, 0, 1}`. Its `2^-12` absolute budget is one quarter of the
 smallest nonzero mathematical result difference; native matrix instructions
