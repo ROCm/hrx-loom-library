@@ -35,3 +35,10 @@ all four view roles, partial and full zeroing extents, empty attention views,
 64-bit byte quantities, reordered stores, and replacement of an existing record.
 Separate VM case benchmarks exercise the same writers and exact comparisons.
 The largest allocation is 296 bytes; no represented payload is materialized.
+
+`vision_pixels.loom` checks the actual shared axis planner against independent
+bicubic coefficients, clipped support, negative lobes, and identity, reduced,
+magnified, and degenerate axes. Nonintegral sampling covers independently rounded
+opposite edges. The source root exposes its private helper to this test without
+making it part of the public linking contract. Model-local image tests exercise
+the same packet producer through real cohort callbacks and GPU pixel filtering.

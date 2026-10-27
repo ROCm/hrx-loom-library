@@ -73,7 +73,7 @@ record across the dense and MoE matrix representations.
 ### Pixel filtering
 
 `vision_resize.loom` consumes the packet layout owned by
-[`vision_pixels.loom`](../vision_pixels.loom). Its specialization arguments are
+the shared [pixel provider](../../../../../program/text/qwen3_8/vision_pixels.loom). Its specialization arguments are
 the two workgroup counts; launch arguments select a directory entry from zero
 through three, the packed input, and a distinct RGB8 output buffer. The caller
 launches `ceil(width / 32)` by `ceil(height / 16)` groups.

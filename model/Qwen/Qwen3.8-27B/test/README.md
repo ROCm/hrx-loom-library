@@ -101,7 +101,7 @@ They use the production providers and independently authored expected values.
 
 | Program | Contract |
 | --- | --- |
-| `vision_pixels` | Exact normalized cubic coefficients, clipped support, negative lobes, identity/reduced/magnified/degenerate axes, and independently rounded edges at a nonintegral 97/31 scale. |
+| [Shared pixel tests](../../../../program/text/qwen3_8/test/README.md) | Exact normalized cubic coefficients, clipped support, negative lobes, identity/reduced/magnified/degenerate axes, and independently rounded edges at a nonintegral 97/31 scale. |
 | `vision_control` | One-to-four-image cohort stage arguments, in-place directory construction, image ordering, physical feature ranges, and logical row counts. Only the native stage declaration sink is substituted. |
 | `vision_resize` | Complete RGB8 output from the production GPU filter. Thirty-two trials cover landscape/portrait orientation, RGB/RGBA input, identity filtering, and extreme scale changes. Analytical coordinate colors expose orientation mistakes; constant colors isolate filtering and alpha composition. |
 
@@ -111,7 +111,7 @@ and access-instrumented profiles. Benchmark smoke verifies executable workload
 plans; performance comparisons require the normal exclusive measurement route.
 
 Coefficient tests include their implementation as a test root to inspect its
-private axis-plan helper. Cohort tests include the unchanged control source
+private axis-plan helper. Cohort tests include the actual model and shared control sources
 with a test stage-declaration provider that observes its arguments. Production
 libraries retain private helpers and link the actual stage provider.
 
