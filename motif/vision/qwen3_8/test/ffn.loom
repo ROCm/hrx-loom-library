@@ -6,68 +6,53 @@
 // uses scalar products and F64 GELU algebra with the VM's F32 exponential,
 // never LDS or matrix-fragment layouts.
 
-kernel.decl @qwen38_vision_statistics() launch(%residual: buffer, %statistics: buffer)
-
-kernel.decl @qwen38_vision_ffn_up() launch(%residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %up_weight: buffer, %up_bias: buffer, %activation: buffer)
-
-kernel.decl @qwen38_vision_ffn_down() launch(%activation: buffer, %down_weight: buffer, %down_bias: buffer, %residual: buffer)
-
 amdgpu.target<gfx11-generic> @vision_test_wave32 {subgroup_size = 32}
+
+func.decl @vision_round(%bf16: i1, %value: f32) -> (i16)
+
+func.decl @vision_widen(%bf16: i1, %bits: i16) -> (f32)
+
+func.decl @vision_gelu(%input: f32) -> (f32)
+
+template.decl @qwen38.vision.statistics(%rows: index, %residual: buffer, %statistics: buffer)
+
+kernel.def target(@vision_test_wave32) @statistics() {
+  %rows = index.constant 68 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%residual: buffer, %statistics: buffer) {
+  %rows = index.constant 68 : index
+  template.apply<@qwen38.vision.statistics>(%rows, %residual, %statistics) : (index, buffer, buffer)
+  kernel.return
+}
 
 template.decl @qwen38.vision.ffn_up(%rows: index, %bf16: i1, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %up_weight: buffer, %up_bias: buffer, %activation: buffer)
 
-kernel.def target(@vision_test_wave32) @vision_test_ffn_up_bf16() {
+kernel.def target(@vision_test_wave32) @ffn_up() {
   %row_tiles = index.constant 2 : index
   %column_tiles = index.constant 23 : index
   %threads = index.constant 384 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%row_tiles, %column_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %up_weight: buffer, %up_bias: buffer, %activation: buffer) {
+} launch(%bf16: i1, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %up_weight: buffer, %up_bias: buffer, %activation: buffer) {
   %rows = index.constant 68 : index
-  %bf16 = scalar.constant true : i1
   template.apply<@qwen38.vision.ffn_up>(%rows, %bf16, %residual, %statistics, %layernorm_weight, %layernorm_bias, %up_weight, %up_bias, %activation) : (index, i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }
 
 template.decl @qwen38.vision.ffn_down(%rows: index, %bf16: i1, %activation: buffer, %down_weight: buffer, %down_bias: buffer, %residual: buffer)
 
-kernel.def target(@vision_test_wave32) @vision_test_ffn_down_bf16() {
+kernel.def target(@vision_test_wave32) @ffn_down() {
   %row_tiles = index.constant 2 : index
   %column_tiles = index.constant 9 : index
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%row_tiles, %column_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%activation: buffer, %down_weight: buffer, %down_bias: buffer, %residual: buffer) {
+} launch(%bf16: i1, %activation: buffer, %down_weight: buffer, %down_bias: buffer, %residual: buffer) {
   %rows = index.constant 68 : index
-  %bf16 = scalar.constant true : i1
   template.apply<@qwen38.vision.ffn_down>(%rows, %bf16, %activation, %down_weight, %down_bias, %residual) : (index, i1, buffer, buffer, buffer, buffer)
   kernel.return
-}
-
-func.def @ffn_round(%bf16: i1, %value: f32) -> (i16) {
-  %bits = scf.if %bf16 -> (i16) {
-    %rounded = scalar.fptrunc %value : f32 to bf16
-    %bits = scalar.bitcast %rounded : bf16 to i16
-    scf.yield %bits : i16
-  } else {
-    %rounded = scalar.fptrunc %value : f32 to f16
-    %bits = scalar.bitcast %rounded : f16 to i16
-    scf.yield %bits : i16
-  }
-  func.return %bits : i16
-}
-
-func.def @ffn_widen(%bf16: i1, %bits: i16) -> (f32) {
-  %value = scf.if %bf16 -> (f32) {
-    %half = scalar.bitcast %bits : i16 to bf16
-    %value = scalar.extf %half : bf16 to f32
-    scf.yield %value : f32
-  } else {
-    %half = scalar.bitcast %bits : i16 to f16
-    %value = scalar.extf %half : f16 to f32
-    scf.yield %value : f32
-  }
-  func.return %value : f32
 }
 
 func.def @ffn_residual(%row: index, %column: index) -> (f32) {
@@ -175,9 +160,9 @@ func.def inline @ffn_weight_fixture(%bf16: i1, %inputs: index, %outputs: index, 
   %bias_view = buffer.view %bias[%origin] : buffer -> view<[%outputs]xf32>
   scf.for %channel = [%c0 to %outputs step %c1] {
     %first, %second, %last, %a, %b, %c, %bias_value = func.call @ffn_taps(%inputs, %channel) : (index, index) -> (index, index, index, f32, f32, f32, f32)
-    %a_bits = func.call @ffn_round(%bf16, %a) : (i1, f32) -> (i16)
-    %b_bits = func.call @ffn_round(%bf16, %b) : (i1, f32) -> (i16)
-    %c_bits = func.call @ffn_round(%bf16, %c) : (i1, f32) -> (i16)
+    %a_bits = func.call @vision_round(%bf16, %a) : (i1, f32) -> (i16)
+    %b_bits = func.call @vision_round(%bf16, %b) : (i1, f32) -> (i16)
+    %c_bits = func.call @vision_round(%bf16, %c) : (i1, f32) -> (i16)
     view.store %a_bits, %weight_view[%channel, %first] : i16, view<[%outputs]x[%inputs]xi16>
     view.store %b_bits, %weight_view[%channel, %second] : i16, view<[%outputs]x[%inputs]xi16>
     view.store %c_bits, %weight_view[%channel, %last] : i16, view<[%outputs]x[%inputs]xi16>
@@ -220,8 +205,8 @@ func.def @ffn_normalized(%bf16: i1, %row: index, %column: index) -> (f32) {
   %normalized = scalar.mulf %centered, %inverse : f32
   %scaled = scalar.mulf %normalized, %scale : f32
   %shifted = scalar.addf %scaled, %shift : f32
-  %bits = func.call @ffn_round(%bf16, %shifted) : (i1, f32) -> (i16)
-  %rounded = func.call @ffn_widen(%bf16, %bits) : (i1, i16) -> (f32)
+  %bits = func.call @vision_round(%bf16, %shifted) : (i1, f32) -> (i16)
+  %rounded = func.call @vision_widen(%bf16, %bits) : (i1, i16) -> (f32)
   func.return %rounded : f32
 }
 
@@ -234,11 +219,6 @@ func.def @ffn_reference(%bf16: i1, %activation: buffer, %output: buffer) {
   %hidden = index.constant 4304 : index
   %activation_view = buffer.view %activation[%origin] : buffer -> view<68x4304xi16>
   %output_view = buffer.view %output[%origin] : buffer -> view<68x1152xf32>
-  %half = scalar.constant 0.5 : f64
-  %c1_f = scalar.constant 1.0 : f64
-  %c2_f = scalar.constant 2.0 : f64
-  %cubic_scale = scalar.constant 0.044714999999999998 : f64
-  %sqrt_two_over_pi = scalar.constant 0.79788456080286541 : f64
   scf.for %row = [%c0 to %rows step %c1] {
     scf.for %channel = [%c0 to %hidden step %c1] {
       %first, %second, %last, %a, %b, %c, %bias = func.call @ffn_taps(%width, %channel) : (index, index) -> (index, index, index, f32, f32, f32, f32)
@@ -251,26 +231,8 @@ func.def @ffn_reference(%bf16: i1, %activation: buffer, %output: buffer) {
       %ab = scalar.addf %ax, %by : f32
       %abc = scalar.addf %ab, %cz : f32
       %biased = scalar.addf %abc, %bias : f32
-      %value = scalar.extf %biased : f32 to f64
-      %square = scalar.mulf %value, %value : f64
-      %cube = scalar.mulf %square, %value : f64
-      %cubic_term = scalar.mulf %cube, %cubic_scale : f64
-      %inner = scalar.addf %value, %cubic_term : f64
-      %angle = scalar.mulf %inner, %sqrt_two_over_pi : f64
-      // tanh(x) = (exp(2*x) - 1) / (exp(2*x) + 1). The fixture's bounded
-      // inputs avoid overflow; F32 exp rounding is below the activation budget.
-      %twice_angle = scalar.mulf %angle, %c2_f : f64
-      %exponent = scalar.fptrunc %twice_angle : f64 to f32
-      %exponential_f32 = scalar.expf<afn> %exponent : f32
-      %exponential = scalar.extf %exponential_f32 : f32 to f64
-      %numerator = scalar.subf %exponential, %c1_f : f64
-      %denominator = scalar.addf %exponential, %c1_f : f64
-      %tangent = scalar.divf %numerator, %denominator : f64
-      %factor = scalar.addf %c1_f, %tangent : f64
-      %half_value = scalar.mulf %half, %value : f64
-      %gelu = scalar.mulf %half_value, %factor : f64
-      %gelu_f32 = scalar.fptrunc %gelu : f64 to f32
-      %bits = func.call @ffn_round(%bf16, %gelu_f32) : (i1, f32) -> (i16)
+      %gelu_f32 = func.call @vision_gelu(%biased) : (f32) -> (f32)
+      %bits = func.call @vision_round(%bf16, %gelu_f32) : (i1, f32) -> (i16)
       view.store %bits, %activation_view[%row, %channel] : i16, view<68x4304xi16>
     }
     scf.for %channel = [%c0 to %width step %c1] {
@@ -278,9 +240,9 @@ func.def @ffn_reference(%bf16: i1, %activation: buffer, %output: buffer) {
       %x_bits = view.load %activation_view[%row, %first] : view<68x4304xi16> -> i16
       %y_bits = view.load %activation_view[%row, %second] : view<68x4304xi16> -> i16
       %z_bits = view.load %activation_view[%row, %last] : view<68x4304xi16> -> i16
-      %x = func.call @ffn_widen(%bf16, %x_bits) : (i1, i16) -> (f32)
-      %y = func.call @ffn_widen(%bf16, %y_bits) : (i1, i16) -> (f32)
-      %z = func.call @ffn_widen(%bf16, %z_bits) : (i1, i16) -> (f32)
+      %x = func.call @vision_widen(%bf16, %x_bits) : (i1, i16) -> (f32)
+      %y = func.call @vision_widen(%bf16, %y_bits) : (i1, i16) -> (f32)
+      %z = func.call @vision_widen(%bf16, %z_bits) : (i1, i16) -> (f32)
       %ax = scalar.mulf %a, %x : f32
       %by = scalar.mulf %b, %y : f32
       %cz = scalar.mulf %c, %z : f32
@@ -295,16 +257,11 @@ func.def @ffn_reference(%bf16: i1, %activation: buffer, %output: buffer) {
   func.return
 }
 
-// Exercise the same ordered launch sequence used by the model command.
+// Statistics, fused normalization/GELU, and the residual update form one command.
 command.program.def @ffn_complete(%bf16: i1) launch(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %up_weight: buffer, %up_bias: buffer, %down_weight: buffer, %down_bias: buffer, %activation: buffer) {
-  kernel.launch @qwen38_vision_statistics(%residual, %statistics) : (buffer, buffer)
-  scf.if %bf16 {
-    kernel.launch @vision_test_ffn_up_bf16(%residual, %statistics, %scale, %shift, %up_weight, %up_bias, %activation) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
-    kernel.launch @vision_test_ffn_down_bf16(%activation, %down_weight, %down_bias, %residual) : (buffer, buffer, buffer, buffer)
-  } else {
-    kernel.launch @qwen38_vision_ffn_up(%residual, %statistics, %scale, %shift, %up_weight, %up_bias, %activation) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
-    kernel.launch @qwen38_vision_ffn_down(%activation, %down_weight, %down_bias, %residual) : (buffer, buffer, buffer, buffer)
-  }
+  kernel.launch @statistics(%residual, %statistics) : (buffer, buffer)
+  kernel.launch @ffn_up(%bf16, %residual, %statistics, %scale, %shift, %up_weight, %up_bias, %activation) : (i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @ffn_down(%bf16, %activation, %down_weight, %down_bias, %residual) : (i1, buffer, buffer, buffer, buffer)
   command.return
 }
 

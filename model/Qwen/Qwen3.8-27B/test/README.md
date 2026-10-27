@@ -44,14 +44,8 @@ F16/half calls the actual dense leaf. Other representations call the same
 shared motif with test-owned specialization facts. No complete checkpoint or
 offline tensor conversion is needed.
 
-`vision_ffn` additionally checks the shared F16/BF16 algorithm with 68 patch
-rows, covering a full 64-row tile, a four-row tail, and the 4304-column down
-projection's reduction tail. Each channel has three signed, independently
-addressed weight taps; analytically known row statistics and scalar products
-provide the reference. The checks observe intermediate activations and final
-residuals separately, with bitwise guards and unchanged weight buffers. F16
-executes the actual model leaf; a BF16 leaf selects the shared alternate
-precision. Both use native and access-instrumented execution profiles.
+Feed-forward numerical cases and benchmarks are owned by the shared
+[vision package](../../../../motif/vision/qwen3_8/test/README.md).
 
 Rectangular normalization uses a linear spatial field with alternating channel
 signs. Its interpolated values and population moments have a closed form, so
