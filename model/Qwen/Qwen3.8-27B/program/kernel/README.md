@@ -40,6 +40,12 @@ shared direct RGB8 projection. The same motif supports BF16 operands and F32
 checkpoint weights, converting only the resident panel. Its two temporal
 contractions remain independent until the F32 epilogue adds them and the bias.
 
+`vision_key_value.loom` selects the four-head cohort launch for the shared K/V
+projection and rotary algorithm. The dense command reuses its key/value banks
+after each attention dispatch. The motif takes the logical cohort and output
+byte origin separately, allowing concurrent cohorts to use distinct regions
+without changing matrix precision, resident layouts, or projection arithmetic.
+
 `vision_merger.loom` supplies the shared merger with original F16 matrices and
 the dense model's 5120-wide output contract. It shares the FFN's resident panel
 layouts and overlaps down-projection panel loads with matrix work. The command

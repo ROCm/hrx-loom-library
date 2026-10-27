@@ -14,6 +14,13 @@ Loom tools; benchmark smoke establishes execution, not performance.
 | DFlash2 | Context attention, proposal packing, candidate selection, and grouped convolution with independently specified buffers and expected state. |
 | Vision projector | Minimum, square, and rectangular geometries across patch embedding, attention, feed-forward, normalization, and merger stages. |
 
+`vision_key_value` checks all sixteen heads against two signed scalar taps per
+channel, including the last reduction column. A 6×6 patch grid crosses the
+32-row tile boundary and exercises both rotary axes, the four-channel head
+tails, and transposed value publication. The actual dense F16 launch executes
+four cohort commands; BF16 uses one concurrent all-head launch. Guards and
+immutable inputs check ownership independently of the numerical comparisons.
+
 `vision_merger` checks the complete up/GELU/down sequence at both the dense
 F16/5120 and Flash-Next BF16/2560 feature widths. Seventy rows cross a full tile
 and a six-row tail. A scalar two-tap reference varies signs and source columns,

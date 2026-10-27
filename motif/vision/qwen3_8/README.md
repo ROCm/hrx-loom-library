@@ -5,6 +5,16 @@ contracts. The dense and MoE models use different matrix precision and final
 feature widths; checkpoint names, geometry selection, launches, and retained
 output ownership belong to their composition leaves.
 
+`key_value.loom` projects four 72-channel heads at a time and applies the
+trained two-dimensional NEOX rotary coordinates to keys. It publishes row-major
+keys and transposed values, keeping 32-row weight reuse, cyclic resident weight
+rows, and padded input/transpose storage. The caller supplies the logical head
+cohort and output byte origin independently: dense composition reuses one bank
+after each attention dispatch, while concurrent cohorts own disjoint banks.
+Original F16/BF16 weights use the same arithmetic without global conversion.
+The independent K/V checks exercise the dense launch and concurrent BF16
+cohorts, including the four-channel head tails and a partial row tile.
+
 `merger.loom` turns each ordered group of four patch rows into one language
 feature. The up projection consumes the F32 4608-wide row and applies tanh
 GELU; the down projection emits the caller's feature width in F32. Dense and
@@ -28,7 +38,7 @@ while original Flash-Next F32 weights round to BF16 inside the resident tile.
 No image-sized patch matrix or converted checkpoint is materialized.
 
 `precision.loom` provides rounding, result publication, and native F16/BF16
-matrix interpretation for patch, feed-forward, and merger projections. It
+matrix interpretation for patch, key/value, feed-forward, and merger projections. It
 carries original half bits between arithmetic boundaries and allocates no
 storage or synchronization. The fragment contract is explicitly RDNA wave32
 with F32 accumulation.
