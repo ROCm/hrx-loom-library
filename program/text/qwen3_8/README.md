@@ -30,6 +30,10 @@ checkpoint's xhigh policy. Explicit effort and enable/disable controls must
 agree. The sampling packet and device execution are independent of this prompt
 selection.
 
+The cold `text_chat_reasoning_v1` declaration advertises `none`, `low`, `medium`,
+and `xhigh` for model discovery, with `none` as the omission default. Accepted
+aliases do not appear as distinct trained policies in the client selector.
+
 `preserve_thinking` defaults to true. False removes thinking envelopes from
 completed exchanges while keeping them in the current tool cycle, independently
 of whether the next response enables reasoning. User-form `<tool_response>`
