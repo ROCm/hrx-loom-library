@@ -30,6 +30,19 @@ checkpoint's xhigh policy. Explicit effort and enable/disable controls must
 agree. The sampling packet and device execution are independent of this prompt
 selection.
 
+`preserve_thinking` defaults to true. False removes thinking envelopes from
+completed exchanges while keeping them in the current tool cycle, independently
+of whether the next response enables reasoning. User-form `<tool_response>`
+wrappers continue the current cycle; an ordinary user message starts a new one.
+Both plain and ordered multimodal content use this boundary. The optional
+history scan follows ranges in the original request without copying history or
+image payloads, and normal preserving requests skip that scan.
+
+`chat_template_kwargs` accepts the same three controls. Top-level and nested
+values must agree after effort alias resolution; member order never overrides
+an explicit preference. Unknown keys, duplicate members within one object, and
+wrongly typed values reject.
+
 `epoch.loom` consumes consecutive first and continuation cohorts. Each record
 carries length, causal and source positions, resident row, known-input range,
 flags, output credit, and continuation owner.
