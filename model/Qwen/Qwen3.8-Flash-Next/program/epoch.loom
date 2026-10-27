@@ -2,7 +2,9 @@
 // output-only selection specialize from prepared capacities; active
 // ownership, page maps, and retained frontiers remain runtime inputs.
 
-command.program.decl @flash_next_finish_output(%layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %epoch: buffer, %mapping: buffer, %rows: buffer, %arena: buffer, %residual: buffer, %mixed: buffer, %injection: buffer, %output: buffer, %capture: buffer)
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
+command.program.decl @flash_next_finish_output(%layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %epoch: buffer, %mapping: buffer, %rows: buffer, %arena: buffer, %residual: buffer, %mixed: buffer, %injection: buffer, %output: buffer, %capture: buffer, %inputs: buffer)
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
@@ -14,7 +16,7 @@ kernel.decl @flash_next_embedding_q8_0() launch(%epoch: buffer, %ids: buffer, %w
 
 command.program.decl @flash_next_ple_residual(%layer: index, %token_history_origin: offset, %convolution_history_origin: offset) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %origins: buffer, %tokens: buffer, %residual: buffer, %arena: buffer, %output: buffer, %capture: buffer)
 
-command.program.decl @flash_next_qsa_residual(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %residual: buffer, %rows: buffer, %arena: buffer, %output: buffer, %capture: buffer)
+command.program.decl @flash_next_qsa_residual(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset, %mixed_inputs: index) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %residual: buffer, %rows: buffer, %arena: buffer, %output: buffer, %capture: buffer, %inputs: buffer)
 
 command.program.decl @flash_next_ffn_residual(%neural_enabled: i1, %layer: index) launch(%parameters: buffer, %span: buffer, %residual: buffer, %output: buffer)
 
@@ -26,6 +28,7 @@ command.program.decl @flash_next_output_head() launch(%parameters: buffer, %epoc
 // active tokens, span ownership, physical page IDs, and recurrent frontiers.
 command.program.def public @flash_next_body_unfused() launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
   %neural_enabled = scalar.constant true : i1
+  %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %tokens = config.get @flash_next.token_count : index
   %pool = config.get @flash_next.pool_capacity : index
   %row_bytes = index.constant 20480 : offset
@@ -85,7 +88,7 @@ command.program.def public @flash_next_body_unfused() launch(%parameters: buffer
       %tail_relative = index.scale %ordinal, %tail_stride : index, offset -> offset
       %tail_origin = index.add %tail_base, %tail_relative : offset
       %attention = buffer.alloca<global> align(256) %activation_bytes : buffer
-      command.program.launch @flash_next_qsa_residual[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %epoch, %mapping, %input, %rows, %state, %attention, %capture) : [i1, index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+      command.program.launch @flash_next_qsa_residual[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin, %mixed_inputs](%parameters, %epoch, %mapping, %input, %rows, %state, %attention, %capture, %input_tokens) : [i1, index, offset, offset, offset, offset, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       command.program.launch @flash_next_ffn_residual[%neural_enabled, %layer](%parameters, %epoch, %attention, %output) : [i1, index](buffer, buffer, buffer, buffer)
     } else {
       %gdn_ordinal = index.sub %layer, %ordinal : index
@@ -116,7 +119,7 @@ command.program.decl @flash_next_hc_ffn_normalized(%layer: index) launch(%parame
 
 command.program.decl @flash_next_gdn_attention(%layer: index, %state_origin: offset) launch(%parameters: buffer, %span: buffer, %input: buffer, %rows: buffer, %arena: buffer, %output: buffer, %capture: buffer)
 
-command.program.decl @flash_next_qsa_attention(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %output: buffer, %capture: buffer)
+command.program.decl @flash_next_qsa_attention(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset, %mixed_inputs: index) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %output: buffer, %capture: buffer, %inputs: buffer)
 
 command.program.decl @flash_next_route(%neural_enabled: i1, %layer: index) launch(%parameters: buffer, %span: buffer, %input: buffer, %ids: buffer, %weights: buffer, %shared_gate: buffer)
 
@@ -127,6 +130,7 @@ command.program.decl @flash_next_experts(%neural_enabled: i1, %layer: index) lau
 // mixers, attention, and expert stages without retaining one live buffer.
 command.program.def public @flash_next_body_normalized(%outputs_only: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
   %neural_enabled = scalar.constant true : i1
+  %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %tokens = config.get @flash_next.token_count : index
   %pool = config.get @flash_next.pool_capacity : index
   %row_bytes = index.constant 20480 : offset
@@ -192,7 +196,7 @@ command.program.def public @flash_next_body_normalized(%outputs_only: i1) launch
       %index_origin = index.add %index_base, %index_relative : offset
       %tail_relative = index.scale %ordinal, %tail_stride : index, offset -> offset
       %tail_origin = index.add %tail_base, %tail_relative : offset
-      command.program.launch @flash_next_finish_output[%layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %epoch, %mapping, %rows, %state, %input, %attention_mixed, %attention_injection, %residual, %capture) : [index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+      command.program.launch @flash_next_finish_output[%layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %epoch, %mapping, %rows, %state, %input, %attention_mixed, %attention_injection, %residual, %capture, %input_tokens) : [index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       scf.yield %residual, %input_normalized : buffer, buffer
     } else {
       %projected = buffer.alloca<global> align(256) %hidden_bytes : buffer
@@ -207,7 +211,7 @@ command.program.def public @flash_next_body_normalized(%outputs_only: i1) launch
         %index_origin = index.add %index_base, %index_relative : offset
         %tail_relative = index.scale %ordinal, %tail_stride : index, offset -> offset
         %tail_origin = index.add %tail_base, %tail_relative : offset
-        command.program.launch @flash_next_qsa_attention[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %epoch, %mapping, %rows, %attention_mixed, %state, %projected, %capture) : [i1, index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+        command.program.launch @flash_next_qsa_attention[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin, %mixed_inputs](%parameters, %epoch, %mapping, %rows, %attention_mixed, %state, %projected, %capture, %input_tokens) : [i1, index, offset, offset, offset, offset, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       } else {
         %gdn_ordinal = index.sub %layer, %ordinal : index
         %state_origin = index.scale %gdn_ordinal, %gdn_stride : index, offset -> offset
@@ -292,6 +296,7 @@ command.program.decl @flash_next_hc_mix_normalized(%down_weight: view<3481600xi8
 
 command.program.def public @flash_next_body_injection_fused(%outputs_only: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
   %neural_enabled = scalar.constant true : i1
+  %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %tokens = config.get @flash_next.token_count : index
   %pool = config.get @flash_next.pool_capacity : index
   %row_bytes = index.constant 20480 : offset
@@ -364,7 +369,7 @@ command.program.def public @flash_next_body_injection_fused(%outputs_only: i1) l
       %index_origin = index.add %index_base, %index_relative : offset
       %tail_relative = index.scale %ordinal, %tail_stride : index, offset -> offset
       %tail_origin = index.add %tail_base, %tail_relative : offset
-      command.program.launch @flash_next_finish_output[%layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %epoch, %mapping, %rows, %state, %input, %attention_mixed, %attention_injection, %residual, %capture) : [index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+      command.program.launch @flash_next_finish_output[%layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %epoch, %mapping, %rows, %state, %input, %attention_mixed, %attention_injection, %residual, %capture, %input_tokens) : [index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       scf.yield %residual, %input_normalized, %attention_injection, %attention_down, %attention_up : buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>
     } else {
       %projected = buffer.alloca<global> align(256) %hidden_bytes : buffer
@@ -379,7 +384,7 @@ command.program.def public @flash_next_body_injection_fused(%outputs_only: i1) l
         %index_origin = index.add %index_base, %index_relative : offset
         %tail_relative = index.scale %ordinal, %tail_stride : index, offset -> offset
         %tail_origin = index.add %tail_base, %tail_relative : offset
-        command.program.launch @flash_next_qsa_attention[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %epoch, %mapping, %rows, %attention_mixed, %state, %projected, %capture) : [i1, index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+        command.program.launch @flash_next_qsa_attention[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin, %mixed_inputs](%parameters, %epoch, %mapping, %rows, %attention_mixed, %state, %projected, %capture, %input_tokens) : [i1, index, offset, offset, offset, offset, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       } else {
         %gdn_ordinal = index.sub %layer, %ordinal : index
         %state_origin = index.scale %gdn_ordinal, %gdn_stride : index, offset -> offset
@@ -441,6 +446,7 @@ command.program.decl @flash_next_hc_mix_quantized(%down_weight: view<3481600xi8>
 
 command.program.def public @flash_next_body_quant_injection(%outputs_only: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
   %neural_enabled = scalar.constant true : i1
+  %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %tokens = config.get @flash_next.token_count : index
   %record_rows = index.constant 16 : index
   %record_rounding = index.constant 15 : index
@@ -521,7 +527,7 @@ command.program.def public @flash_next_body_quant_injection(%outputs_only: i1) l
       %index_origin = index.add %index_base, %index_relative : offset
       %tail_relative = index.scale %ordinal, %tail_stride : index, offset -> offset
       %tail_origin = index.add %tail_base, %tail_relative : offset
-      command.program.launch @flash_next_finish_output[%layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %epoch, %mapping, %rows, %state, %input, %attention_mixed, %attention_injection, %residual, %capture) : [index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+      command.program.launch @flash_next_finish_output[%layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %epoch, %mapping, %rows, %state, %input, %attention_mixed, %attention_injection, %residual, %capture, %input_tokens) : [index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       scf.yield %residual, %input_normalized, %attention_injection, %attention_down, %attention_up, %input_quantized : buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>, buffer
     } else {
       %projected = buffer.alloca<global> align(256) %hidden_bytes : buffer
@@ -536,7 +542,7 @@ command.program.def public @flash_next_body_quant_injection(%outputs_only: i1) l
         %index_origin = index.add %index_base, %index_relative : offset
         %tail_relative = index.scale %ordinal, %tail_stride : index, offset -> offset
         %tail_origin = index.add %tail_base, %tail_relative : offset
-        command.program.launch @flash_next_qsa_attention[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %epoch, %mapping, %rows, %attention_mixed, %state, %projected, %capture) : [i1, index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+        command.program.launch @flash_next_qsa_attention[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin, %mixed_inputs](%parameters, %epoch, %mapping, %rows, %attention_mixed, %state, %projected, %capture, %input_tokens) : [i1, index, offset, offset, offset, offset, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       } else {
         %gdn_ordinal = index.sub %layer, %ordinal : index
         %state_origin = index.scale %gdn_ordinal, %gdn_stride : index, offset -> offset

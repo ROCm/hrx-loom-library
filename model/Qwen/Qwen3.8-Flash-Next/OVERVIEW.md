@@ -101,8 +101,8 @@ The card rounds those estimates upward to 104 and 107 GiB. It does not infer a
 hardware fit or reserve memory from those figures.
 
 Mutable storage is additional: 25,344 bytes per pooled KV token and
-115,651,840 bytes per recurrent endpoint. MTP adds 44,032 bytes of carry per
-retained owner, 2,116 bytes per pooled token, and a 768-byte working tail per
+115,652,096 bytes per recurrent endpoint. MTP adds 44,032 bytes of carry per
+retained owner, 2,116 bytes per pooled token, and a 1,024-byte working tail per
 execution row. The retained carry includes 22,784 bytes for draft-vocabulary
 membership and history. Allocation granularity, workspace, compiler,
 tokenizer, and driver overhead are also additional, so no complete transient

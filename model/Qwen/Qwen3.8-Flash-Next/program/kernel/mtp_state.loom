@@ -95,7 +95,8 @@ func.def public inline @flash_next_mtp_span(%epoch: buffer, %span: index) -> (in
 }
 
 // Carry begins with 1280 raw-hidden packets and 48 partial-index packets,
-// each sixteen bytes, followed by request-owned draft vocabulary. Only
+// each sixteen bytes, followed by request-owned draft vocabulary. An aligned
+// coordinate record at byte 43952 shares the existing 44032-byte stride. Only
 // position%4 index rows are live. Restore them to the working cache before
 // proposing or replacing rejected speculative entries. The row directory
 // supplies the writable tail address independently of the KV plane layout.
@@ -135,6 +136,18 @@ kernel.def @flash_next_mtp_restore() {
     }
     %tail_rows = index.rem %position, %c4 : index
     %tail_packets = index.mul %tail_rows, %c16 : index
+    // The aligned coordinate record is live exactly when the raw tail is.
+    %has_tail = index.cmp ne, %tail_rows, %c0 : index
+    %first_thread = index.cmp eq, %thread, %c0 : index
+    %copies_coordinate = scalar.andi %has_tail, %first_thread : i1
+    scf.if %copies_coordinate {
+      %coordinate_offset = index.constant 768 : offset
+      %reader, %writer = func.call @flash_next_row_state(%rows, %row, %position, %coordinate_offset) : (buffer, index, index, offset) -> (offset, offset)
+      %working_coordinate = buffer.view %cache[%writer] : buffer -> view<4xi32>
+      %carry_coordinate = index.constant 2747 : index
+      %coordinate = vector.load %source[%carry_coordinate, %c0] : view<2752x4xi32> -> vector<4xi32>
+      vector.store %coordinate, %working_coordinate[%c0] : vector<4xi32>, view<4xi32>
+    }
     %copies_tail = index.cmp ult, %thread, %tail_packets : index
     scf.if %copies_tail {
       %reader, %writer = func.call @flash_next_row_state(%rows, %row, %position, %origin) : (buffer, index, index, offset) -> (offset, offset)
@@ -227,6 +240,18 @@ kernel.def @flash_next_mtp_commit() {
     %end = index.add %position, %length : index
     %tail_rows = index.rem %end, %c4 : index
     %tail_packets = index.mul %tail_rows, %c16 : index
+    // The aligned coordinate record is live exactly when the raw tail is.
+    %has_tail = index.cmp ne, %tail_rows, %c0 : index
+    %first_thread = index.cmp eq, %thread, %c0 : index
+    %copies_coordinate = scalar.andi %has_tail, %first_thread : i1
+    scf.if %copies_coordinate {
+      %coordinate_offset = index.constant 768 : offset
+      %reader, %writer = func.call @flash_next_row_state(%rows, %row, %position, %coordinate_offset) : (buffer, index, index, offset) -> (offset, offset)
+      %working_coordinate = buffer.view %cache[%writer] : buffer -> view<4xi32>
+      %carry_coordinate = index.constant 2747 : index
+      %coordinate = vector.load %working_coordinate[%c0] : view<4xi32> -> vector<4xi32>
+      vector.store %coordinate, %output[%carry_coordinate, %c0] : vector<4xi32>, view<2752x4xi32>
+    }
     %copies_tail = index.cmp ult, %thread, %tail_packets : index
     scf.if %copies_tail {
       %reader, %writer = func.call @flash_next_row_state(%rows, %row, %position, %origin) : (buffer, index, index, offset) -> (offset, offset)

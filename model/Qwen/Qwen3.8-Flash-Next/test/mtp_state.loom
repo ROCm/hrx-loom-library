@@ -10,7 +10,26 @@ kernel.decl @flash_next_mtp_ids() launch(%epoch: buffer, %origins: buffer, %targ
 
 kernel.decl @flash_next_mtp_commit() launch(%epoch: buffer, %rows: buffer, %origins: buffer, %target: buffer, %cache: buffer, %ids: buffer, %carry: buffer)
 
-kernel.decl @qsa_publish_tail(%neural_enabled: i1) launch(%tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer)
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
+template.decl @flash_next.qsa_publish_tail.body(%capacity: index, %verification: index, %publish_coordinates: i1, %mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %coordinate_origin: offset, %inputs: buffer, %origins: buffer, %tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer)
+
+kernel.def @publish_tail() {
+  %c1 = index.constant 1 : index
+  %spans = index.constant 4 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%spans, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%epoch: buffer, %rows: buffer, %raw: buffer, %inputs: buffer, %origins: buffer, %arena: buffer) {
+  %capacity = index.constant 16 : index
+  %verification = index.constant 0 : index
+  %publish = scalar.constant true : i1
+  %remapped = scalar.constant true : i1
+  %mixed = config.get @runner.qwen38.mixed_inputs : index
+  %coordinate = index.constant 768 : offset
+  %tail = index.constant 0 : offset
+  template.apply<@flash_next.qsa_publish_tail.body>(%capacity, %verification, %publish, %mixed, %remapped, %capacity, %capacity, %coordinate, %inputs, %origins, %tail, %epoch, %rows, %raw, %arena) : (index, index, i1, index, i1, index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
+  kernel.return
+}
 
 // Four original spans leave holes, one is empty, and physical owner order
 // differs from packed order. Positions cross both page and index boundaries;
@@ -36,7 +55,7 @@ kernel.def @fixture() {
   %history_origin = index.constant 1081344 : offset
   %tails_origin = index.constant 1083392 : offset
   %history = buffer.view %expected_cache[%history_origin] : buffer -> view<512xi32>
-  %published = buffer.view %expected_cache[%tails_origin] : buffer -> view<17x192xi32>
+  %published = buffer.view %expected_cache[%tails_origin] : buffer -> view<17x256xi32>
   %c0_word = scalar.constant 0 : i32
   %c1_word = scalar.constant 1 : i32
   %c2_word = scalar.constant 2 : i32
@@ -132,7 +151,7 @@ kernel.def @fixture() {
   %c64 = index.constant 64 : index
   %c128 = index.constant 128 : index
   %c192 = index.constant 192 : index
-  %tail_bytes = scalar.constant 768 : i64
+  %tail_bytes = scalar.constant 1024 : i64
   %tail_base = scalar.constant 1083392 : i64
   %map_origin = index.constant 640 : offset
   %maps = buffer.view %rows[%map_origin] : buffer -> view<16x2xi32>
@@ -170,13 +189,13 @@ kernel.def @fixture() {
     %word = index.cast %column : index to i32
     %base = scalar.constant 127136 : i32
     %value = scalar.addi %word, %base : i32
-    view.store %value, %published[14, %column] : i32, view<17x192xi32>
+    view.store %value, %published[14, %column] : i32, view<17x256xi32>
   }
   scf.for %column = [%c0 to %c128 step %c1] {
     %word = index.cast %column : index to i32
     %base = scalar.constant 204192 : i32
     %value = scalar.addi %word, %base : i32
-    view.store %value, %published[7, %column] : i32, view<17x192xi32>
+    view.store %value, %published[7, %column] : i32, view<17x256xi32>
   }
   scf.for %column = [%c0 to %width step %c1] {
     %word = index.cast %column : index to i32
@@ -205,8 +224,8 @@ kernel.def @fixture() {
     %continued = scalar.addi %word, %continued_base : i32
     view.store %fresh, %carry[7, %destination] : i32, view<16x11008xi32>
     view.store %continued, %carry[2, %destination] : i32, view<16x11008xi32>
-    view.store %fresh, %published[9, %column] : i32, view<17x192xi32>
-    view.store %continued, %published[14, %column] : i32, view<17x192xi32>
+    view.store %fresh, %published[9, %column] : i32, view<17x256xi32>
+    view.store %continued, %published[14, %column] : i32, view<17x256xi32>
   }
   scf.for %column = [%c0 to %c64 step %c1] {
     %word = index.cast %column : index to i32
@@ -215,8 +234,37 @@ kernel.def @fixture() {
     %base = scalar.constant 150320 : i32
     %value = scalar.addi %word, %base : i32
     view.store %value, %carry[9, %destination] : i32, view<16x11008xi32>
-    view.store %value, %published[7, %slot] : i32, view<17x192xi32>
+    view.store %value, %published[7, %slot] : i32, view<17x256xi32>
   }
+  %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
+  %mixed = index.cmp ne, %mixed_inputs, %c0 : index
+  %media_coordinate = scalar.constant 12345 : i32
+  %fresh_coordinate = scalar.constant 9 : i32
+  %continued_coordinate = scalar.constant 32 : i32
+  %fresh_source = scf.select %mixed, %media_coordinate, %fresh_coordinate : i32
+  %continued_source = scf.select %mixed, %media_coordinate, %continued_coordinate : i32
+  %axis_count = index.constant 3 : index
+  %coordinate_field = index.constant 10988 : index
+  %working_field = index.constant 192 : index
+  %old_coordinate = scalar.constant 210060 : i32
+  scf.for %axis = [%c0 to %axis_count step %c1] {
+    %carry_field = index.add %coordinate_field, %axis : index
+    %cache_field = index.add %working_field, %axis : index
+    %axis_word = index.cast %axis : index to i32
+    %prior_source = scalar.addi %old_coordinate, %axis_word : i32
+    view.store %fresh_source, %carry[7, %carry_field] : i32, view<16x11008xi32>
+    view.store %continued_source, %carry[2, %carry_field] : i32, view<16x11008xi32>
+    view.store %prior_source, %carry[9, %carry_field] : i32, view<16x11008xi32>
+    view.store %fresh_source, %published[9, %cache_field] : i32, view<17x256xi32>
+    view.store %continued_source, %published[14, %cache_field] : i32, view<17x256xi32>
+    view.store %prior_source, %published[7, %cache_field] : i32, view<17x256xi32>
+  }
+  view.store %c0_word, %carry[7, 10991] : i32, view<16x11008xi32>
+  view.store %c0_word, %carry[2, 10991] : i32, view<16x11008xi32>
+  view.store %c0_word, %carry[9, 10991] : i32, view<16x11008xi32>
+  view.store %c0_word, %published[9, 195] : i32, view<17x256xi32>
+  view.store %c0_word, %published[14, 195] : i32, view<17x256xi32>
+  view.store %c0_word, %published[7, 195] : i32, view<17x256xi32>
   // Continued owners have valid empty vocabulary state. Fresh owner seven
   // will reset its live header and bitmap again at the publication boundary.
   %policy_first = index.constant 5312 : index
@@ -252,7 +300,6 @@ kernel.def @fixture() {
 }
 
 check.case public @accepted_carry_with_holes {
-  %neural_enabled = check.literal value(true) : i1
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   %epoch = check.generate.fill value(-7) : tensor<99xi32>
   %compact = check.generate.fill value(-7) : tensor<99xi32>
@@ -268,24 +315,23 @@ check.case public @accepted_carry_with_holes {
   %expected_ids = check.generate.fill value(-7) : tensor<16xi32>
   %carry = check.generate.iota offset(100000) step(1) : tensor<16x11008xi32>
   %expected_carry = check.generate.iota offset(100000) step(1) : tensor<16x11008xi32>
-  %cache = check.generate.fill value(-7) : tensor<274112xi32>
-  %expected_cache = check.generate.fill value(-7) : tensor<274112xi32>
+  %cache = check.generate.fill value(-7) : tensor<275200xi32>
+  %expected_cache = check.generate.fill value(-7) : tensor<275200xi32>
   %raw = check.generate.iota offset(150000) step(1) : tensor<16x64xi32>
-  %origin = check.literal value(0) : offset
-  kernel.launch @fixture(%epoch, %expected_epoch, %expected_origins, %rows, %expected_hidden, %source_ids, %expected_ids, %carry, %expected_carry, %expected_cache) : (tensor<99xi32>, tensor<99xi32>, tensor<16xi32>, tensor<96xi64>, tensor<16x5120xi32>, tensor<16xi32>, tensor<16xi32>, tensor<16x11008xi32>, tensor<16x11008xi32>, tensor<274112xi32>)
+  kernel.launch @fixture(%epoch, %expected_epoch, %expected_origins, %rows, %expected_hidden, %source_ids, %expected_ids, %carry, %expected_carry, %expected_cache) : (tensor<99xi32>, tensor<99xi32>, tensor<16xi32>, tensor<96xi64>, tensor<16x5120xi32>, tensor<16xi32>, tensor<16xi32>, tensor<16x11008xi32>, tensor<16x11008xi32>, tensor<275200xi32>)
   %input_capacity = check.literal value(16) : index
   %inputs = check.generate.fill value(12345) : tensor<16x8xi32>
   kernel.launch @input_packet_fixture(%input_capacity, %source_ids, %inputs) : (index, tensor<16xi32>, tensor<16x8xi32>)
   kernel.launch @flash_next_mtp_compact(%epoch, %compact, %origins) : (tensor<99xi32>, tensor<99xi32>, tensor<16xi32>)
   check.expect.bitwise actual(%compact) expected(%expected_epoch) : tensor<99xi32>
   check.expect.bitwise actual(%origins) expected(%expected_origins) : tensor<16xi32>
-  kernel.launch @flash_next_mtp_restore(%compact, %rows, %carry, %cache, %hidden) : (tensor<99xi32>, tensor<96xi64>, tensor<16x11008xi32>, tensor<274112xi32>, tensor<16x5120xi32>)
-  kernel.launch @flash_next_mtp_ids(%compact, %origins, %inputs, %ids, %rows, %cache) : (tensor<99xi32>, tensor<16xi32>, tensor<16x8xi32>, tensor<16xi32>, tensor<96xi64>, tensor<274112xi32>)
+  kernel.launch @flash_next_mtp_restore(%compact, %rows, %carry, %cache, %hidden) : (tensor<99xi32>, tensor<96xi64>, tensor<16x11008xi32>, tensor<275200xi32>, tensor<16x5120xi32>)
+  kernel.launch @flash_next_mtp_ids(%compact, %origins, %inputs, %ids, %rows, %cache) : (tensor<99xi32>, tensor<16xi32>, tensor<16x8xi32>, tensor<16xi32>, tensor<96xi64>, tensor<275200xi32>)
   check.expect.bitwise actual(%hidden) expected(%expected_hidden) : tensor<16x5120xi32>
   check.expect.bitwise actual(%ids) expected(%expected_ids) : tensor<16xi32>
-  kernel.launch @qsa_publish_tail[%neural_enabled](%origin, %compact, %rows, %raw, %cache) : [i1](offset, tensor<99xi32>, tensor<96xi64>, tensor<16x64xi32>, tensor<274112xi32>)
-  kernel.launch @flash_next_mtp_commit(%compact, %rows, %origins, %source, %cache, %ids, %carry) : (tensor<99xi32>, tensor<96xi64>, tensor<16xi32>, tensor<16x5120xi32>, tensor<274112xi32>, tensor<16xi32>, tensor<16x11008xi32>)
-  check.expect.bitwise actual(%cache) expected(%expected_cache) : tensor<274112xi32>
+  kernel.launch @publish_tail(%compact, %rows, %raw, %inputs, %origins, %cache) : (tensor<99xi32>, tensor<96xi64>, tensor<16x64xi32>, tensor<16x8xi32>, tensor<16xi32>, tensor<275200xi32>)
+  kernel.launch @flash_next_mtp_commit(%compact, %rows, %origins, %source, %cache, %ids, %carry) : (tensor<99xi32>, tensor<96xi64>, tensor<16xi32>, tensor<16x5120xi32>, tensor<275200xi32>, tensor<16xi32>, tensor<16x11008xi32>)
+  check.expect.bitwise actual(%cache) expected(%expected_cache) : tensor<275200xi32>
   check.expect.bitwise actual(%carry) expected(%expected_carry) : tensor<16x11008xi32>
   check.return
 }

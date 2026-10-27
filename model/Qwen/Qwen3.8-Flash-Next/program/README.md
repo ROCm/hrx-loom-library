@@ -52,6 +52,23 @@ through the shared input contract. Replay and draft vocabulary continue to
 consume compact I32 histories. These input-content contracts do not by
 themselves advertise an image service on the model card.
 
+Rotary coordinates are independent of causal cache positions. The four-word
+token map carries causal position, resident row, packed span beginning, and
+source position. Image records supply temporal, height, and width coordinates;
+ordinary text uses the source position. Compact queries and accepted predictor
+rows resolve original records through their span-origin map, whose extent is
+independent of the original input allocation.
+
+A compressed index key rotates at the first member of its four-token group.
+When a group crosses an epoch boundary, its original coordinate survives with
+the partial raw tail in one 16-byte record shared by all twelve indexer layers.
+The last layer publishes that record after every layer has read the old value.
+Forks read the immutable anchor, and later epochs read their private writer.
+Accepted-prefix replay publishes from descriptors and original inputs without
+retaining a token map. Predictor restore and commit transfer the same record
+within the existing carry stride. Fresh or aligned endpoints never read it.
+No per-context coordinate history, packet copy, or extra dispatch is required.
+
 Greedy proposal rounds first search accepted token history. A trigram bitset
 locates the newest sixteen occurrences, and backward comparison selects the
 longest suffix, breaking ties toward the newest occurrence. A match of at least
