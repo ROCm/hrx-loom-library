@@ -93,8 +93,9 @@ sampling and descriptor layout described above.
 No transform waits for a device or recovers ownership from buffer contents.
 
 `media.loom` fills eight-word mixed-input records and tracks compressed image
-positions. Mixed packets have at most 512 records per plane and 1024 across
-two planes; this bound is independent of the larger ordinary Flash packet.
+positions. Each input plane's extent comes from the prepared source geometry
+and native invocation packet, independently of resident session capacity.
+Compaction preserves feature offsets into the original immutable packet.
 `vision_geometry.loom` evaluates the processor's smart-resize policy on the
 integer grid of 32-pixel merged patches, including ties-to-even alignment and
 minimum/maximum image area. Image availability remains a model-component
