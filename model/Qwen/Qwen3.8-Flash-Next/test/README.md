@@ -16,6 +16,7 @@ workload can be planned, executed, and measured through the ordinary Loom tools.
 | Copied-history proposals | Closed-form repeated-token fixtures cross page and subgroup boundaries, choose the newest equal-length match, reject short or incomplete continuations, and compare complete compacted buffers. Empty, copied, neural, mixed, and sampled cohorts retain distinct resident, input, output, and policy identities. |
 | Experts and mixed quantization | Scalar decoding of each admitted block format, independent matrix references, route grouping, padded tasks, and routed/shared output composition. |
 | MTP, output, and vocabulary | Independent projection references and explicit expected state for accepted history, compact vocabularies, fallback selection, proposal rejection, and retained carry. |
+| Image memory forecasts | The real 2560-wide image callbacks account for padded attention, both residual banks, private workspace reuse, and disjoint retained outputs at two geometries. |
 
 `retained`, `mtp_state`, and `speculation` run the same independent ordinary-ID
 oracles against ordinary and media input carriers. Media metadata differs from
@@ -88,3 +89,29 @@ without changing production cache policy. These checks use the same externally
 provisioned assets and current built providers as the shorter service checks;
 they require two complete long prefills and do not measure broad long-context
 task quality or isolated throughput.
+
+## Image service checks
+
+`serve_source_vision_test`, `serve_archive_vision_test`, and
+`serve_mixed_vision_test` use original BF16 projector parameters in addition to
+the text assets. Each has a `_vision_mtp_test` counterpart for Q8 MTP. The
+provisioned installation also supplies `parameter/mmproj.gguf` from the card's
+asset lock. The same staging and joined-server harness serves all these checks.
+
+`vision_check.py` constructs small, lossless solid-color PNGs with independent
+answer expectations. It checks two encoder geometries, four-image ordering,
+ordinary text in the image-enabled service, and two retained forks whose
+checkpoint ends inside a four-token sparse-attention pool. The forks recall the
+image while the projector is deactivated and its committed bytes are zero.
+A fresh image reactivates the projector; primary-weight eviction/reactivation
+preserves the pinned endpoint without recompilation. Finally, the harness joins
+the server, starts a fresh process, and replays the complete image-bearing
+history with zero cached positions.
+
+Answers are checked for the task result rather than identical capitalization
+or whitespace across batch shapes and MTP. The pin seed has a canonical chat
+suffix, and a noncanonical leading-space response retains the service's pin
+rejection. These checks establish image/service ownership and simple visual
+grounding. The shared vision numerical tests and retained-position tests cover
+the arithmetic and speculative-state boundaries; color answers alone do not
+establish broad visual-language task quality.

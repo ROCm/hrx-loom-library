@@ -1,0 +1,334 @@
+// Flash-Next original-projector launch contracts. Geometry specializes the
+// shared 1152-wide encoder, while checkpoint matrices retain original BF16
+// storage and patch weights retain F32 storage. Residuals, affine terms, and
+// accumulation remain F32; no converted checkpoint is required.
+//
+// K/V and attention expose all sixteen heads in one dispatch each: workgroup
+// Z selects a four-head cohort with a disjoint resident K/V bank. The command
+// owns these banks through attention completion and reuses them for FFN.
+// Every merged patch publishes 2560 F32 language features into separate output.
+
+amdgpu.target<gfx11-generic> @qwen38_vision_gfx11 {subgroup_size = 32}
+
+config.decl @qwen38.vision.image_height : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
+
+config.decl @qwen38.vision.image_width : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
+
+template.decl @qwen38.vision.patch_embedding(%image_height: index, %image_width: index, %bf16: i1, %weights_f32: i1, %source_offset: offset, %source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer)
+
+kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_patch_embedding() {
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %c18 = index.constant 18 : index
+  %c64 = index.constant 64 : index
+  %c256 = index.constant 256 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch_height = index.div %image_height, %c16 : index
+  %patch_width = index.div %image_width, %c16 : index
+  %rows = index.mul %patch_height, %patch_width : index
+  %c63 = index.constant 63 : index
+  %rounded_rows = index.add %rows, %c63 : index
+  %row_groups = index.div %rounded_rows, %c64 : index
+  kernel.launch.config workgroups(%row_groups, %c18, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%source_offset: offset, %source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %bf16 = scalar.constant true : i1
+  %weights_f32 = scalar.constant true : i1
+  template.apply<@qwen38.vision.patch_embedding>(%image_height, %image_width, %bf16, %weights_f32, %source_offset, %source, %weight0, %weight1, %bias, %output) : (index, index, i1, i1, offset, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+template.decl @qwen38.vision.statistics(%rows_value: index, %residual: buffer, %statistics: buffer)
+
+kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_statistics() {
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %c256 = index.constant 256 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch_height = index.div %image_height, %c16 : index
+  %patch_width = index.div %image_width, %c16 : index
+  %rows = index.mul %patch_height, %patch_width : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%residual: buffer, %statistics: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch = index.constant 16 : index
+  %height = index.div %image_height, %patch : index
+  %width = index.div %image_width, %patch : index
+  %rows = index.mul %height, %width : index
+  template.apply<@qwen38.vision.statistics>(%rows, %residual, %statistics) : (index, buffer, buffer)
+  kernel.return
+}
+
+template.decl @qwen38.vision.position_statistics(%image_height: index, %image_width: index, %position_table: buffer, %residual: buffer, %statistics: buffer)
+
+kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_position_layernorm_statistics() {
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %c256 = index.constant 256 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch_height = index.div %image_height, %c16 : index
+  %patch_width = index.div %image_width, %c16 : index
+  %rows = index.mul %patch_height, %patch_width : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%position_table: buffer, %residual: buffer, %statistics: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  template.apply<@qwen38.vision.position_statistics>(%image_height, %image_width, %position_table, %residual, %statistics) : (index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+template.decl @qwen38.vision.layernorm_apply(%image_height: index, %image_width: index, %residual: buffer, %statistics: buffer, %weight: buffer, %bias: buffer, %output: buffer)
+
+kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_layernorm_apply() {
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %c256 = index.constant 256 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch_height = index.div %image_height, %c16 : index
+  %patch_width = index.div %image_width, %c16 : index
+  %rows = index.mul %patch_height, %patch_width : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%residual: buffer, %statistics: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  template.apply<@qwen38.vision.layernorm_apply>(%image_height, %image_width, %residual, %statistics, %weight, %bias, %output) : (index, index, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+template.decl @qwen38.vision.ffn_up(%rows_value: index, %bf16: i1, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %up_weight: buffer, %up_bias: buffer, %activation: buffer)
+
+kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_ffn_up() {
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch_height = index.div %image_height, %c16 : index
+  %patch_width = index.div %image_width, %c16 : index
+  %rows0 = index.mul %patch_height, %patch_width : index
+  %rows = index.assume %rows0 [range(%rows0, 4, 65536), multiple_of(%rows0, 4)] : index
+  %rounded_rows = index.add %rows, %c63 : index
+  %row_tiles = index.div %rounded_rows, %c64 : index
+  %c23 = index.constant 23 : index
+  %c384 = index.constant 384 : index
+  kernel.launch.config workgroups(%row_tiles, %c23, %c1) workgroup_size(%c384, %c1, %c1) : index
+} launch(%residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %up_weight: buffer, %up_bias: buffer, %activation: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch = index.constant 16 : index
+  %height = index.div %image_height, %patch : index
+  %width = index.div %image_width, %patch : index
+  %rows = index.mul %height, %width : index
+  %bf16 = scalar.constant true : i1
+  template.apply<@qwen38.vision.ffn_up>(%rows, %bf16, %residual, %statistics, %layernorm_weight, %layernorm_bias, %up_weight, %up_bias, %activation) : (index, i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+template.decl @qwen38.vision.ffn_down(%rows_value: index, %bf16: i1, %activation: buffer, %down_weight: buffer, %down_bias: buffer, %residual: buffer)
+
+kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_ffn_down() {
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch_height = index.div %image_height, %c16 : index
+  %patch_width = index.div %image_width, %c16 : index
+  %rows0 = index.mul %patch_height, %patch_width : index
+  %rows = index.assume %rows0 [range(%rows0, 4, 65536), multiple_of(%rows0, 4)] : index
+  %rounded_rows = index.add %rows, %c63 : index
+  %row_tiles = index.div %rounded_rows, %c64 : index
+  %c9 = index.constant 9 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %c9, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%activation: buffer, %down_weight: buffer, %down_bias: buffer, %residual: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch = index.constant 16 : index
+  %height = index.div %image_height, %patch : index
+  %width = index.div %image_width, %patch : index
+  %rows = index.mul %height, %width : index
+  %bf16 = scalar.constant true : i1
+  template.apply<@qwen38.vision.ffn_down>(%rows, %bf16, %activation, %down_weight, %down_bias, %residual) : (index, i1, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+template.decl @qwen38.vision.merger_up(%rows_value: index, %bf16: i1, %input: buffer, %weight: buffer, %bias: buffer, %activation: buffer)
+
+kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_merger_up() {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %merged_height = index.div %image_height, %c32 : index
+  %merged_width = index.div %image_width, %c32 : index
+  %rows0 = index.mul %merged_height, %merged_width : index
+  %rows = index.assume %rows0 [range(%rows0, 1, 16384)] : index
+  %rounded_rows = index.add %rows, %c63 : index
+  %row_tiles = index.div %rounded_rows, %c64 : index
+  %c36 = index.constant 36 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %c36, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %bias: buffer, %activation: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %merge = index.constant 32 : index
+  %height = index.div %image_height, %merge : index
+  %width = index.div %image_width, %merge : index
+  %rows = index.mul %height, %width : index
+  %bf16 = scalar.constant true : i1
+  template.apply<@qwen38.vision.merger_up>(%rows, %bf16, %input, %weight, %bias, %activation) : (index, i1, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+template.decl @qwen38.vision.merger_down(%rows_value: index, %bf16: i1, %output_columns: index, %activation: buffer, %weight: buffer, %bias: buffer, %output: buffer)
+
+kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_merger_down() {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %merged_height = index.div %image_height, %c32 : index
+  %merged_width = index.div %image_width, %c32 : index
+  %rows0 = index.mul %merged_height, %merged_width : index
+  %rows = index.assume %rows0 [range(%rows0, 1, 16384)] : index
+  %rounded_rows = index.add %rows, %c63 : index
+  %row_tiles = index.div %rounded_rows, %c64 : index
+  %c20 = index.constant 20 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %c20, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%activation: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %merge = index.constant 32 : index
+  %height = index.div %image_height, %merge : index
+  %width = index.div %image_width, %merge : index
+  %rows = index.mul %height, %width : index
+  %bf16 = scalar.constant true : i1
+  %output_columns = index.constant 2560 : index
+  template.apply<@qwen38.vision.merger_down>(%rows, %bf16, %output_columns, %activation, %weight, %bias, %output) : (index, i1, index, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+template.decl @qwen38.vision.resize(%image: index, %input: buffer, %output: buffer)
+
+kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_resize(%groups_x: index, %groups_y: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups_x, %groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%image: index, %input: buffer, %output: buffer) where [range(%image, 0, 3)] {
+  template.apply<@qwen38.vision.resize>(%image, %input, %output) : (index, buffer, buffer)
+  kernel.return
+}
+
+template.decl @qwen38.vision.key_value(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %cohort: index, %output_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer)
+
+kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_key_value() {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c16 = index.constant 16 : index
+  %c31 = index.constant 31 : index
+  %c32 = index.constant 32 : index
+  %c384 = index.constant 384 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch_height = index.div %image_height, %c16 : index
+  %patch_width = index.div %image_width, %c16 : index
+  %rows = index.mul %patch_height, %patch_width : index
+  %padded_rows = index.add %rows, %c31 : index
+  %row_tiles = index.div %padded_rows, %c32 : index
+  %cohort_count = index.constant 4 : index
+  kernel.launch.config workgroups(%row_tiles, %c2, %cohort_count) workgroup_size(%c384, %c1, %c1) : index
+} launch(%residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch = index.constant 16 : index
+  %height = index.div %image_height, %patch : index
+  %width = index.div %image_width, %patch : index
+  %bf16 = scalar.constant true : i1
+  %cohort_raw = kernel.workgroup.id<z> : index
+  %cohort = index.assume %cohort_raw [range(%cohort_raw, 0, 3)] : index
+  %rows = index.mul %height, %width : index
+  %cohort_row_bytes = index.constant 576 : index
+  %cohort_rows = index.mul %cohort, %rows : index
+  %cohort_bytes = index.mul %cohort_rows, %cohort_row_bytes : index
+  %output_offset = index.cast %cohort_bytes : index to offset
+  template.apply<@qwen38.vision.key_value>(%height, %width, %bf16, %cohort, %output_offset, %residual, %statistics, %layernorm_weight, %layernorm_bias, %qkv_weight, %qkv_bias, %key, %value) : (index, index, i1, index, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+template.decl @qwen38.vision.attention(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %cohort: index, %cohort_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer)
+
+template.decl @qwen38.vision.attention_output(%rows_value: index, %bf16: i1, %context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer)
+
+kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_attention() {
+  %c1 = index.constant 1 : index
+  %c15 = index.constant 15 : index
+  %c16 = index.constant 16 : index
+  %c128 = index.constant 128 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch_height = index.div %image_height, %c16 : index
+  %patch_width = index.div %image_width, %c16 : index
+  %rows = index.mul %patch_height, %patch_width : index
+  %padded_rows = index.add %rows, %c15 : index
+  %query_tiles = index.div %padded_rows, %c16 : index
+  %cohort_count = index.constant 4 : index
+  kernel.launch.config workgroups(%query_tiles, %c1, %cohort_count) workgroup_size(%c128, %c1, %c1) : index
+} launch(%residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch = index.constant 16 : index
+  %height = index.div %image_height, %patch : index
+  %width = index.div %image_width, %patch : index
+  %bf16 = scalar.constant true : i1
+  %cohort_raw = kernel.workgroup.id<z> : index
+  %cohort = index.assume %cohort_raw [range(%cohort_raw, 0, 3)] : index
+  %rows = index.mul %height, %width : index
+  %row_bytes = index.constant 576 : index
+  %cohort_rows = index.mul %cohort, %rows : index
+  %byte_index = index.mul %cohort_rows, %row_bytes : index
+  %cohort_offset = index.cast %byte_index : index to offset
+  template.apply<@qwen38.vision.attention>(%height, %width, %bf16, %cohort, %cohort_offset, %residual, %statistics, %layernorm_weight, %layernorm_bias, %qkv_weight, %qkv_bias, %key, %value, %output) : (index, index, i1, index, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_attention_output() {
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch_height = index.div %image_height, %c16 : index
+  %patch_width = index.div %image_width, %c16 : index
+  %rows0 = index.mul %patch_height, %patch_width : index
+  %rows = index.assume %rows0 [range(%rows0, 4, 65536), multiple_of(%rows0, 4)] : index
+  %rounded_rows = index.add %rows, %c63 : index
+  %row_tiles = index.div %rounded_rows, %c64 : index
+  %c9 = index.constant 9 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %c9, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch = index.constant 16 : index
+  %height = index.div %image_height, %patch : index
+  %width = index.div %image_width, %patch : index
+  %bf16 = scalar.constant true : i1
+  %rows = index.mul %height, %width : index
+  template.apply<@qwen38.vision.attention_output>(%rows, %bf16, %context, %weight, %bias, %residual, %output) : (index, i1, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}

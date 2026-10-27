@@ -1,4 +1,4 @@
-# Flash-Next text programs
+# Flash-Next text and image programs
 
 The model composes the shared Qwen text service with its own parameter layout,
 48-layer execution, recurrent state, sparse attention, and multi-token
@@ -49,8 +49,7 @@ original feature packet through the compact span-origin map; features are
 never repacked for catch-up. Ordinary catch-up retains its compact-ID path.
 PLE hashes, token-history publication, and speculative ID capture read IDs
 through the shared input contract. Replay and draft vocabulary continue to
-consume compact I32 histories. These input-content contracts do not by
-themselves advertise an image service on the model card.
+consume compact I32 histories.
 
 Rotary coordinates are independent of causal cache positions. The four-word
 token map carries causal position, resident row, packed span beginning, and
@@ -101,6 +100,30 @@ occupy the contiguous grid axis, allowing neighboring workgroups to reuse the
 same vocabulary rows. Each query retains its original block reduction order
 and BF16 logit publication; inactive queries neither read inputs nor publish
 outputs.
+
+## Original image projector
+
+Image-enabled variants set `flash_next.image_inputs` and add the image service
+exports. Preparation declares ordinary and mixed-input target, proposal, warm,
+verification, and continuation stages using one catalog builder and the same
+immutable parameter handles. The shared controller chooses the corresponding
+catalog from each packet's actual input representation. Text-only variants
+retain only the ordinary catalog.
+
+The projector reads original BF16 matrices and F32 affine parameters from the
+separate `vision` scope. `vision_projector.loom` owns the complete resize,
+27-layer encoder, and 2560-wide merger command. Its static dispatch leaves
+specialize shared vision motifs with checkpoint dimensions and BF16 precision.
+The dense Qwen model uses those same algorithms with its own F16 policy.
+
+Each image keeps all heads' keys and values resident through attention. Output
+and feed-forward projections reuse 64-row activation panels, and two F32
+residual banks alternate without copying complete layers. One pure workspace
+layout query serves both command allocation and service memory forecasting.
+The image cohort reuses private workspace sequentially and writes disjoint
+feature ranges into the caller's output. The service owns upload completion,
+feature retention, and release; projector weight residency does not own any
+retained conversation's lifetime.
 
 ## Panel reuse within an epoch
 

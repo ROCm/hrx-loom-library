@@ -2,6 +2,10 @@
 // parameter scopes produce shared source handles, shape-specialized stages,
 // and explicit allocation/retained-state records for the shared text owner.
 
+// Image-enabled compositions publish a second input-specialized catalog.
+// Text-only compositions keep their original compilation and parameter costs.
+config.def @flash_next.image_inputs = false : i1
+
 // flash_next_epoch_output_only
 global.rodata.def @output_only_root = bytes("666c6173685f6e6578745f65706f63685f6f75747075745f6f6e6c79")
 
@@ -90,11 +94,16 @@ global.rodata.def @limits_error = bytes("466c6173682d4e6578742072657175697265732
 // qwen38.packet_capacity
 global.rodata.def @packet_capacity_key = bytes("7177656e33382e7061636b65745f6361706163697479")
 
+// runner.qwen38.mixed_inputs
+global.rodata.def @mixed_key = bytes("72756e6e65722e7177656e33382e6d697865645f696e70757473")
+
 // Each root selects a contiguous view of the shared parameter bank. Proposal
 // keeps target embedding and vocabulary in separate roots; warm selects three
 // sidecar subviews for input fusion, attention mixing, and cache append.
-func.def @declare_stage(%root: buffer, %tokens: i64, %spans: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %sidecar_roots: i32, %target_roots: i32, %verification: i64, %packet_capacity: i64) -> (i32) {
+func.def @declare_stage(%root: buffer, %tokens: i64, %spans: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %sidecar_roots: i32, %target_roots: i32, %verification: i64, %packet_capacity: i64, %mixed: i64) -> (i32) {
   %stage = func.call @stage(%root, %tokens) : (buffer, i64) -> (i32)
+  %mixed_key = global.load @mixed_key : buffer
+  func.call @config_i64(%stage, %mixed_key, %mixed) : (i32, buffer, i64)
   %packet_key = global.load @packet_capacity_key : buffer
   func.call @config_i64(%stage, %packet_key, %packet_capacity) : (i32, buffer, i64)
   %tokens_key = global.load @tokens_key : buffer
@@ -323,13 +332,102 @@ func.def @qwen38.storage(%tokens: i64, %context: i64, %pool: i64, %rows_arg: i64
 
 // Shapes are scheduler-owned little-endian {token capacity, span capacity}
 // pairs. Every bucket executes the same model over its active packed prefix.
+// Each catalog has consecutive target shapes, proposal cohorts, warm shapes,
+// verification shapes, and one continuation. Only the input representation
+// differs; every stage binds the same immutable checkpoint source handles.
+func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %enabled: i1, %depth: i64, %mixed: i64, %packet_capacity: i64) -> (i32, i32, i32, i64) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %c0_i64 = scalar.constant 0 : i64
+  %limit = scalar.constant 32768 : i64
+  %diagnostic = global.load @limits_error : buffer
+  %full_root = global.load @root : buffer
+  %selected_root = global.load @output_only_root : buffer
+  %root = scf.select %enabled, %full_root, %selected_root : buffer
+  %one_root = scalar.constant 1 : i32
+  %two_roots = scalar.constant 2 : i32
+  %three_roots = scalar.constant 3 : i32
+  %bounded = scalar.assume %shape_count [range(%shape_count, 1, 2147483647)] : i64
+  %count = index.cast %bounded : i64 to index
+  %view = buffer.view %shapes[%origin] : buffer -> view<[%count]x2xi64>
+  %anchor = scalar.constant 1 : i64
+  %verification = scalar.addi %depth, %anchor : i64
+  %maximum, %proposal_capacity, %target_first = scf.for %i = [%c0 to %count step %c1](%previous = %c0_i64 : i64, %prior_proposals = %anchor : i64, %first_stage = %c0_i32 : i32) -> (i64, i64, i32) {
+    %tokens = view.load %view[%i, 0] : view<[%count]x2xi64> -> i64
+    %spans = view.load %view[%i, 1] : view<[%count]x2xi64> -> i64
+    %fits = scalar.cmpi ule, %tokens, %limit : i64
+    %fits_word = scalar.extui %fits : i1 to i32
+    func.call @require(%fits_word, %diagnostic) : (i32, buffer)
+    %stage = func.call @declare_stage(%root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %c0_i32, %one_root, %c0_i64, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
+    %larger = scalar.cmpi ugt, %tokens, %previous : i64
+    %next = scf.select %larger, %tokens, %previous : i64
+    %verifiers = scalar.divui %tokens, %verification : i64
+    %by_spans = scalar.cmpi ult, %spans, %verifiers : i64
+    %fitting = scf.select %by_spans, %spans, %verifiers : i64
+    %more = scalar.cmpi ugt, %fitting, %prior_proposals : i64
+    %proposals = scf.select %more, %fitting, %prior_proposals : i64
+    %first_shape = index.cmp eq, %i, %c0 : index
+    %first = scf.select %first_shape, %stage, %first_stage : i32
+    scf.yield %next, %proposals, %first : i64, i64, i32
+  }
+  %proposal, %warm_first = scf.if %enabled -> (i32, i32) {
+    %proposal_root = global.load @proposal_root : buffer
+    %draft_depth_key = global.load @draft_depth_key : buffer
+    %epoch_capacity_key = global.load @epoch_capacity_key : buffer
+    %capacity_word = scalar.trunci %proposal_capacity : i64 to i32
+    %last_level = func.call @qwen38.proposal_level(%capacity_word) : (i32) -> (i32)
+    %last_index = index.cast %last_level : i32 to index
+    %levels = index.add %last_index, %c1 : index
+    // Cohort geometry changes launch work, not the retained packet layout or
+    // parameter domain. Small requests never execute the maximum-capacity grid.
+    %proposal = scf.for %level = [%c0 to %levels step %c1](%first = %c0_i32 : i32) -> (i32) {
+      %shift = index.cast %level : index to i64
+      %capacity = scalar.shli %anchor, %shift : i64
+      %stage = func.call @declare_stage(%proposal_root, %capacity, %capacity, %context, %pool, %model_source, %draft_source, %one_root, %two_roots, %c0_i64, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
+      func.call @config_i64(%stage, %draft_depth_key, %depth) : (i32, buffer, i64)
+      func.call @config_i64(%stage, %epoch_capacity_key, %packet_capacity) : (i32, buffer, i64)
+      %initial = index.cmp eq, %level, %c0 : index
+      %origin = scf.select %initial, %stage, %first : i32
+      scf.yield %origin : i32
+    }
+    %warm_root = global.load @warm_root : buffer
+    %verify_root = global.load @verify_root : buffer
+    %warm_first = scf.for %i = [%c0 to %count step %c1](%first = %c0_i32 : i32) -> (i32) {
+      %tokens = view.load %view[%i, 0] : view<[%count]x2xi64> -> i64
+      %spans = view.load %view[%i, 1] : view<[%count]x2xi64> -> i64
+      %warm = func.call @declare_stage(%warm_root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %three_roots, %one_root, %c0_i64, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
+      %initial = index.cmp eq, %i, %c0 : index
+      %origin = scf.select %initial, %warm, %first : i32
+      scf.yield %origin : i32
+    }
+    scf.for %i = [%c0 to %count step %c1] {
+      %tokens = view.load %view[%i, 0] : view<[%count]x2xi64> -> i64
+      %spans = view.load %view[%i, 1] : view<[%count]x2xi64> -> i64
+      %verify = func.call @declare_stage(%verify_root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %c0_i32, %one_root, %verification, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
+    }
+    %continue_root = global.load @continue_root : buffer
+    %continuation = func.call @stage(%continue_root, %c0_i64) : (buffer, i64) -> (i32)
+    %mixed_key = global.load @mixed_key : buffer
+    func.call @config_i64(%continuation, %mixed_key, %mixed) : (i32, buffer, i64)
+    %packet_key = global.load @packet_capacity_key : buffer
+    func.call @config_i64(%continuation, %packet_key, %packet_capacity) : (i32, buffer, i64)
+    %context_key = global.load @context_key : buffer
+    func.call @config_i64(%continuation, %context_key, %context) : (i32, buffer, i64)
+    func.call @config_i64(%continuation, %epoch_capacity_key, %packet_capacity) : (i32, buffer, i64)
+    scf.yield %proposal, %warm_first : i32, i32
+  } else {
+    scf.yield %c0_i32, %c0_i32 : i32, i32
+  }
+  func.return %target_first, %proposal, %warm_first, %maximum : i32, i32, i32, i64
+}
+
 func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %draft_depth: i32, %shapes: buffer, %shape_count: i64, %weights: buffer, %options: buffer) -> (i64, i32, buffer, buffer, buffer, buffer, buffer, buffer, buffer) {
   %packet_capacity = func.call @qwen38.packet_capacity(%shapes, %shape_count, %prefill) : (buffer, i64, i64) -> (i64)
   %origin = index.constant 0 : offset
   %c0_i64 = scalar.constant 0 : i64
   %c0_i32 = scalar.constant 0 : i32
-  %c0 = index.constant 0 : index
-  %c1 = index.constant 1 : index
   %c64 = scalar.constant 64 : i64
   %limit = scalar.constant 32768 : i64
   %has_shapes = scalar.cmpi ugt, %shape_count, %c0_i64 : i64
@@ -356,89 +454,29 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
   } else {
     scf.yield %c0_i32 : i32
   }
-  %full_root = global.load @root : buffer
-  %selected_root = global.load @output_only_root : buffer
-  %root = scf.select %enabled, %full_root, %selected_root : buffer
-  %one_root = scalar.constant 1 : i32
-  %two_roots = scalar.constant 2 : i32
-  %three_roots = scalar.constant 3 : i32
-  %bounded = scalar.assume %shape_count [range(%shape_count, 1, 2147483647)] : i64
-  %count = index.cast %bounded : i64 to index
-  %view = buffer.view %shapes[%origin] : buffer -> view<[%count]x2xi64>
   %depth = scalar.extui %draft_depth : i32 to i64
-  %anchor = scalar.constant 1 : i64
-  %verification = scalar.addi %depth, %anchor : i64
-  %maximum, %proposal_capacity = scf.for %i = [%c0 to %count step %c1](%previous = %c0_i64 : i64, %prior_proposals = %anchor : i64) -> (i64, i64) {
-    %tokens = view.load %view[%i, 0] : view<[%count]x2xi64> -> i64
-    %spans = view.load %view[%i, 1] : view<[%count]x2xi64> -> i64
-    %fits = scalar.cmpi ule, %tokens, %limit : i64
-    %fits_word = scalar.extui %fits : i1 to i32
-    func.call @require(%fits_word, %diagnostic) : (i32, buffer)
-    %stage = func.call @declare_stage(%root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %c0_i32, %one_root, %c0_i64, %packet_capacity) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64) -> (i32)
-    %larger = scalar.cmpi ugt, %tokens, %previous : i64
-    %next = scf.select %larger, %tokens, %previous : i64
-    %verifiers = scalar.divui %tokens, %verification : i64
-    %by_spans = scalar.cmpi ult, %spans, %verifiers : i64
-    %fitting = scf.select %by_spans, %spans, %verifiers : i64
-    %more = scalar.cmpi ugt, %fitting, %prior_proposals : i64
-    %proposals = scf.select %more, %fitting, %prior_proposals : i64
-    scf.yield %next, %proposals : i64, i64
-  }
-  %proposal, %warm_first = scf.if %enabled -> (i32, i32) {
-    %proposal_root = global.load @proposal_root : buffer
-    %draft_depth_key = global.load @draft_depth_key : buffer
-    %epoch_capacity_key = global.load @epoch_capacity_key : buffer
-    %capacity_word = scalar.trunci %proposal_capacity : i64 to i32
-    %last_level = func.call @qwen38.proposal_level(%capacity_word) : (i32) -> (i32)
-    %last_index = index.cast %last_level : i32 to index
-    %levels = index.add %last_index, %c1 : index
-    // Cohort geometry changes launch work, not the retained packet layout or
-    // parameter domain. Small requests never execute the maximum-capacity grid.
-    %proposal = scf.for %level = [%c0 to %levels step %c1](%first = %c0_i32 : i32) -> (i32) {
-      %shift = index.cast %level : index to i64
-      %capacity = scalar.shli %anchor, %shift : i64
-      %stage = func.call @declare_stage(%proposal_root, %capacity, %capacity, %context, %pool, %model_source, %draft_source, %one_root, %two_roots, %c0_i64, %packet_capacity) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64) -> (i32)
-      func.call @config_i64(%stage, %draft_depth_key, %depth) : (i32, buffer, i64)
-      func.call @config_i64(%stage, %epoch_capacity_key, %packet_capacity) : (i32, buffer, i64)
-      %initial = index.cmp eq, %level, %c0 : index
-      %origin = scf.select %initial, %stage, %first : i32
-      scf.yield %origin : i32
-    }
-    %warm_root = global.load @warm_root : buffer
-    %verify_root = global.load @verify_root : buffer
-    %warm_first = scf.for %i = [%c0 to %count step %c1](%first = %c0_i32 : i32) -> (i32) {
-      %tokens = view.load %view[%i, 0] : view<[%count]x2xi64> -> i64
-      %spans = view.load %view[%i, 1] : view<[%count]x2xi64> -> i64
-      %warm = func.call @declare_stage(%warm_root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %three_roots, %one_root, %c0_i64, %packet_capacity) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64) -> (i32)
-      %initial = index.cmp eq, %i, %c0 : index
-      %origin = scf.select %initial, %warm, %first : i32
-      scf.yield %origin : i32
-    }
-    scf.for %i = [%c0 to %count step %c1] {
-      %tokens = view.load %view[%i, 0] : view<[%count]x2xi64> -> i64
-      %spans = view.load %view[%i, 1] : view<[%count]x2xi64> -> i64
-      %verify = func.call @declare_stage(%verify_root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %c0_i32, %one_root, %verification, %packet_capacity) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64) -> (i32)
-    }
-    %continue_root = global.load @continue_root : buffer
-    %continuation = func.call @stage(%continue_root, %c0_i64) : (buffer, i64) -> (i32)
-    %packet_key = global.load @packet_capacity_key : buffer
-    func.call @config_i64(%continuation, %packet_key, %packet_capacity) : (i32, buffer, i64)
-    %context_key = global.load @context_key : buffer
-    func.call @config_i64(%continuation, %context_key, %context) : (i32, buffer, i64)
-    func.call @config_i64(%continuation, %epoch_capacity_key, %packet_capacity) : (i32, buffer, i64)
-    scf.yield %proposal, %warm_first : i32, i32
+  %target_first, %proposal, %warm_first, %maximum = func.call @declare_packed_stages(%shapes, %shape_count, %context, %pool, %model_source, %draft_source, %enabled, %depth, %c0_i64, %packet_capacity) : (buffer, i64, i64, i64, i32, i32, i1, i64, i64, i64) -> (i32, i32, i32, i64)
+  %images = config.get @flash_next.image_inputs : i1
+  %mixed_target, %mixed_proposal, %mixed_warm = scf.if %images -> (i32, i32, i32) {
+    %mixed = scalar.constant 1 : i64
+    %target, %proposal, %warm, %maximum = func.call @declare_packed_stages(%shapes, %shape_count, %context, %pool, %model_source, %draft_source, %enabled, %depth, %mixed, %packet_capacity) : (buffer, i64, i64, i64, i32, i32, i1, i64, i64, i64) -> (i32, i32, i32, i64)
+    scf.yield %target, %proposal, %warm : i32, i32, i32
   } else {
-    scf.yield %c0_i32, %c0_i32 : i32, i32
+    scf.yield %c0_i32, %c0_i32, %c0_i32 : i32, i32, i32
   }
   %shared = scalar.trunci %shape_count : i64 to i32
-  // Target stages begin at zero. The shared header retains separate proposal
-  // and warm origins; sampling follows its ten words at byte 40.
+  // The shared controller selects explicit ordinary/mixed catalog origins.
+  // Sampling follows these ten control words at byte 40.
   %dflash = scalar.constant false : i1
   %state = func.call @qwen38.control_create(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer)
   %state_view = buffer.view %state[%origin] : buffer -> view<10xi32>
   view.store %shared, %state_view[2] : i32, view<10xi32>
   view.store %proposal, %state_view[3] : i32, view<10xi32>
+  view.store %target_first, %state_view[5] : i32, view<10xi32>
+  view.store %mixed_target, %state_view[6] : i32, view<10xi32>
+  view.store %mixed_proposal, %state_view[7] : i32, view<10xi32>
   view.store %warm_first, %state_view[8] : i32, view<10xi32>
+  view.store %mixed_warm, %state_view[9] : i32, view<10xi32>
   %less = scalar.cmpi ult, %maximum, %prefill : i64
   %effective = scf.select %less, %maximum, %prefill : i64
   %terminal = global.load @terminal : buffer

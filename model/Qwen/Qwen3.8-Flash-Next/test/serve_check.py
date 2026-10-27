@@ -24,6 +24,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import context_check
+import vision_check
 from loom_serve_testing.chat import request
 from loom_serve_testing.http_harness import control, running_server, wait_status
 from loom_serve_testing.model_staging import stage_model
@@ -274,10 +275,16 @@ def main():
         "--reference", type=Path, default=Path(__file__).with_name("reference.json")
     )
     parser.add_argument("--output", type=Path)
-    parser.add_argument(
+    scenarios = parser.add_mutually_exclusive_group()
+    scenarios.add_argument(
         "--native-context",
         action="store_true",
         help="check the full native context, retained forks, and cold replay",
+    )
+    scenarios.add_argument(
+        "--vision",
+        action="store_true",
+        help="check image answers, retained forks, component eviction, and cold replay",
     )
     args = parser.parse_args()
     if args.assets is None:
@@ -294,7 +301,7 @@ def main():
     card = args.model.absolute()
     model = json.loads(card.read_text())["model"]["id"]
     reference = None
-    if not args.native_context:
+    if not args.native_context and not args.vision:
         reference = json.loads(args.reference.read_text())
         assert reference["model"] == model, (reference["model"], model)
     result = None
@@ -302,9 +309,10 @@ def main():
         staged = stage_model(card, args.assets.absolute(), Path(temporary) / "model")
         # A process restart makes the second history genuinely cold without
         # changing the deployment's production prefix-cache policy.
-        for phase in (
-            ("context", "cold-replay") if args.native_context else ("service",)
-        ):
+        scenario = (
+            context_check if args.native_context else vision_check if args.vision else None
+        )
+        for phase in (("service", "cold-replay") if scenario else ("service",)):
             log = output / (phase + ".log")
             command = [
                 str(args.server.absolute()),
@@ -331,12 +339,17 @@ def main():
                         raise RuntimeError(details)
                     if details["registration"] == "ready":
                         break
-                if phase == "context":
-                    result = context_check.run(address, model)
-                elif phase == "cold-replay":
-                    result["cold_replay"] = context_check.replay(
-                        address, model, result, cold=True
-                    )
+                if phase == "cold-replay":
+                    if args.native_context:
+                        result["cold_replay"] = context_check.replay(
+                            address, model, result, cold=True
+                        )
+                    else:
+                        result["cold_replay"] = vision_check.replay(
+                            address, model, result
+                        )
+                elif scenario:
+                    result = scenario.run(address, model)
                 else:
                     result = run(address, model, reference)
                 wait_status(
