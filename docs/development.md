@@ -51,7 +51,9 @@ BUILD files and public Loom rule contracts are the same in each mode.
 With Lefthook installed, `python dev.py hook` enables the repository's
 pre-commit hook. It formats staged `.loom` files, stages their canonical form,
 and stops after any rewrite so the result can be reviewed. It refuses
-partially staged Loom files.
+partially staged Loom files. It also checks generated model-card compiler lists
+against Bazel analysis; [model authoring](model-authoring.md#derive-compiler-files-from-provider-dependencies)
+describes the check/fix workflow and staged-input requirements.
 
 ## Repository layers
 
@@ -79,6 +81,7 @@ correctness cases, benchmark plans, and target profiles to Loom's public rules:
 
 ```sh
 python dev.py format --check
+python dev.py model-card --check
 python dev.py lint
 python dev.py test
 python dev.py build
@@ -91,7 +94,8 @@ python dev.py test --target=//kernel/ggml/... -- --config=asan --config=amdgpu
 ```
 
 `dev.py test` first checks formatting across the repository, including
-experimental sources, then runs the selected tests. `format --fix` rewrites
+experimental sources, source policy, and managed model-card compiler lists,
+then runs the selected tests. `format --fix` rewrites
 sources through the selected compiler and verifies the result; passing paths
 limits formatting to those files. Direct `bazelisk test` invocations also retain
 the generated per-library checks. Hardware execution requires a matching device

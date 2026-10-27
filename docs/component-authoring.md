@@ -106,8 +106,11 @@ all contribute to that cost.
 ## Integrate the consumer with the component
 
 A complete change includes the shared implementation, actual callers, focused
-checks, package documentation, and explicit provider dependencies. Model source
-maps describe the changed program closure; asset locks change only when their
+checks, package documentation, and explicit provider dependencies. For a
+[provider-derived model composition](model-authoring.md#derive-compiler-files-from-provider-dependencies),
+`python dev.py model-card --fix` updates the checked-in compiler closure from
+those dependencies. Explicitly mapped compositions maintain their file lists
+in the card and BUILD declaration. Asset locks change only when their
 asset dependencies change. Existing source, archive, and mixed packages should
 still link through those providers; their builds do not fetch weights.
 

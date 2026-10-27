@@ -34,6 +34,13 @@ source tree.
 
 ## Composition and ownership
 
+The [BUILD declaration](BUILD.bazel) names the service's primary providers and
+library roots. Providers own their direct dependencies; Bazel derives the
+source, bytecode, and mixed file lists from that graph. After changing those
+dependencies, `python dev.py model-card --fix` synchronizes the card's compiler
+lists. The [authoring guide](../../../docs/model-authoring.md#derive-compiler-files-from-provider-dependencies)
+explains the generated fields and repository-relative installation layout.
+
 The [program package](program/README.md) binds named `model`, `vision`, and
 `draft` parameter scopes to shape-specialized stages. The `qwen38.draft_kind`
 JIT setting selects checkpoint MTP or DFlash2; draft depth and continuation
