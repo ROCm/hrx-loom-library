@@ -14,6 +14,15 @@ Loom tools; benchmark smoke establishes execution, not performance.
 | DFlash2 | Context attention, proposal packing, candidate selection, and grouped convolution with independently specified buffers and expected state. |
 | Vision projector | Minimum, square, and rectangular geometries across patch embedding, attention, feed-forward, normalization, and merger stages. |
 
+`vision_patch_*` checks the cross-product of F16/BF16 compute and original-half/
+F32 checkpoint storage. Coordinate-coded RGB8 pixels, signed channel-varying
+weights, two temporal matrices, and a last-column tap give an independent
+sparse convolution reference. Seventy-two patches cover a full tile and a
+tail; a nonzero source origin and output guards exercise the buffer ABI.
+F16/half calls the actual dense leaf. Other representations call the same
+shared motif with test-owned specialization facts. No complete checkpoint or
+offline tensor conversion is needed.
+
 `vision_ffn` additionally checks the shared F16/BF16 algorithm with 68 patch
 rows, covering a full 64-row tile, a four-row tail, and the 4304-column down
 projection's reduction tail. Each channel has three signed, independently

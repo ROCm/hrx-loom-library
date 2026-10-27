@@ -1,0 +1,62 @@
+// Half-precision interpretation for Qwen3.8 vision matrix panels.
+//
+// Stored values retain their original 16 bits. The compile-known bf16 fact
+// selects IEEE F16 or BF16 only at rounding and matrix-product boundaries.
+// Rounding uses the ordinary fptrunc semantics; no checkpoint conversion or
+// runtime precision dispatch is required. Scalar and four-value packet forms
+// match tail publication and vector panel staging respectively.
+//
+// product requires complete RDNA wave32 16x16x16 fragments: sixteen half
+// elements per lane for each operand and eight F32 accumulator elements.
+// The caller supplies the fragment layout, target, and synchronization.
+// Arithmetic follows native half-input/F32-accumulator matrix semantics.
+// These helpers allocate no storage and introduce no memory ordering.
+
+// Round one vectorized panel packet and preserve the resulting half bits.
+func.def public inline @qwen38_vision_round_packet(%bf16: i1, %values: vector<4xf32>) -> (vector<4xi16>) {
+  %bits = scf.if %bf16 -> (vector<4xi16>) {
+    %rounded = vector.fptrunc %values : vector<4xf32> to vector<4xbf16>
+    %result = vector.bitcast %rounded : vector<4xbf16> to vector<4xi16>
+    scf.yield %result : vector<4xi16>
+  } else {
+    %rounded = vector.fptrunc %values : vector<4xf32> to vector<4xf16>
+    %result = vector.bitcast %rounded : vector<4xf16> to vector<4xi16>
+    scf.yield %result : vector<4xi16>
+  }
+  func.return %bits : vector<4xi16>
+}
+
+func.def public inline @qwen38_vision_round_scalar(%bf16: i1, %value: f32) -> (i16) {
+  %bits = scf.if %bf16 -> (i16) {
+    %rounded = scalar.fptrunc %value : f32 to bf16
+    %result = scalar.bitcast %rounded : bf16 to i16
+    scf.yield %result : i16
+  } else {
+    %rounded = scalar.fptrunc %value : f32 to f16
+    %result = scalar.bitcast %rounded : f16 to i16
+    scf.yield %result : i16
+  }
+  func.return %bits : i16
+}
+
+func.def public inline @qwen38_vision_product(%bf16: i1, %left: vector<16xi16>, %right: vector<16xi16>, %accumulator: vector<8xf32>) -> (vector<8xf32>) {
+  %tile = index.constant 16 : index
+  %result = scf.if %bf16 -> (vector<8xf32>) {
+    %left_values = vector.bitcast %left : vector<16xi16> to vector<16xbf16>
+    %right_values = vector.bitcast %right : vector<16xi16> to vector<16xbf16>
+    %lhs = vector.fragment<lhs> %left_values shape [%tile, %tile] : vector<16xbf16>
+    %rhs = vector.fragment<rhs> %right_values shape [%tile, %tile] : vector<16xbf16>
+    %initial = vector.fragment<init> %accumulator shape [%tile, %tile] : vector<8xf32>
+    %product = vector.mma %lhs, %rhs, %initial : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+    scf.yield %product : vector<8xf32>
+  } else {
+    %left_values = vector.bitcast %left : vector<16xi16> to vector<16xf16>
+    %right_values = vector.bitcast %right : vector<16xi16> to vector<16xf16>
+    %lhs = vector.fragment<lhs> %left_values shape [%tile, %tile] : vector<16xf16>
+    %rhs = vector.fragment<rhs> %right_values shape [%tile, %tile] : vector<16xf16>
+    %initial = vector.fragment<init> %accumulator shape [%tile, %tile] : vector<8xf32>
+    %product = vector.mma %lhs, %rhs, %initial : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    scf.yield %product : vector<8xf32>
+  }
+  func.return %result : vector<8xf32>
+}

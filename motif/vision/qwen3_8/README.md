@@ -5,6 +5,18 @@ contracts. The dense and MoE models use different matrix precision and final
 feature widths; checkpoint names, geometry selection, launches, and retained
 output ownership belong to their composition leaves.
 
+`patch.loom` projects packed RGB8 directly into the trained 2×2 patch order.
+It retains two independent temporal weight contractions in F32, sharing one
+resident input panel between them. Checkpoint storage and operand precision
+are independent specialization facts: original dense F16 is read unchanged,
+while original Flash-Next F32 weights round to BF16 inside the resident tile.
+No image-sized patch matrix or converted checkpoint is materialized.
+
+`precision.loom` provides the rounding and native F16/BF16 matrix interpretation
+used by patch and feed-forward projections. It carries original half bits
+between arithmetic boundaries and introduces no storage or synchronization.
+The fragment contract is explicitly RDNA wave32 with F32 accumulation.
+
 `normalization.loom` owns F32 row moments, aligned-corners interpolation of
 the learned 48×48 position table, and final affine normalization. Position
 addition updates the residual and computes its moments in one pass. The

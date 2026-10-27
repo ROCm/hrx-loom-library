@@ -35,6 +35,11 @@ They retain the trained patch/merge order and explicit scratch ownership.
 The command owner can reuse intermediates across a cohort while preserving
 each image's output feature range.
 
+`vision_patch_embedding.loom` selects original F16 weights and the launch for
+shared direct RGB8 projection. The same motif supports BF16 operands and F32
+checkpoint weights, converting only the resident panel. Its two temporal
+contractions remain independent until the F32 epilogue adds them and the bias.
+
 `vision_ffn.loom` specializes the [shared vision FFN](../../../../../motif/vision/qwen3_8/README.md)
 with image geometry and original F16 matrix storage. The motif owns normalized
 input staging, LDS permutations, read-ahead, and F32 matrix accumulation. The
