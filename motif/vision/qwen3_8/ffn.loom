@@ -26,76 +26,13 @@ func.decl @qwen38_vision_round_scalar(%bf16: i1, %value: f32) -> (i16)
 
 func.decl @qwen38_vision_product(%bf16: i1, %left: vector<16xi16>, %right: vector<16xi16>, %accumulator: vector<8xf32>) -> (vector<8xf32>)
 
-// Preserve the target's result-fragment store and conversion semantics. The
-// complete output tile is valid; partial tiles use the scalar publication path.
-func.def inline @vision_store_result(%bf16: i1, %rows: index, %columns: index, %output: buffer, %row: index, %column: index, %values: vector<8xf32>) {
-  %origin = index.constant 0 : offset
-  %tile = index.constant 16 : index
-  scf.if %bf16 {
-    %view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%columns]xbf16>
-    vector.fragment.store<result> %values, %view[%row, %column] shape [%tile, %tile] : vector<8xf32>, view<[%rows]x[%columns]xbf16>
-  } else {
-    %view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%columns]xf16>
-    vector.fragment.store<result> %values, %view[%row, %column] shape [%tile, %tile] : vector<8xf32>, view<[%rows]x[%columns]xf16>
-  }
-  func.return
-}
+func.decl @qwen38_vision_store_result(%bf16: i1, %rows: index, %columns: index, %output: buffer, %row: index, %column: index, %values: vector<8xf32>)
 
-// Every row permutes its eight 16-byte chunks across LDS banks. Matching
-// stores and reads preserve logical values without padding or external copies.
-func.def inline @vision_input_store(%stage: buffer, %row: index, %column: index, %values: vector<4xi16>) {
-  %origin = index.constant 0 : offset
-  %c7 = index.constant 7 : index
-  %c8 = index.constant 8 : index
-  %local = buffer.assume.memory_space<workgroup> %stage : buffer
-  %view = buffer.view %local[%origin] : buffer -> view<64x64xi16>
-  %row_lane = index.andi %row, %c7 : index
-  %rotation = index.mul %row_lane, %c8 : index
-  %physical = index.xori %column, %rotation : index
-  vector.store %values, %view[%row, %physical] : vector<4xi16>, view<64x64xi16>
-  func.return
-}
+func.decl @qwen38_vision_panel_input_store(%stage: buffer, %row: index, %column: index, %values: vector<4xi16>)
 
-func.def inline @vision_input_fragment(%stage: buffer, %block_row: index, %lane_row: index, %column: index) -> (vector<16xi16>) {
-  %origin = index.constant 0 : offset
-  %c7 = index.constant 7 : index
-  %c8 = index.constant 8 : index
-  %local = buffer.assume.memory_space<workgroup> %stage : buffer
-  %view = buffer.view %local[%origin] : buffer -> view<64x64xi16>
-  %row = index.add %block_row, %lane_row : index
-  %row_lane = index.andi %lane_row, %c7 : index
-  %rotation = index.mul %row_lane, %c8 : index
-  %second = index.add %column, %c8 : index
-  %physical0 = index.xori %column, %rotation : index
-  %physical1 = index.xori %second, %rotation : index
-  %low = vector.load %view[%row, %physical0] : view<64x64xi16> -> vector<8xi16>
-  %high = vector.load %view[%row, %physical1] : view<64x64xi16> -> vector<8xi16>
-  %values = vector.concat<0> %low, %high : vector<8xi16>, vector<8xi16> -> vector<16xi16>
-  func.return %values : vector<16xi16>
-}
+func.decl @qwen38_vision_panel_input_fragment(%stage: buffer, %block_row: index, %lane_row: index, %column: index) -> (vector<16xi16>)
 
-// Reconstructs one logical fragment from a 64-value row rotated by eight
-// values for each successive row modulo eight.
-func.def inline @qwen38_vision_ffn_swizzled_weight_fragment(%stage_rows: index, %stage: buffer, %row: index, %fragment_column: index) -> (vector<16xi16>) {
-  %origin = index.constant 0 : offset
-  %c8 = index.constant 8 : index
-  %c64 = index.constant 64 : index
-  %stage_local = buffer.assume.memory_space<workgroup> %stage : buffer
-  %stage_view = buffer.view %stage_local[%origin] : buffer -> view<[%stage_rows]x64xi16>
-  %row_lane = index.rem %row, %c8 : index
-  %rotation = index.mul %row_lane, %c8 : index
-  %low_column0 = index.add %fragment_column, %rotation : index
-  %low_column_raw = index.rem %low_column0, %c64 : index
-  %low_column = index.assume %low_column_raw [range(%low_column_raw, 0, 56), multiple_of(%low_column_raw, 8)] : index
-  %logical_high_column = index.add %fragment_column, %c8 : index
-  %high_column0 = index.add %logical_high_column, %rotation : index
-  %high_column_raw = index.rem %high_column0, %c64 : index
-  %high_column = index.assume %high_column_raw [range(%high_column_raw, 0, 56), multiple_of(%high_column_raw, 8)] : index
-  %low = vector.load %stage_view[%row, %low_column] : view<[%stage_rows]x64xi16> -> vector<8xi16>
-  %high = vector.load %stage_view[%row, %high_column] : view<[%stage_rows]x64xi16> -> vector<8xi16>
-  %values = vector.concat<0> %low, %high : vector<8xi16>, vector<8xi16> -> vector<16xi16>
-  func.return %values : vector<16xi16>
-}
+func.decl @qwen38_vision_panel_weight_fragment(%stage_rows: index, %stage: buffer, %row: index, %fragment_column: index) -> (vector<16xi16>)
 
 func.def inline @qwen38_vision_ffn_gelu_fragment(%input: vector<8xf32>) -> (vector<8xf32>) {
   %half = vector.constant 0.5 : vector<8xf32>
@@ -223,7 +160,7 @@ template.def<@qwen38.vision.ffn_up> device @qwen38_vision_ffn_up_body(%rows_valu
         scf.yield %c0_i16x4 : vector<4xi16>
       }
       scf.if %input_loader {
-        func.call @vision_input_store(%input_stage, %stage_row, %stage_column, %rounded) : (buffer, index, index, vector<4xi16>)
+        func.call @qwen38_vision_panel_input_store(%input_stage, %stage_row, %stage_column, %rounded) : (buffer, index, index, vector<4xi16>)
       }
     }
 
@@ -251,11 +188,11 @@ template.def<@qwen38.vision.ffn_up> device @qwen38_vision_ffn_up_body(%rows_valu
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
     %next0, %next1, %next2, %next3 = scf.for %fragment_column = [%c0 to %c64 step %c16](%fragment_acc0 = %acc0 : vector<8xf32>, %fragment_acc1 = %acc1 : vector<8xf32>, %fragment_acc2 = %acc2 : vector<8xf32>, %fragment_acc3 = %acc3 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll {
-      %input_values = func.call @vision_input_fragment(%input_stage, %wave_row, %lane_column, %fragment_column) : (buffer, index, index, index) -> (vector<16xi16>)
-      %weight_values0 = func.call @qwen38_vision_ffn_swizzled_weight_fragment(%c192, %weight_stage, %weight_stage_row0, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
-      %weight_values1 = func.call @qwen38_vision_ffn_swizzled_weight_fragment(%c192, %weight_stage, %weight_stage_row1, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
-      %weight_values2 = func.call @qwen38_vision_ffn_swizzled_weight_fragment(%c192, %weight_stage, %weight_stage_row2, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
-      %weight_values3 = func.call @qwen38_vision_ffn_swizzled_weight_fragment(%c192, %weight_stage, %weight_stage_row3, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %input_values = func.call @qwen38_vision_panel_input_fragment(%input_stage, %wave_row, %lane_column, %fragment_column) : (buffer, index, index, index) -> (vector<16xi16>)
+      %weight_values0 = func.call @qwen38_vision_panel_weight_fragment(%c192, %weight_stage, %weight_stage_row0, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %weight_values1 = func.call @qwen38_vision_panel_weight_fragment(%c192, %weight_stage, %weight_stage_row1, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %weight_values2 = func.call @qwen38_vision_panel_weight_fragment(%c192, %weight_stage, %weight_stage_row2, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %weight_values3 = func.call @qwen38_vision_panel_weight_fragment(%c192, %weight_stage, %weight_stage_row3, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
       %fragment_next0 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values0, %fragment_acc0) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
       %fragment_next1 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values1, %fragment_acc1) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
       %fragment_next2 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values2, %fragment_acc2) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
@@ -315,16 +252,16 @@ template.def<@qwen38.vision.ffn_up> device @qwen38_vision_ffn_up_body(%rows_valu
   %output_full = scalar.ori %all_tiles_full, %fragment_full : i1
   scf.if %output_full {
     scf.if %valid0 {
-      func.call @vision_store_result(%bf16, %rows, %c4304, %activation_noalias, %result_row, %result_column0, %activated0) : (i1, index, index, buffer, index, index, vector<8xf32>)
+      func.call @qwen38_vision_store_result(%bf16, %rows, %c4304, %activation_noalias, %result_row, %result_column0, %activated0) : (i1, index, index, buffer, index, index, vector<8xf32>)
     }
     scf.if %valid1 {
-      func.call @vision_store_result(%bf16, %rows, %c4304, %activation_noalias, %result_row, %result_column1, %activated1) : (i1, index, index, buffer, index, index, vector<8xf32>)
+      func.call @qwen38_vision_store_result(%bf16, %rows, %c4304, %activation_noalias, %result_row, %result_column1, %activated1) : (i1, index, index, buffer, index, index, vector<8xf32>)
     }
     scf.if %valid2 {
-      func.call @vision_store_result(%bf16, %rows, %c4304, %activation_noalias, %result_row, %result_column2, %activated2) : (i1, index, index, buffer, index, index, vector<8xf32>)
+      func.call @qwen38_vision_store_result(%bf16, %rows, %c4304, %activation_noalias, %result_row, %result_column2, %activated2) : (i1, index, index, buffer, index, index, vector<8xf32>)
     }
     scf.if %valid3 {
-      func.call @vision_store_result(%bf16, %rows, %c4304, %activation_noalias, %result_row, %result_column3, %activated3) : (i1, index, index, buffer, index, index, vector<8xf32>)
+      func.call @qwen38_vision_store_result(%bf16, %rows, %c4304, %activation_noalias, %result_row, %result_column3, %activated3) : (i1, index, index, buffer, index, index, vector<8xf32>)
     }
   } else {
     %lane_row_parity = index.div %lane, %c16 : index
@@ -434,7 +371,7 @@ template.def<@qwen38.vision.ffn_down> device @qwen38_vision_ffn_down_body(%rows_
       } else {
         scf.yield %c0_i16x4 : vector<4xi16>
       }
-      func.call @vision_input_store(%input_stage, %input_stage_row, %input_stage_column, %input_values) : (buffer, index, index, vector<4xi16>)
+      func.call @qwen38_vision_panel_input_store(%input_stage, %input_stage_row, %input_stage_column, %input_values) : (buffer, index, index, vector<4xi16>)
     }
 
     scf.for %weight_round = [%c0 to %c8 step %c1] unroll {
@@ -461,11 +398,11 @@ template.def<@qwen38.vision.ffn_down> device @qwen38_vision_ffn_down_body(%rows_
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
     %next0, %next1, %next2, %next3 = scf.for %fragment_column = [%c0 to %c64 step %c16](%fragment0 = %current0 : vector<8xf32>, %fragment1 = %current1 : vector<8xf32>, %fragment2 = %current2 : vector<8xf32>, %fragment3 = %current3 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll {
-      %input_values = func.call @vision_input_fragment(%input_stage, %wave_row, %lane_column, %fragment_column) : (buffer, index, index, index) -> (vector<16xi16>)
-      %weight_values0 = func.call @qwen38_vision_ffn_swizzled_weight_fragment(%c128, %weight_stage, %weight_stage_row0, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
-      %weight_values1 = func.call @qwen38_vision_ffn_swizzled_weight_fragment(%c128, %weight_stage, %weight_stage_row1, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
-      %weight_values2 = func.call @qwen38_vision_ffn_swizzled_weight_fragment(%c128, %weight_stage, %weight_stage_row2, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
-      %weight_values3 = func.call @qwen38_vision_ffn_swizzled_weight_fragment(%c128, %weight_stage, %weight_stage_row3, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %input_values = func.call @qwen38_vision_panel_input_fragment(%input_stage, %wave_row, %lane_column, %fragment_column) : (buffer, index, index, index) -> (vector<16xi16>)
+      %weight_values0 = func.call @qwen38_vision_panel_weight_fragment(%c128, %weight_stage, %weight_stage_row0, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %weight_values1 = func.call @qwen38_vision_panel_weight_fragment(%c128, %weight_stage, %weight_stage_row1, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %weight_values2 = func.call @qwen38_vision_panel_weight_fragment(%c128, %weight_stage, %weight_stage_row2, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %weight_values3 = func.call @qwen38_vision_panel_weight_fragment(%c128, %weight_stage, %weight_stage_row3, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
       %updated0 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values0, %fragment0) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
       %updated1 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values1, %fragment1) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
       %updated2 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values2, %fragment2) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)

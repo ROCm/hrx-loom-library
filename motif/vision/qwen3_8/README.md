@@ -5,6 +5,21 @@ contracts. The dense and MoE models use different matrix precision and final
 feature widths; checkpoint names, geometry selection, launches, and retained
 output ownership belong to their composition leaves.
 
+`merger.loom` turns each ordered group of four patch rows into one language
+feature. The up projection consumes the F32 4608-wide row and applies tanh
+GELU; the down projection emits the caller's feature width in F32. Dense and
+Flash-Next select 5120 and 2560 columns respectively. Original F16/BF16 weights
+and the rounded intermediate use the precision provider, while output storage
+and permission to reuse an earlier residual stay with the command owner.
+F16 up keeps conversion live ranges within one panel; BF16 up and both down
+projections overlap two panels. Precision specializes this schedule without
+introducing runtime branches or changing external reuse.
+
+`panels.loom` owns matching XOR input stores/reads and cyclic weight reads for
+the FFN and merger. Its raw half-bit layouts preserve reuse without global
+packing or padding. Callers own storage and synchronization; the provider owns
+the correspondence between logical matrix coordinates and physical LDS rows.
+
 `patch.loom` projects packed RGB8 directly into the trained 2×2 patch order.
 It retains two independent temporal weight contractions in F32, sharing one
 resident input panel between them. Checkpoint storage and operand precision
@@ -12,10 +27,11 @@ are independent specialization facts: original dense F16 is read unchanged,
 while original Flash-Next F32 weights round to BF16 inside the resident tile.
 No image-sized patch matrix or converted checkpoint is materialized.
 
-`precision.loom` provides the rounding and native F16/BF16 matrix interpretation
-used by patch and feed-forward projections. It carries original half bits
-between arithmetic boundaries and introduces no storage or synchronization.
-The fragment contract is explicitly RDNA wave32 with F32 accumulation.
+`precision.loom` provides rounding, result publication, and native F16/BF16
+matrix interpretation for patch, feed-forward, and merger projections. It
+carries original half bits between arithmetic boundaries and allocates no
+storage or synchronization. The fragment contract is explicitly RDNA wave32
+with F32 accumulation.
 
 `normalization.loom` owns F32 row moments, aligned-corners interpolation of
 the learned 48×48 position table, and final affine normalization. Position
@@ -35,6 +51,7 @@ exercise that actual leaf and a test-only BF16 interpretation of the same motif.
 
 Shared normalization supplies eight statistics bytes per patch. Up projection
 normalizes while staging and publishes only the 4304-wide half-precision GELU
-activation; down projection updates the F32 residual in place. Input and weight tiles reuse
-external reads across multiple rows and output channels. Their matched LDS
-permutations and read-ahead schedule belong to the algorithm, not model policy.
+activation; down projection updates the F32 residual in place. Input and weight
+tiles reuse external reads across multiple rows and output channels. Their
+matched LDS permutations and read-ahead schedule belong to the algorithm,
+not model policy.

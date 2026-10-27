@@ -1,0 +1,69 @@
+// Resident half-bit panel layouts shared by Qwen3.8 vision projections.
+//
+// The input panel is 64x64 I16. Four-value stores use rows 0..63 and columns
+// 0..60 divisible by four, at column XOR ((row & 7)*8). Fragment reads
+// reconstruct sixteen logical values from two eight-value reads.
+// block_row is a multiple of 16, lane_row is 0..15, and fragment column is
+// one of 0,16,32,48. Matrix interpretation belongs to the precision provider.
+//
+// Weight panels have stage_rows rows and 64 I16 columns. Producers rotate each
+// row by (row % 8)*8 modulo 64; the reader recovers its logical 16-value fragment
+// from two aligned reads. Actual callers use 128 or 192 rows. Every fetched
+// panel is reused across the caller's row/output tile before being overwritten.
+// Both layouts preserve the original half bits and use no padded global tensor.
+//
+// Callers provide workgroup-local storage, complete panel publication before
+// reads, and a barrier before reuse. These helpers allocate no memory and do
+// not introduce barriers, conversion, or a launch ABI.
+
+func.def public inline @qwen38_vision_panel_input_store(%stage: buffer, %row: index, %column: index, %values: vector<4xi16>) {
+  %origin = index.constant 0 : offset
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %local = buffer.assume.memory_space<workgroup> %stage : buffer
+  %view = buffer.view %local[%origin] : buffer -> view<64x64xi16>
+  %row_lane = index.andi %row, %c7 : index
+  %rotation = index.mul %row_lane, %c8 : index
+  %physical = index.xori %column, %rotation : index
+  vector.store %values, %view[%row, %physical] : vector<4xi16>, view<64x64xi16>
+  func.return
+}
+
+func.def public inline @qwen38_vision_panel_input_fragment(%stage: buffer, %block_row: index, %lane_row: index, %column: index) -> (vector<16xi16>) {
+  %origin = index.constant 0 : offset
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %local = buffer.assume.memory_space<workgroup> %stage : buffer
+  %view = buffer.view %local[%origin] : buffer -> view<64x64xi16>
+  %row = index.add %block_row, %lane_row : index
+  %row_lane = index.andi %lane_row, %c7 : index
+  %rotation = index.mul %row_lane, %c8 : index
+  %second = index.add %column, %c8 : index
+  %physical0 = index.xori %column, %rotation : index
+  %physical1 = index.xori %second, %rotation : index
+  %low = vector.load %view[%row, %physical0] : view<64x64xi16> -> vector<8xi16>
+  %high = vector.load %view[%row, %physical1] : view<64x64xi16> -> vector<8xi16>
+  %values = vector.concat<0> %low, %high : vector<8xi16>, vector<8xi16> -> vector<16xi16>
+  func.return %values : vector<16xi16>
+}
+
+func.def public inline @qwen38_vision_panel_weight_fragment(%stage_rows: index, %stage: buffer, %row: index, %fragment_column: index) -> (vector<16xi16>) {
+  %origin = index.constant 0 : offset
+  %c8 = index.constant 8 : index
+  %c64 = index.constant 64 : index
+  %stage_local = buffer.assume.memory_space<workgroup> %stage : buffer
+  %stage_view = buffer.view %stage_local[%origin] : buffer -> view<[%stage_rows]x64xi16>
+  %row_lane = index.rem %row, %c8 : index
+  %rotation = index.mul %row_lane, %c8 : index
+  %low_column0 = index.add %fragment_column, %rotation : index
+  %low_column_raw = index.rem %low_column0, %c64 : index
+  %low_column = index.assume %low_column_raw [range(%low_column_raw, 0, 56), multiple_of(%low_column_raw, 8)] : index
+  %logical_high_column = index.add %fragment_column, %c8 : index
+  %high_column0 = index.add %logical_high_column, %rotation : index
+  %high_column_raw = index.rem %high_column0, %c64 : index
+  %high_column = index.assume %high_column_raw [range(%high_column_raw, 0, 56), multiple_of(%high_column_raw, 8)] : index
+  %low = vector.load %stage_view[%row, %low_column] : view<[%stage_rows]x64xi16> -> vector<8xi16>
+  %high = vector.load %stage_view[%row, %high_column] : view<[%stage_rows]x64xi16> -> vector<8xi16>
+  %values = vector.concat<0> %low, %high : vector<8xi16>, vector<8xi16> -> vector<16xi16>
+  func.return %values : vector<16xi16>
+}

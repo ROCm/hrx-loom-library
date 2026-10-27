@@ -40,6 +40,12 @@ shared direct RGB8 projection. The same motif supports BF16 operands and F32
 checkpoint weights, converting only the resident panel. Its two temporal
 contractions remain independent until the F32 epilogue adds them and the bias.
 
+`vision_merger.loom` supplies the shared merger with original F16 matrices and
+the dense model's 5120-wide output contract. It shares the FFN's resident panel
+layouts and overlaps down-projection panel loads with matrix work. The command
+preserves the postnormalized input before allowing the final feature range to
+replace the earlier residual bank.
+
 `vision_ffn.loom` specializes the [shared vision FFN](../../../../../motif/vision/qwen3_8/README.md)
 with image geometry and original F16 matrix storage. The motif owns normalized
 input staging, LDS permutations, read-ahead, and F32 matrix accumulation. The
