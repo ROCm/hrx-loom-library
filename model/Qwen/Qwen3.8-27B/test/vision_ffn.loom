@@ -1,0 +1,422 @@
+// Independent sparse-product reference for the complete vision FFN.
+// Each residual row permutes 64 evenly spaced values, repeated 18 times;
+// its mean is row/8 and variance is exactly 4095/12288. Affine terms and
+// three signed weights vary by channel. One weight always addresses the last
+// K column, including the 16-value tail of the down projection. The reference
+// uses scalar products and F64 GELU algebra with the VM's F32 exponential,
+// never LDS or matrix-fragment layouts.
+
+kernel.decl @qwen38_vision_statistics() launch(%residual: buffer, %statistics: buffer)
+
+kernel.decl @qwen38_vision_ffn_up() launch(%residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %up_weight: buffer, %up_bias: buffer, %activation: buffer)
+
+kernel.decl @qwen38_vision_ffn_down() launch(%activation: buffer, %down_weight: buffer, %down_bias: buffer, %residual: buffer)
+
+amdgpu.target<gfx11-generic> @vision_test_wave32 {subgroup_size = 32}
+
+template.decl @qwen38.vision.ffn_up(%rows: index, %bf16: i1, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %up_weight: buffer, %up_bias: buffer, %activation: buffer)
+
+kernel.def target(@vision_test_wave32) @vision_test_ffn_up_bf16() {
+  %row_tiles = index.constant 2 : index
+  %column_tiles = index.constant 23 : index
+  %threads = index.constant 384 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%row_tiles, %column_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %up_weight: buffer, %up_bias: buffer, %activation: buffer) {
+  %rows = index.constant 68 : index
+  %bf16 = scalar.constant true : i1
+  template.apply<@qwen38.vision.ffn_up>(%rows, %bf16, %residual, %statistics, %layernorm_weight, %layernorm_bias, %up_weight, %up_bias, %activation) : (index, i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+template.decl @qwen38.vision.ffn_down(%rows: index, %bf16: i1, %activation: buffer, %down_weight: buffer, %down_bias: buffer, %residual: buffer)
+
+kernel.def target(@vision_test_wave32) @vision_test_ffn_down_bf16() {
+  %row_tiles = index.constant 2 : index
+  %column_tiles = index.constant 9 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%row_tiles, %column_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%activation: buffer, %down_weight: buffer, %down_bias: buffer, %residual: buffer) {
+  %rows = index.constant 68 : index
+  %bf16 = scalar.constant true : i1
+  template.apply<@qwen38.vision.ffn_down>(%rows, %bf16, %activation, %down_weight, %down_bias, %residual) : (index, i1, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+func.def @ffn_round(%bf16: i1, %value: f32) -> (i16) {
+  %bits = scf.if %bf16 -> (i16) {
+    %rounded = scalar.fptrunc %value : f32 to bf16
+    %bits = scalar.bitcast %rounded : bf16 to i16
+    scf.yield %bits : i16
+  } else {
+    %rounded = scalar.fptrunc %value : f32 to f16
+    %bits = scalar.bitcast %rounded : f16 to i16
+    scf.yield %bits : i16
+  }
+  func.return %bits : i16
+}
+
+func.def @ffn_widen(%bf16: i1, %bits: i16) -> (f32) {
+  %value = scf.if %bf16 -> (f32) {
+    %half = scalar.bitcast %bits : i16 to bf16
+    %value = scalar.extf %half : bf16 to f32
+    scf.yield %value : f32
+  } else {
+    %half = scalar.bitcast %bits : i16 to f16
+    %value = scalar.extf %half : f16 to f32
+    scf.yield %value : f32
+  }
+  func.return %value : f32
+}
+
+func.def @ffn_residual(%row: index, %column: index) -> (f32) {
+  %c13 = index.constant 13 : index
+  %c17 = index.constant 17 : index
+  %c64 = index.constant 64 : index
+  %row_phase = index.mul %row, %c17 : index
+  %phase = index.madd %column, %c13, %row_phase : index
+  %phase_mod = index.rem %phase, %c64 : index
+  %phase_i32 = index.cast %phase_mod : index to i32
+  %phase_f32 = scalar.sitofp %phase_i32 : i32 to f32
+  %midpoint = scalar.constant 31.5 : f32
+  %step = scalar.constant 0.03125 : f32
+  %centered = scalar.subf %phase_f32, %midpoint : f32
+  %value = scalar.mulf %centered, %step : f32
+  %row_i32 = index.cast %row : index to i32
+  %row_f32 = scalar.sitofp %row_i32 : i32 to f32
+  %mean_step = scalar.constant 0.125 : f32
+  %mean = scalar.mulf %row_f32, %mean_step : f32
+  %shifted = scalar.addf %value, %mean : f32
+  func.return %shifted : f32
+}
+
+func.def @ffn_statistics_reference(%row: index) -> (f32, f32) {
+  %row_i32 = index.cast %row : index to i32
+  %row_f32 = scalar.sitofp %row_i32 : i32 to f32
+  %mean_step = scalar.constant 0.125 : f32
+  %mean = scalar.mulf %row_f32, %mean_step : f32
+  // Independently rounded 1/sqrt(4095/12288 + 1e-6).
+  %inverse = scalar.constant 1.7322596311569214 : f32
+  func.return %mean, %inverse : f32, f32
+}
+
+func.def @ffn_affine(%column: index) -> (f32, f32) {
+  %c5 = index.constant 5 : index
+  %c7 = index.constant 7 : index
+  %scale_index = index.rem %column, %c5 : index
+  %shift_index = index.rem %column, %c7 : index
+  %scale_i32 = index.cast %scale_index : index to i32
+  %shift_i32 = index.cast %shift_index : index to i32
+  %scale_f32 = scalar.sitofp %scale_i32 : i32 to f32
+  %shift_f32 = scalar.sitofp %shift_i32 : i32 to f32
+  %c1_f = scalar.constant 1.0 : f32
+  %c3_f32 = scalar.constant 3.0 : f32
+  %scale_step = scalar.constant 0.0625 : f32
+  %shift_step = scalar.constant 0.015625 : f32
+  %scale_delta = scalar.mulf %scale_f32, %scale_step : f32
+  %scale = scalar.addf %c1_f, %scale_delta : f32
+  %centered_shift = scalar.subf %shift_f32, %c3_f32 : f32
+  %shift = scalar.mulf %centered_shift, %shift_step : f32
+  func.return %scale, %shift : f32, f32
+}
+
+// The first two taps exclude the last column and cannot collide. The third
+// exercises every output's K tail. Coefficients are exact in both formats.
+func.def inline @ffn_taps(%inputs: index, %channel: index) -> (index, index, index, f32, f32, f32, f32) {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c7 = index.constant 7 : index
+  %c9 = index.constant 9 : index
+  %c11 = index.constant 11 : index
+  %c17 = index.constant 17 : index
+  %last = index.sub %inputs, %c1 : index
+  %half = index.div %inputs, %c2 : index
+  %phase = index.madd %channel, %c17, %c3 : index
+  %first = index.rem %phase, %last : index
+  %second_phase = index.add %first, %half : index
+  %second = index.rem %second_phase, %last : index
+  %a_index = index.rem %channel, %c11 : index
+  %b_index = index.rem %channel, %c7 : index
+  %c_index = index.rem %channel, %c2 : index
+  %bias_index = index.rem %channel, %c9 : index
+  %a_i32 = index.cast %a_index : index to i32
+  %b_i32 = index.cast %b_index : index to i32
+  %c_i32 = index.cast %c_index : index to i32
+  %bias_i32 = index.cast %bias_index : index to i32
+  %a_f32 = scalar.sitofp %a_i32 : i32 to f32
+  %b_f32 = scalar.sitofp %b_i32 : i32 to f32
+  %c_f32 = scalar.sitofp %c_i32 : i32 to f32
+  %bias_f32 = scalar.sitofp %bias_i32 : i32 to f32
+  %c5_f32 = scalar.constant 5.0 : f32
+  %c3_f32 = scalar.constant 3.0 : f32
+  %c4_f32 = scalar.constant 4.0 : f32
+  %half_f32 = scalar.constant 0.5 : f32
+  %a_step = scalar.constant 0.0625 : f32
+  %b_step = scalar.constant 0.03125 : f32
+  %bias_step = scalar.constant 0.0078125 : f32
+  %a_centered = scalar.subf %a_f32, %c5_f32 : f32
+  %b_centered = scalar.subf %b_f32, %c3_f32 : f32
+  %c_centered = scalar.subf %c_f32, %half_f32 : f32
+  %bias_centered = scalar.subf %bias_f32, %c4_f32 : f32
+  %a = scalar.mulf %a_centered, %a_step : f32
+  %b = scalar.mulf %b_centered, %b_step : f32
+  %c = scalar.mulf %c_centered, %b_step : f32
+  %bias = scalar.mulf %bias_centered, %bias_step : f32
+  func.return %first, %second, %last, %a, %b, %c, %bias : index, index, index, f32, f32, f32, f32
+}
+
+func.def inline @ffn_weight_fixture(%bf16: i1, %inputs: index, %outputs: index, %weight: buffer, %bias: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<[%outputs]x[%inputs]xi16>
+  %bias_view = buffer.view %bias[%origin] : buffer -> view<[%outputs]xf32>
+  scf.for %channel = [%c0 to %outputs step %c1] {
+    %first, %second, %last, %a, %b, %c, %bias_value = func.call @ffn_taps(%inputs, %channel) : (index, index) -> (index, index, index, f32, f32, f32, f32)
+    %a_bits = func.call @ffn_round(%bf16, %a) : (i1, f32) -> (i16)
+    %b_bits = func.call @ffn_round(%bf16, %b) : (i1, f32) -> (i16)
+    %c_bits = func.call @ffn_round(%bf16, %c) : (i1, f32) -> (i16)
+    view.store %a_bits, %weight_view[%channel, %first] : i16, view<[%outputs]x[%inputs]xi16>
+    view.store %b_bits, %weight_view[%channel, %second] : i16, view<[%outputs]x[%inputs]xi16>
+    view.store %c_bits, %weight_view[%channel, %last] : i16, view<[%outputs]x[%inputs]xi16>
+    view.store %bias_value, %bias_view[%channel] : f32, view<[%outputs]xf32>
+  }
+  func.return
+}
+
+func.def @ffn_fixture(%bf16: i1, %residual: buffer, %scale: buffer, %shift: buffer, %up_weight: buffer, %up_bias: buffer, %down_weight: buffer, %down_bias: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %rows = index.constant 68 : index
+  %width = index.constant 1152 : index
+  %hidden = index.constant 4304 : index
+  %residual_view = buffer.view %residual[%origin] : buffer -> view<68x1152xf32>
+  %scale_view = buffer.view %scale[%origin] : buffer -> view<1152xf32>
+  %shift_view = buffer.view %shift[%origin] : buffer -> view<1152xf32>
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %column = [%c0 to %width step %c1] {
+      %value = func.call @ffn_residual(%row, %column) : (index, index) -> (f32)
+      view.store %value, %residual_view[%row, %column] : f32, view<68x1152xf32>
+    }
+  }
+  scf.for %column = [%c0 to %width step %c1] {
+    %scale_value, %shift_value = func.call @ffn_affine(%column) : (index) -> (f32, f32)
+    view.store %scale_value, %scale_view[%column] : f32, view<1152xf32>
+    view.store %shift_value, %shift_view[%column] : f32, view<1152xf32>
+  }
+  func.call @ffn_weight_fixture(%bf16, %width, %hidden, %up_weight, %up_bias) : (i1, index, index, buffer, buffer)
+  func.call @ffn_weight_fixture(%bf16, %hidden, %width, %down_weight, %down_bias) : (i1, index, index, buffer, buffer)
+  func.return
+}
+
+func.def @ffn_normalized(%bf16: i1, %row: index, %column: index) -> (f32) {
+  %value = func.call @ffn_residual(%row, %column) : (index, index) -> (f32)
+  %mean, %inverse = func.call @ffn_statistics_reference(%row) : (index) -> (f32, f32)
+  %scale, %shift = func.call @ffn_affine(%column) : (index) -> (f32, f32)
+  %centered = scalar.subf %value, %mean : f32
+  %normalized = scalar.mulf %centered, %inverse : f32
+  %scaled = scalar.mulf %normalized, %scale : f32
+  %shifted = scalar.addf %scaled, %shift : f32
+  %bits = func.call @ffn_round(%bf16, %shifted) : (i1, f32) -> (i16)
+  %rounded = func.call @ffn_widen(%bf16, %bits) : (i1, i16) -> (f32)
+  func.return %rounded : f32
+}
+
+func.def @ffn_reference(%bf16: i1, %activation: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %rows = index.constant 68 : index
+  %width = index.constant 1152 : index
+  %hidden = index.constant 4304 : index
+  %activation_view = buffer.view %activation[%origin] : buffer -> view<68x4304xi16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<68x1152xf32>
+  %half = scalar.constant 0.5 : f64
+  %c1_f = scalar.constant 1.0 : f64
+  %c2_f = scalar.constant 2.0 : f64
+  %cubic_scale = scalar.constant 0.044714999999999998 : f64
+  %sqrt_two_over_pi = scalar.constant 0.79788456080286541 : f64
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %channel = [%c0 to %hidden step %c1] {
+      %first, %second, %last, %a, %b, %c, %bias = func.call @ffn_taps(%width, %channel) : (index, index) -> (index, index, index, f32, f32, f32, f32)
+      %x = func.call @ffn_normalized(%bf16, %row, %first) : (i1, index, index) -> (f32)
+      %y = func.call @ffn_normalized(%bf16, %row, %second) : (i1, index, index) -> (f32)
+      %z = func.call @ffn_normalized(%bf16, %row, %last) : (i1, index, index) -> (f32)
+      %ax = scalar.mulf %a, %x : f32
+      %by = scalar.mulf %b, %y : f32
+      %cz = scalar.mulf %c, %z : f32
+      %ab = scalar.addf %ax, %by : f32
+      %abc = scalar.addf %ab, %cz : f32
+      %biased = scalar.addf %abc, %bias : f32
+      %value = scalar.extf %biased : f32 to f64
+      %square = scalar.mulf %value, %value : f64
+      %cube = scalar.mulf %square, %value : f64
+      %cubic_term = scalar.mulf %cube, %cubic_scale : f64
+      %inner = scalar.addf %value, %cubic_term : f64
+      %angle = scalar.mulf %inner, %sqrt_two_over_pi : f64
+      // tanh(x) = (exp(2*x) - 1) / (exp(2*x) + 1). The fixture's bounded
+      // inputs avoid overflow; F32 exp rounding is below the activation budget.
+      %twice_angle = scalar.mulf %angle, %c2_f : f64
+      %exponent = scalar.fptrunc %twice_angle : f64 to f32
+      %exponential_f32 = scalar.expf<afn> %exponent : f32
+      %exponential = scalar.extf %exponential_f32 : f32 to f64
+      %numerator = scalar.subf %exponential, %c1_f : f64
+      %denominator = scalar.addf %exponential, %c1_f : f64
+      %tangent = scalar.divf %numerator, %denominator : f64
+      %factor = scalar.addf %c1_f, %tangent : f64
+      %half_value = scalar.mulf %half, %value : f64
+      %gelu = scalar.mulf %half_value, %factor : f64
+      %gelu_f32 = scalar.fptrunc %gelu : f64 to f32
+      %bits = func.call @ffn_round(%bf16, %gelu_f32) : (i1, f32) -> (i16)
+      view.store %bits, %activation_view[%row, %channel] : i16, view<68x4304xi16>
+    }
+    scf.for %channel = [%c0 to %width step %c1] {
+      %first, %second, %last, %a, %b, %c, %bias = func.call @ffn_taps(%hidden, %channel) : (index, index) -> (index, index, index, f32, f32, f32, f32)
+      %x_bits = view.load %activation_view[%row, %first] : view<68x4304xi16> -> i16
+      %y_bits = view.load %activation_view[%row, %second] : view<68x4304xi16> -> i16
+      %z_bits = view.load %activation_view[%row, %last] : view<68x4304xi16> -> i16
+      %x = func.call @ffn_widen(%bf16, %x_bits) : (i1, i16) -> (f32)
+      %y = func.call @ffn_widen(%bf16, %y_bits) : (i1, i16) -> (f32)
+      %z = func.call @ffn_widen(%bf16, %z_bits) : (i1, i16) -> (f32)
+      %ax = scalar.mulf %a, %x : f32
+      %by = scalar.mulf %b, %y : f32
+      %cz = scalar.mulf %c, %z : f32
+      %ab = scalar.addf %ax, %by : f32
+      %abc = scalar.addf %ab, %cz : f32
+      %biased = scalar.addf %abc, %bias : f32
+      %residual = func.call @ffn_residual(%row, %channel) : (index, index) -> (f32)
+      %result = scalar.addf %residual, %biased : f32
+      view.store %result, %output_view[%row, %channel] : f32, view<68x1152xf32>
+    }
+  }
+  func.return
+}
+
+// Exercise the same ordered launch sequence used by the model command.
+command.program.def @ffn_complete(%bf16: i1) launch(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %up_weight: buffer, %up_bias: buffer, %down_weight: buffer, %down_bias: buffer, %activation: buffer) {
+  kernel.launch @qwen38_vision_statistics(%residual, %statistics) : (buffer, buffer)
+  scf.if %bf16 {
+    kernel.launch @vision_test_ffn_up_bf16(%residual, %statistics, %scale, %shift, %up_weight, %up_bias, %activation) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @vision_test_ffn_down_bf16(%activation, %down_weight, %down_bias, %residual) : (buffer, buffer, buffer, buffer)
+  } else {
+    kernel.launch @qwen38_vision_ffn_up(%residual, %statistics, %scale, %shift, %up_weight, %up_bias, %activation) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @qwen38_vision_ffn_down(%activation, %down_weight, %down_bias, %residual) : (buffer, buffer, buffer, buffer)
+  }
+  command.return
+}
+
+func.def @ffn_complete_reference(%bf16: i1, %residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %up_weight: buffer, %up_bias: buffer, %down_weight: buffer, %down_bias: buffer, %activation: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %rows = index.constant 68 : index
+  %statistics_view = buffer.view %statistics[%origin] : buffer -> view<68x2xf32>
+  scf.for %row = [%c0 to %rows step %c1] {
+    %mean, %inverse = func.call @ffn_statistics_reference(%row) : (index) -> (f32, f32)
+    view.store %mean, %statistics_view[%row, %c0] : f32, view<68x2xf32>
+    view.store %inverse, %statistics_view[%row, %c1] : f32, view<68x2xf32>
+  }
+  func.call @ffn_reference(%bf16, %activation, %residual) : (i1, buffer, buffer)
+  func.return
+}
+
+func.def @ffn_f16_reference(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %up_weight: buffer, %up_bias: buffer, %down_weight: buffer, %down_bias: buffer, %activation: buffer) {
+  %bf16 = scalar.constant false : i1
+  func.call @ffn_complete_reference(%bf16, %residual, %statistics, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias, %activation) : (i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+// One half-precision ULP bounds activation rounding near a tie. Residual
+// tolerance bounds propagation through the three sparse coefficients.
+check.scenario public @vision_ffn_f16 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %bf16 = check.literal value(false) : i1
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %residual_storage = check.generate.fill value(99.0) : tensor<78368xf32>
+    %residual = check.tensor.view %residual_storage offset(64) : tensor<78368xf32> -> tensor<68x1152xf32>
+    %residual_prefix = check.tensor.view %residual_storage offset(0) : tensor<78368xf32> -> tensor<16xf32>
+    %residual_suffix = check.tensor.view %residual_storage offset(313408) : tensor<78368xf32> -> tensor<16xf32>
+    %statistics = check.generate.fill value(99.0) : tensor<68x2xf32>
+    %scale = check.generate.fill value(0.0) : tensor<1152xf32>
+    %shift = check.generate.fill value(0.0) : tensor<1152xf32>
+    %up_weight = check.generate.fill value(0.0) : tensor<4304x1152xf16>
+    %up_bias = check.generate.fill value(0.0) : tensor<4304xf32>
+    %down_weight = check.generate.fill value(0.0) : tensor<1152x4304xf16>
+    %down_bias = check.generate.fill value(0.0) : tensor<1152xf32>
+    %activation_storage = check.generate.fill value(99.0) : tensor<292736xf16>
+    %activation = check.tensor.view %activation_storage offset(64) : tensor<292736xf16> -> tensor<68x4304xf16>
+    %activation_prefix = check.tensor.view %activation_storage offset(0) : tensor<292736xf16> -> tensor<32xf16>
+    %activation_suffix = check.tensor.view %activation_storage offset(585408) : tensor<292736xf16> -> tensor<32xf16>
+    check.generate<@ffn_fixture>(%bf16, %residual, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias) : (i1, tensor<68x1152xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<4304x1152xf16>, tensor<4304xf32>, tensor<1152x4304xf16>, tensor<1152xf32>) -> ()
+    check.compare<@ffn_complete, @ffn_f16_reference>[%bf16](%residual, %statistics, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias, %activation) : [i1](tensor<68x1152xf32>, tensor<68x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<4304x1152xf16>, tensor<4304xf32>, tensor<1152x4304xf16>, tensor<1152xf32>, tensor<68x4304xf16>) -> () {
+      check.expect.close actual(%statistics) expected(%statistics) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<68x2xf32>
+      check.expect.close actual(%activation) expected(%activation) atol(0.00050000000000000001) rtol(0.001) nan(different) : tensor<68x4304xf16>
+      check.expect.close actual(%residual) expected(%residual) atol(0.00020000000000000001) rtol(0.0001) nan(different) : tensor<68x1152xf32>
+      check.expect.bitwise actual(%residual_prefix) expected(%residual_prefix) : tensor<16xf32>
+      check.expect.bitwise actual(%residual_suffix) expected(%residual_suffix) : tensor<16xf32>
+      check.expect.bitwise actual(%activation_prefix) expected(%activation_prefix) : tensor<32xf16>
+      check.expect.bitwise actual(%activation_suffix) expected(%activation_suffix) : tensor<32xf16>
+      check.expect.bitwise actual(%scale) expected(%scale) : tensor<1152xf32>
+      check.expect.bitwise actual(%shift) expected(%shift) : tensor<1152xf32>
+      check.expect.bitwise actual(%up_weight) expected(%up_weight) : tensor<4304x1152xf16>
+      check.expect.bitwise actual(%up_bias) expected(%up_bias) : tensor<4304xf32>
+      check.expect.bitwise actual(%down_weight) expected(%down_weight) : tensor<1152x4304xf16>
+      check.expect.bitwise actual(%down_bias) expected(%down_bias) : tensor<1152xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@vision_ffn_f16> @vision_ffn_f16_full_and_tail
+
+func.def @ffn_bf16_reference(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %up_weight: buffer, %up_bias: buffer, %down_weight: buffer, %down_bias: buffer, %activation: buffer) {
+  %bf16 = scalar.constant true : i1
+  func.call @ffn_complete_reference(%bf16, %residual, %statistics, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias, %activation) : (i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+// One half-precision ULP bounds activation rounding near a tie. Residual
+// tolerance bounds propagation through the three sparse coefficients.
+check.scenario public @vision_ffn_bf16 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %bf16 = check.literal value(true) : i1
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %residual_storage = check.generate.fill value(99.0) : tensor<78368xf32>
+    %residual = check.tensor.view %residual_storage offset(64) : tensor<78368xf32> -> tensor<68x1152xf32>
+    %residual_prefix = check.tensor.view %residual_storage offset(0) : tensor<78368xf32> -> tensor<16xf32>
+    %residual_suffix = check.tensor.view %residual_storage offset(313408) : tensor<78368xf32> -> tensor<16xf32>
+    %statistics = check.generate.fill value(99.0) : tensor<68x2xf32>
+    %scale = check.generate.fill value(0.0) : tensor<1152xf32>
+    %shift = check.generate.fill value(0.0) : tensor<1152xf32>
+    %up_weight = check.generate.fill value(0.0) : tensor<4304x1152xbf16>
+    %up_bias = check.generate.fill value(0.0) : tensor<4304xf32>
+    %down_weight = check.generate.fill value(0.0) : tensor<1152x4304xbf16>
+    %down_bias = check.generate.fill value(0.0) : tensor<1152xf32>
+    %activation_storage = check.generate.fill value(99.0) : tensor<292736xbf16>
+    %activation = check.tensor.view %activation_storage offset(64) : tensor<292736xbf16> -> tensor<68x4304xbf16>
+    %activation_prefix = check.tensor.view %activation_storage offset(0) : tensor<292736xbf16> -> tensor<32xbf16>
+    %activation_suffix = check.tensor.view %activation_storage offset(585408) : tensor<292736xbf16> -> tensor<32xbf16>
+    check.generate<@ffn_fixture>(%bf16, %residual, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias) : (i1, tensor<68x1152xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<4304x1152xbf16>, tensor<4304xf32>, tensor<1152x4304xbf16>, tensor<1152xf32>) -> ()
+    check.compare<@ffn_complete, @ffn_bf16_reference>[%bf16](%residual, %statistics, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias, %activation) : [i1](tensor<68x1152xf32>, tensor<68x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<4304x1152xbf16>, tensor<4304xf32>, tensor<1152x4304xbf16>, tensor<1152xf32>, tensor<68x4304xbf16>) -> () {
+      check.expect.close actual(%statistics) expected(%statistics) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<68x2xf32>
+      check.expect.close actual(%activation) expected(%activation) atol(0.0040000000000000001) rtol(0.0080000000000000002) nan(different) : tensor<68x4304xbf16>
+      check.expect.close actual(%residual) expected(%residual) atol(0.002) rtol(0.0001) nan(different) : tensor<68x1152xf32>
+      check.expect.bitwise actual(%residual_prefix) expected(%residual_prefix) : tensor<16xf32>
+      check.expect.bitwise actual(%residual_suffix) expected(%residual_suffix) : tensor<16xf32>
+      check.expect.bitwise actual(%activation_prefix) expected(%activation_prefix) : tensor<32xbf16>
+      check.expect.bitwise actual(%activation_suffix) expected(%activation_suffix) : tensor<32xbf16>
+      check.expect.bitwise actual(%scale) expected(%scale) : tensor<1152xf32>
+      check.expect.bitwise actual(%shift) expected(%shift) : tensor<1152xf32>
+      check.expect.bitwise actual(%up_weight) expected(%up_weight) : tensor<4304x1152xbf16>
+      check.expect.bitwise actual(%up_bias) expected(%up_bias) : tensor<4304xf32>
+      check.expect.bitwise actual(%down_weight) expected(%down_weight) : tensor<1152x4304xbf16>
+      check.expect.bitwise actual(%down_bias) expected(%down_bias) : tensor<1152xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@vision_ffn_bf16> @vision_ffn_bf16_full_and_tail

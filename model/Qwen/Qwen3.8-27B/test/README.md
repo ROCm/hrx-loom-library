@@ -14,6 +14,15 @@ Loom tools; benchmark smoke establishes execution, not performance.
 | DFlash2 | Context attention, proposal packing, candidate selection, and grouped convolution with independently specified buffers and expected state. |
 | Vision projector | Minimum, square, and rectangular geometries across patch embedding, attention, feed-forward, normalization, and merger stages. |
 
+`vision_ffn` additionally checks the shared F16/BF16 algorithm with 68 patch
+rows, covering a full 64-row tile, a four-row tail, and the 4304-column down
+projection's reduction tail. Each channel has three signed, independently
+addressed weight taps; analytically known row statistics and scalar products
+provide the reference. The checks observe intermediate activations and final
+residuals separately, with bitwise guards and unchanged weight buffers. F16
+executes the actual model leaf; a BF16 leaf selects the shared alternate
+precision. Both use native and access-instrumented execution profiles.
+
 The full-width Q5 staging comparison uses weights on a `2^-10` lattice and
 inputs in `{-1, 0, 1}`. Its `2^-12` absolute budget is one quarter of the
 smallest nonzero mathematical result difference; native matrix instructions

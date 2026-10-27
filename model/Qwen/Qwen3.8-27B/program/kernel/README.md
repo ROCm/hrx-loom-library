@@ -35,6 +35,13 @@ They retain the trained patch/merge order and explicit scratch ownership.
 The command owner can reuse intermediates across a cohort while preserving
 each image's output feature range.
 
+`vision_ffn.loom` specializes the [shared vision FFN](../../../../../motif/vision/qwen3_8/README.md)
+with image geometry and original F16 matrix storage. The motif owns normalized
+input staging, LDS permutations, read-ahead, and F32 matrix accumulation. The
+model leaf owns the wave32 launch and existing statistics/up/down buffer ABI.
+The motif's BF16 specialization uses the same schedule without converting
+checkpoints.
+
 ### Pixel filtering
 
 `vision_resize.loom` consumes the packet layout owned by
