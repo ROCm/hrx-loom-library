@@ -109,9 +109,9 @@ the selected `loom-serve` through HTTP. This keeps internal API qualification
 available without rebuilding the compiler behind an installed SDK selection.
 
 `loom_motif_library` emits linkable bytecode and checks that its sources are
-non-launchable. `loom_kernel_library` adds concrete kernel products, test
-modules, target profiles, and compiler reports. `loom_test` exercises a private
-composition through the same test-module contract. The [Bazel rule guide](../build_tools/bazel/)
+non-launchable. `loom_kernel_library` adds concrete kernel products, target
+profiles, and compiler reports. `loom_test` owns correctness cases and benchmarks
+in a separate module that depends on production providers. The [Bazel rule guide](../build_tools/bazel/)
 explains their declarations; the [public Loom build guide](https://rocm.github.io/hrx-system/loom/workflows/build-with-bazel/)
 owns the underlying toolchain and linker behavior.
 
@@ -124,10 +124,10 @@ Build a quantization kernel together with its motif dependencies and test module
 
 ```shell
 bazelisk build --config=opt \
-  //kernel/ggml/quantize:q8_1_x4_f32_benchmark_module
+  //kernel/ggml/quantize:q8_1_x4_f32_checks_benchmark_module
 LOOM_MODULE="$(realpath bazel-bin/kernel/ggml/quantize/q8_1_x4_f32.loombc)"
 LOOM_LIBRARY="$(realpath bazel-bin/motif/format/ggml/q8_1_x4.loombc)"
-LOOM_TEST_MODULE="$(realpath bazel-bin/kernel/ggml/quantize/q8_1_x4_f32_test_module.loombc)"
+LOOM_TEST_MODULE="$(realpath bazel-bin/kernel/ggml/quantize/q8_1_x4_f32_checks_module.loombc)"
 ```
 
 The resolved paths keep these inputs stable when a later tool invocation changes
@@ -180,7 +180,7 @@ so its schemas and lifecycle remain independent. Benchmark sweep workspaces use
 
 ### Sweep repository benchmarks
 
-`dev.py benchmark` discovers every kernel and test module admitted to the
+`dev.py benchmark` discovers every test module admitted to the
 repository benchmark corpus, uses HRX's linked root-owned test module plus the
 public benchmark runner from the selected SDK or HRX source checkout, and
 maintains a local sweep workspace:
@@ -237,7 +237,7 @@ The workspace is rooted at
 measurement history.
 
 `--target` accepts Bazel target patterns. Recursive scopes select admitted
-benchmark modules below a package, exact library labels select one module, and
+benchmark modules below a package, exact test labels select one module, and
 repeating the option forms a union:
 
 ```shell

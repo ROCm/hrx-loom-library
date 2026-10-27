@@ -23,9 +23,9 @@ This repository admits reusable compiler inputs and complete model compositions.
 | Surface | Ownership | Admission evidence |
 | --- | --- | --- |
 | `motif/` | Target-neutral data representations and algorithms expressed as `func.def`, `template.def`, encodings, and related declarations. | Canonical and lint-clean source, scoped documentation, no launch surface, and reachability from a qualified kernel or test leaf. |
-| `kernel/` | Concrete `kernel.def` entry points implementing one operation contract and ABI. | A semantic benchmark plan, at least one target profile, at least one execution profile, and dependencies confined to production motifs. |
+| `kernel/` | Concrete `kernel.def` entry points implementing one operation contract and ABI. | At least one target profile, reachability from an executing benchmark test, and dependencies confined to production motifs. |
 | `program/` | Shared service policy and executable compositions used by multiple models. | Explicit `loom_library` providers, scoped documentation, real service or command callers, and dependencies that do not point back to a model. |
-| `motif/**/test/`, `kernel/**/test/`, and `program/**/test/` | Test-only programs that exercise production contracts. | Private root-owned test module, semantic benchmarks and correctness cases, and one execution profile. |
+| Adjacent `*_test.loom` or `test/` below each layer | Test-only programs that exercise production contracts. | Private root-owned test module, semantic benchmarks and correctness cases, and one execution profile. |
 | `target/` | Genuinely repository-specific target or execution policy. | A concrete policy difference that cannot be expressed by canonical HRX profiles; upstream profiles are consumed directly otherwise. |
 | `model/` descriptions | Portable model facts, asset variants, service contracts, and provider composition. | A card validated through `loom_model_documentation`, a standalone overview with exact upstream links, and a precise supported-variant and hardware contract. |
 | `model/` executable ports | Model-specific programs and portable serving compositions. | Explicit `loom_library` providers, a card published through `loom_model`, and an independently checked native service output for each supported representation. |
@@ -73,11 +73,13 @@ changes using examples from the library.
 
 A `check.case` is an executable statement of behavior, not merely sample data. Cases cover the contracts most likely to be lost during specialization: signedness, byte and lane order, extrema, tails, non-power-of-two extents, dynamic dimensions, aliasing, and numerical tolerance. Expected values come from a transparent reference or independently established oracle.
 
-Keeping a production kernel and its cases in one `.loom` file is the shortest iteration loop: a reproducer can be formatted, planned, compiled, and executed without a build-system edit. Larger packages may split implementation and checks into separate source files in the same library. Motifs use test-only wrapper kernels only when no production kernel already exercises the same carrier; a second wrapper that duplicates an existing launch surface adds code without adding evidence.
+Production `.loom` sources and adjacent `_test.loom` sources have separate owners. `loom_kernel_library` owns production code; `loom_test` owns cases, scenarios, benchmarks, and independent oracles, and depends on the production provider. Test sources never enter production archives or model-card file lists. A test edit changes its test module and result without invalidating models that consume the kernel. The [component guide](docs/component-authoring.md#keep-tests-out-of-production-dependencies) shows the declarations.
 
-Every kernel and test leaf is benchmark-planned by the public Loom runner. A module with no `check.benchmark` fails planning. Benchmarks name correctness cases and select workloads that expose meaningful operating regimes rather than one flattering shape. Decode, small-batch, prefill, tails, and format-specific stress shapes are separate benchmark declarations when they exercise different specialization or hardware behavior.
+Related semantic ABIs can share a file and helpers: overwrite and in-place residual operations are distinct entry points in one coherent family. Shapes, tile sizes, and subgroup widths specialize those entries through templates; scenarios provide workload coverage. Different algorithms or storage lifecycles, such as a paged block pool and a dense tensor, can own different files. Motifs use test-only wrapper kernels only when no production kernel exercises the same contract.
 
-Each kernel names at least one target profile proving that the linked program lowers through a real backend and produces a final artifact. Each kernel names at least one execution profile, while each test leaf names one execution profile proving its public cases through a real runner. Test wrappers remain execution witnesses rather than standalone target products. Profiles are reusable and target-owned; common library rules contain no gfx, Vulkan, HIP, or other device-specific conditionals. Additional kernel targets strengthen portability without recompiling target-neutral motif modules independently for every leaf.
+Every test leaf is benchmark-planned by the public Loom runner. A module with no `check.benchmark` fails planning. Benchmarks name correctness cases and select workloads that expose meaningful operating regimes rather than one flattering shape. Decode, small-batch, prefill, tails, and format-specific stress shapes are separate benchmark declarations when they exercise different specialization or hardware behavior.
+
+Each kernel names at least one target profile proving that the linked program lowers through a real backend and produces a final artifact. Each kernel is reachable from a test leaf that names at least one execution profile proving its cases through a real runner. Test wrappers remain execution witnesses rather than standalone target products. Profiles are reusable and target-owned; common library rules contain no gfx, Vulkan, HIP, or other device-specific conditionals. Additional kernel targets strengthen portability without recompiling target-neutral motif modules independently for every leaf.
 
 ## Performance evidence
 
@@ -96,7 +98,7 @@ python dev.py build
 python dev.py compile-report --base=origin/main
 ```
 
-`dev.py lint` checks filesystem policy and asks Bazel to prove that every source-bearing motif reaches a benchmarkable kernel or test leaf. `dev.py test` first checks canonical formatting for the complete repository, then runs source policy, public lint, benchmark-plan, target-compilation, and available execution tests. Hardware tests without a matching local resource skip locally and execute through the repository runner matrix.
+`dev.py lint` checks filesystem policy and asks Bazel to prove that every source-bearing motif and kernel reaches a benchmarkable test leaf. `dev.py test` first checks canonical formatting for the complete repository, then runs source policy, public lint, benchmark-plan, target-compilation, and available execution tests. Hardware tests without a matching local resource skip locally and execute through the repository runner matrix.
 
 A focused performance capture adds an explicit target and device:
 
@@ -105,7 +107,7 @@ python dev.py benchmark \
   --config=amdgpu \
   --device=amdgpu://0 \
   --output-dir=/tmp/hrx-loom-library-candidate \
-  --target=//kernel/ggml/quantize:q8_1_x4_f32 \
+  --target=//kernel/ggml/quantize:q8_1_x4_f32_checks \
   -- \
   --measure=dispatch_complete \
   --batch-size=64 \

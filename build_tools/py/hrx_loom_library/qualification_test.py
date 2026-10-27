@@ -37,7 +37,7 @@ class QualificationTest(unittest.TestCase):
             "//experimental/... union //kernel/... union //motif/... union //program/...)",
         )
 
-    def test_motif_admission_uses_repository_tags_and_dependency_edges(self):
+    def test_library_admission_uses_repository_tags_and_dependency_edges(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository_root = Path(temporary_directory)
             for root in ("kernel", "motif"):
@@ -47,28 +47,29 @@ class QualificationTest(unittest.TestCase):
                     "# package\n", encoding="utf-8"
                 )
 
-            expression = qualification._motif_admission_query_expression(
+            expression = qualification._library_admission_query_expression(
                 repository_root
             )
 
         self.assertEqual(
             expression,
-            'labels(srcs, attr(tags, "loom-admission-motif", //motif/...)) '
+            'labels(srcs, attr(tags, "loom-benchmark-admission", '
+            '//kernel/... union //motif/...)) '
             "except "
             'deps(attr(tags, "loom-benchmark-module", '
             "//kernel/... union //motif/...))",
         )
 
-    def test_motif_admission_accepts_complete_qualification_closure(self):
+    def test_library_admission_accepts_complete_qualification_closure(self):
         context = mock.Mock(spec=RepositoryContext)
         context.repository_root = Path("/repository")
         context.bazel.return_value = ""
         with mock.patch.object(
             qualification,
-            "_motif_admission_query_expression",
+            "_library_admission_query_expression",
             return_value="qualification expression",
         ):
-            qualification._check_motif_qualification(context)
+            qualification._check_library_qualification(context)
 
         context.bazel.assert_called_once_with(
             [
@@ -82,24 +83,26 @@ class QualificationTest(unittest.TestCase):
             capture_output=True,
         )
 
-    def test_motif_admission_reports_every_unqualified_library(self):
+    def test_library_admission_reports_every_unqualified_library(self):
         context = mock.Mock(spec=RepositoryContext)
         context.repository_root = Path("/repository")
         context.bazel.return_value = (
+            "//kernel/linear:projection\n"
             "//motif/format/other:q3\n//motif/format/ggml:q5_k\n"
         )
         with (
             mock.patch.object(
                 qualification,
-                "_motif_admission_query_expression",
+                "_library_admission_query_expression",
                 return_value="qualification expression",
             ),
             self.assertRaisesRegex(
                 UserError,
-                "(?s)//motif/format/ggml:q5_k.*//motif/format/other:q3",
+                "(?s)//kernel/linear:projection.*"
+                "//motif/format/ggml:q5_k.*//motif/format/other:q3",
             ),
         ):
-            qualification._check_motif_qualification(context)
+            qualification._check_library_qualification(context)
 
 
 if __name__ == "__main__":

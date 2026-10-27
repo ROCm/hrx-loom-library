@@ -81,6 +81,44 @@ bazelisk test --config=asan --config=amdgpu \
   //program/text/qwen3_8/test:packet_capacity
 ```
 
+## Keep tests out of production dependencies
+
+The production archive contains only reusable code. Adjacent checks depend on
+it through an ordinary test rule. For the [Q6 projection package](../kernel/ggml/linear/BUILD.bazel),
+the declarations have this shape:
+
+```starlark
+loom_kernel_library(
+    name = "q6_k_q8_1_x4",
+    srcs = ["q6_k_q8_1_x4.loom"],
+    targets = [
+        "@hrx//loom/target/amdgpu:gfx11-generic",
+        "@hrx//loom/target/amdgpu:gfx9-4-generic",
+    ],
+    deps = ["//motif/linear/ggml:q6_k_q8_1_x4"],
+)
+
+loom_test(
+    name = "q6_k_q8_1_x4_checks",
+    srcs = [
+        "q6_k_q8_1_x4_test.loom",
+        "//kernel/ggml/linear/test:reference",
+    ],
+    execution_profiles = [AMD_GPU_HARDWARE_PROFILE],
+    deps = [":q6_k_q8_1_x4"],
+)
+```
+
+The `reference` target is test-only. Adding an oracle or a scenario changes the
+test module without changing the production archive, its compiler file list,
+or models that link it. Production changes flow to both consumers. A model's
+asset lock remains independent of these editable source files.
+
+`dev.py lint` checks that each production motif and kernel is reachable from a
+benchmarkable test. The rule-owned source check rejects `check.*` operations
+and `_test.loom` inputs in production. Target profiles select artifact coverage;
+execution profiles select where the same test module runs.
+
 ## Keep representative performance workloads available
 
 `check.benchmark` names the workloads that matter for measurement. Small cases

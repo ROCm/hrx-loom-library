@@ -13,11 +13,11 @@ from .context import RepositoryContext, UserError
 
 LOOM_BENCHMARK_ROOTS = ("experimental", "kernel", "model", "motif", "program")
 LOOM_BENCHMARK_TAG = "loom-benchmark-module"
-LOOM_MOTIF_ADMISSION_TAG = "loom-admission-motif"
+LOOM_BENCHMARK_ADMISSION_TAG = "loom-benchmark-admission"
 
 
-def benchmark_query_expression(repository_root: Path) -> str:
-    """Returns the populated repository scope containing benchmark modules."""
+def _authoring_scope(repository_root: Path) -> str:
+    """Returns the populated packages participating in authoring policy."""
     scopes = [
         f"//{root}/..."
         for root in LOOM_BENCHMARK_ROOTS
@@ -25,23 +25,28 @@ def benchmark_query_expression(repository_root: Path) -> str:
     ]
     if not scopes:
         raise UserError("No benchmark library packages exist in this checkout")
-    scope_expression = " union ".join(scopes)
-    return f'attr(tags, "{LOOM_BENCHMARK_TAG}", {scope_expression})'
+    return " union ".join(scopes)
 
 
-def _motif_admission_query_expression(repository_root: Path) -> str:
-    benchmark_targets = benchmark_query_expression(repository_root)
-    source_motifs = (
-        f'labels(srcs, attr(tags, "{LOOM_MOTIF_ADMISSION_TAG}", //motif/...))'
+def benchmark_query_expression(repository_root: Path) -> str:
+    """Returns the repository's test-owned benchmark modules."""
+    return f'attr(tags, "{LOOM_BENCHMARK_TAG}", {_authoring_scope(repository_root)})'
+
+
+def _library_admission_query_expression(repository_root: Path) -> str:
+    scope = _authoring_scope(repository_root)
+    benchmark_targets = f'attr(tags, "{LOOM_BENCHMARK_TAG}", {scope})'
+    source_libraries = (
+        f'labels(srcs, attr(tags, "{LOOM_BENCHMARK_ADMISSION_TAG}", {scope}))'
     )
-    return f"{source_motifs} except deps({benchmark_targets})"
+    return f"{source_libraries} except deps({benchmark_targets})"
 
 
-def _check_motif_qualification(context: RepositoryContext) -> None:
+def _check_library_qualification(context: RepositoryContext) -> None:
     output = context.bazel(
         [
             "cquery",
-            _motif_admission_query_expression(context.repository_root),
+            _library_admission_query_expression(context.repository_root),
             "--output=label",
             "--noimplicit_deps",
             "--notool_deps",
@@ -49,14 +54,14 @@ def _check_motif_qualification(context: RepositoryContext) -> None:
         ],
         capture_output=True,
     )
-    unqualified_motifs = sorted(
+    unqualified_libraries = sorted(
         line.strip() for line in output.splitlines() if line.strip()
     )
-    if unqualified_motifs:
-        labels = "\n  ".join(unqualified_motifs)
+    if unqualified_libraries:
+        labels = "\n  ".join(unqualified_libraries)
         raise UserError(
-            "Source-bearing motifs require a benchmarkable kernel or test "
-            f"qualification leaf:\n  {labels}"
+            "Source-bearing motifs and kernels require a benchmarkable "
+            f"test dependency:\n  {labels}"
         )
 
 
@@ -73,4 +78,4 @@ def lint_repository(context: RepositoryContext) -> None:
             f"--repository-root={context.repository_root}",
         ]
     )
-    _check_motif_qualification(context)
+    _check_library_qualification(context)
