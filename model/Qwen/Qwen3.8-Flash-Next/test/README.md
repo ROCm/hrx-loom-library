@@ -42,7 +42,7 @@ activation, or joined server shutdown.
 
 ## Installed service checks
 
-The `serve_source_test`, `serve_archive_test`, and `serve_mixed_test` targets
+The `serve_source_test` and `serve_archive_test` targets
 run the installed service contract with each built representation. The same
 checks have `_mtp`, `_mtp_continuation`, `_long_context`, and `_long_context_mtp` forms, for example
 `serve_archive_mtp_test`. These manual targets require a provisioned asset

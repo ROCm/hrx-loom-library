@@ -27,8 +27,8 @@ include generation and text-chunk positions, so cohort reordering cannot
 change a request's random stream. Unicode and sampling algorithms come from
 the shared text and tensor motifs; model geometry remains in these leaves.
 
-The BUILD file names every provider and its direct dependencies. Source,
-bytecode, and mixed packages retain the same service contract and support
+The BUILD file names every provider and its direct dependencies. Source and
+bytecode packages retain the same service contract and support
 runtime linking and specialization. Concrete device targets come from serving
 preparation; numerical test leaves supply their own target and geometry.
 

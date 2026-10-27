@@ -30,12 +30,11 @@ MTP remains part of the text service. The model card selects the predictor param
 
 ## Build representations and regressions
 
-`source`, `archive`, and `mixed` describe provider representations. A source package retains `.loom` files; an archive package links `.loombc` providers; a mixed package keeps preparation, identity, and chat formatting editable while linking compiled providers. All retain the explicit weight-preparation source as auxiliary compiler data. The programs share the same public service contracts and parameter identities.
+`source` and `archive` describe provider representations. A source package retains `.loom` files; an archive package contains `.loombc` providers for runtime linking. Both retain the explicit weight-preparation source as auxiliary compiler data. The programs share the same public service contracts and parameter identities.
 
 ```sh
 bazel build //model/Qwen/Qwen3.8-Flash-Next:source \
-  //model/Qwen/Qwen3.8-Flash-Next:archive \
-  //model/Qwen/Qwen3.8-Flash-Next:mixed
+  //model/Qwen/Qwen3.8-Flash-Next:archive
 bazel test --config=asan --config=amdgpu \
   //model/Qwen/Qwen3.8-Flash-Next/test/...
 ```

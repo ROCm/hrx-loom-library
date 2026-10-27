@@ -13,15 +13,13 @@ From the repository root:
 ```sh
 bazel build --config=amdgpu \
   //model/krea/Krea-2-Turbo:source \
-  //model/krea/Krea-2-Turbo:archive \
-  //model/krea/Krea-2-Turbo:mixed
+  //model/krea/Krea-2-Turbo:archive
 ```
 
 The unsuffixed targets select the BF16 `image` preset. Suffixes `_int8`,
 `_bounded_workspace`, and `_lifecycle` select the other presets; for example,
-`:mixed_bounded_workspace` contains the INT8 model with its 768 MiB workspace
-policy. `source` retains text, `archive` uses relocatable bytecode, and `mixed`
-keeps preparation/control as text with bytecode numerical providers. Each
+`:archive_bounded_workspace` contains the INT8 model with its 768 MiB workspace
+policy. `source` retains text and `archive` uses relocatable bytecode. Each
 produces a selected `model.json`, a deployment `serve.json`, and the complete
 program closure. The full checkpoints and tokenizer remain acquisition
 descriptors; none enters Bazel's repositories, action inputs, or content cache.
@@ -73,8 +71,7 @@ bazel test --config=asan --config=amdgpu \
   --strategy=TestRunner=standalone \
   --test_env=LOOM_MODEL_ASSETS="$(realpath ../krea2)" \
   //model/krea/Krea-2-Turbo/test:image_source_test \
-  //model/krea/Krea-2-Turbo/test:image_archive_test \
-  //model/krea/Krea-2-Turbo/test:image_mixed_test
+  //model/krea/Krea-2-Turbo/test:image_archive_test
 ```
 
 These explicit `manual` tests run the real server, compare complete decoded
@@ -99,8 +96,7 @@ bazel test --config=asan --config=amdgpu \
   --test_env=LOOM_MODEL_ASSETS="$(realpath ../krea2)" \
   --test_env=LOOM_KREA_SOFTWATERCOLOR="$(realpath ../krea2/adapter/softwatercolor/softwatercolor.safetensors)" \
   //model/krea/Krea-2-Turbo/test:adapter_source_test \
-  //model/krea/Krea-2-Turbo/test:adapter_archive_test \
-  //model/krea/Krea-2-Turbo/test:adapter_mixed_test
+  //model/krea/Krea-2-Turbo/test:adapter_archive_test
 ```
 
 The `_int8` suffix selects the corresponding INT8 base installation. These
@@ -110,7 +106,7 @@ adapter's external identity and participates in the Bazel test key.
 
 Supplying `LOOM_KREA_RETROANIME` enables the explicit
 `:adapter_source_banks_test` and `:adapter_source_pressure_test` targets, with
-equivalent archive and mixed targets. They test distinct original banks and
+equivalent archive targets. They test distinct original banks and
 eviction in a finite arena using the BF16 installation. The test reference
 identifies the exact retroanime repository, revision, filename, and digest.
 
@@ -119,11 +115,11 @@ actual output bytes and are generated outside Bazel:
 
 ```sh
 mkdir -p .reports/krea2
-PROGRAMS="$(realpath bazel-bin/model/krea/Krea-2-Turbo/mixed)"
+PROGRAMS="$(realpath bazel-bin/model/krea/Krea-2-Turbo/archive)"
 loom-fetch "$PROGRAMS/model.json" --offline --update-lock --lock-scope=all \
-  --lockfile="$PWD/.reports/krea2/mixed.lock.json" \
-  --output="$PWD/.reports/krea2/mixed"
-loom-serve --device=amdgpu --model=./.reports/krea2/mixed/model.json
+  --lockfile="$PWD/.reports/krea2/archive.lock.json" \
+  --output="$PWD/.reports/krea2/archive"
+loom-serve --device=amdgpu --model=./.reports/krea2/archive/model.json
 ```
 
 This offline example requires the checkpoint files in the Hugging Face cache,

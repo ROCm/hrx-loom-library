@@ -12,7 +12,7 @@ Loom SDK and build the small Moonshine package as a concrete starting point:
 
 ```sh
 python dev.py setup --sdk
-bazelisk build //model/moonshine-ai/moonshine-streaming-tiny:source //model/moonshine-ai/moonshine-streaming-tiny:archive //model/moonshine-ai/moonshine-streaming-tiny:mixed
+bazelisk build //model/moonshine-ai/moonshine-streaming-tiny:source //model/moonshine-ai/moonshine-streaming-tiny:archive
 ```
 
 The [development setup](development.md#select-a-compiler) lists prerequisites
@@ -58,7 +58,7 @@ name reusable acquisition locations, and each file can specify a different
 remote name and local destination. When remixing a package, update program
 origins to your fork while retaining the intended upstream checkpoint origins.
 
-Program sets describe linker inputs and libraries. Source, bytecode, and mixed
+Program sets describe linker inputs and libraries. Source and bytecode
 sets can implement the same service; bytecode still supports linking and
 runtime specialization. JIT `config` values select program behavior, while
 presets record canonical execution choices. Device placement and request-time
@@ -113,12 +113,13 @@ provider names constructed by a running preparation program. Production
 providers exclude check programs and independent test oracles; those belong
 to separate `loom_test` inputs.
 
-`input_form` and `library_form` independently select `sources` or `module`.
+`form` selects `sources` or `module` for the complete provider closure.
 Sources are the original declared files, which may themselves be bytecode;
 module selects each provider's merged relocatable output. The program-set key
-has no format semantics. Qwen uses sources/sources, module/module, and
-sources/module for its three representations. Its `prepare` provider retains
-the auxiliary weight policies in all three forms.
+has no format semantics. Qwen offers source and archive packages. An archive
+contains per-provider bytecode modules that are linked and specialized at
+runtime. Its `prepare` provider retains the auxiliary weight policies in both
+forms.
 
 Refresh the checked-in compiler lists after changing the graph:
 

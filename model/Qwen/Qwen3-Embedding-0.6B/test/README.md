@@ -1,6 +1,6 @@
 # Embedding service regression
 
-The source, archive, and mixed tests run the built providers through the real
+The source and archive tests run the built providers through the real
 HTTP embedding service on an eight-column Strix Halo NPU context with explicit
 fixed resident backing. The caller
 supplies a `loom-fetch` installation containing the original checkpoint through

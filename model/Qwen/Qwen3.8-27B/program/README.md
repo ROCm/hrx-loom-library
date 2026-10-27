@@ -32,7 +32,7 @@ The `weights.loom` import policy prepares target and MTP FFN gate/up tensors
 into channel-eight storage. The transform reads each disjoint group before
 replacing its bytes, preserving the packed footprint. `dflash_weights.loom`
 selects draft preparation. These policies are auxiliary compiler inputs in
-all three representations; checkpoints stay outside the build payload graph.
+both representations; checkpoints stay outside the build payload graph.
 
 ## Image input
 

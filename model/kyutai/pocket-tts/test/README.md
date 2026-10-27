@@ -38,8 +38,8 @@ use the optimized profile and a qualified measurement host.
 
 ## Full learned speech
 
-The explicit `speech_*_test` targets exercise both voice variants in source,
-archive, and mixed form. Each test starts the real native server with built
+The explicit `speech_*_test` targets exercise both voice variants in source
+and archive form. Each test starts the real native server with built
 providers and a separately provisioned installation. Sequential requests
 establish each voice's PCM; concurrent requests must reproduce those bytes
 while rows and active cohorts change. Changing the seed must change the output.

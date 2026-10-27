@@ -25,8 +25,8 @@ owned by this repository:
   parameter and tokenizer files retain their acquisition descriptors for
   `loom-fetch`; small fixtures may instead be supplied as declared assets.
   The rule publishes a selected card and native serving deployment.
-  `encoding="preserve"` retains authored source, bytecode, or
-  mixed inputs; `text` and `bc` normalize providers using the public linker.
+  `encoding="preserve"` retains each declared provider's bytes and format;
+  `text` and `bc` normalize providers using the public linker.
 - `loom_model_documentation` re-exports the public metadata-only reference rule.
   It accepts a card, with optional authored Markdown, complete acquisition
   lock, and publication URL inputs.

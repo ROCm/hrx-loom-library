@@ -8,17 +8,16 @@ and installed-SDK workflow. [model.json](model.json) and its
 
 A user with the SDK can fetch the source preset and serve the resulting local
 card without running Bazel. Authors use Bazel to check the numerical programs
-and produce equivalent source, relocatable-bytecode, or mixed packages:
+and produce equivalent source or relocatable-bytecode packages:
 
 ```sh
 bazel build //model/Qwen/Qwen3.8-27B:source_vision \
-  //model/Qwen/Qwen3.8-27B:archive_vision \
-  //model/Qwen/Qwen3.8-27B:mixed_vision
+  //model/Qwen/Qwen3.8-27B:archive_vision
 bazel test --config=asan --config=amdgpu \
   //model/Qwen/Qwen3.8-27B/test/...
 ```
 
-The unsuffixed `source`, `archive`, and `mixed` targets select `chat`.
+The unsuffixed `source` and `archive` targets select `chat`.
 Suffixes `_vision`, `_target_only`, `_dflash2`, and `_cdna_text` select the
 corresponding card presets. Each target publishes its selected `model.json`,
 `serve.json`, and exact compiler inputs below its output directory.
@@ -36,7 +35,7 @@ source tree.
 
 The [BUILD declaration](BUILD.bazel) names the service's primary providers and
 library roots. Providers own their direct dependencies; Bazel derives the
-source, bytecode, and mixed file lists from that graph. After changing those
+source and bytecode file lists from that graph. After changing those
 dependencies, `python dev.py model-card --fix` synchronizes the card's compiler
 lists. The [authoring guide](../../../docs/model-authoring.md#derive-compiler-files-from-provider-dependencies)
 explains the generated fields and repository-relative installation layout.

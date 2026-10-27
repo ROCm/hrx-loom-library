@@ -12,14 +12,12 @@ From the repository root:
 ```sh
 bazel build --config=amdgpu \
   //model/kyutai/pocket-tts:source \
-  //model/kyutai/pocket-tts:archive \
-  //model/kyutai/pocket-tts:mixed
+  //model/kyutai/pocket-tts:archive
 ```
 
-`source` retains Loom text, `archive` uses bytecode, and `mixed` retains text
-preparation/control with bytecode numerical and shared motif providers. All
-three expose speech ABI 2 and remain inputs to runtime linking and JIT
-specialization. The numerical phases share the scoped `model` checkpoint;
+`source` retains Loom text and `archive` uses bytecode. Both expose speech ABI 2
+and remain inputs to runtime linking and JIT specialization. The numerical
+phases share the scoped `model` checkpoint;
 the tokenizer identity is `text`. CPU Loom prepares audio and initializes
 rotary tables once, while the native service owns reusable voice slots.
 
@@ -30,7 +28,7 @@ acquisition descriptors. No build contacts those origins or passes a checkpoint
 through Bazel's repositories, actions, outputs, or runfiles.
 
 The `_noncommercial` target suffix selects the four-voice variant and preset,
-for example `:mixed_noncommercial`. The model's provider code is shared across
+for example `:archive_noncommercial`. The model's provider code is shared across
 both variants; only the selected card and original recordings differ.
 
 Generate the standalone model reference with:
@@ -73,8 +71,7 @@ bazel test --config=asan --config=amdgpu \
   --strategy=TestRunner=standalone \
   --test_env=LOOM_MODEL_ASSETS="$(realpath ../pocket-tts)" \
   //model/kyutai/pocket-tts/test:speech_source_test \
-  //model/kyutai/pocket-tts/test:speech_archive_test \
-  //model/kyutai/pocket-tts/test:speech_mixed_test
+  //model/kyutai/pocket-tts/test:speech_archive_test
 ```
 
 These explicit `manual` targets run a real native server, compare seeded PCM
@@ -86,9 +83,9 @@ independent numerical and normalization references.
 
 For the four-voice package, fetch `--preset=streaming-noncommercial` into a
 separate installation, point `LOOM_MODEL_ASSETS` there, and select
-`:speech_source_noncommercial_test`, `:speech_archive_noncommercial_test`, and
-`:speech_mixed_noncommercial_test`. Tests trust that provisioned assets match
-the authored lock. The card, lock, built programs, server, checker, and test
+`:speech_source_noncommercial_test` and `:speech_archive_noncommercial_test`.
+Tests trust that provisioned assets match the authored lock. The card, lock,
+built programs, server, checker, and test
 configuration determine cache identity. A cache hit reads no external weights;
 changing weights without updating the lock intentionally permits that hit.
 
@@ -98,10 +95,10 @@ output tree:
 
 ```sh
 mkdir -p .reports/pocket
-PROGRAMS="$(realpath bazel-bin/model/kyutai/pocket-tts/mixed)"
+PROGRAMS="$(realpath bazel-bin/model/kyutai/pocket-tts/archive)"
 loom-fetch "$PROGRAMS/model.json" --offline --update-lock --lock-scope=all \
-  --lockfile="$PWD/.reports/pocket/mixed.lock.json" \
-  --output="$PWD/.reports/pocket/mixed"
+  --lockfile="$PWD/.reports/pocket/archive.lock.json" \
+  --output="$PWD/.reports/pocket/archive"
 ```
 
 This example requires the checkpoint, tokenizer, and original recordings in the

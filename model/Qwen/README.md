@@ -11,5 +11,5 @@ presets from the separate DFlash2 service gate.
 [Flash-Next](Qwen3.8-Flash-Next/OVERVIEW.md) supplies sharded text and MTP
 compositions. [Qwen3 Embedding](Qwen3-Embedding-0.6B/OVERVIEW.md) supplies an
 NPU composition that loads the original BF16 checkpoint and converts projection
-panels in device memory during model loading. Each package has source, bytecode,
-and mixed representations, plus numerical and service checks.
+panels in device memory during model loading. Each package has source and
+bytecode representations, plus numerical and service checks.

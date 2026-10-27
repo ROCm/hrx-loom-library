@@ -81,7 +81,7 @@ learned text and projector outputs require the complete model composition.
 
 ## Learned service checks
 
-The manual `serve_source_test`, `serve_archive_test`, and `serve_mixed_test`
+The manual `serve_source_test` and `serve_archive_test`
 targets exercise the complete model using provisioned assets. The `_vision`,
 `_target_only`, `_dflash2`, and `_cdna_text` suffixes select the corresponding
 canonical preset, such as `serve_archive_vision_test`:

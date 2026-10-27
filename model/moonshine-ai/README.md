@@ -7,5 +7,5 @@ library's kernel and motif layers requires preserving their shape, layout, and
 independent numerical checks.
 
 [Moonshine Streaming Tiny](moonshine-streaming-tiny/) is the English F32
-recognition package. Its portable card selects source, bytecode, or mixed
+recognition package. Its portable card selects source or bytecode
 providers; deployment chooses the physical device separately.
