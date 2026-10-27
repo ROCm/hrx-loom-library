@@ -214,22 +214,35 @@ template.def<@qwen3_embedding.panels.probability_value_egress.transfer_final_out
   template.return
 }
 
-func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.probability_value_egress(%row_column: index, %final_output_offset: i64, %final_output_packet: i32, %normalized_offset: i64, %normalized_packet: i32, %feature_offset: index, %query_offset: offset, %key_offset: offset, %query_key_packet: i32, %value_offset: i64, %value_packet: i32, %mlp_offset: i64, %residual_offset: i64, %residual_packet: i32, %attention_output_offset: i64) {
+func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.probability_value_egress(%cohort_panel_count: index, %attention_window_tokens: index, %row_column: index, %final_output_offset: i64, %final_output_packet: i32, %normalized_offset: i64, %normalized_packet: i32, %feature_offset: index, %query_offset: offset, %key_offset: offset, %query_key_packet: i32, %value_offset: i64, %value_packet: i32, %mlp_offset: i64, %residual_offset: i64, %residual_packet: i32, %attention_output_offset: i64) {
+  %cohort_unit = index.constant 1 : index
+  %query_waves_per_panel = index.constant 2 : index
+  %attention_wave_tokens = index.constant 64 : index
+  %cohort_query_waves = index.mul %cohort_panel_count, %query_waves_per_panel : index
+  %cohort_last_query_wave = index.sub %cohort_query_waves, %cohort_unit : index
+  %window_query_waves = index.div %attention_window_tokens, %attention_wave_tokens : index
+  %window_last_query_wave = index.sub %window_query_waves, %cohort_unit : index
+  %head_projection_groups = index.constant 2 : index
+  %cohort_head_panels = index.mul %cohort_panel_count, %head_projection_groups : index
+  %cohort_last_head_panel = index.sub %cohort_head_panels, %cohort_unit : index
+  %projection_group_count = index.constant 7 : index
+  %cohort_projection_panels = index.mul %cohort_panel_count, %projection_group_count : index
+  %cohort_last_projection_panel = index.sub %cohort_projection_panels, %cohort_unit : index
   %online_probability_blocked = index.constant 0 : offset
   %dense_result_offset = index.constant 48064 : offset
   %record_stride = index.constant 8192 : offset
   %dense_rope_offset = index.constant 8704 : offset
   %full_learned_layers = index.constant 28 : index
-  %panel_one = index.constant 1 : index
-  %panel_head_end = index.constant 7 : index
-  %panel_shift = index.constant 2 : index
-  %panel_count = index.constant 4 : index
+  %c1_index = index.constant 1 : index
+  %c7_index = index.constant 7 : index
+  %c2_index = index.constant 2 : index
+  %c4_index = index.constant 4 : index
   %epoch_layer_boundary = index.constant 0 : index
-  %panel_mask = index.constant 3 : index
+  %c3_index = index.constant 3 : index
   %c6 = index.constant 6 : index
   %c24 = index.constant 24 : index
   %c16 = index.constant 16 : index
-  %panel_waves = index.constant 8 : index
+  %c8_index = index.constant 8 : index
   %released_credit = scalar.constant 1 : i32
   %end = index.constant 4096 : index
   %c32 = index.constant 32 : index
@@ -309,32 +322,32 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %layer = index.assume %block_2_index [range(%block_2_index, 0, 28)] : index
   %final_layer = index.cmp eq, %layer, %full_learned_layers : index
   %learned_layer = index.cmp ult, %layer, %full_learned_layers : index
-  %active_groups = scf.select %final_layer, %panel_one, %panel_head_end : index
-  %panel_groups = index.shli %active_groups, %panel_shift : index
-  %row_records = scf.select %final_layer, %panel_count, %panel_shift : index
+  %active_groups = scf.select %final_layer, %c1_index, %c7_index : index
+  %panel_groups = index.mul %active_groups, %cohort_panel_count : index
+  %row_records = scf.select %final_layer, %c4_index, %c2_index : index
   cfg.br ^block_4(%epoch_layer_boundary: index, %block_2_offset: offset, %block_2_offset_1: offset, %block_2_offset_2: offset)
 ^block_4(%block_4_index: index, %block_4_offset: offset, %block_4_offset_1: offset, %block_4_offset_2: offset):
   %cmp = index.cmp slt, %block_4_index, %panel_groups : index
   cfg.cond_br %cmp, ^block_5, ^block_199
 ^block_5:
-  %panel_group = index.assume %block_4_index [range(%block_4_index, 0, 27), lt(%block_4_index, %panel_groups)] : index
-  %dense_group = index.shrui %panel_group, %panel_shift : index
-  %episode = index.andi %panel_group, %panel_mask : index
+  %panel_group = index.assume %block_4_index [range(%block_4_index, 0, %cohort_last_projection_panel), lt(%block_4_index, %panel_groups)] : index
+  %dense_group = index.div %panel_group, %cohort_panel_count : index
+  %episode = index.rem %panel_group, %cohort_panel_count : index
   %query_key_group = index.cmp eq, %dense_group, %epoch_layer_boundary : index
-  %head_group = index.cmp ult, %dense_group, %panel_shift : index
-  %output_group = index.cmp eq, %dense_group, %panel_shift : index
+  %head_group = index.cmp ult, %dense_group, %c2_index : index
+  %output_group = index.cmp eq, %dense_group, %c2_index : index
   %down_group = index.cmp eq, %dense_group, %c6 : index
   %residual_group = scalar.ori %output_group, %down_group : i1
-  %gate_or_later = index.cmp uge, %dense_group, %panel_mask : index
+  %gate_or_later = index.cmp uge, %dense_group, %c3_index : index
   %before_down = index.cmp ult, %dense_group, %c6 : index
   %mlp_group = scalar.andi %gate_or_later, %before_down : i1
-  %post_norm_group = index.cmp eq, %dense_group, %panel_mask : index
+  %post_norm_group = index.cmp eq, %dense_group, %c3_index : index
   %normalize_rows = scalar.ori %query_key_group, %post_norm_group : i1
   %wide_chunks = scf.select %down_group, %c24, %c16 : index
-  %dense_chunks = scf.select %residual_group, %wide_chunks, %panel_waves : index
-  %dense_roles = scf.select %residual_group, %panel_one, %panel_shift : index
-  %last_dense_role = index.sub %dense_roles, %panel_one : index
-  %last_chunk = index.sub %dense_chunks, %panel_one : index
+  %dense_chunks = scf.select %residual_group, %wide_chunks, %c8_index : index
+  %dense_roles = scf.select %residual_group, %c1_index, %c2_index : index
+  %last_dense_role = index.sub %dense_roles, %c1_index : index
+  %last_chunk = index.sub %dense_chunks, %c1_index : index
   %needs_metadata = scalar.ori %head_group, %final_layer : i1
   cfg.cond_br %needs_metadata, ^block_6, ^block_201
 ^block_6:
@@ -351,7 +364,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   low.invoke @qwen3_embedding.panels.release_lock_50(%released_credit) : (i32)
   cfg.br ^block_9(%epoch_layer_boundary: index, %block_7_offset: offset, %block_7_offset_1: offset, %block_7_offset_2: offset)
 ^block_9(%block_9_index: index, %block_9_offset: offset, %block_9_offset_1: offset, %block_9_offset_2: offset):
-  %cmp_1 = index.cmp slt, %block_9_index, %panel_waves : index
+  %cmp_1 = index.cmp slt, %block_9_index, %c8_index : index
   cfg.cond_br %cmp_1, ^block_10, ^block_15
 ^block_10:
   %row_record = index.assume %block_9_index [range(%block_9_index, 0, 7)] : index
@@ -375,7 +388,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   cfg.br ^block_12(%add: index, %block_12_offset: offset, %block_12_offset_1: offset, %block_12_offset_2: offset)
 ^block_14(%block_14_offset: offset, %block_14_offset_1: offset, %block_14_offset_2: offset):
   low.invoke @qwen3_embedding.panels.release_lock_50(%released_credit) : (i32)
-  %add_1 = index.add %row_record, %panel_one : index
+  %add_1 = index.add %row_record, %c1_index : index
   cfg.br ^block_9(%add_1: index, %block_14_offset: offset, %block_14_offset_1: offset, %block_14_offset_2: offset)
 ^block_15:
   low.invoke @qwen3_embedding.panels.acquire_lock_53(%acquire_credit_result) : (i32)
@@ -429,8 +442,8 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %zero_address_converted = index.cast %zero_address : i64 to offset
   cfg.cond_br %final_layer, ^block_18, ^block_19
 ^block_18:
-  %finish_member = index.shrui %output_record, %panel_one : index
-  %finish_half = index.andi %output_record, %panel_one : index
+  %finish_member = index.shrui %output_record, %c1_index : index
+  %finish_half = index.andi %output_record, %c1_index : index
   %episode_converted = index.cast %episode : index to i64
   %muli = scalar.muli %episode_converted, %output_panel_bytes : i64
   %addi = scalar.addi %final_output_offset, %muli : i64
@@ -472,7 +485,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   cfg.br ^block_20(%block_16_offset: offset, %block_16_offset_1: offset, %select: offset)
 ^block_20(%block_20_offset: offset, %block_20_offset_1: offset, %block_20_offset_2: offset):
   low.invoke @qwen3_embedding.panels.release_lock_60(%released_credit) : (i32)
-  %add_7 = index.add %output_record, %panel_one : index
+  %add_7 = index.add %output_record, %c1_index : index
   cfg.br ^block_16(%add_7: index, %block_20_offset: offset, %block_20_offset_1: offset, %block_20_offset_2: offset)
 ^block_21:
   low.invoke @qwen3_embedding.panels.acquire_lock_53(%acquire_credit_result) : (i32)
@@ -536,14 +549,14 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %local_address_70000_result_2 = low.invoke @qwen3_embedding.panels.local_address_70000() : () -> (buffer)
   cfg.br ^block_43(%online_probability_blocked: offset, %block_40_offset: offset, %block_40_offset_1: offset, %block_40_offset_2: offset)
 ^block_43(%following_read: offset, %block_43_offset: offset, %block_43_offset_1: offset, %block_43_offset_2: offset):
-  %add_8 = index.add %dense_role, %panel_one : index
+  %add_8 = index.add %dense_role, %c1_index : index
   cfg.br ^block_26(%add_8: index, %following_read: offset, %block_43_offset: offset, %block_43_offset_1: offset, %block_43_offset_2: offset)
 ^block_44:
-  %add_9 = index.add %dense_chunk, %panel_one : index
+  %add_9 = index.add %dense_chunk, %c1_index : index
   cfg.br ^block_24(%add_9: index, %weight_read: offset, %block_26_offset: offset, %block_26_offset_1: offset, %block_26_offset_2: offset)
 ^block_45:
-  %head_records = scf.select %head_group, %panel_shift, %panel_one : index
-  %preparation_records = scf.select %residual_group, %panel_waves, %head_records : index
+  %head_records = scf.select %head_group, %c2_index, %c1_index : index
+  %preparation_records = scf.select %residual_group, %c8_index, %head_records : index
   cfg.br ^block_46(%epoch_layer_boundary: index, %block_24_offset: offset, %block_24_offset_1: offset, %block_24_offset_2: offset)
 ^block_46(%block_46_index: index, %block_46_offset: offset, %block_46_offset_1: offset, %block_46_offset_2: offset):
   %cmp_7 = index.cmp slt, %block_46_index, %preparation_records : index
@@ -587,12 +600,12 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %skip_rows = view.bitcast %dense_secondary_bits : view<4096xbf16> -> view<32x128xbf16>
   cfg.br ^block_57(%epoch_layer_boundary: index, %block_46_offset: offset, %block_46_offset_1: offset, %block_46_offset_2: offset)
 ^block_57(%block_57_index: index, %block_57_offset: offset, %block_57_offset_1: offset, %block_57_offset_2: offset):
-  %cmp_10 = index.cmp slt, %block_57_index, %panel_count : index
+  %cmp_10 = index.cmp slt, %block_57_index, %c4_index : index
   cfg.cond_br %cmp_10, ^block_58, ^block_218
 ^block_58:
   %row = index.assume %block_57_index [range(%block_57_index, 0, 3)] : index
   %input_base = index.madd %row, %width, %feature_offset : index
-  %output_row = index.madd %record, %panel_count, %row : index
+  %output_row = index.madd %record, %c4_index, %row : index
   cfg.br ^block_59(%epoch_layer_boundary: index, %block_57_offset: offset, %block_57_offset_1: offset, %block_57_offset_2: offset)
 ^block_59(%block_59_index: index, %block_59_offset: offset, %block_59_offset_1: offset, %block_59_offset_2: offset):
   %cmp_11 = index.cmp slt, %block_59_index, %features : index
@@ -605,7 +618,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %add_12 = index.add %word_1, %c32 : index
   cfg.br ^block_59(%add_12: index, %block_59_offset: offset, %block_59_offset_1: offset, %block_59_offset_2: offset)
 ^block_61:
-  %add_13 = index.add %row, %panel_one : index
+  %add_13 = index.add %row, %c1_index : index
   cfg.br ^block_57(%add_13: index, %block_59_offset: offset, %block_59_offset_1: offset, %block_59_offset_2: offset)
 ^block_62:
   cfg.br ^block_63(%epoch_layer_boundary: index, %block_46_offset: offset, %block_46_offset_1: offset, %block_46_offset_2: offset)
@@ -620,7 +633,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   cfg.br ^block_63(%add_14: index, %block_63_offset: offset, %block_63_offset_1: offset, %block_63_offset_2: offset)
 ^block_65(%block_65_offset: offset, %block_65_offset_1: offset, %block_65_offset_2: offset):
   low.invoke @qwen3_embedding.panels.release_lock_50(%released_credit) : (i32)
-  %add_15 = index.add %record, %panel_one : index
+  %add_15 = index.add %record, %c1_index : index
   cfg.br ^block_46(%add_15: index, %block_65_offset: offset, %block_65_offset_1: offset, %block_65_offset_2: offset)
 ^block_66:
   low.invoke @qwen3_embedding.panels.acquire_lock_53(%acquire_credit_result) : (i32)
@@ -651,14 +664,14 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   cfg.cond_br %cmp_13, ^block_69, ^block_205
 ^block_69:
   %block = index.assume %block_68_index [range(%block_68_index, 0, 255)] : index
-  %relative = index.shli %block, %panel_count : index
+  %relative = index.shli %block, %c4_index : index
   %index = index.sub %last, %relative : index
   %value_2 = vector.load %raw[%index] : view<4096xbf16> -> vector<16xbf16>
   %duplicate = vector.concat<0> %value_2, %value_2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %first = index.shli %index, %panel_one : index
+  %first = index.shli %index, %c1_index : index
   vector.store %duplicate, %lookup_ab[%first] : vector<32xbf16>, view<8192xbf16>
   vector.store %duplicate, %lookup_cd[%first] : vector<32xbf16>, view<8192xbf16>
-  %add_16 = index.add %block, %panel_one : index
+  %add_16 = index.add %block, %c1_index : index
   cfg.br ^block_68(%add_16: index, %block_68_offset: offset, %block_68_offset_1: offset, %block_68_offset_2: offset)
 ^block_70(%block_70_offset: offset, %block_70_offset_1: offset, %block_70_offset_2: offset):
   cfg.br ^block_71(%epoch_layer_boundary: index, %block_70_offset: offset, %block_70_offset_1: offset, %block_70_offset_2: offset)
@@ -674,7 +687,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %scale_offset = index.add %record_stride, %scale_relative : offset
   cfg.br ^block_73(%epoch_layer_boundary: index, %block_71_offset: offset, %block_71_offset_1: offset, %block_71_offset_2: offset)
 ^block_73(%block_73_index: index, %block_73_offset: offset, %block_73_offset_1: offset, %block_73_offset_2: offset):
-  %cmp_15 = index.cmp slt, %block_73_index, %panel_shift : index
+  %cmp_15 = index.cmp slt, %block_73_index, %c2_index : index
   cfg.cond_br %cmp_15, ^block_74, ^block_122
 ^block_74:
   %head_member = index.assume %block_73_index [range(%block_73_index, 0, 1)] : index
@@ -740,14 +753,14 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   cfg.cond_br %cmp_17, ^block_80, ^block_87
 ^block_80:
   %panel = index.assume %block_79_index [range(%block_79_index, 0, 15)] : index
-  %feature_base = index.shli %panel, %panel_mask : index
+  %feature_base = index.shli %panel, %c3_index : index
   cfg.br ^block_81(%epoch_layer_boundary: index, %block_79_offset: offset, %block_79_offset_1: offset, %block_79_offset_2: offset)
 ^block_81(%block_81_index: index, %block_81_offset: offset, %block_81_offset_1: offset, %block_81_offset_2: offset):
-  %cmp_18 = index.cmp slt, %block_81_index, %panel_count : index
+  %cmp_18 = index.cmp slt, %block_81_index, %c4_index : index
   cfg.cond_br %cmp_18, ^block_82, ^block_86
 ^block_82:
   %block_1 = index.assume %block_81_index [range(%block_81_index, 0, 3)] : index
-  %token_base = index.shli %block_1, %panel_mask : index
+  %token_base = index.shli %block_1, %c3_index : index
   cfg.cond_br %first_projection, ^block_83, ^block_84
 ^block_83:
   %primary_values = vector.load %head_primary[%panel, %block_1, 0] : view<16x4x64xf32> -> vector<64xf32>
@@ -761,16 +774,16 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %transposed = vector.transpose<[1, 0]> %tile : vector<8x8xbf16> -> vector<8x8xbf16>
   %values0 = vector.extract %transposed[0] : vector<8x8xbf16> -> vector<8xbf16>
   vector.store %values0, %raw_matrix[%token_base, %feature_base] : vector<8xbf16>, view<32x128xbf16>
-  %row1 = index.add %token_base, %panel_one : index
+  %row1 = index.add %token_base, %c1_index : index
   %values1 = vector.extract %transposed[1] : vector<8x8xbf16> -> vector<8xbf16>
   vector.store %values1, %raw_matrix[%row1, %feature_base] : vector<8xbf16>, view<32x128xbf16>
-  %row2 = index.add %token_base, %panel_shift : index
+  %row2 = index.add %token_base, %c2_index : index
   %values2 = vector.extract %transposed[2] : vector<8x8xbf16> -> vector<8xbf16>
   vector.store %values2, %raw_matrix[%row2, %feature_base] : vector<8xbf16>, view<32x128xbf16>
-  %row3 = index.add %token_base, %panel_mask : index
+  %row3 = index.add %token_base, %c3_index : index
   %values3 = vector.extract %transposed[3] : vector<8x8xbf16> -> vector<8xbf16>
   vector.store %values3, %raw_matrix[%row3, %feature_base] : vector<8xbf16>, view<32x128xbf16>
-  %row4 = index.add %token_base, %panel_count : index
+  %row4 = index.add %token_base, %c4_index : index
   %values4 = vector.extract %transposed[4] : vector<8x8xbf16> -> vector<8xbf16>
   vector.store %values4, %raw_matrix[%row4, %feature_base] : vector<8xbf16>, view<32x128xbf16>
   %row5 = index.add %token_base, %lane5 : index
@@ -779,13 +792,13 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %row6 = index.add %token_base, %c6 : index
   %values6 = vector.extract %transposed[6] : vector<8x8xbf16> -> vector<8xbf16>
   vector.store %values6, %raw_matrix[%row6, %feature_base] : vector<8xbf16>, view<32x128xbf16>
-  %row7 = index.add %token_base, %panel_head_end : index
+  %row7 = index.add %token_base, %c7_index : index
   %values7 = vector.extract %transposed[7] : vector<8x8xbf16> -> vector<8xbf16>
   vector.store %values7, %raw_matrix[%row7, %feature_base] : vector<8xbf16>, view<32x128xbf16>
-  %add_18 = index.add %block_1, %panel_one : index
+  %add_18 = index.add %block_1, %c1_index : index
   cfg.br ^block_81(%add_18: index, %block_85_offset: offset, %block_85_offset_1: offset, %block_85_offset_2: offset)
 ^block_86:
-  %add_19 = index.add %panel, %panel_one : index
+  %add_19 = index.add %panel, %c1_index : index
   cfg.br ^block_79(%add_19: index, %block_81_offset: offset, %block_81_offset_1: offset, %block_81_offset_2: offset)
 ^block_87:
   cfg.cond_br %head_normalization, ^block_88, ^block_100
@@ -900,7 +913,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %add_22 = index.add %position_6, %c16 : index
   cfg.br ^block_97(%add_22: index, %block_97_offset: offset, %block_97_offset_1: offset, %block_97_offset_2: offset)
 ^block_99:
-  %add_23 = index.add %row_1, %panel_one : index
+  %add_23 = index.add %row_1, %c1_index : index
   cfg.br ^block_89(%add_23: index, %block_97_offset: offset, %block_97_offset_1: offset, %block_97_offset_2: offset)
 ^block_100:
   cfg.cond_br %residual_group, ^block_101, ^block_210
@@ -940,7 +953,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %panel_1 = index.assume %block_106_index [range(%block_106_index, 0, 15)] : index
   cfg.br ^block_108(%epoch_layer_boundary: index, %block_106_offset: offset, %block_106_offset_1: offset, %block_106_offset_2: offset)
 ^block_108(%block_108_index: index, %block_108_offset: offset, %block_108_offset_1: offset, %block_108_offset_2: offset):
-  %cmp_26 = index.cmp slt, %block_108_index, %panel_count : index
+  %cmp_26 = index.cmp slt, %block_108_index, %c4_index : index
   cfg.cond_br %cmp_26, ^block_109, ^block_110
 ^block_109:
   %block_2 = index.assume %block_108_index [range(%block_108_index, 0, 3)] : index
@@ -949,10 +962,10 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %transposed_1 = vector.transpose<[1, 0]> %tile_1 : vector<8x8xbf16> -> vector<8x8xbf16>
   %result_2 = vector.bitcast %transposed_1 : vector<8x8xbf16> to vector<64xbf16>
   vector.store %result_2, %head_destination_blocks[%panel_1, %block_2, 0] : vector<64xbf16>, view<16x4x64xbf16>
-  %add_26 = index.add %block_2, %panel_one : index
+  %add_26 = index.add %block_2, %c1_index : index
   cfg.br ^block_108(%add_26: index, %block_108_offset: offset, %block_108_offset_1: offset, %block_108_offset_2: offset)
 ^block_110:
-  %add_27 = index.add %panel_1, %panel_one : index
+  %add_27 = index.add %panel_1, %c1_index : index
   cfg.br ^block_106(%add_27: index, %block_108_offset: offset, %block_108_offset_1: offset, %block_108_offset_2: offset)
 ^block_111:
   cfg.cond_br %normalize_projection, ^block_112, ^block_115
@@ -975,35 +988,35 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   cfg.cond_br %cmp_28, ^block_117, ^block_214
 ^block_117:
   %feature_block = index.assume %block_116_index [range(%block_116_index, 0, 15)] : index
-  %feature_base_1 = index.shli %feature_block, %panel_mask : index
-  %destination_row1 = index.add %feature_base_1, %panel_one : index
-  %destination_row2 = index.add %feature_base_1, %panel_shift : index
-  %destination_row3 = index.add %feature_base_1, %panel_mask : index
-  %destination_row4 = index.add %feature_base_1, %panel_count : index
+  %feature_base_1 = index.shli %feature_block, %c3_index : index
+  %destination_row1 = index.add %feature_base_1, %c1_index : index
+  %destination_row2 = index.add %feature_base_1, %c2_index : index
+  %destination_row3 = index.add %feature_base_1, %c3_index : index
+  %destination_row4 = index.add %feature_base_1, %c4_index : index
   %destination_row5 = index.add %feature_base_1, %lane5 : index
   %destination_row6 = index.add %feature_base_1, %c6 : index
-  %destination_row7 = index.add %feature_base_1, %panel_head_end : index
+  %destination_row7 = index.add %feature_base_1, %c7_index : index
   cfg.br ^block_118(%epoch_layer_boundary: index, %block_116_offset: offset, %block_116_offset_1: offset, %block_116_offset_2: offset)
 ^block_118(%block_118_index: index, %block_118_offset: offset, %block_118_offset_1: offset, %block_118_offset_2: offset):
-  %cmp_29 = index.cmp slt, %block_118_index, %panel_count : index
+  %cmp_29 = index.cmp slt, %block_118_index, %c4_index : index
   cfg.cond_br %cmp_29, ^block_119, ^block_120
 ^block_119:
   %token_block = index.assume %block_118_index [range(%block_118_index, 0, 3)] : index
-  %token_base_1 = index.shli %token_block, %panel_mask : index
+  %token_base_1 = index.shli %token_block, %c3_index : index
   %row0 = vector.load %raw_matrix[%token_base_1, %feature_base_1] : view<32x128xbf16> -> vector<8xbf16>
-  %source_row1 = index.add %token_base_1, %panel_one : index
+  %source_row1 = index.add %token_base_1, %c1_index : index
   %row1_1 = vector.load %raw_matrix[%source_row1, %feature_base_1] : view<32x128xbf16> -> vector<8xbf16>
-  %source_row2 = index.add %token_base_1, %panel_shift : index
+  %source_row2 = index.add %token_base_1, %c2_index : index
   %row2_1 = vector.load %raw_matrix[%source_row2, %feature_base_1] : view<32x128xbf16> -> vector<8xbf16>
-  %source_row3 = index.add %token_base_1, %panel_mask : index
+  %source_row3 = index.add %token_base_1, %c3_index : index
   %row3_1 = vector.load %raw_matrix[%source_row3, %feature_base_1] : view<32x128xbf16> -> vector<8xbf16>
-  %source_row4 = index.add %token_base_1, %panel_count : index
+  %source_row4 = index.add %token_base_1, %c4_index : index
   %row4_1 = vector.load %raw_matrix[%source_row4, %feature_base_1] : view<32x128xbf16> -> vector<8xbf16>
   %source_row5 = index.add %token_base_1, %lane5 : index
   %row5_1 = vector.load %raw_matrix[%source_row5, %feature_base_1] : view<32x128xbf16> -> vector<8xbf16>
   %source_row6 = index.add %token_base_1, %c6 : index
   %row6_1 = vector.load %raw_matrix[%source_row6, %feature_base_1] : view<32x128xbf16> -> vector<8xbf16>
-  %source_row7 = index.add %token_base_1, %panel_head_end : index
+  %source_row7 = index.add %token_base_1, %c7_index : index
   %row7_1 = vector.load %raw_matrix[%source_row7, %feature_base_1] : view<32x128xbf16> -> vector<8xbf16>
   %join8_0 = vector.concat<0> %row0, %row1_1 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
   %join8_2 = vector.concat<0> %row2_1, %row3_1 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
@@ -1016,19 +1029,19 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %transposed_2 = vector.transpose<[1, 0]> %tile_2 : vector<8x8xbf16> -> vector<8x8xbf16>
   %value_block = vector.bitcast %transposed_2 : vector<8x8xbf16> to vector<64xbf16>
   vector.store %value_block, %value_blocks[%feature_block, %token_block, 0] : vector<64xbf16>, view<16x4x64xbf16>
-  %add_29 = index.add %token_block, %panel_one : index
+  %add_29 = index.add %token_block, %c1_index : index
   cfg.br ^block_118(%add_29: index, %block_118_offset: offset, %block_118_offset_1: offset, %block_118_offset_2: offset)
 ^block_120:
-  %add_30 = index.add %feature_block, %panel_one : index
+  %add_30 = index.add %feature_block, %c1_index : index
   cfg.br ^block_116(%add_30: index, %block_118_offset: offset, %block_118_offset_1: offset, %block_118_offset_2: offset)
 ^block_121(%block_121_offset: offset, %block_121_offset_1: offset, %block_121_offset_2: offset):
   low.invoke @qwen3_embedding.panels.release_lock_59(%released_credit) : (i32)
-  %add_31 = index.add %head_member, %panel_one : index
+  %add_31 = index.add %head_member, %c1_index : index
   cfg.br ^block_73(%add_31: index, %block_121_offset: offset, %block_121_offset_1: offset, %block_121_offset_2: offset)
 ^block_122:
   cfg.br ^block_123(%epoch_layer_boundary: index, %block_73_offset: offset, %block_73_offset_1: offset, %block_73_offset_2: offset)
 ^block_123(%block_123_index: index, %block_123_offset: offset, %block_123_offset_1: offset, %block_123_offset_2: offset):
-  %cmp_30 = index.cmp slt, %block_123_index, %panel_shift : index
+  %cmp_30 = index.cmp slt, %block_123_index, %c2_index : index
   cfg.cond_br %cmp_30, ^block_124, ^block_132
 ^block_124:
   %member = index.assume %block_123_index [range(%block_123_index, 0, 1)] : index
@@ -1130,7 +1143,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   cfg.br ^block_131(%select_2: offset, %block_123_offset_1: offset, %block_123_offset_2: offset)
 ^block_131(%block_131_offset: offset, %block_131_offset_1: offset, %block_131_offset_2: offset):
   low.invoke @qwen3_embedding.panels.release_lock_58(%released_credit) : (i32)
-  %add_41 = index.add %member, %panel_one : index
+  %add_41 = index.add %member, %c1_index : index
   cfg.br ^block_123(%add_41: index, %block_131_offset: offset, %block_131_offset_1: offset, %block_131_offset_2: offset)
 ^block_132:
   low.invoke @qwen3_embedding.panels.acquire_lock_53(%acquire_credit_result) : (i32)
@@ -1151,28 +1164,28 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %payload_9 = buffer.view %aligned_storage_14[%online_probability_blocked] : buffer -> view<16xi32>
   vector.store %c0, %payload_9[0] : vector<16xi32>, view<16xi32>
   low.invoke @qwen3_embedding.panels.release_lock_55(%released_credit) : (i32)
-  %add_42 = index.add %projection_role, %panel_one : index
+  %add_42 = index.add %projection_role, %c1_index : index
   cfg.br ^block_71(%add_42: index, %block_123_offset: offset, %block_123_offset_1: offset, %block_123_offset_2: offset)
 ^block_133:
-  %joint_attention = index.cmp eq, %panel_group, %panel_head_end : index
+  %joint_attention = index.cmp eq, %panel_group, %cohort_last_head_panel : index
   low.invoke @qwen3_embedding.panels.release_lock_48(%released_credit) : (i32)
   cfg.cond_br %joint_attention, ^block_134, ^block_206
 ^block_134:
   low.invoke @qwen3_embedding.panels.attention_join_c0_r2() : ()
   cfg.br ^block_135(%epoch_layer_boundary: index, %block_71_offset: offset, %block_71_offset_1: offset, %block_71_offset_2: offset)
 ^block_135(%block_135_index: index, %block_135_offset: offset, %block_135_offset_1: offset, %block_135_offset_2: offset):
-  %cmp_32 = index.cmp slt, %block_135_index, %panel_waves : index
+  %cmp_32 = index.cmp slt, %block_135_index, %cohort_query_waves : index
   cfg.cond_br %cmp_32, ^block_136, ^block_207
 ^block_136:
-  %online_query_wave = index.assume %block_135_index [range(%block_135_index, 0, 7)] : index
-  %panel_local_query_wave = index.andi %online_query_wave, %panel_mask : index
+  %online_query_wave = index.assume %block_135_index [range(%block_135_index, 0, %cohort_last_query_wave)] : index
+  %panel_local_query_wave = index.rem %online_query_wave, %window_query_waves : index
   low.invoke @qwen3_embedding.panels.acquire_lock_49(%acquire_credit_result) : (i32)
   %local_address_70000_result_3 = low.invoke @qwen3_embedding.panels.local_address_70000() : () -> (buffer)
   low.invoke @qwen3_embedding.panels.release_lock_48(%released_credit) : (i32)
-  %online_key_blocks = index.add %panel_local_query_wave, %panel_one : index
+  %online_key_blocks = index.add %panel_local_query_wave, %c1_index : index
   cfg.br ^block_138(%epoch_layer_boundary: index, %block_135_offset: offset, %block_135_offset_1: offset, %block_135_offset_2: offset)
 ^block_138(%block_138_index: index, %block_138_offset: offset, %block_138_offset_1: offset, %block_138_offset_2: offset):
-  %online_key_block = index.assume %block_138_index [range(%block_138_index, 0, 3), lt(%block_138_index, %online_key_blocks)] : index
+  %online_key_block = index.assume %block_138_index [range(%block_138_index, 0, %window_last_query_wave), lt(%block_138_index, %online_key_blocks)] : index
   low.invoke @qwen3_embedding.panels.acquire_lock_49(%acquire_credit_result) : (i32)
   %local_address_70000_result_4 = low.invoke @qwen3_embedding.panels.local_address_70000() : () -> (buffer)
   low.invoke @qwen3_embedding.panels.acquire_lock_9(%acquire_credit_result) : (i32)
@@ -1207,7 +1220,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   low.invoke @qwen3_embedding.panels.acquire_lock_49(%acquire_credit_result) : (i32)
   %local_address_70000_result_5 = low.invoke @qwen3_embedding.panels.local_address_70000() : () -> (buffer)
   func.call @qwen3_embedding.panels.pack_high_residual_stream(%aligned_storage, %online_probability_blocked, %online_value_high, %online_value_low, %online_pack128) : (buffer, offset, offset, offset, i32)
-  %add_44 = index.add %online_key_block, %panel_one : index
+  %add_44 = index.add %online_key_block, %c1_index : index
   %diag_more_key_blocks_w31 = index.cmp slt, %add_44, %online_key_blocks : index
   scf.if %diag_more_key_blocks_w31 {
     low.invoke @qwen3_embedding.panels.release_lock_48(%released_credit) : (i32)
@@ -1216,7 +1229,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %online_has_previous = index.cmp ne, %online_key_block, %epoch_layer_boundary : index
   cfg.br ^block_142(%epoch_layer_boundary: index, %block_139_offset: offset, %block_139_offset_1: offset, %block_139_offset_2: offset)
 ^block_142(%block_142_index: index, %block_142_offset: offset, %block_142_offset_1: offset, %block_142_offset_2: offset):
-  %cmp_34 = index.cmp slt, %block_142_index, %panel_shift : index
+  %cmp_34 = index.cmp slt, %block_142_index, %c2_index : index
   cfg.cond_br %cmp_34, ^block_143, ^block_178
 ^block_143:
   %online_probability_half = index.assume %block_142_index [range(%block_142_index, 0, 1)] : index
@@ -1225,36 +1238,36 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %online_probability_blocked_view = buffer.view %aligned_storage[%online_value_low] : buffer -> view<2048xbf16>
   cfg.br ^block_144(%epoch_layer_boundary: index, %block_142_offset: offset, %block_142_offset_1: offset, %block_142_offset_2: offset)
 ^block_144(%block_144_index: index, %block_144_offset: offset, %block_144_offset_1: offset, %block_144_offset_2: offset):
-  %cmp_35 = index.cmp slt, %block_144_index, %panel_waves : index
+  %cmp_35 = index.cmp slt, %block_144_index, %c8_index : index
   cfg.cond_br %cmp_35, ^block_145, ^block_152
 ^block_145:
   %reduction = index.assume %block_144_index [range(%block_144_index, 0, 7)] : index
-  %column = index.shli %reduction, %panel_mask : index
+  %column = index.shli %reduction, %c3_index : index
   cfg.br ^block_146(%epoch_layer_boundary: index, %block_144_offset: offset, %block_144_offset_1: offset, %block_144_offset_2: offset)
 ^block_146(%block_146_index: index, %block_146_offset: offset, %block_146_offset_1: offset, %block_146_offset_2: offset):
-  %cmp_36 = index.cmp slt, %block_146_index, %panel_count : index
+  %cmp_36 = index.cmp slt, %block_146_index, %c4_index : index
   cfg.cond_br %cmp_36, ^block_147, ^block_151
 ^block_147:
   %block_3 = index.assume %block_146_index [range(%block_146_index, 0, 3)] : index
-  %tile_3 = index.madd %reduction, %panel_count, %block_3 : index
+  %tile_3 = index.madd %reduction, %c4_index, %block_3 : index
   cfg.br ^block_148(%epoch_layer_boundary: index, %block_146_offset: offset, %block_146_offset_1: offset, %block_146_offset_2: offset)
 ^block_148(%block_148_index: index, %block_148_offset: offset, %block_148_offset_1: offset, %block_148_offset_2: offset):
-  %cmp_37 = index.cmp slt, %block_148_index, %panel_waves : index
+  %cmp_37 = index.cmp slt, %block_148_index, %c8_index : index
   cfg.cond_br %cmp_37, ^block_149, ^block_150
 ^block_149:
   %lane = index.assume %block_148_index [range(%block_148_index, 0, 7)] : index
-  %row_2 = index.madd %block_3, %panel_waves, %lane : index
+  %row_2 = index.madd %block_3, %c8_index, %lane : index
   %values_7 = vector.load %online_probability_rows[%row_2, %column] : view<32x64xbf16> -> vector<8xbf16>
-  %lane_offset = index.shli %lane, %panel_mask : index
+  %lane_offset = index.shli %lane, %c3_index : index
   %destination = index.madd %tile_3, %half, %lane_offset : index
   vector.store %values_7, %online_probability_blocked_view[%destination] : vector<8xbf16>, view<2048xbf16>
-  %add_45 = index.add %lane, %panel_one : index
+  %add_45 = index.add %lane, %c1_index : index
   cfg.br ^block_148(%add_45: index, %block_148_offset: offset, %block_148_offset_1: offset, %block_148_offset_2: offset)
 ^block_150:
-  %add_46 = index.add %block_3, %panel_one : index
+  %add_46 = index.add %block_3, %c1_index : index
   cfg.br ^block_146(%add_46: index, %block_148_offset: offset, %block_148_offset_1: offset, %block_148_offset_2: offset)
 ^block_151:
-  %add_47 = index.add %reduction, %panel_one : index
+  %add_47 = index.add %reduction, %c1_index : index
   cfg.br ^block_144(%add_47: index, %block_146_offset: offset, %block_146_offset_1: offset, %block_146_offset_2: offset)
 ^block_152:
   func.call @qwen3_embedding.panels.pack_high_residual_stream(%aligned_storage, %online_value_low, %private_probability_high, %private_probability_low, %online_pack32) : (buffer, offset, offset, offset, i32)
@@ -1266,11 +1279,11 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
 ^block_153:
   cfg.br ^block_154(%epoch_layer_boundary: index, %block_144_offset: offset, %block_144_offset_1: offset, %block_144_offset_2: offset)
 ^block_154(%block_154_index: index, %block_154_offset: offset, %block_154_offset_1: offset, %block_154_offset_2: offset):
-  %cmp_38 = index.cmp slt, %block_154_index, %panel_count : index
+  %cmp_38 = index.cmp slt, %block_154_index, %c4_index : index
   cfg.cond_br %cmp_38, ^block_155, ^block_209
 ^block_155:
   %block_4 = index.assume %block_154_index [range(%block_154_index, 0, 3)] : index
-  %scale_row = index.madd %block_4, %panel_waves, %online_probability_row : index
+  %scale_row = index.madd %block_4, %c8_index, %online_probability_row : index
   %factors = vector.load %online_old_scales[%scale_row] : view<64xbf16> -> vector<8xbf16>
   cfg.br ^block_156(%epoch_layer_boundary: index, %block_154_offset: offset, %block_154_offset_1: offset, %block_154_offset_2: offset)
 ^block_156(%block_156_index: index, %block_156_offset: offset, %block_156_offset_1: offset, %block_156_offset_2: offset):
@@ -1280,28 +1293,28 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %panel_2 = index.assume %block_156_index [range(%block_156_index, 0, 15)] : index
   cfg.br ^block_158(%epoch_layer_boundary: index, %block_156_offset: offset, %block_156_offset_1: offset, %block_156_offset_2: offset)
 ^block_158(%block_158_index: index, %block_158_offset: offset, %block_158_offset_1: offset, %block_158_offset_2: offset):
-  %cmp_40 = index.cmp slt, %block_158_index, %panel_waves : index
+  %cmp_40 = index.cmp slt, %block_158_index, %c8_index : index
   cfg.cond_br %cmp_40, ^block_159, ^block_160
 ^block_159:
   %feature = index.assume %block_158_index [range(%block_158_index, 0, 7)] : index
-  %feature_base_2 = index.shli %feature, %panel_mask : index
+  %feature_base_2 = index.shli %feature, %c3_index : index
   %values_8 = vector.load %online_context[%panel_2, %block_4, %feature_base_2] : view<16x4x64xbf16> -> vector<8xbf16>
   %value_pairs = vector.interleave<0> %values_8, %values_8 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
   %factor_pairs = vector.interleave<0> %factors, %narrow_zeros : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
   %wide_1 = vector.dot2f %value_pairs, %factor_pairs, %wide_zeros : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
   %scaled_1 = vector.fptrunc<daz> %wide_1 : vector<8xf32> to vector<8xbf16>
   vector.store %scaled_1, %online_context[%panel_2, %block_4, %feature_base_2] : vector<8xbf16>, view<16x4x64xbf16>
-  %add_48 = index.add %feature, %panel_one : index
+  %add_48 = index.add %feature, %c1_index : index
   cfg.br ^block_158(%add_48: index, %block_158_offset: offset, %block_158_offset_1: offset, %block_158_offset_2: offset)
 ^block_160:
-  %add_49 = index.add %panel_2, %panel_one : index
+  %add_49 = index.add %panel_2, %c1_index : index
   cfg.br ^block_156(%add_49: index, %block_158_offset: offset, %block_158_offset_1: offset, %block_158_offset_2: offset)
 ^block_161:
-  %add_50 = index.add %block_4, %panel_one : index
+  %add_50 = index.add %block_4, %c1_index : index
   cfg.br ^block_154(%add_50: index, %block_156_offset: offset, %block_156_offset_1: offset, %block_156_offset_2: offset)
 ^block_162(%block_162_offset: offset, %block_162_offset_1: offset, %block_162_offset_2: offset):
   %partials = buffer.view %aligned_storage[%private_probability_partials] : buffer -> view<4x64xf32>
-  %initial = vector.fragment<init> %c0_0 shape [%panel_waves, %panel_waves] : vector<64xf32>
+  %initial = vector.fragment<init> %c0_0 shape [%c8_index, %c8_index] : vector<64xf32>
   cfg.br ^block_163(%epoch_layer_boundary: index, %block_162_offset: offset, %block_162_offset_1: offset, %block_162_offset_2: offset)
 ^block_163(%block_163_index: index, %block_163_offset: offset, %block_163_offset_1: offset, %block_163_offset_2: offset):
   %cmp_41 = index.cmp slt, %block_163_index, %c16 : index
@@ -1321,48 +1334,48 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %partial_tile3 = view.bitcast %partial_span3 : view<1x64xf32> -> view<8x8xf32>
   cfg.br ^block_165(%epoch_layer_boundary: index, %block_163_offset: offset, %block_163_offset_1: offset, %block_163_offset_2: offset)
 ^block_165(%block_165_index: index, %block_165_offset: offset, %block_165_offset_1: offset, %block_165_offset_2: offset):
-  %cmp_42 = index.cmp slt, %block_165_index, %panel_shift : index
+  %cmp_42 = index.cmp slt, %block_165_index, %c2_index : index
   cfg.cond_br %cmp_42, ^block_166, ^block_170
 ^block_166:
   %product_phase = index.assume %block_165_index [range(%block_165_index, 0, 1)] : index
   %first_product = index.cmp eq, %product_phase, %epoch_layer_boundary : index
-  %left_residual_product = index.cmp eq, %product_phase, %panel_one : index
-  %right_residual_product = index.cmp eq, %product_phase, %panel_shift : index
+  %left_residual_product = index.cmp eq, %product_phase, %c1_index : index
+  %right_residual_product = index.cmp eq, %product_phase, %c2_index : index
   %product_right = scf.select %right_residual_product, %low_offset, %high_offset : offset
   %product_left = scf.select %left_residual_product, %private_probability_low, %private_probability_high : offset
   %product0, %product1, %product2, %product3 = low.invoke @qwen3_embedding.panels.dot64(%aligned_storage, %product_right, %aligned_storage, %product_left, %initial, %initial, %initial, %initial) : (buffer, offset, buffer, offset, vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>)
   cfg.cond_br %first_product, ^block_167, ^block_168
 ^block_167:
-  vector.fragment.store<result> %product0, %partial_tile0[0, 0] shape [%panel_waves, %panel_waves] : vector<64xf32>, view<8x8xf32>
-  vector.fragment.store<result> %product1, %partial_tile1[0, 0] shape [%panel_waves, %panel_waves] : vector<64xf32>, view<8x8xf32>
-  vector.fragment.store<result> %product2, %partial_tile2[0, 0] shape [%panel_waves, %panel_waves] : vector<64xf32>, view<8x8xf32>
-  vector.fragment.store<result> %product3, %partial_tile3[0, 0] shape [%panel_waves, %panel_waves] : vector<64xf32>, view<8x8xf32>
+  vector.fragment.store<result> %product0, %partial_tile0[0, 0] shape [%c8_index, %c8_index] : vector<64xf32>, view<8x8xf32>
+  vector.fragment.store<result> %product1, %partial_tile1[0, 0] shape [%c8_index, %c8_index] : vector<64xf32>, view<8x8xf32>
+  vector.fragment.store<result> %product2, %partial_tile2[0, 0] shape [%c8_index, %c8_index] : vector<64xf32>, view<8x8xf32>
+  vector.fragment.store<result> %product3, %partial_tile3[0, 0] shape [%c8_index, %c8_index] : vector<64xf32>, view<8x8xf32>
   cfg.br ^block_169(%block_165_offset: offset, %block_165_offset_1: offset, %block_165_offset_2: offset)
 ^block_168:
   %previous0 = vector.load %partials[0, 0] : view<4x64xf32> -> vector<64xf32>
-  %fragment0 = vector.fragment<init> %previous0 shape [%panel_waves, %panel_waves] : vector<64xf32>
+  %fragment0 = vector.fragment<init> %previous0 shape [%c8_index, %c8_index] : vector<64xf32>
   %added0 = vector.addf<nnan|ninf|nsz> %fragment0, %product0 : vector<64xf32>
-  vector.fragment.store<result> %added0, %partial_tile0[0, 0] shape [%panel_waves, %panel_waves] : vector<64xf32>, view<8x8xf32>
+  vector.fragment.store<result> %added0, %partial_tile0[0, 0] shape [%c8_index, %c8_index] : vector<64xf32>, view<8x8xf32>
   %previous1 = vector.load %partials[1, 0] : view<4x64xf32> -> vector<64xf32>
-  %fragment1 = vector.fragment<init> %previous1 shape [%panel_waves, %panel_waves] : vector<64xf32>
+  %fragment1 = vector.fragment<init> %previous1 shape [%c8_index, %c8_index] : vector<64xf32>
   %added1 = vector.addf<nnan|ninf|nsz> %fragment1, %product1 : vector<64xf32>
-  vector.fragment.store<result> %added1, %partial_tile1[0, 0] shape [%panel_waves, %panel_waves] : vector<64xf32>, view<8x8xf32>
+  vector.fragment.store<result> %added1, %partial_tile1[0, 0] shape [%c8_index, %c8_index] : vector<64xf32>, view<8x8xf32>
   %previous2 = vector.load %partials[2, 0] : view<4x64xf32> -> vector<64xf32>
-  %fragment2 = vector.fragment<init> %previous2 shape [%panel_waves, %panel_waves] : vector<64xf32>
+  %fragment2 = vector.fragment<init> %previous2 shape [%c8_index, %c8_index] : vector<64xf32>
   %added2 = vector.addf<nnan|ninf|nsz> %fragment2, %product2 : vector<64xf32>
-  vector.fragment.store<result> %added2, %partial_tile2[0, 0] shape [%panel_waves, %panel_waves] : vector<64xf32>, view<8x8xf32>
+  vector.fragment.store<result> %added2, %partial_tile2[0, 0] shape [%c8_index, %c8_index] : vector<64xf32>, view<8x8xf32>
   %previous3 = vector.load %partials[3, 0] : view<4x64xf32> -> vector<64xf32>
-  %fragment3 = vector.fragment<init> %previous3 shape [%panel_waves, %panel_waves] : vector<64xf32>
+  %fragment3 = vector.fragment<init> %previous3 shape [%c8_index, %c8_index] : vector<64xf32>
   %added3 = vector.addf<nnan|ninf|nsz> %fragment3, %product3 : vector<64xf32>
-  vector.fragment.store<result> %added3, %partial_tile3[0, 0] shape [%panel_waves, %panel_waves] : vector<64xf32>, view<8x8xf32>
+  vector.fragment.store<result> %added3, %partial_tile3[0, 0] shape [%c8_index, %c8_index] : vector<64xf32>, view<8x8xf32>
   cfg.br ^block_169(%block_165_offset: offset, %block_165_offset_1: offset, %block_165_offset_2: offset)
 ^block_169(%block_169_offset: offset, %block_169_offset_1: offset, %block_169_offset_2: offset):
-  %add_51 = index.add %product_phase, %panel_one : index
+  %add_51 = index.add %product_phase, %c1_index : index
   cfg.br ^block_165(%add_51: index, %block_169_offset: offset, %block_169_offset_1: offset, %block_169_offset_2: offset)
 ^block_170:
   cfg.br ^block_171(%epoch_layer_boundary: index, %block_165_offset: offset, %block_165_offset_1: offset, %block_165_offset_2: offset)
 ^block_171(%block_171_index: index, %block_171_offset: offset, %block_171_offset_1: offset, %block_171_offset_2: offset):
-  %cmp_43 = index.cmp slt, %block_171_index, %panel_count : index
+  %cmp_43 = index.cmp slt, %block_171_index, %c4_index : index
   cfg.cond_br %cmp_43, ^block_172, ^block_176
 ^block_172:
   %result_block = index.assume %block_171_index [range(%block_171_index, 0, 3)] : index
@@ -1378,24 +1391,24 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
 ^block_175(%combined: vector<64xf32>, %block_175_offset: offset, %block_175_offset_1: offset, %block_175_offset_2: offset):
   %flat_1 = vector.fptrunc<daz> %combined : vector<64xf32> to vector<64xbf16>
   vector.store %flat_1, %online_context[%panel_3, %result_block, 0] : vector<64xbf16>, view<16x4x64xbf16>
-  %add_52 = index.add %result_block, %panel_one : index
+  %add_52 = index.add %result_block, %c1_index : index
   cfg.br ^block_171(%add_52: index, %block_175_offset: offset, %block_175_offset_1: offset, %block_175_offset_2: offset)
 ^block_176:
-  %add_53 = index.add %panel_3, %panel_one : index
+  %add_53 = index.add %panel_3, %c1_index : index
   cfg.br ^block_163(%add_53: index, %block_171_offset: offset, %block_171_offset_1: offset, %block_171_offset_2: offset)
 ^block_177:
-  %add_54 = index.add %online_probability_half, %panel_one : index
+  %add_54 = index.add %online_probability_half, %c1_index : index
   cfg.br ^block_142(%add_54: index, %block_163_offset: offset, %block_163_offset_1: offset, %block_163_offset_2: offset)
 ^block_178:
   cfg.cond_br %diag_more_key_blocks_w31, ^__release_intermediate_value_w31, ^block_179
 ^__release_intermediate_value_w31:
   cfg.br ^block_138(%add_44: index, %block_142_offset: offset, %block_142_offset_1: offset, %block_142_offset_2: offset)
 ^block_179:
-  %online_result_panel = index.shrui %online_query_wave, %panel_one : index
-  %online_result_wave = index.andi %online_query_wave, %panel_one : index
+  %online_result_panel = index.shrui %online_query_wave, %c1_index : index
+  %online_result_wave = index.andi %online_query_wave, %c1_index : index
   cfg.br ^block_180(%epoch_layer_boundary: index, %block_142_offset: offset, %block_142_offset_1: offset, %block_142_offset_2: offset)
 ^block_180(%block_180_index: index, %block_180_offset: offset, %block_180_offset_1: offset, %block_180_offset_2: offset):
-  %cmp_44 = index.cmp slt, %block_180_index, %panel_shift : index
+  %cmp_44 = index.cmp slt, %block_180_index, %c2_index : index
   cfg.cond_br %cmp_44, ^block_181, ^block_197
 ^block_181:
   %online_result_half = index.assume %block_180_index [range(%block_180_index, 0, 1)] : index
@@ -1408,12 +1421,12 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   %online_context_1 = buffer.view %aligned_storage[%online_context_offset_1] : buffer -> view<16x4x64xbf16>
   %online_inverse_sums_for_context = buffer.view %aligned_storage[%online_inverse_sum_offset] : buffer -> view<64xbf16>
   %fused_31_result = view.bitcast %online_result_payload : view<4096xbf16> -> view<16x4x64xbf16>
-  scf.for %fused_31_block = [%epoch_layer_boundary to %panel_count step %panel_one] {
-    %fused_31_block_row = index.shli %fused_31_block, %panel_mask : index
+  scf.for %fused_31_block = [%epoch_layer_boundary to %c4_index step %c1_index] {
+    %fused_31_block_row = index.shli %fused_31_block, %c3_index : index
     %fused_31_scale_row = index.madd %online_result_half, %c32, %fused_31_block_row : index
     %fused_31_factors = vector.load %online_inverse_sums_for_context[%fused_31_scale_row] : view<64xbf16> -> vector<8xbf16>
     %fused_31_factor_pairs = vector.interleave<0> %fused_31_factors, %narrow_zeros : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
-    scf.for %fused_31_panel = [%epoch_layer_boundary to %c16 step %panel_one] {
+    scf.for %fused_31_panel = [%epoch_layer_boundary to %c16 step %c1_index] {
       %fused_31_flat = vector.load %online_context_1[%fused_31_panel, %fused_31_block, 0] : view<16x4x64xbf16> -> vector<64xbf16>
       %fused_31_tile = vector.bitcast %fused_31_flat : vector<64xbf16> to vector<8x8xbf16>
       %fused_31_row0 = vector.extract %fused_31_tile[0] : vector<8x8xbf16> -> vector<8xbf16>
@@ -1479,21 +1492,21 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.pro
   template.apply<@qwen3_embedding.panels.probability_value_egress.transfer_final_output_packet_transfer_binding_7fc70_descriptor_9>(%final_output_packet, %addi_16_converted_converted_converted) : (i32, i32)
   low.invoke @qwen3_embedding.panels.await_control_completion() : ()
   low.invoke @qwen3_embedding.panels.release_lock_56(%released_credit) : (i32)
-  %fused_31_next_half = index.add %online_result_half, %panel_one : index
+  %fused_31_next_half = index.add %online_result_half, %c1_index : index
   cfg.br ^block_180(%fused_31_next_half: index, %block_180_offset: offset, %block_180_offset_1: offset, %block_180_offset_2: offset)
 ^block_197:
   low.invoke @qwen3_embedding.panels.release_lock_48(%released_credit) : (i32)
-  %panel_next_query_wave = index.add %online_query_wave, %panel_one : index
+  %panel_next_query_wave = index.add %online_query_wave, %c1_index : index
   cfg.br ^block_135(%panel_next_query_wave: index, %block_180_offset: offset, %block_180_offset_1: offset, %block_180_offset_2: offset)
 ^block_198(%block_198_offset: offset, %block_198_offset_1: offset, %block_198_offset_2: offset):
-  %add_55 = index.add %panel_group, %panel_one : index
+  %add_55 = index.add %panel_group, %c1_index : index
   cfg.br ^block_4(%add_55: index, %block_198_offset: offset, %block_198_offset_1: offset, %block_198_offset_2: offset)
 ^block_199:
-  %epoch_layer_remainder = index.andi %layer, %panel_mask : index
+  %epoch_layer_remainder = index.andi %layer, %c3_index : index
   %epoch_continue = index.cmp ne, %epoch_layer_remainder, %epoch_layer_boundary : index
   cfg.cond_br %epoch_continue, ^__s256_epoch_continue_31, ^block_200
 ^__s256_epoch_continue_31:
-  %add_56 = index.add %layer, %panel_one : index
+  %add_56 = index.add %layer, %c1_index : index
   cfg.br ^block_2(%add_56: index, %block_4_offset: offset, %block_4_offset_1: offset, %block_4_offset_2: offset)
 ^block_200:
   low.invoke @qwen3_embedding.panels.park_after_lock_62() : ()

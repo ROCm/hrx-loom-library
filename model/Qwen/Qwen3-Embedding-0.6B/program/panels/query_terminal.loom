@@ -88,13 +88,21 @@ low.func.decl inline target<amd.xdna.aie2p.core> @qwen3_embedding.panels.epoch_s
 
 func.decl noinline @qwen3_embedding.panels.pack_key_residual(%storage: buffer, %input: offset, %residual_output: offset)
 
-func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.core_c7_r2() {
-  %panel_count = index.constant 4 : index
-  %panel_shift = index.constant 2 : index
-  %panel_mask = index.constant 3 : index
-  %panel_head_end = index.constant 7 : index
-  %panel_waves = index.constant 8 : index
-  %panel_one = index.constant 1 : index
+func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.query_key_terminal(%cohort_panel_count: index, %attention_window_tokens: index) {
+  %cohort_unit = index.constant 1 : index
+  %query_waves_per_panel = index.constant 2 : index
+  %attention_wave_tokens = index.constant 64 : index
+  %cohort_query_waves = index.mul %cohort_panel_count, %query_waves_per_panel : index
+  %cohort_last_query_wave = index.sub %cohort_query_waves, %cohort_unit : index
+  %window_query_waves = index.div %attention_window_tokens, %attention_wave_tokens : index
+  %window_last_query_wave = index.sub %window_query_waves, %cohort_unit : index
+  %head_projection_groups = index.constant 2 : index
+  %cohort_head_panels = index.mul %cohort_panel_count, %head_projection_groups : index
+  %cohort_last_head_panel = index.sub %cohort_head_panels, %cohort_unit : index
+  %projection_group_count = index.constant 7 : index
+  %cohort_projection_panels = index.mul %cohort_panel_count, %projection_group_count : index
+  %cohort_last_projection_panel = index.sub %cohort_projection_panels, %cohort_unit : index
+  %c1_index = index.constant 1 : index
   %c1 = index.constant 1 : index
   %c0 = index.constant 0 : index
   %c18816 = index.constant 18816 : offset
@@ -181,16 +189,16 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.cor
   %final_layer = index.cmp eq, %layer, %full_learned_layers : index
   %learned_layer = index.cmp ult, %layer, %full_learned_layers : index
   %active_groups = scf.select %final_layer, %c1, %c7 : index
-  %panel_groups = index.shli %active_groups, %panel_shift : index
+  %panel_groups = index.mul %active_groups, %cohort_panel_count : index
   %row_records = scf.select %final_layer, %c4, %c2 : index
   cfg.br ^block_4(%c0: index, %block_2_offset: offset)
 ^block_4(%block_4_index: index, %block_4_offset: offset):
   %cmp = index.cmp slt, %block_4_index, %panel_groups : index
   cfg.cond_br %cmp, ^block_5, ^block_105
 ^block_5:
-  %panel_group = index.assume %block_4_index [range(%block_4_index, 0, 27), lt(%block_4_index, %panel_groups)] : index
-  %dense_group = index.shrui %panel_group, %panel_shift : index
-  %episode = index.andi %panel_group, %panel_mask : index
+  %panel_group = index.assume %block_4_index [range(%block_4_index, 0, %cohort_last_projection_panel), lt(%block_4_index, %panel_groups)] : index
+  %dense_group = index.div %panel_group, %cohort_panel_count : index
+  %episode = index.rem %panel_group, %cohort_panel_count : index
   %query_key_group = index.cmp eq, %dense_group, %c0 : index
   %head_group = index.cmp ult, %dense_group, %c2 : index
   %output_group = index.cmp eq, %dense_group, %c2 : index
@@ -724,18 +732,18 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.cor
   %add_30 = index.add %projection_role, %c1 : index
   cfg.br ^block_79(%add_30: index, %block_81_offset: offset)
 ^block_91:
-  %joint_attention = index.cmp eq, %panel_group, %panel_head_end : index
+  %joint_attention = index.cmp eq, %panel_group, %cohort_last_head_panel : index
   low.invoke @qwen3_embedding.panels.release_lock_48(%c1_1) : (i32)
   cfg.cond_br %joint_attention, ^block_92, ^block_110
 ^block_92:
   low.invoke @qwen3_embedding.panels.attention_join_c2_r2() : ()
   cfg.br ^block_93(%c0: index, %block_79_offset: offset)
 ^block_93(%block_93_index: index, %block_93_offset: offset):
-  %cmp_20 = index.cmp slt, %block_93_index, %panel_waves : index
+  %cmp_20 = index.cmp slt, %block_93_index, %cohort_query_waves : index
   cfg.cond_br %cmp_20, ^block_94, ^block_111
 ^block_94:
-  %online_query_wave = index.assume %block_93_index [range(%block_93_index, 0, 7)] : index
-  %panel_local_query_wave = index.andi %online_query_wave, %panel_mask : index
+  %online_query_wave = index.assume %block_93_index [range(%block_93_index, 0, %cohort_last_query_wave)] : index
+  %panel_local_query_wave = index.rem %online_query_wave, %window_query_waves : index
   low.invoke @qwen3_embedding.panels.acquire_lock_49(%acquire_credit_result) : (i32)
   %online_query_sequences = buffer.view %aligned_storage_1[%c18816] : buffer -> view<64xi32>
   func.call @qwen3_embedding.panels.pack_attention_panel_with_sequences(%aligned_storage_1, %c0_1, %dense_packed_offset, %online_query_low, %online_pack128, %online_query_sequences) : (buffer, offset, offset, offset, i32, view<64xi32>)
@@ -748,7 +756,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.cor
   %online_query_position_base = index.shli %panel_local_query_wave, %c6 : index
   cfg.br ^block_96(%c0: index, %block_93_offset: offset)
 ^block_96(%block_96_index: index, %block_96_offset: offset):
-  %online_key_block = index.assume %block_96_index [range(%block_96_index, 0, 3), lt(%block_96_index, %online_key_blocks)] : index
+  %online_key_block = index.assume %block_96_index [range(%block_96_index, 0, %window_last_query_wave), lt(%block_96_index, %online_key_blocks)] : index
   low.invoke @qwen3_embedding.panels.acquire_lock_49(%acquire_credit_result) : (i32)
   %online_key_sequences = buffer.view %aligned_storage_1[%online_key_sequence_offset_for_copy] : buffer -> view<64xi32>
   func.call @qwen3_embedding.panels.pack_attention_panel_with_sequences(%aligned_storage_1, %c0_1, %online_key_high, %online_key_low, %online_pack128, %online_key_sequences) : (buffer, offset, offset, offset, i32, view<64xi32>)
@@ -824,7 +832,7 @@ func.def inline target(@qwen3_embedding.panels.core) @qwen3_embedding.panels.cor
   cfg.br ^block_101(%add_33: index, %block_101_offset: offset)
 ^block_103:
   low.invoke @qwen3_embedding.panels.release_lock_48(%c1_1) : (i32)
-  %panel_next_query_wave = index.add %online_query_wave, %panel_one : index
+  %panel_next_query_wave = index.add %online_query_wave, %c1_index : index
   cfg.br ^block_93(%panel_next_query_wave: index, %block_101_offset: offset)
 ^block_104(%block_104_offset: offset):
   %add_34 = index.add %panel_group, %c1 : index

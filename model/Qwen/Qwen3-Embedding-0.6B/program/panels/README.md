@@ -41,8 +41,20 @@ inference.
 
 ## Source ownership
 
-`array.loom` owns concrete targets, placement, and the kernel entry. Worker
-files own complete mathematical roles and their lock contracts. `matrix.loom`,
+`array.loom` owns concrete targets, placement, and the kernel entry. All 32
+physical entries pass the cohort's panel count and attention-window size to
+eleven mathematical worker roles. The roles derive their dense traversal,
+attention-wave bounds, and window-local key ranges from those facts. Fixed
+matrix fragments and four-layer DMA epochs retain their own dimensions;
+changing a cohort count cannot change an 8x8 matrix fragment.
+
+The current `cohort_shape` supplies four panels and 256-token windows to match
+the finite DMA plan and binding extents. A different geometry requires matching
+worker traversal, queue record counts, descriptors, and storage extents in the
+array configuration. Worker arguments alone do not select another executable
+geometry.
+
+Worker files own complete mathematical roles and their lock contracts. `matrix.loom`,
 `attention.loom`, `packing.loom`, and `activation.loom` own tile arithmetic.
 Resource and transport files carry immediate instruction forms and bound
 external transfers. Configuration files own stream routes, descriptors,
