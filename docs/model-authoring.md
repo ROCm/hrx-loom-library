@@ -76,9 +76,8 @@ Keep architecture-specific parameter interpretation and orchestration in the
 model. Shared service policy belongs in `program/`, concrete launch contracts
 in `kernel/`, and reusable representations and algorithms in `motif/`.
 [Repository layers](development.md#repository-layers) explains these boundaries.
-The [component-authoring guide](component-authoring.md) follows real extractions
-and their small independent tests, including the separation of correctness
-checks from production-size benchmark workloads.
+The [component-authoring guide](component-authoring.md) shows production and
+test declarations, provider dependencies, and the local check commands.
 
 Model programs use `loom_library` from `//build_tools/bazel:defs.bzl`.
 A `loom_model` target selects a card preset and its compiler composition.
@@ -110,8 +109,9 @@ auxiliary `data`. Analysis carries their transitive closure into the package
 and the card. A shared template's new motif dependency therefore reaches every
 managed consumer without another flattened list in a model BUILD file.
 Runtime-selected stages still need declared dependencies: analysis cannot infer
-provider names constructed by a running preparation program. Every declared
-source participates, including check programs if they share a provider's `srcs`.
+provider names constructed by a running preparation program. Production
+providers exclude check programs and independent test oracles; those belong
+to separate `loom_test` inputs.
 
 `input_form` and `library_form` independently select `sources` or `module`.
 Sources are the original declared files, which may themselves be bytecode;
