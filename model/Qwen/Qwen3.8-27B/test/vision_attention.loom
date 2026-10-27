@@ -1,0 +1,558 @@
+// Independent rectangular vision-attention oracle. A 6x12 patch grid covers
+// complete and partial query/key tiles and a 64-row output tile plus its tail.
+// The query matrix is diagonal; dyadic residuals, affine terms, and bias make
+// its pre-rotary result exact. Keys vary by row, head, and channel. Positive
+// values make context error relative to its magnitude meaningful even when
+// scores change sign. The reference uses logical heads, scalar rotary/dots,
+// and a complete-row softmax; it never uses fragments or online tile state.
+// Context bounds cover native probability rounding and final half rounding:
+// two half ULPs, with a 1e-7 cancellation floor. Output projection is checked
+// separately against two exact scalar taps, so context tolerance cannot hide
+// a projection error. Outputs have guards and all input buffers are immutable.
+
+kernel.decl @qwen38_vision_attention_cohort(%cohort_parameter: index) launch(%cohort_argument: index, %residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer, %context: buffer)
+
+kernel.decl @qwen38_vision_attention_output() launch(%context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer)
+
+func.def @attention_round(%bf16: i1, %value: f32) -> (i16) {
+  %bits = scf.if %bf16 -> (i16) {
+    %rounded = scalar.fptrunc %value : f32 to bf16
+    %bits = scalar.bitcast %rounded : bf16 to i16
+    scf.yield %bits : i16
+  } else {
+    %rounded = scalar.fptrunc %value : f32 to f16
+    %bits = scalar.bitcast %rounded : f16 to i16
+    scf.yield %bits : i16
+  }
+  func.return %bits : i16
+}
+
+func.def @attention_extend(%bf16: i1, %bits: i16) -> (f32) {
+  %value = scf.if %bf16 -> (f32) {
+    %half = scalar.bitcast %bits : i16 to bf16
+    %value = scalar.extf %half : bf16 to f32
+    scf.yield %value : f32
+  } else {
+    %half = scalar.bitcast %bits : i16 to f16
+    %value = scalar.extf %half : f16 to f32
+    scf.yield %value : f32
+  }
+  func.return %value : f32
+}
+
+func.def @attention_sample(%row: index, %column: index) -> (f32) {
+  %c3 = index.constant 3 : index
+  %c7 = index.constant 7 : index
+  %c31 = index.constant 31 : index
+  %row_phase = index.mul %row, %c3 : index
+  %phase = index.madd %column, %c7, %row_phase : index
+  %phase_mod = index.rem %phase, %c31 : index
+  %phase_i32 = index.cast %phase_mod : index to i32
+  %phase_f32 = scalar.uitofp %phase_i32 : i32 to f32
+  %midpoint = scalar.constant 15.0 : f32
+  %step = scalar.constant 0.0625 : f32
+  %centered = scalar.subf %phase_f32, %midpoint : f32
+  %value = scalar.mulf %centered, %step : f32
+  func.return %value : f32
+}
+
+func.def @attention_fixture(%bf16: i1, %residual: buffer, %statistics: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %rows = index.constant 72 : index
+  %width = index.constant 1152 : index
+  %cohort_width = index.constant 288 : index
+  %mean = scalar.constant 0.25 : f32
+  %inverse = scalar.constant 2.0 : f32
+  %unit_value = scalar.constant 1.0 : f32
+  %bias_midpoint = scalar.constant 2.0 : f32
+  %step = scalar.constant 0.0625 : f32
+  %quarter = scalar.constant 0.25 : f32
+  %residual_view = buffer.view %residual[%origin] : buffer -> view<72x1152xf32>
+  %statistics_view = buffer.view %statistics[%origin] : buffer -> view<72x2xf32>
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<3456x1152xi16>
+  %bias_view = buffer.view %bias[%origin] : buffer -> view<3456xf32>
+  %key_view = buffer.view %key[%origin] : buffer -> view<4x72x288xi16>
+  %value_view = buffer.view %value[%origin] : buffer -> view<4x288x72xi16>
+  %unit_bits = func.call @attention_round(%bf16, %unit_value) : (i1, f32) -> (i16)
+  scf.for %column = [%c0 to %width step %c1] {
+    view.store %unit_bits, %weight_view[%column, %column] : i16, view<3456x1152xi16>
+    %bias_index = index.rem %column, %c5 : index
+    %bias_i32 = index.cast %bias_index : index to i32
+    %bias_f32 = scalar.uitofp %bias_i32 : i32 to f32
+    %bias_centered = scalar.subf %bias_f32, %bias_midpoint : f32
+    %bias_value = scalar.mulf %bias_centered, %step : f32
+    view.store %bias_value, %bias_view[%column] : f32, view<3456xf32>
+  }
+  scf.for %row = [%c0 to %rows step %c1] {
+    view.store %mean, %statistics_view[%row, %c0] : f32, view<72x2xf32>
+    view.store %inverse, %statistics_view[%row, %c1] : f32, view<72x2xf32>
+    scf.for %column = [%c0 to %width step %c1] {
+      %sample = func.call @attention_sample(%row, %column) : (index, index) -> (f32)
+      %input = scalar.addf %sample, %mean : f32
+      view.store %input, %residual_view[%row, %column] : f32, view<72x1152xf32>
+      %cohort = index.div %column, %cohort_width : index
+      %local_column = index.rem %column, %cohort_width : index
+      %key_sample = func.call @attention_sample(%column, %row) : (index, index) -> (f32)
+      %key_value = scalar.mulf %key_sample, %quarter : f32
+      %scaled_value = scalar.mulf %sample, %quarter : f32
+      %value_value = scalar.addf %unit_value, %scaled_value : f32
+      %key_bits = func.call @attention_round(%bf16, %key_value) : (i1, f32) -> (i16)
+      %value_bits = func.call @attention_round(%bf16, %value_value) : (i1, f32) -> (i16)
+      view.store %key_bits, %key_view[%cohort, %row, %local_column] : i16, view<4x72x288xi16>
+      view.store %value_bits, %value_view[%cohort, %local_column, %row] : i16, view<4x288x72xi16>
+    }
+  }
+  func.return
+}
+
+func.def @attention_reference(%bf16: i1, %residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer, %context: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %block_width = index.constant 6 : index
+  %heads = index.constant 16 : index
+  %axis_pairs = index.constant 18 : index
+  %pairs = index.constant 36 : index
+  %width = index.constant 72 : index
+  %rows = index.constant 72 : index
+  %initial_sum = scalar.constant 0.0 : f32
+  %mean = scalar.constant 0.25 : f32
+  %log_base = scalar.constant 9.2103403719761836 : f32
+  %inverse_axis_pairs = scalar.constant 0.055555555555555559 : f32
+  %score_scale = scalar.constant 0.11785113019775793 : f32
+  %negative = scalar.constant -1000000000.0 : f32
+  %scratch_bytes = index.constant 576 : offset
+  %score_origin = index.constant 288 : offset
+  %scratch = buffer.alloca<private> align(16) %scratch_bytes : buffer
+  %query_view = buffer.view %scratch[%origin] : buffer -> view<72xf32>
+  %score_view = buffer.view %scratch[%score_origin] : buffer -> view<72xf32>
+  %residual_view = buffer.view %residual[%origin] : buffer -> view<72x1152xf32>
+  %bias_view = buffer.view %bias[%origin] : buffer -> view<3456xf32>
+  %key_view = buffer.view %key[%origin] : buffer -> view<4x72x288xi16>
+  %value_view = buffer.view %value[%origin] : buffer -> view<4x288x72xi16>
+  %context_view = buffer.view %context[%origin] : buffer -> view<72x1152xi16>
+  scf.for %row = [%c0 to %rows step %c1] {
+    %block = index.div %row, %c4 : index
+    %within = index.rem %row, %c4 : index
+    %block_y = index.div %block, %block_width : index
+    %block_x = index.rem %block, %block_width : index
+    %dy = index.div %within, %c2 : index
+    %dx = index.rem %within, %c2 : index
+    %y = index.madd %block_y, %c2, %dy : index
+    %x = index.madd %block_x, %c2, %dx : index
+    scf.for %head = [%c0 to %heads step %c1] {
+      %cohort = index.div %head, %c4 : index
+      %local_head = index.rem %head, %c4 : index
+      %global_base = index.mul %head, %width : index
+      %local_base = index.mul %local_head, %width : index
+      scf.for %pair = [%c0 to %pairs step %c1] {
+        %right = index.add %pair, %pairs : index
+        %global_left = index.add %global_base, %pair : index
+        %global_right = index.add %global_base, %right : index
+        %left_value = view.load %residual_view[%row, %global_left] : view<72x1152xf32> -> f32
+        %right_value = view.load %residual_view[%row, %global_right] : view<72x1152xf32> -> f32
+        %left_bias = view.load %bias_view[%global_left] : view<3456xf32> -> f32
+        %right_bias = view.load %bias_view[%global_right] : view<3456xf32> -> f32
+        %left_centered = scalar.subf %left_value, %mean : f32
+        %right_centered = scalar.subf %right_value, %mean : f32
+        %left = scalar.addf %left_centered, %left_bias : f32
+        %right_input = scalar.addf %right_centered, %right_bias : f32
+        %axis_pair = index.rem %pair, %axis_pairs : index
+        %uses_y = index.cmp ult, %pair, %axis_pairs : index
+        %coordinate = scf.select %uses_y, %y, %x : index
+        %pair_i32 = index.cast %axis_pair : index to i32
+        %coordinate_i32 = index.cast %coordinate : index to i32
+        %pair_f32 = scalar.uitofp %pair_i32 : i32 to f32
+        %coordinate_f32 = scalar.uitofp %coordinate_i32 : i32 to f32
+        %fraction = scalar.mulf %pair_f32, %inverse_axis_pairs : f32
+        %exponent = scalar.mulf %fraction, %log_base : f32
+        %negative_exponent = scalar.negf %exponent : f32
+        %frequency = scalar.expf<afn> %negative_exponent : f32
+        %angle = scalar.mulf %coordinate_f32, %frequency : f32
+        %sine = scalar.sinf<afn> %angle : f32
+        %cosine = scalar.cosf<afn> %angle : f32
+        %lc = scalar.mulf %left, %cosine : f32
+        %rs = scalar.mulf %right_input, %sine : f32
+        %ls = scalar.mulf %left, %sine : f32
+        %rc = scalar.mulf %right_input, %cosine : f32
+        %rotated_left = scalar.subf %lc, %rs : f32
+        %rotated_right = scalar.addf %ls, %rc : f32
+        %left_bits = func.call @attention_round(%bf16, %rotated_left) : (i1, f32) -> (i16)
+        %right_bits = func.call @attention_round(%bf16, %rotated_right) : (i1, f32) -> (i16)
+        %left_half = func.call @attention_extend(%bf16, %left_bits) : (i1, i16) -> (f32)
+        %right_half = func.call @attention_extend(%bf16, %right_bits) : (i1, i16) -> (f32)
+        view.store %left_half, %query_view[%pair] : f32, view<72xf32>
+        view.store %right_half, %query_view[%right] : f32, view<72xf32>
+      }
+      %maximum = scf.for %key_row = [%c0 to %rows step %c1](%maximum = %negative : f32) -> (f32) {
+        %dot = scf.for %channel = [%c0 to %width step %c1](%sum = %initial_sum : f32) -> (f32) {
+          %local_column = index.add %local_base, %channel : index
+          %query_value = view.load %query_view[%channel] : view<72xf32> -> f32
+          %key_bits = view.load %key_view[%cohort, %key_row, %local_column] : view<4x72x288xi16> -> i16
+          %key_value = func.call @attention_extend(%bf16, %key_bits) : (i1, i16) -> (f32)
+          %product = scalar.mulf %query_value, %key_value : f32
+          %next = scalar.addf %sum, %product : f32
+          scf.yield %next : f32
+        }
+        %score = scalar.mulf %dot, %score_scale : f32
+        view.store %score, %score_view[%key_row] : f32, view<72xf32>
+        %next_maximum = scalar.maxnumf %maximum, %score : f32
+        scf.yield %next_maximum : f32
+      }
+      %denominator = scf.for %key_row = [%c0 to %rows step %c1](%sum = %initial_sum : f32) -> (f32) {
+        %score = view.load %score_view[%key_row] : view<72xf32> -> f32
+        %delta = scalar.subf %score, %maximum : f32
+        %probability = scalar.expf<afn> %delta : f32
+        view.store %probability, %score_view[%key_row] : f32, view<72xf32>
+        %next = scalar.addf %sum, %probability : f32
+        scf.yield %next : f32
+      }
+      scf.for %channel = [%c0 to %width step %c1] {
+        %local_column = index.add %local_base, %channel : index
+        %numerator = scf.for %key_row = [%c0 to %rows step %c1](%sum = %initial_sum : f32) -> (f32) {
+          %probability = view.load %score_view[%key_row] : view<72xf32> -> f32
+          %value_bits = view.load %value_view[%cohort, %local_column, %key_row] : view<4x288x72xi16> -> i16
+          %value_value = func.call @attention_extend(%bf16, %value_bits) : (i1, i16) -> (f32)
+          %product = scalar.mulf %probability, %value_value : f32
+          %next = scalar.addf %sum, %product : f32
+          scf.yield %next : f32
+        }
+        %normalized = scalar.divf %numerator, %denominator : f32
+        %bits = func.call @attention_round(%bf16, %normalized) : (i1, f32) -> (i16)
+        %global_column = index.add %global_base, %channel : index
+        view.store %bits, %context_view[%row, %global_column] : i16, view<72x1152xi16>
+      }
+    }
+  }
+  func.return
+}
+
+command.program.def @attention_run(%bf16: i1) launch(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer, %context: buffer) {
+  scf.if %bf16 {
+    kernel.launch @vision_attention_all_heads(%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value, %context) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  } else {
+    %c0 = index.constant 0 : index
+    %c1 = index.constant 1 : index
+    %cohorts = index.constant 4 : index
+    %bank_bytes = index.constant 41472 : index
+    scf.for %cohort = [%c0 to %cohorts step %c1] unroll {
+      %byte_index = index.mul %cohort, %bank_bytes : index
+      %offset = index.cast %byte_index : index to offset
+      %key_bank = buffer.view %key[%offset] : buffer -> view<72x288xf16>
+      %value_bank = buffer.view %value[%offset] : buffer -> view<288x72xf16>
+      kernel.launch @qwen38_vision_attention_cohort[%cohort](%cohort, %residual, %statistics, %scale, %shift, %weight, %bias, %key_bank, %value_bank, %context) : [index](index, buffer, buffer, buffer, buffer, buffer, buffer, view<72x288xf16>, view<288x72xf16>, buffer)
+    }
+  }
+  command.return
+}
+
+// Projection inputs are independent of the attention result. Every output
+// uses one varying source column and column 1151, including the last K panel.
+func.def @attention_output_fixture(%bf16: i1, %context: buffer, %weight: buffer, %bias: buffer, %residual: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c7 = index.constant 7 : index
+  %rows = index.constant 72 : index
+  %width = index.constant 1152 : index
+  %last = index.constant 1151 : index
+  %unit_value = scalar.constant 1.0 : f32
+  %half = scalar.constant 0.5 : f32
+  %negative_quarter = scalar.constant -0.25 : f32
+  %context_view = buffer.view %context[%origin] : buffer -> view<72x1152xi16>
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<1152x1152xi16>
+  %bias_view = buffer.view %bias[%origin] : buffer -> view<1152xf32>
+  %residual_view = buffer.view %residual[%origin] : buffer -> view<72x1152xf32>
+  %a = func.call @attention_round(%bf16, %half) : (i1, f32) -> (i16)
+  %b = func.call @attention_round(%bf16, %negative_quarter) : (i1, f32) -> (i16)
+  scf.for %column = [%c0 to %width step %c1] {
+    %phase = index.mul %column, %c7 : index
+    %first = index.rem %phase, %last : index
+    view.store %a, %weight_view[%column, %first] : i16, view<1152x1152xi16>
+    view.store %b, %weight_view[%column, %last] : i16, view<1152x1152xi16>
+    %bias_value = func.call @attention_sample(%c0, %column) : (index, index) -> (f32)
+    view.store %bias_value, %bias_view[%column] : f32, view<1152xf32>
+  }
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %column = [%c0 to %width step %c1] {
+      %sample = func.call @attention_sample(%row, %column) : (index, index) -> (f32)
+      %bits = func.call @attention_round(%bf16, %sample) : (i1, f32) -> (i16)
+      view.store %bits, %context_view[%row, %column] : i16, view<72x1152xi16>
+      %residual_value = scalar.addf %sample, %unit_value : f32
+      view.store %residual_value, %residual_view[%row, %column] : f32, view<72x1152xf32>
+    }
+  }
+  func.return
+}
+
+func.def @attention_output_reference(%bf16: i1, %context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c7 = index.constant 7 : index
+  %rows = index.constant 72 : index
+  %width = index.constant 1152 : index
+  %last = index.constant 1151 : index
+  %half = scalar.constant 0.5 : f32
+  %negative_quarter = scalar.constant -0.25 : f32
+  %context_view = buffer.view %context[%origin] : buffer -> view<72x1152xi16>
+  %bias_view = buffer.view %bias[%origin] : buffer -> view<1152xf32>
+  %residual_view = buffer.view %residual[%origin] : buffer -> view<72x1152xf32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<72x1152xf32>
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %column = [%c0 to %width step %c1] {
+      %phase = index.mul %column, %c7 : index
+      %first = index.rem %phase, %last : index
+      %a_bits = view.load %context_view[%row, %first] : view<72x1152xi16> -> i16
+      %b_bits = view.load %context_view[%row, %last] : view<72x1152xi16> -> i16
+      %a = func.call @attention_extend(%bf16, %a_bits) : (i1, i16) -> (f32)
+      %b = func.call @attention_extend(%bf16, %b_bits) : (i1, i16) -> (f32)
+      %ax = scalar.mulf %a, %half : f32
+      %by = scalar.mulf %b, %negative_quarter : f32
+      %sum = scalar.addf %ax, %by : f32
+      %bias_value = view.load %bias_view[%column] : view<1152xf32> -> f32
+      %biased = scalar.addf %sum, %bias_value : f32
+      %residual_value = view.load %residual_view[%row, %column] : view<72x1152xf32> -> f32
+      %result = scalar.addf %residual_value, %biased : f32
+      view.store %result, %output_view[%row, %column] : f32, view<72x1152xf32>
+    }
+  }
+  func.return
+}
+
+command.program.def @attention_output_run(%bf16: i1) launch(%context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) {
+  scf.if %bf16 {
+    kernel.launch @attention_output_bf16(%context, %weight, %bias, %residual, %output) : (buffer, buffer, buffer, buffer, buffer)
+  } else {
+    kernel.launch @qwen38_vision_attention_output(%context, %weight, %bias, %residual, %output) : (buffer, buffer, buffer, buffer, buffer)
+  }
+  command.return
+}
+
+amdgpu.target<gfx11-generic> @attention_test_wave32 {subgroup_size = 32}
+
+config.decl @qwen38.vision.image_height : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
+
+config.decl @qwen38.vision.image_width : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
+
+template.decl @qwen38.vision.attention(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %cohort: index, %cohort_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer)
+
+template.decl @qwen38.vision.attention_output(%rows_value: index, %bf16: i1, %context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer)
+
+kernel.def target(@attention_test_wave32) @vision_attention_all_heads() {
+  %c1 = index.constant 1 : index
+  %c15 = index.constant 15 : index
+  %c16 = index.constant 16 : index
+  %c128 = index.constant 128 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch_height = index.div %image_height, %c16 : index
+  %patch_width = index.div %image_width, %c16 : index
+  %rows = index.mul %patch_height, %patch_width : index
+  %padded_rows = index.add %rows, %c15 : index
+  %query_tiles = index.div %padded_rows, %c16 : index
+  %cohort_count = index.constant 4 : index
+  kernel.launch.config workgroups(%query_tiles, %c1, %cohort_count) workgroup_size(%c128, %c1, %c1) : index
+} launch(%residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch = index.constant 16 : index
+  %height = index.div %image_height, %patch : index
+  %width = index.div %image_width, %patch : index
+  %bf16 = scalar.constant true : i1
+  %cohort_raw = kernel.workgroup.id<z> : index
+  %cohort = index.assume %cohort_raw [range(%cohort_raw, 0, 3)] : index
+  %rows = index.mul %height, %width : index
+  %row_bytes = index.constant 576 : index
+  %cohort_rows = index.mul %cohort, %rows : index
+  %byte_index = index.mul %cohort_rows, %row_bytes : index
+  %cohort_offset = index.cast %byte_index : index to offset
+  template.apply<@qwen38.vision.attention>(%height, %width, %bf16, %cohort, %cohort_offset, %residual, %statistics, %layernorm_weight, %layernorm_bias, %qkv_weight, %qkv_bias, %key, %value, %output) : (index, index, i1, index, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@attention_test_wave32) @attention_output_bf16() {
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch_height = index.div %image_height, %c16 : index
+  %patch_width = index.div %image_width, %c16 : index
+  %rows0 = index.mul %patch_height, %patch_width : index
+  %rows = index.assume %rows0 [range(%rows0, 4, 65536), multiple_of(%rows0, 4)] : index
+  %rounded_rows = index.add %rows, %c63 : index
+  %row_tiles = index.div %rounded_rows, %c64 : index
+  %c9 = index.constant 9 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %c9, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) {
+  %image_height = config.get @qwen38.vision.image_height : index
+  %image_width = config.get @qwen38.vision.image_width : index
+  %patch = index.constant 16 : index
+  %height = index.div %image_height, %patch : index
+  %width = index.div %image_width, %patch : index
+  %bf16 = scalar.constant true : i1
+  %rows = index.mul %height, %width : index
+  template.apply<@qwen38.vision.attention_output>(%rows, %bf16, %context, %weight, %bias, %residual, %output) : (index, i1, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+func.def @attention_f16_reference(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer, %context: buffer) {
+  %bf16 = scalar.constant false : i1
+  func.call @attention_reference(%bf16, %residual, %statistics, %scale, %shift, %weight, %bias, %key, %value, %context) : (i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @vision_attention_f16_nonuniform {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %bf16 = check.literal value(false) : i1
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %residual = check.generate.fill value(0.0) : tensor<72x1152xf32>
+    %statistics = check.generate.fill value(0.0) : tensor<72x2xf32>
+    %scale = check.generate.fill value(0.5) : tensor<1152xf32>
+    %shift = check.generate.fill value(0.0) : tensor<1152xf32>
+    %weight = check.generate.fill value(0.0) : tensor<3456x1152xf16>
+    %bias = check.generate.fill value(0.0) : tensor<3456xf32>
+    %key = check.generate.fill value(0.0) : tensor<4x72x288xf16>
+    %value = check.generate.fill value(0.0) : tensor<4x288x72xf16>
+    check.generate<@attention_fixture>(%bf16, %residual, %statistics, %weight, %bias, %key, %value) : (i1, tensor<72x1152xf32>, tensor<72x2xf32>, tensor<3456x1152xf16>, tensor<3456xf32>, tensor<4x72x288xf16>, tensor<4x288x72xf16>) -> ()
+    %storage = check.generate.fill value(99.0) : tensor<83008xf16>
+    %context = check.tensor.view %storage offset(64) : tensor<83008xf16> -> tensor<72x1152xf16>
+    %prefix = check.tensor.view %storage offset(0) : tensor<83008xf16> -> tensor<32xf16>
+    %suffix = check.tensor.view %storage offset(165952) : tensor<83008xf16> -> tensor<32xf16>
+    check.compare<@attention_run, @attention_f16_reference>[%bf16](%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value, %context) : [i1](tensor<72x1152xf32>, tensor<72x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xf16>, tensor<3456xf32>, tensor<4x72x288xf16>, tensor<4x288x72xf16>, tensor<72x1152xf16>) -> () {
+      check.expect.close actual(%context) expected(%context) atol(9.9999999999999995e-08) rtol(0.002) nan(different) : tensor<72x1152xf16>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<32xf16>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<32xf16>
+      check.expect.bitwise actual(%residual) expected(%residual) : tensor<72x1152xf32>
+      check.expect.bitwise actual(%statistics) expected(%statistics) : tensor<72x2xf32>
+      check.expect.bitwise actual(%scale) expected(%scale) : tensor<1152xf32>
+      check.expect.bitwise actual(%shift) expected(%shift) : tensor<1152xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<3456x1152xf16>
+      check.expect.bitwise actual(%bias) expected(%bias) : tensor<3456xf32>
+      check.expect.bitwise actual(%key) expected(%key) : tensor<4x72x288xf16>
+      check.expect.bitwise actual(%value) expected(%value) : tensor<4x288x72xf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@vision_attention_f16_nonuniform> @vision_attention_f16_all_heads_and_tails
+
+func.def @attention_output_f16_reference(%context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) {
+  %bf16 = scalar.constant false : i1
+  func.call @attention_output_reference(%bf16, %context, %weight, %bias, %residual, %output) : (i1, buffer, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @vision_attention_output_f16 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %bf16 = check.literal value(false) : i1
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %context = check.generate.fill value(0.0) : tensor<72x1152xf16>
+    %weight = check.generate.fill value(0.0) : tensor<1152x1152xf16>
+    %bias = check.generate.fill value(0.0) : tensor<1152xf32>
+    %residual = check.generate.fill value(0.0) : tensor<72x1152xf32>
+    check.generate<@attention_output_fixture>(%bf16, %context, %weight, %bias, %residual) : (i1, tensor<72x1152xf16>, tensor<1152x1152xf16>, tensor<1152xf32>, tensor<72x1152xf32>) -> ()
+    %storage = check.generate.fill value(99.0) : tensor<82976xf32>
+    %output = check.tensor.view %storage offset(64) : tensor<82976xf32> -> tensor<72x1152xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<82976xf32> -> tensor<16xf32>
+    %suffix = check.tensor.view %storage offset(331840) : tensor<82976xf32> -> tensor<16xf32>
+    check.compare<@attention_output_run, @attention_output_f16_reference>[%bf16](%context, %weight, %bias, %residual, %output) : [i1](tensor<72x1152xf16>, tensor<1152x1152xf16>, tensor<1152xf32>, tensor<72x1152xf32>, tensor<72x1152xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(9.9999999999999995e-08) rtol(9.9999999999999995e-07) nan(different) : tensor<72x1152xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<16xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<16xf32>
+      check.expect.bitwise actual(%context) expected(%context) : tensor<72x1152xf16>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1152x1152xf16>
+      check.expect.bitwise actual(%bias) expected(%bias) : tensor<1152xf32>
+      check.expect.bitwise actual(%residual) expected(%residual) : tensor<72x1152xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@vision_attention_output_f16> @vision_attention_output_f16_tile_and_tail
+
+func.def @attention_bf16_reference(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer, %context: buffer) {
+  %bf16 = scalar.constant true : i1
+  func.call @attention_reference(%bf16, %residual, %statistics, %scale, %shift, %weight, %bias, %key, %value, %context) : (i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @vision_attention_bf16_nonuniform {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %bf16 = check.literal value(true) : i1
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %residual = check.generate.fill value(0.0) : tensor<72x1152xf32>
+    %statistics = check.generate.fill value(0.0) : tensor<72x2xf32>
+    %scale = check.generate.fill value(0.5) : tensor<1152xf32>
+    %shift = check.generate.fill value(0.0) : tensor<1152xf32>
+    %weight = check.generate.fill value(0.0) : tensor<3456x1152xbf16>
+    %bias = check.generate.fill value(0.0) : tensor<3456xf32>
+    %key = check.generate.fill value(0.0) : tensor<4x72x288xbf16>
+    %value = check.generate.fill value(0.0) : tensor<4x288x72xbf16>
+    check.generate<@attention_fixture>(%bf16, %residual, %statistics, %weight, %bias, %key, %value) : (i1, tensor<72x1152xf32>, tensor<72x2xf32>, tensor<3456x1152xbf16>, tensor<3456xf32>, tensor<4x72x288xbf16>, tensor<4x288x72xbf16>) -> ()
+    %storage = check.generate.fill value(99.0) : tensor<83008xbf16>
+    %context = check.tensor.view %storage offset(64) : tensor<83008xbf16> -> tensor<72x1152xbf16>
+    %prefix = check.tensor.view %storage offset(0) : tensor<83008xbf16> -> tensor<32xbf16>
+    %suffix = check.tensor.view %storage offset(165952) : tensor<83008xbf16> -> tensor<32xbf16>
+    check.compare<@attention_run, @attention_bf16_reference>[%bf16](%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value, %context) : [i1](tensor<72x1152xf32>, tensor<72x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xbf16>, tensor<3456xf32>, tensor<4x72x288xbf16>, tensor<4x288x72xbf16>, tensor<72x1152xbf16>) -> () {
+      check.expect.close actual(%context) expected(%context) atol(9.9999999999999995e-08) rtol(0.016) nan(different) : tensor<72x1152xbf16>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<32xbf16>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<32xbf16>
+      check.expect.bitwise actual(%residual) expected(%residual) : tensor<72x1152xf32>
+      check.expect.bitwise actual(%statistics) expected(%statistics) : tensor<72x2xf32>
+      check.expect.bitwise actual(%scale) expected(%scale) : tensor<1152xf32>
+      check.expect.bitwise actual(%shift) expected(%shift) : tensor<1152xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<3456x1152xbf16>
+      check.expect.bitwise actual(%bias) expected(%bias) : tensor<3456xf32>
+      check.expect.bitwise actual(%key) expected(%key) : tensor<4x72x288xbf16>
+      check.expect.bitwise actual(%value) expected(%value) : tensor<4x288x72xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@vision_attention_bf16_nonuniform> @vision_attention_bf16_all_heads_and_tails
+
+func.def @attention_output_bf16_reference(%context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) {
+  %bf16 = scalar.constant true : i1
+  func.call @attention_output_reference(%bf16, %context, %weight, %bias, %residual, %output) : (i1, buffer, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @vision_attention_output_bf16 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %bf16 = check.literal value(true) : i1
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %context = check.generate.fill value(0.0) : tensor<72x1152xbf16>
+    %weight = check.generate.fill value(0.0) : tensor<1152x1152xbf16>
+    %bias = check.generate.fill value(0.0) : tensor<1152xf32>
+    %residual = check.generate.fill value(0.0) : tensor<72x1152xf32>
+    check.generate<@attention_output_fixture>(%bf16, %context, %weight, %bias, %residual) : (i1, tensor<72x1152xbf16>, tensor<1152x1152xbf16>, tensor<1152xf32>, tensor<72x1152xf32>) -> ()
+    %storage = check.generate.fill value(99.0) : tensor<82976xf32>
+    %output = check.tensor.view %storage offset(64) : tensor<82976xf32> -> tensor<72x1152xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<82976xf32> -> tensor<16xf32>
+    %suffix = check.tensor.view %storage offset(331840) : tensor<82976xf32> -> tensor<16xf32>
+    check.compare<@attention_output_run, @attention_output_bf16_reference>[%bf16](%context, %weight, %bias, %residual, %output) : [i1](tensor<72x1152xbf16>, tensor<1152x1152xbf16>, tensor<1152xf32>, tensor<72x1152xf32>, tensor<72x1152xf32>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(9.9999999999999995e-08) rtol(9.9999999999999995e-07) nan(different) : tensor<72x1152xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<16xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<16xf32>
+      check.expect.bitwise actual(%context) expected(%context) : tensor<72x1152xbf16>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1152x1152xbf16>
+      check.expect.bitwise actual(%bias) expected(%bias) : tensor<1152xf32>
+      check.expect.bitwise actual(%residual) expected(%residual) : tensor<72x1152xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@vision_attention_output_bf16> @vision_attention_output_bf16_tile_and_tail

@@ -5,6 +5,16 @@ contracts. The dense and MoE models use different matrix precision and final
 feature widths; checkpoint names, geometry selection, launches, and retained
 output ownership belong to their composition leaves.
 
+`attention.loom` keeps query projection and online softmax in one resident
+program, streaming K/V panels without a global score matrix. Each workgroup
+owns sixteen queries and four heads, with F32 maxima, sums, and accumulation.
+Padded resident rows distribute LDS accesses across banks; query storage
+changes representation only after the preceding reads complete. The caller
+selects a logical cohort and its K/V byte origin independently, permitting
+sequential bank reuse or concurrent heads. A separate shared output projection
+reuses each matrix panel across 64 rows and adds the F32 residual. Original
+F16 and BF16 checkpoints share both algorithms through explicit precision.
+
 `key_value.loom` projects four 72-channel heads at a time and applies the
 trained two-dimensional NEOX rotary coordinates to keys. It publishes row-major
 keys and transposed values, keeping 32-row weight reuse, cyclic resident weight
@@ -38,10 +48,9 @@ while original Flash-Next F32 weights round to BF16 inside the resident tile.
 No image-sized patch matrix or converted checkpoint is materialized.
 
 `precision.loom` provides rounding, result publication, and native F16/BF16
-matrix interpretation for patch, key/value, feed-forward, and merger projections. It
-carries original half bits between arithmetic boundaries and allocates no
-storage or synchronization. The fragment contract is explicitly RDNA wave32
-with F32 accumulation.
+matrix interpretation for the shared projections. It carries original half
+bits between arithmetic boundaries and allocates no storage or synchronization.
+The fragment contract is explicitly RDNA wave32 with F32 accumulation.
 
 `normalization.loom` owns F32 row moments, aligned-corners interpolation of
 the learned 48×48 position table, and final affine normalization. Position

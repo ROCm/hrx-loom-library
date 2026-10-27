@@ -46,6 +46,11 @@ after each attention dispatch. The motif takes the logical cohort and output
 byte origin separately, allowing concurrent cohorts to use distinct regions
 without changing matrix precision, resident layouts, or projection arithmetic.
 
+`vision_attention.loom` binds the same cohort bank to shared query projection
+and online softmax, followed by the shared residual projection. The first
+launch owns only its context columns; the output matrix and bias belong to
+the second launch. Both preserve F32 accumulation and the original F16 operands.
+
 `vision_merger.loom` supplies the shared merger with original F16 matrices and
 the dense model's 5120-wide output contract. It shares the FFN's resident panel
 layouts and overlaps down-projection panel loads with matrix work. The command

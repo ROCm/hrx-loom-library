@@ -21,6 +21,13 @@ tails, and transposed value publication. The actual dense F16 launch executes
 four cohort commands; BF16 uses one concurrent all-head launch. Guards and
 immutable inputs check ownership independently of the numerical comparisons.
 
+`vision_attention` checks nonuniform attention against a logical scalar
+reference with a complete-row softmax. The rectangular 6×12 patch grid
+exercises both rotary axes, all sixteen heads, 72-channel tails, and partial
+query/key tiles. Separate sparse output projections cover a full 64-row tile
+and its tail without inheriting the attention comparison's rounding allowance.
+Both F16 and BF16 checks guard output ranges and preserve all input buffers.
+
 `vision_merger` checks the complete up/GELU/down sequence at both the dense
 F16/5120 and Flash-Next BF16/2560 feature widths. Seventy rows cross a full tile
 and a six-row tail. A scalar two-tap reference varies signs and source columns,
