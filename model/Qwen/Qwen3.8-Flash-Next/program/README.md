@@ -42,6 +42,16 @@ accepted prefix into non-page state. Catch-up uses accepted target hidden
 rows to advance predictor state. Draft vocabulary membership is learned from
 accepted tokens and is retained with the request.
 
+The input-content kernels distinguish ordinary IDs from media records using
+composition facts. Target embedding reads original Q8 vocabulary rows or F32
+features and publishes BF16 residuals. Accepted predictor embedding binds the
+original feature packet through the compact span-origin map; features are
+never repacked for catch-up. Ordinary catch-up retains its compact-ID path.
+PLE hashes, token-history publication, and speculative ID capture read IDs
+through the shared input contract. Replay and draft vocabulary continue to
+consume compact I32 histories. These input-content contracts do not by
+themselves advertise an image service on the model card.
+
 Greedy proposal rounds first search accepted token history. A trigram bitset
 locates the newest sixteen occurrences, and backward comparison selects the
 longest suffix, breaking ties toward the newest occurrence. A match of at least

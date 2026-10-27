@@ -8,6 +8,7 @@ workload can be planned, executed, and measured through the ordinary Loom tools.
 
 | Checks | Independent expectation |
 | --- | --- |
+| Embedding and mixed inputs | Exact signed Q8 values, distinct image features, an immutable source packet larger than the compact accepted batch, rejected holes, ordinary recursive proposals, and complete inactive-output comparisons. |
 | Q8 projection and preparation | Scalar F64 decoding from original GGML bytes, including the selected operand-rounding boundary; batch-independent reductions and in-place preparation preserve output and untouched storage. |
 | GDN and fused convolution | Scalar channel traversal and per-value recurrence; a closed-form Q8 projection fixture varies inputs and codes across K and tests tile boundaries, shared anchors, advancing writers, and speculative capture in narrow and paired-head schedules. |
 | Hyperconnection and residual fusion | Independent normalization and projection, explicit BF16 publication, and complete inactive-buffer comparisons. |
@@ -15,6 +16,11 @@ workload can be planned, executed, and measured through the ordinary Loom tools.
 | Copied-history proposals | Closed-form repeated-token fixtures cross page and subgroup boundaries, choose the newest equal-length match, reject short or incomplete continuations, and compare complete compacted buffers. Empty, copied, neural, mixed, and sampled cohorts retain distinct resident, input, output, and policy identities. |
 | Experts and mixed quantization | Scalar decoding of each admitted block format, independent matrix references, route grouping, padded tasks, and routed/shared output composition. |
 | MTP, output, and vocabulary | Independent projection references and explicit expected state for accepted history, compact vocabularies, fallback selection, proposal rejection, and retained carry. |
+
+`retained`, `mtp_state`, and `speculation` run the same independent ordinary-ID
+oracles against ordinary and media input carriers. Media metadata differs from
+IDs, so a mistaken contiguous-I32 read cannot pass. Accepted ID capture remains
+a compact plane, and predictor vocabulary learns only the accepted IDs.
 
 `proposal_launch` exercises the real Q8 projection template at its wave and
 two matrix entry shapes. GPU-published conditions alternate between active

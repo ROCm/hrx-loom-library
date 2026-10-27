@@ -3,6 +3,12 @@
 // descriptors select stable capture slots without copying the captured
 // payload.
 
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
+config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 8)]
+
+func.decl @qwen38_input_token(%mixed: index, %capacity: index, %inputs: buffer, %input: index) -> (i32)
+
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
 config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
@@ -42,20 +48,9 @@ func.def public inline @flash_next_span_publishes(%verification: index, %epoch: 
 // Capture preserves transition inputs, not recurrent endpoints. Every source
 // token keeps its original packed offset. Known spans leave their tokens
 // untouched; acceptance compacts replay descriptors without copying payloads.
-kernel.def @flash_next_capture_rows(%neural_enabled: i1, %span_capacity: index, %row_bytes: offset) {
-  %capacity = index.assume %span_capacity [range(%span_capacity, 1, 2147483647)] : index
-  %spans = func.call pure @flash_next_span_workers(%capacity) : (index) -> (index)
-  %bytes = index.cast %row_bytes : offset to index
-  %rounding = index.constant 511 : index
-  %group_bytes = index.constant 512 : index
-  %rounded = index.add %bytes, %rounding : index
-  %groups = index.div %rounded, %group_bytes : index
-  %threads = index.constant 128 : index
-  %c1 = index.constant 1 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %spans, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%source_capacity_value: index, %width_value: index, %row_bytes_value: offset, %epoch: buffer, %input: buffer, %capture: buffer, %capture_origin: offset) {
+template.decl @flash_next.capture_rows(%token_ids: i1, %source_capacity_value: index, %width_value: index, %row_bytes_value: offset, %epoch: buffer, %input: buffer, %capture: buffer, %capture_origin: offset)
+
+template.def<@flash_next.capture_rows> device @flash_next_capture_rows_body(%token_ids: i1, %source_capacity_value: index, %width_value: index, %row_bytes_value: offset, %epoch: buffer, %input: buffer, %capture: buffer, %capture_origin: offset) {
   %source_capacity = index.assume %source_capacity_value [range(%source_capacity_value, 1, 32768)] : index
   %width = index.assume %width_value [range(%width_value, 1, 8)] : index
   %row_bytes = index.assume %row_bytes_value [range(%row_bytes_value, 4, 20480), multiple_of(%row_bytes_value, 4)] : offset
@@ -92,14 +87,57 @@ kernel.def @flash_next_capture_rows(%neural_enabled: i1, %span_capacity: index, 
           %source_row = index.scale %source, %row_bytes : index, offset -> offset
           %source_origin = index.add %source_row, %byte : offset
           %destination_origin = index.add %capture_origin, %source_origin : offset
-          %input_view = buffer.view %input[%source_origin] : buffer -> view<4xi8>
-          %output_view = buffer.view %capture[%destination_origin] : buffer -> view<4xi8>
-          %value = vector.load %input_view[%c0] : view<4xi8> -> vector<4xi8>
-          vector.store %value, %output_view[%c0] : vector<4xi8>, view<4xi8>
+          scf.if %token_ids {
+            %mixed = config.get @runner.qwen38.mixed_inputs : index
+            %value = func.call @qwen38_input_token(%mixed, %source_capacity, %input, %source) : (index, index, buffer, index) -> (i32)
+            %output_view = buffer.view %capture[%destination_origin] : buffer -> view<1xi32>
+            view.store %value, %output_view[%c0] : i32, view<1xi32>
+          } else {
+            %input_view = buffer.view %input[%source_origin] : buffer -> view<4xi8>
+            %output_view = buffer.view %capture[%destination_origin] : buffer -> view<4xi8>
+            %value = vector.load %input_view[%c0] : view<4xi8> -> vector<4xi8>
+            vector.store %value, %output_view[%c0] : vector<4xi8>, view<4xi8>
+          }
         }
       }
     }
   }
+  template.return
+}
+
+kernel.def @flash_next_capture_rows(%neural_enabled: i1, %span_capacity: index, %row_bytes: offset) {
+  %capacity = index.assume %span_capacity [range(%span_capacity, 1, 2147483647)] : index
+  %spans = func.call pure @flash_next_span_workers(%capacity) : (index) -> (index)
+  %bytes = index.cast %row_bytes : offset to index
+  %rounding = index.constant 511 : index
+  %group_bytes = index.constant 512 : index
+  %rounded = index.add %bytes, %rounding : index
+  %groups = index.div %rounded, %group_bytes : index
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %spans, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%source_capacity_value: index, %width_value: index, %row_bytes_value: offset, %epoch: buffer, %input: buffer, %capture: buffer, %capture_origin: offset) {
+  %token_ids = scalar.constant false : i1
+  template.apply<@flash_next.capture_rows>(%token_ids, %source_capacity_value, %width_value, %row_bytes_value, %epoch, %input, %capture, %capture_origin) : (i1, index, index, offset, buffer, buffer, buffer, offset)
+  kernel.return
+}
+
+// ID replay retains a compact I32 plane even when the immutable source uses
+// media records. Reuse the exact speculative-span selection of vector capture.
+kernel.def @flash_next_capture_ids() {
+  %capacity = config.get @flash_next.span_capacity : index
+  %spans = func.call pure @flash_next_span_workers(%capacity) : (index) -> (index)
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%c1, %spans, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%epoch: buffer, %input: buffer, %capture: buffer, %capture_origin: offset) {
+  %token_ids = scalar.constant true : i1
+  %capacity = config.get @flash_next.token_count : index
+  %width = config.get @flash_next.verification_width : index
+  %row_bytes = index.constant 4 : offset
+  template.apply<@flash_next.capture_rows>(%token_ids, %capacity, %width, %row_bytes, %epoch, %input, %capture, %capture_origin) : (i1, index, index, offset, buffer, buffer, buffer, offset)
   kernel.return
 }
 
