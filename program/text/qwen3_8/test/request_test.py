@@ -276,6 +276,102 @@ class RequestCheckTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("image_url must be a base64", result.stderr)
 
+    def test_reasoning_efforts_select_exact_checkpoint_prompts(self):
+        instructions = {
+            "none": "",
+            "low": (
+                "Reasoning effort is set to low. Keep your thinking brief and focused, "
+                "moving directly to the conclusion without unnecessary elaboration."
+            ),
+            "medium": "",
+            "xhigh": (
+                "Reasoning effort is set to xhigh. Please think carefully through the task, "
+                "validate key assumptions, consider plausible alternatives, and prioritize "
+                "correctness, consistency, and clarity in the final answer."
+            ),
+        }
+        for effort, instruction in instructions.items():
+            for system in ("", "Follow the project rules."):
+                with self.subTest(effort=effort, system=system):
+                    request = self.request(reasoning_effort=effort)
+                    del request["enable_thinking"]
+                    if system:
+                        request["messages"].insert(
+                            0, {"role": "developer", "content": system}
+                        )
+                    value = self.success(self.execute(request))
+                    system_text = "\n\n".join(
+                        text for text in (instruction, system) if text
+                    )
+                    prefix = (
+                        "<|im_start|>system\n" + system_text + "<|im_end|>\n"
+                        if system_text
+                        else ""
+                    )
+                    generation = "<|im_start|>assistant\n<think>\n"
+                    if effort == "none":
+                        generation += "\n</think>\n\n"
+                    expected = (
+                        prefix + "<|im_start|>user\nHello λ.<|im_end|>\n" + generation
+                    )
+                    self.assertEqual(value["prompt"], expected)
+                    self.assertEqual(
+                        bytes(value["request_options"]),
+                        struct.pack("<ffiiq", 0, 1, 0, 0, 1),
+                    )
+                    request["enable_thinking"] = effort != "none"
+                    self.assertEqual(
+                        self.success(self.execute(request))["prompt"], expected
+                    )
+
+    def test_reasoning_aliases_preserve_tools_and_instruction_order(self):
+        for alias, canonical in (
+            ("minimal", "low"),
+            ("high", "xhigh"),
+            ("max", "xhigh"),
+        ):
+            with self.subTest(alias=alias):
+                request = self.request(
+                    enable_thinking=True, tools=TOOLS, reasoning_effort=canonical
+                )
+                expected = self.success(self.execute(request))
+                request["reasoning_effort"] = alias
+                self.assertEqual(self.success(self.execute(request)), expected)
+        request = self.request(enable_thinking=True, tools=TOOLS)
+        enabled = self.success(self.execute(request))
+        request["reasoning_effort"] = "xhigh"
+        self.assertEqual(self.success(self.execute(request)), enabled)
+        request["reasoning_effort"] = "medium"
+        medium = self.success(self.execute(request))
+        instruction = enabled["prompt"].split("\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(
+            medium["prompt"], enabled["prompt"].replace(instruction + "\n\n", "", 1)
+        )
+
+    def test_reasoning_options_reject_conflicts_and_invalid_values(self):
+        for effort in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=effort):
+                request = self.request(
+                    reasoning_effort=effort, enable_thinking=effort == "none"
+                )
+                result = self.execute(request)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("agree with enable_thinking", result.stderr)
+        for effort in (None, False, 1, [], {}, "", "LOW", "unknown"):
+            with self.subTest(effort=effort):
+                result = self.execute(self.request(reasoning_effort=effort))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+        request = json.dumps(self.request(enable_thinking=True, reasoning_effort="low"))
+        expected = self.success(self.execute(request))
+        escaped = request.replace('"low"', '"l\\u006fw"')
+        self.assertEqual(self.success(self.execute(escaped)), expected)
+        duplicate = request.replace('"low"', '"low", "reasoning_effort": "low"')
+        result = self.execute(duplicate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
     def test_text_parts_preserve_order_and_have_no_media_spans(self):
         request = self.request()
         expected = self.success(self.execute(request))

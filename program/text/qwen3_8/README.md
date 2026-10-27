@@ -20,6 +20,16 @@ role `system` or `developer`; both render the same Qwen system tokens. A second
 instruction message or one after user/assistant history is rejected, since the
 checkpoint template has no corresponding role or priority boundary.
 
+`reasoning_effort` selects the checkpoint's trained prompt policy: `none` closes
+the thinking prefix, `low` requests brief reasoning, `medium` opens thinking
+without an extra instruction, and `xhigh` requests careful reasoning. The common
+client values `minimal`, `high`, and `max` alias `low`, `xhigh`, and `xhigh`,
+respectively; they do not introduce additional token budgets. Omitting both
+thinking controls keeps reasoning off. `enable_thinking=true` alone retains the
+checkpoint's xhigh policy. Explicit effort and enable/disable controls must
+agree. The sampling packet and device execution are independent of this prompt
+selection.
+
 `epoch.loom` consumes consecutive first and continuation cohorts. Each record
 carries length, causal and source positions, resident row, known-input range,
 flags, output credit, and continuation owner.
