@@ -61,7 +61,10 @@ cohort-sized pixel copy.
 
 Cold preparation registers a descriptor-only memory forecast for bounded
 serving. It accounts for the projector bank, the upload ceiling, and the largest
-image's shared private workspace. Retained output estimates include a full
+image's shared private workspace. Command composition and forecasting use the
+same shared vision workspace query. The 5120-column final output temporarily
+holds a residual bank, then receives features after post-normalization has
+preserved the merger input. Retained output estimates include a full
 four-image cohort for each image in the request because peer requests can share
 the allocation. Expanded feature storage counts only this request's rows.
 The forecast needs neither decoded pixels nor activated weights; it lets the

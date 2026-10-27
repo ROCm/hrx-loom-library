@@ -5,6 +5,14 @@ contracts. The dense and MoE models use different matrix precision and final
 feature widths; checkpoint names, geometry selection, launches, and retained
 output ownership belong to their composition leaves.
 
+`workspace.loom` defines the allocation lengths and aligned private peak used
+by both command composition and admission forecasting. A final feature width
+of at least 4608 can hold one temporary residual bank; narrower outputs need
+two private banks. The activation bank serves RGB, context/K/V, FFN, and merger
+at disjoint dispatch lifetimes. K/V origins depend on the resident cohort
+count, so sequential and concurrent head schedules share the same layout rule.
+Image count affects retained output, while sequential images reuse workspace.
+
 `attention.loom` keeps query projection and online softmax in one resident
 program, streaming K/V panels without a global score matrix. Each workgroup
 owns sixteen queries and four heads, with F32 maxima, sums, and accumulation.

@@ -1,0 +1,129 @@
+// Literal storage witnesses for encoder command composition and admission.
+// No checkpoint, image allocation, or device execution is needed to check the
+// independent alignment and live-bank contracts.
+
+func.decl pure @qwen38_vision_workspace(%rows: index, %feature_columns: index) -> (offset, offset, offset, offset, offset) where [range(%rows, 4, 65536), multiple_of(%rows, 4)]
+
+func.decl pure @qwen38_vision_attention_offsets(%rows: index, %cohorts: index) -> (offset, offset) where [range(%rows, 4, 65536), multiple_of(%rows, 4), range(%cohorts, 1, 4)]
+
+check.case public @minimum_output_backed_workspace {
+  %rows = check.literal value(4) : index
+  %columns = check.literal value(5120) : index
+  %residual, %secondary, %statistics, %activation, %total = func.call pure @qwen38_vision_workspace(%rows, %columns) : (index, index) -> (offset, offset, offset, offset, offset)
+  %expected_residual = check.literal value(18432) : offset
+  %expected_secondary = check.literal value(0) : offset
+  %expected_statistics = check.literal value(32) : offset
+  %expected_activation = check.literal value(34432) : offset
+  // Statistics round to 256 bytes and activation rounds to 34560 bytes.
+  %expected_total = check.literal value(53248) : offset
+  check.expect.equal actual(%residual) expected(%expected_residual) : offset
+  check.expect.equal actual(%secondary) expected(%expected_secondary) : offset
+  check.expect.equal actual(%statistics) expected(%expected_statistics) : offset
+  check.expect.equal actual(%activation) expected(%expected_activation) : offset
+  check.expect.equal actual(%total) expected(%expected_total) : offset
+  check.return
+}
+
+check.case public @unaligned_private_workspace {
+  // 288x416 pixels have 468 patch rows and 117 output rows.
+  %rows = check.literal value(468) : index
+  %columns = check.literal value(2560) : index
+  %residual, %secondary, %statistics, %activation, %total = func.call pure @qwen38_vision_workspace(%rows, %columns) : (index, index) -> (offset, offset, offset, offset, offset)
+  %expected_residual = check.literal value(2156544) : offset
+  %expected_statistics = check.literal value(3744) : offset
+  %expected_activation = check.literal value(4028544) : offset
+  // Both residuals stay live; statistics/activation round independently.
+  %expected_total = check.literal value(8345600) : offset
+  check.expect.equal actual(%residual) expected(%expected_residual) : offset
+  check.expect.equal actual(%secondary) expected(%expected_residual) : offset
+  check.expect.equal actual(%statistics) expected(%expected_statistics) : offset
+  check.expect.equal actual(%activation) expected(%expected_activation) : offset
+  check.expect.equal actual(%total) expected(%expected_total) : offset
+  check.return
+}
+
+check.case public @residual_output_capacity_boundary {
+  %rows = check.literal value(4) : index
+  %exact_columns = check.literal value(4608) : index
+  %short_columns = check.literal value(4480) : index
+  %residual, %secondary, %statistics, %activation, %total = func.call pure @qwen38_vision_workspace(%rows, %exact_columns) : (index, index) -> (offset, offset, offset, offset, offset)
+  %short_residual, %short_secondary, %short_statistics, %short_activation, %short_total = func.call pure @qwen38_vision_workspace(%rows, %short_columns) : (index, index) -> (offset, offset, offset, offset, offset)
+  %empty = check.literal value(0) : offset
+  %bank = check.literal value(18432) : offset
+  %one_bank_total = check.literal value(53248) : offset
+  %two_bank_total = check.literal value(71680) : offset
+  check.expect.equal actual(%secondary) expected(%empty) : offset
+  check.expect.equal actual(%short_secondary) expected(%bank) : offset
+  check.expect.equal actual(%total) expected(%one_bank_total) : offset
+  check.expect.equal actual(%short_total) expected(%two_bank_total) : offset
+  check.return
+}
+
+check.case public @full_encoder_workspace {
+  %rows = check.literal value(4096) : index
+  %columns = check.literal value(2560) : index
+  %residual, %secondary, %statistics, %activation, %total = func.call pure @qwen38_vision_workspace(%rows, %columns) : (index, index) -> (offset, offset, offset, offset, offset)
+  %expected_residual = check.literal value(18874368) : offset
+  %expected_statistics = check.literal value(32768) : offset
+  %expected_activation = check.literal value(35258368) : offset
+  %expected_total = check.literal value(73039872) : offset
+  check.expect.equal actual(%residual) expected(%expected_residual) : offset
+  check.expect.equal actual(%secondary) expected(%expected_residual) : offset
+  check.expect.equal actual(%statistics) expected(%expected_statistics) : offset
+  check.expect.equal actual(%activation) expected(%expected_activation) : offset
+  check.expect.equal actual(%total) expected(%expected_total) : offset
+  check.return
+}
+
+check.case public @maximum_encoder_workspace {
+  %rows = check.literal value(65536) : index
+  %dense_columns = check.literal value(5120) : index
+  %moe_columns = check.literal value(2560) : index
+  %residual, %secondary, %statistics, %activation, %total = func.call pure @qwen38_vision_workspace(%rows, %dense_columns) : (index, index) -> (offset, offset, offset, offset, offset)
+  %moe_residual, %moe_secondary, %moe_statistics, %moe_activation, %moe_total = func.call pure @qwen38_vision_workspace(%rows, %moe_columns) : (index, index) -> (offset, offset, offset, offset, offset)
+  %expected_dense = check.literal value(866648064) : offset
+  %expected_moe = check.literal value(1168637952) : offset
+  check.expect.equal actual(%total) expected(%expected_dense) : offset
+  check.expect.equal actual(%moe_total) expected(%expected_moe) : offset
+  check.return
+}
+
+check.case public @resident_attention_banks {
+  %rows = check.literal value(468) : index
+  %one_cohort = check.literal value(1) : index
+  %two_cohorts = check.literal value(2) : index
+  %three_cohorts = check.literal value(3) : index
+  %four_cohorts = check.literal value(4) : index
+  %key1, %value1 = func.call pure @qwen38_vision_attention_offsets(%rows, %one_cohort) : (index, index) -> (offset, offset)
+  %key2, %value2 = func.call pure @qwen38_vision_attention_offsets(%rows, %two_cohorts) : (index, index) -> (offset, offset)
+  %key3, %value3 = func.call pure @qwen38_vision_attention_offsets(%rows, %three_cohorts) : (index, index) -> (offset, offset)
+  %key4, %value4 = func.call pure @qwen38_vision_attention_offsets(%rows, %four_cohorts) : (index, index) -> (offset, offset)
+  %expected_key = check.literal value(1078272) : offset
+  %expected_value1 = check.literal value(1347840) : offset
+  %expected_value2 = check.literal value(1617408) : offset
+  %expected_value3 = check.literal value(1886976) : offset
+  %expected_value4 = check.literal value(2156544) : offset
+  check.expect.equal actual(%key1) expected(%expected_key) : offset
+  check.expect.equal actual(%key2) expected(%expected_key) : offset
+  check.expect.equal actual(%key3) expected(%expected_key) : offset
+  check.expect.equal actual(%key4) expected(%expected_key) : offset
+  check.expect.equal actual(%value1) expected(%expected_value1) : offset
+  check.expect.equal actual(%value2) expected(%expected_value2) : offset
+  check.expect.equal actual(%value3) expected(%expected_value3) : offset
+  check.expect.equal actual(%value4) expected(%expected_value4) : offset
+  // Four V banks occupy another 1078272 bytes, ending at 3234816,
+  // below the FFN allocation's 4028544-byte endpoint.
+  check.return
+}
+
+check.benchmark<@minimum_output_backed_workspace> @workspace_minimum
+
+check.benchmark<@unaligned_private_workspace> @workspace_padding
+
+check.benchmark<@residual_output_capacity_boundary> @workspace_output_boundary
+
+check.benchmark<@full_encoder_workspace> @workspace_full_encoder
+
+check.benchmark<@maximum_encoder_workspace> @workspace_maximum
+
+check.benchmark<@resident_attention_banks> @workspace_attention_cohorts

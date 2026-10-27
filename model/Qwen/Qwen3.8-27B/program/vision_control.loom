@@ -10,6 +10,8 @@
 //
 func.decl import("runner") @execute_2(%stage: i32, %input: hal.buffer, %output: hal.buffer) -> (i64)
 
+func.decl pure @qwen38_vision_workspace(%rows: index, %feature_columns: index) -> (offset, offset, offset, offset, offset) where [range(%rows, 4, 65536), multiple_of(%rows, 4)]
+
 func.decl @qwen38_vision_pixel_packet(%request: buffer) -> (buffer)
 
 func.decl @qwen38_vision_stage(%height: i64, %width: i64, %count: i64) -> (i32)
@@ -42,23 +44,14 @@ func.def public @qwen38_vision_forecast_memory(%state: buffer, %ranges: buffer, 
     %next_largest = scf.select %larger, %rows, %largest : i64
     scf.yield %next_total, %next_largest : i64, i64
   }
-  // The command reuses one workspace across images: four patch rows per
-  // feature, each with 4608 residual, 8 statistics, and 8608 activation bytes.
-  // Residuals are already 256-byte aligned; the other two buffers round up.
-  %residual_per_feature = scalar.constant 18432 : i64
-  %statistics_per_feature = scalar.constant 32 : i64
-  %activation_per_feature = scalar.constant 34432 : i64
-  %alignment_padding = scalar.constant 255 : i64
-  %alignment_mask = scalar.constant -256 : i64
-  %residual = scalar.muli %largest_rows, %residual_per_feature : i64
-  %statistics = scalar.muli %largest_rows, %statistics_per_feature : i64
-  %activation = scalar.muli %largest_rows, %activation_per_feature : i64
-  %statistics_padded = scalar.addi %statistics, %alignment_padding : i64
-  %activation_padded = scalar.addi %activation, %alignment_padding : i64
-  %statistics_aligned = scalar.andi %statistics_padded, %alignment_mask : i64
-  %activation_aligned = scalar.andi %activation_padded, %alignment_mask : i64
-  %intermediates = scalar.addi %statistics_aligned, %activation_aligned : i64
-  %workspace = scalar.addi %residual, %intermediates : i64
+  // Four patch rows form one feature. The command and admission share the
+  // same allocation lengths and output-backed residual lifetime.
+  %patches_per_feature = scalar.constant 4 : i64
+  %patch_rows64 = scalar.muli %largest_rows, %patches_per_feature : i64
+  %patch_rows = index.cast %patch_rows64 : i64 to index
+  %feature_columns = index.constant 5120 : index
+  %residual_bytes, %secondary_bytes, %statistics_bytes, %activation_bytes, %workspace_bytes = func.call pure @qwen38_vision_workspace(%patch_rows, %feature_columns) : (index, index) -> (offset, offset, offset, offset, offset)
+  %workspace = index.cast %workspace_bytes : offset to i64
   // The F16/F32 projector bank occupies 927592448 bytes; round to 1 GiB.
   // Its direct-import policy needs no preparation staging. Peer images may
   // have larger original pixel planes, so use the full prepared upload cap.
