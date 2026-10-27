@@ -14,15 +14,22 @@ func.decl @vision_widen(%bf16: i1, %bits: i16) -> (f32)
 
 func.decl @vision_gelu(%input: f32) -> (f32)
 
+config.decl @vision_ffn_test.rows : %value: index where [range(%value, 4, 68), multiple_of(%value, 4)]
+
+func.def pure inline @ffn_rows() -> (index) {
+  %rows = config.get @vision_ffn_test.rows : index
+  func.return %rows : index
+}
+
 template.decl @qwen38.vision.statistics(%rows: index, %residual: buffer, %statistics: buffer)
 
 kernel.def target(@vision_test_wave32) @statistics() {
-  %rows = index.constant 68 : index
+  %rows = config.get @vision_ffn_test.rows : index
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%residual: buffer, %statistics: buffer) {
-  %rows = index.constant 68 : index
+  %rows = config.get @vision_ffn_test.rows : index
   template.apply<@qwen38.vision.statistics>(%rows, %residual, %statistics) : (index, buffer, buffer)
   kernel.return
 }
@@ -30,13 +37,17 @@ kernel.def target(@vision_test_wave32) @statistics() {
 template.decl @qwen38.vision.ffn_up(%rows: index, %bf16: i1, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %up_weight: buffer, %up_bias: buffer, %activation: buffer)
 
 kernel.def target(@vision_test_wave32) @ffn_up() {
-  %row_tiles = index.constant 2 : index
+  %rows = config.get @vision_ffn_test.rows : index
+  %tile = index.constant 64 : index
+  %tail = index.constant 63 : index
+  %rounded_rows = index.add %rows, %tail : index
+  %row_tiles = index.div %rounded_rows, %tile : index
   %column_tiles = index.constant 23 : index
   %threads = index.constant 384 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%row_tiles, %column_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%bf16: i1, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %up_weight: buffer, %up_bias: buffer, %activation: buffer) {
-  %rows = index.constant 68 : index
+  %rows = config.get @vision_ffn_test.rows : index
   template.apply<@qwen38.vision.ffn_up>(%rows, %bf16, %residual, %statistics, %layernorm_weight, %layernorm_bias, %up_weight, %up_bias, %activation) : (index, i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }
@@ -44,13 +55,17 @@ kernel.def target(@vision_test_wave32) @ffn_up() {
 template.decl @qwen38.vision.ffn_down(%rows: index, %bf16: i1, %activation: buffer, %down_weight: buffer, %down_bias: buffer, %residual: buffer)
 
 kernel.def target(@vision_test_wave32) @ffn_down() {
-  %row_tiles = index.constant 2 : index
+  %rows = config.get @vision_ffn_test.rows : index
+  %tile = index.constant 64 : index
+  %tail = index.constant 63 : index
+  %rounded_rows = index.add %rows, %tail : index
+  %row_tiles = index.div %rounded_rows, %tile : index
   %column_tiles = index.constant 9 : index
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%row_tiles, %column_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%bf16: i1, %activation: buffer, %down_weight: buffer, %down_bias: buffer, %residual: buffer) {
-  %rows = index.constant 68 : index
+  %rows = config.get @vision_ffn_test.rows : index
   template.apply<@qwen38.vision.ffn_down>(%rows, %bf16, %activation, %down_weight, %down_bias, %residual) : (index, i1, buffer, buffer, buffer, buffer)
   kernel.return
 }
@@ -175,16 +190,16 @@ func.def @ffn_fixture(%bf16: i1, %residual: buffer, %scale: buffer, %shift: buff
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
-  %rows = index.constant 68 : index
+  %rows = config.get @vision_ffn_test.rows : index
   %width = index.constant 1152 : index
   %hidden = index.constant 4304 : index
-  %residual_view = buffer.view %residual[%origin] : buffer -> view<68x1152xf32>
+  %residual_view = buffer.view %residual[%origin] : buffer -> view<[%rows]x1152xf32>
   %scale_view = buffer.view %scale[%origin] : buffer -> view<1152xf32>
   %shift_view = buffer.view %shift[%origin] : buffer -> view<1152xf32>
   scf.for %row = [%c0 to %rows step %c1] {
     scf.for %column = [%c0 to %width step %c1] {
       %value = func.call @ffn_residual(%row, %column) : (index, index) -> (f32)
-      view.store %value, %residual_view[%row, %column] : f32, view<68x1152xf32>
+      view.store %value, %residual_view[%row, %column] : f32, view<[%rows]x1152xf32>
     }
   }
   scf.for %column = [%c0 to %width step %c1] {
@@ -214,11 +229,11 @@ func.def @ffn_reference(%bf16: i1, %activation: buffer, %output: buffer) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
-  %rows = index.constant 68 : index
+  %rows = config.get @vision_ffn_test.rows : index
   %width = index.constant 1152 : index
   %hidden = index.constant 4304 : index
-  %activation_view = buffer.view %activation[%origin] : buffer -> view<68x4304xi16>
-  %output_view = buffer.view %output[%origin] : buffer -> view<68x1152xf32>
+  %activation_view = buffer.view %activation[%origin] : buffer -> view<[%rows]x4304xi16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x1152xf32>
   scf.for %row = [%c0 to %rows step %c1] {
     scf.for %channel = [%c0 to %hidden step %c1] {
       %first, %second, %last, %a, %b, %c, %bias = func.call @ffn_taps(%width, %channel) : (index, index) -> (index, index, index, f32, f32, f32, f32)
@@ -233,13 +248,13 @@ func.def @ffn_reference(%bf16: i1, %activation: buffer, %output: buffer) {
       %biased = scalar.addf %abc, %bias : f32
       %gelu_f32 = func.call @vision_gelu(%biased) : (f32) -> (f32)
       %bits = func.call @vision_round(%bf16, %gelu_f32) : (i1, f32) -> (i16)
-      view.store %bits, %activation_view[%row, %channel] : i16, view<68x4304xi16>
+      view.store %bits, %activation_view[%row, %channel] : i16, view<[%rows]x4304xi16>
     }
     scf.for %channel = [%c0 to %width step %c1] {
       %first, %second, %last, %a, %b, %c, %bias = func.call @ffn_taps(%hidden, %channel) : (index, index) -> (index, index, index, f32, f32, f32, f32)
-      %x_bits = view.load %activation_view[%row, %first] : view<68x4304xi16> -> i16
-      %y_bits = view.load %activation_view[%row, %second] : view<68x4304xi16> -> i16
-      %z_bits = view.load %activation_view[%row, %last] : view<68x4304xi16> -> i16
+      %x_bits = view.load %activation_view[%row, %first] : view<[%rows]x4304xi16> -> i16
+      %y_bits = view.load %activation_view[%row, %second] : view<[%rows]x4304xi16> -> i16
+      %z_bits = view.load %activation_view[%row, %last] : view<[%rows]x4304xi16> -> i16
       %x = func.call @vision_widen(%bf16, %x_bits) : (i1, i16) -> (f32)
       %y = func.call @vision_widen(%bf16, %y_bits) : (i1, i16) -> (f32)
       %z = func.call @vision_widen(%bf16, %z_bits) : (i1, i16) -> (f32)
@@ -251,7 +266,7 @@ func.def @ffn_reference(%bf16: i1, %activation: buffer, %output: buffer) {
       %biased = scalar.addf %abc, %bias : f32
       %residual = func.call @ffn_residual(%row, %channel) : (index, index) -> (f32)
       %result = scalar.addf %residual, %biased : f32
-      view.store %result, %output_view[%row, %channel] : f32, view<68x1152xf32>
+      view.store %result, %output_view[%row, %channel] : f32, view<[%rows]x1152xf32>
     }
   }
   func.return
@@ -269,12 +284,12 @@ func.def @ffn_complete_reference(%bf16: i1, %residual: buffer, %statistics: buff
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
-  %rows = index.constant 68 : index
-  %statistics_view = buffer.view %statistics[%origin] : buffer -> view<68x2xf32>
+  %rows = config.get @vision_ffn_test.rows : index
+  %statistics_view = buffer.view %statistics[%origin] : buffer -> view<[%rows]x2xf32>
   scf.for %row = [%c0 to %rows step %c1] {
     %mean, %inverse = func.call @ffn_statistics_reference(%row) : (index) -> (f32, f32)
-    view.store %mean, %statistics_view[%row, %c0] : f32, view<68x2xf32>
-    view.store %inverse, %statistics_view[%row, %c1] : f32, view<68x2xf32>
+    view.store %mean, %statistics_view[%row, %c0] : f32, view<[%rows]x2xf32>
+    view.store %inverse, %statistics_view[%row, %c1] : f32, view<[%rows]x2xf32>
   }
   func.call @ffn_reference(%bf16, %activation, %residual) : (i1, buffer, buffer)
   func.return
@@ -292,11 +307,12 @@ check.scenario public @vision_ffn_f16 {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   %bf16 = check.literal value(false) : i1
   check.trial[1](%trial: index, %entropy: check.entropy) {
+    %rows = check.generate<@ffn_rows>() : () -> (index)
     %residual_storage = check.generate.fill value(99.0) : tensor<78368xf32>
-    %residual = check.tensor.view %residual_storage offset(64) : tensor<78368xf32> -> tensor<68x1152xf32>
+    %residual = check.tensor.view %residual_storage offset(64) : tensor<78368xf32> -> tensor<[%rows]x1152xf32>
     %residual_prefix = check.tensor.view %residual_storage offset(0) : tensor<78368xf32> -> tensor<16xf32>
     %residual_suffix = check.tensor.view %residual_storage offset(313408) : tensor<78368xf32> -> tensor<16xf32>
-    %statistics = check.generate.fill value(99.0) : tensor<68x2xf32>
+    %statistics = check.generate.fill value(99.0) : tensor<[%rows]x2xf32>
     %scale = check.generate.fill value(0.0) : tensor<1152xf32>
     %shift = check.generate.fill value(0.0) : tensor<1152xf32>
     %up_weight = check.generate.fill value(0.0) : tensor<4304x1152xf16>
@@ -304,14 +320,14 @@ check.scenario public @vision_ffn_f16 {
     %down_weight = check.generate.fill value(0.0) : tensor<1152x4304xf16>
     %down_bias = check.generate.fill value(0.0) : tensor<1152xf32>
     %activation_storage = check.generate.fill value(99.0) : tensor<292736xf16>
-    %activation = check.tensor.view %activation_storage offset(64) : tensor<292736xf16> -> tensor<68x4304xf16>
+    %activation = check.tensor.view %activation_storage offset(64) : tensor<292736xf16> -> tensor<[%rows]x4304xf16>
     %activation_prefix = check.tensor.view %activation_storage offset(0) : tensor<292736xf16> -> tensor<32xf16>
     %activation_suffix = check.tensor.view %activation_storage offset(585408) : tensor<292736xf16> -> tensor<32xf16>
-    check.generate<@ffn_fixture>(%bf16, %residual, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias) : (i1, tensor<68x1152xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<4304x1152xf16>, tensor<4304xf32>, tensor<1152x4304xf16>, tensor<1152xf32>) -> ()
-    check.compare<@ffn_complete, @ffn_f16_reference>[%bf16](%residual, %statistics, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias, %activation) : [i1](tensor<68x1152xf32>, tensor<68x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<4304x1152xf16>, tensor<4304xf32>, tensor<1152x4304xf16>, tensor<1152xf32>, tensor<68x4304xf16>) -> () {
-      check.expect.close actual(%statistics) expected(%statistics) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<68x2xf32>
-      check.expect.close actual(%activation) expected(%activation) atol(0.00050000000000000001) rtol(0.001) nan(different) : tensor<68x4304xf16>
-      check.expect.close actual(%residual) expected(%residual) atol(0.00020000000000000001) rtol(0.0001) nan(different) : tensor<68x1152xf32>
+    check.generate<@ffn_fixture>(%bf16, %residual, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias) : (i1, tensor<[%rows]x1152xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<4304x1152xf16>, tensor<4304xf32>, tensor<1152x4304xf16>, tensor<1152xf32>) -> ()
+    check.compare<@ffn_complete, @ffn_f16_reference>[%bf16](%residual, %statistics, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias, %activation) : [i1](tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<4304x1152xf16>, tensor<4304xf32>, tensor<1152x4304xf16>, tensor<1152xf32>, tensor<[%rows]x4304xf16>) -> () {
+      check.expect.close actual(%statistics) expected(%statistics) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<[%rows]x2xf32>
+      check.expect.close actual(%activation) expected(%activation) atol(0.00050000000000000001) rtol(0.001) nan(different) : tensor<[%rows]x4304xf16>
+      check.expect.close actual(%residual) expected(%residual) atol(0.00020000000000000001) rtol(0.0001) nan(different) : tensor<[%rows]x1152xf32>
       check.expect.bitwise actual(%residual_prefix) expected(%residual_prefix) : tensor<16xf32>
       check.expect.bitwise actual(%residual_suffix) expected(%residual_suffix) : tensor<16xf32>
       check.expect.bitwise actual(%activation_prefix) expected(%activation_prefix) : tensor<32xf16>
@@ -327,7 +343,7 @@ check.scenario public @vision_ffn_f16 {
   check.return
 }
 
-check.benchmark<@vision_ffn_f16> @vision_ffn_f16_full_and_tail
+check.benchmark<@vision_ffn_f16> @vision_ffn_f16_complete
 
 func.def @ffn_bf16_reference(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %up_weight: buffer, %up_bias: buffer, %down_weight: buffer, %down_bias: buffer, %activation: buffer) {
   %bf16 = scalar.constant true : i1
@@ -341,11 +357,12 @@ check.scenario public @vision_ffn_bf16 {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   %bf16 = check.literal value(true) : i1
   check.trial[1](%trial: index, %entropy: check.entropy) {
+    %rows = check.generate<@ffn_rows>() : () -> (index)
     %residual_storage = check.generate.fill value(99.0) : tensor<78368xf32>
-    %residual = check.tensor.view %residual_storage offset(64) : tensor<78368xf32> -> tensor<68x1152xf32>
+    %residual = check.tensor.view %residual_storage offset(64) : tensor<78368xf32> -> tensor<[%rows]x1152xf32>
     %residual_prefix = check.tensor.view %residual_storage offset(0) : tensor<78368xf32> -> tensor<16xf32>
     %residual_suffix = check.tensor.view %residual_storage offset(313408) : tensor<78368xf32> -> tensor<16xf32>
-    %statistics = check.generate.fill value(99.0) : tensor<68x2xf32>
+    %statistics = check.generate.fill value(99.0) : tensor<[%rows]x2xf32>
     %scale = check.generate.fill value(0.0) : tensor<1152xf32>
     %shift = check.generate.fill value(0.0) : tensor<1152xf32>
     %up_weight = check.generate.fill value(0.0) : tensor<4304x1152xbf16>
@@ -353,14 +370,14 @@ check.scenario public @vision_ffn_bf16 {
     %down_weight = check.generate.fill value(0.0) : tensor<1152x4304xbf16>
     %down_bias = check.generate.fill value(0.0) : tensor<1152xf32>
     %activation_storage = check.generate.fill value(99.0) : tensor<292736xbf16>
-    %activation = check.tensor.view %activation_storage offset(64) : tensor<292736xbf16> -> tensor<68x4304xbf16>
+    %activation = check.tensor.view %activation_storage offset(64) : tensor<292736xbf16> -> tensor<[%rows]x4304xbf16>
     %activation_prefix = check.tensor.view %activation_storage offset(0) : tensor<292736xbf16> -> tensor<32xbf16>
     %activation_suffix = check.tensor.view %activation_storage offset(585408) : tensor<292736xbf16> -> tensor<32xbf16>
-    check.generate<@ffn_fixture>(%bf16, %residual, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias) : (i1, tensor<68x1152xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<4304x1152xbf16>, tensor<4304xf32>, tensor<1152x4304xbf16>, tensor<1152xf32>) -> ()
-    check.compare<@ffn_complete, @ffn_bf16_reference>[%bf16](%residual, %statistics, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias, %activation) : [i1](tensor<68x1152xf32>, tensor<68x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<4304x1152xbf16>, tensor<4304xf32>, tensor<1152x4304xbf16>, tensor<1152xf32>, tensor<68x4304xbf16>) -> () {
-      check.expect.close actual(%statistics) expected(%statistics) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<68x2xf32>
-      check.expect.close actual(%activation) expected(%activation) atol(0.0040000000000000001) rtol(0.0080000000000000002) nan(different) : tensor<68x4304xbf16>
-      check.expect.close actual(%residual) expected(%residual) atol(0.002) rtol(0.0001) nan(different) : tensor<68x1152xf32>
+    check.generate<@ffn_fixture>(%bf16, %residual, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias) : (i1, tensor<[%rows]x1152xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<4304x1152xbf16>, tensor<4304xf32>, tensor<1152x4304xbf16>, tensor<1152xf32>) -> ()
+    check.compare<@ffn_complete, @ffn_bf16_reference>[%bf16](%residual, %statistics, %scale, %shift, %up_weight, %up_bias, %down_weight, %down_bias, %activation) : [i1](tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<4304x1152xbf16>, tensor<4304xf32>, tensor<1152x4304xbf16>, tensor<1152xf32>, tensor<[%rows]x4304xbf16>) -> () {
+      check.expect.close actual(%statistics) expected(%statistics) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<[%rows]x2xf32>
+      check.expect.close actual(%activation) expected(%activation) atol(0.0040000000000000001) rtol(0.0080000000000000002) nan(different) : tensor<[%rows]x4304xbf16>
+      check.expect.close actual(%residual) expected(%residual) atol(0.002) rtol(0.0001) nan(different) : tensor<[%rows]x1152xf32>
       check.expect.bitwise actual(%residual_prefix) expected(%residual_prefix) : tensor<16xf32>
       check.expect.bitwise actual(%residual_suffix) expected(%residual_suffix) : tensor<16xf32>
       check.expect.bitwise actual(%activation_prefix) expected(%activation_prefix) : tensor<32xbf16>
@@ -376,4 +393,4 @@ check.scenario public @vision_ffn_bf16 {
   check.return
 }
 
-check.benchmark<@vision_ffn_bf16> @vision_ffn_bf16_full_and_tail
+check.benchmark<@vision_ffn_bf16> @vision_ffn_bf16_complete

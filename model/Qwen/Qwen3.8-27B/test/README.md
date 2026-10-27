@@ -12,46 +12,11 @@ Loom tools; benchmark smoke establishes execution, not performance.
 | Gated DeltaNet | Serial four-tap convolution and recurrence, retained forks, span ownership, speculative capture, and accepted-state publication. |
 | Selection and inputs | Token/feature gather, lower-ID ties, per-owner sampling streams and permissions, selected-row padding, and MTP carry. Tied-logit sampling uses an analytic maximum-uniform reference rather than the production sampler. |
 | DFlash2 | Context attention, proposal packing, candidate selection, and grouped convolution with independently specified buffers and expected state. |
-| Vision projector | Minimum, square, and rectangular geometries across patch embedding, attention, feed-forward, normalization, and merger stages. |
 
-`vision_key_value` checks all sixteen heads against two signed scalar taps per
-channel, including the last reduction column. A 6×6 patch grid crosses the
-32-row tile boundary and exercises both rotary axes, the four-channel head
-tails, and transposed value publication. The actual dense F16 launch executes
-four cohort commands; BF16 uses one concurrent all-head launch. Guards and
-immutable inputs check ownership independently of the numerical comparisons.
-
-`vision_attention` checks nonuniform attention against a logical scalar
-reference with a complete-row softmax. The rectangular 6×12 patch grid
-exercises both rotary axes, all sixteen heads, 72-channel tails, and partial
-query/key tiles. Separate sparse output projections cover a full 64-row tile
-and its tail without inheriting the attention comparison's rounding allowance.
-Both F16 and BF16 checks guard output ranges and preserve all input buffers.
-
-`vision_merger` checks the complete up/GELU/down sequence at both the dense
-F16/5120 and Flash-Next BF16/2560 feature widths. Seventy rows cross a full tile
-and a six-row tail. A scalar two-tap reference varies signs and source columns,
-includes the final reduction column, and uses F64 GELU algebra. Assertions
-observe rounded activations and final features separately, with guarded output
-and immutable input/weight checks. The F16 case uses the actual dense leaves.
-
-`vision_patch_*` checks the cross-product of F16/BF16 compute and original-half/
-F32 checkpoint storage. Coordinate-coded RGB8 pixels, signed channel-varying
-weights, two temporal matrices, and a last-column tap give an independent
-sparse convolution reference. Seventy-two patches cover a full tile and a
-tail; a nonzero source origin and output guards exercise the buffer ABI.
-F16/half calls the actual dense leaf. Other representations call the same
-shared motif with test-owned specialization facts. No complete checkpoint or
-offline tensor conversion is needed.
-
-Feed-forward numerical cases and benchmarks are owned by the shared
-[vision package](../../../../motif/vision/qwen3_8/test/README.md).
-
-Rectangular normalization uses a linear spatial field with alternating channel
-signs. Its interpolated values and population moments have a closed form, so
-the reference does not repeat the GPU interpolation or reduction. Both image
-orientations cover fractional positions, boundaries, and 2×2 merge-block order;
-residuals, statistics, and normalized output are checked separately.
+Vision numerical cases and benchmarks live in the shared
+[vision package](../../../../motif/vision/qwen3_8/test/README.md). It owns
+precision, geometry, numerical references, and device profiles independently
+of model composition and checkpoint acquisition.
 
 The full-width Q5 staging comparison uses weights on a `2^-10` lattice and
 inputs in `{-1, 0, 1}`. Its `2^-12` absolute budget is one quarter of the
