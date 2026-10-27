@@ -163,6 +163,82 @@ class RequestCheckTest(unittest.TestCase):
                     self.assertFalse(value["reusable"])
                     self.assertTrue(value["checkpoint"].endswith("<|im_end|>\n"))
 
+    def test_leading_instruction_roles_share_the_model_envelope(self):
+        for thinking in (False, True):
+            for tools in ([], TOOLS):
+                with self.subTest(thinking=thinking, tools=bool(tools)):
+                    request = self.request(
+                        enable_thinking=thinking,
+                        tools=tools,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "  Follow the project rules.  ",
+                            },
+                            {"role": "user", "content": "Hello λ."},
+                        ],
+                    )
+                    expected = self.success(self.execute(request))
+                    request["messages"][0]["role"] = "developer"
+                    actual = self.success(self.execute(request))
+                    self.assertEqual(actual["prompt"], expected["prompt"])
+                    self.assertEqual(actual["tokens"], expected["tokens"])
+                    self.assertEqual(actual["prompt"].count("<|im_start|>system\n"), 1)
+                    self.assertIn(
+                        "Follow the project rules.<|im_end|>\n", actual["prompt"]
+                    )
+
+    def test_instruction_envelope_cannot_be_reintroduced(self):
+        for role in ("system", "developer"):
+            for preceding_role in ("system", "developer", "user"):
+                with self.subTest(role=role, preceding_role=preceding_role):
+                    result = self.execute(
+                        self.request(
+                            messages=[
+                                {"role": preceding_role, "content": "First."},
+                                {"role": role, "content": "Second."},
+                                {"role": "user", "content": "Hello λ."},
+                            ]
+                        )
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(
+                        "unsupported role, role fields, or message order", result.stderr
+                    )
+
+    def test_developer_tool_round_trip_with_omitted_thinking(self):
+        # Generic clients use developer for a reasoning-capable model even
+        # when the current turn leaves reasoning disabled by omission.
+        request = {
+            "model": "qwen3.8-policy-test",
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "store": False,
+            "max_completion_tokens": 16384,
+            "tools": TOOLS,
+            "messages": [
+                {"role": "developer", "content": "Follow the project rules."},
+                {"role": "user", "content": "Read a.txt."},
+            ],
+        }
+        response = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"
+        first = self.success(self.execute(request, response, chunk_size=7))
+        self.assertTrue(first["reusable"])
+        self.assertEqual(len(first["tool_calls"]), 1)
+        call = {
+            key: value
+            for key, value in first["tool_calls"][0].items()
+            if key != "index"
+        }
+        request["messages"] += [
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": call["id"], "content": "Found it."},
+        ]
+        following = self.success(self.execute(request))
+        self.assertTrue(following["prompt"].startswith(first["checkpoint"]))
+        self.assertTrue(following["prompt"].endswith("<think>\n\n</think>\n\n"))
+
     def test_thinking_defaults_off_and_remains_request_selectable(self):
         for tools in ([], TOOLS):
             with self.subTest(tools=bool(tools)):
@@ -199,6 +275,309 @@ class RequestCheckTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertIn("image_url must be a base64", result.stderr)
+
+    def test_reasoning_efforts_select_exact_checkpoint_prompts(self):
+        instructions = {
+            "none": "",
+            "low": (
+                "Reasoning effort is set to low. Keep your thinking brief and focused, "
+                "moving directly to the conclusion without unnecessary elaboration."
+            ),
+            "medium": "",
+            "xhigh": (
+                "Reasoning effort is set to xhigh. Please think carefully through the task, "
+                "validate key assumptions, consider plausible alternatives, and prioritize "
+                "correctness, consistency, and clarity in the final answer."
+            ),
+        }
+        for effort, instruction in instructions.items():
+            for system in ("", "Follow the project rules."):
+                with self.subTest(effort=effort, system=system):
+                    request = self.request(reasoning_effort=effort)
+                    del request["enable_thinking"]
+                    if system:
+                        request["messages"].insert(
+                            0, {"role": "developer", "content": system}
+                        )
+                    value = self.success(self.execute(request))
+                    system_text = "\n\n".join(
+                        text for text in (instruction, system) if text
+                    )
+                    prefix = (
+                        "<|im_start|>system\n" + system_text + "<|im_end|>\n"
+                        if system_text
+                        else ""
+                    )
+                    generation = "<|im_start|>assistant\n<think>\n"
+                    if effort == "none":
+                        generation += "\n</think>\n\n"
+                    expected = (
+                        prefix + "<|im_start|>user\nHello λ.<|im_end|>\n" + generation
+                    )
+                    self.assertEqual(value["prompt"], expected)
+                    self.assertEqual(
+                        bytes(value["request_options"]),
+                        struct.pack("<ffiiq", 0, 1, 0, 0, 1),
+                    )
+                    request["enable_thinking"] = effort != "none"
+                    self.assertEqual(
+                        self.success(self.execute(request))["prompt"], expected
+                    )
+
+    def test_reasoning_aliases_preserve_tools_and_instruction_order(self):
+        for alias, canonical in (
+            ("minimal", "low"),
+            ("high", "xhigh"),
+            ("max", "xhigh"),
+        ):
+            with self.subTest(alias=alias):
+                request = self.request(
+                    enable_thinking=True, tools=TOOLS, reasoning_effort=canonical
+                )
+                expected = self.success(self.execute(request))
+                request["reasoning_effort"] = alias
+                self.assertEqual(self.success(self.execute(request)), expected)
+        request = self.request(enable_thinking=True, tools=TOOLS)
+        enabled = self.success(self.execute(request))
+        request["reasoning_effort"] = "xhigh"
+        self.assertEqual(self.success(self.execute(request)), enabled)
+        request["reasoning_effort"] = "medium"
+        medium = self.success(self.execute(request))
+        instruction = enabled["prompt"].split("\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(
+            medium["prompt"], enabled["prompt"].replace(instruction + "\n\n", "", 1)
+        )
+
+    def test_reasoning_options_reject_conflicts_and_invalid_values(self):
+        for effort in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=effort):
+                request = self.request(
+                    reasoning_effort=effort, enable_thinking=effort == "none"
+                )
+                result = self.execute(request)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("agree with enable_thinking", result.stderr)
+        for effort in (None, False, 1, [], {}, "", "LOW", "unknown"):
+            with self.subTest(effort=effort):
+                result = self.execute(self.request(reasoning_effort=effort))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+        request = json.dumps(self.request(enable_thinking=True, reasoning_effort="low"))
+        expected = self.success(self.execute(request))
+        escaped = request.replace('"low"', '"l\\u006fw"')
+        self.assertEqual(self.success(self.execute(escaped)), expected)
+        duplicate = request.replace('"low"', '"low", "reasoning_effort": "low"')
+        result = self.execute(duplicate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_template_controls_merge_semantics_independent_of_member_order(self):
+        selections = (
+            {"enable_thinking": False, "reasoning_effort": "none"},
+            {"enable_thinking": True, "reasoning_effort": "low"},
+            {"enable_thinking": True, "reasoning_effort": "medium"},
+            {"enable_thinking": True, "reasoning_effort": "xhigh"},
+            {"preserve_thinking": False},
+            {"preserve_thinking": True},
+        )
+        for controls in selections:
+            with self.subTest(controls=controls):
+                request = self.request()
+                del request["enable_thinking"]
+                expected = self.success(self.execute({**request, **controls}))
+                for combined in (
+                    {**request, "chat_template_kwargs": controls},
+                    {**request, **controls, "chat_template_kwargs": controls},
+                    {"chat_template_kwargs": controls, **request, **controls},
+                ):
+                    self.assertEqual(self.success(self.execute(combined)), expected)
+        request = self.request(
+            enable_thinking=True,
+            reasoning_effort="high",
+            chat_template_kwargs={"reasoning_effort": "xhigh"},
+        )
+        expected = self.success(self.execute(request))
+        del request["chat_template_kwargs"]
+        self.assertEqual(self.success(self.execute(request)), expected)
+
+    def test_template_controls_reject_conflicts_types_duplicates_and_unknown_keys(self):
+        for name, top, nested in (
+            ("enable_thinking", True, False),
+            ("preserve_thinking", True, False),
+            ("reasoning_effort", "low", "medium"),
+        ):
+            request = self.request(
+                **{name: top, "chat_template_kwargs": {name: nested}}
+            )
+            for ordered in (request, dict(reversed(list(request.items())))):
+                result = self.execute(ordered)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("must agree", result.stderr)
+        invalid = (
+            None,
+            [],
+            True,
+            {"unknown": True},
+            {"enable_thinking": "false"},
+            {"reasoning_effort": None},
+            {"preserve_thinking": 1},
+        )
+        for controls in invalid:
+            with self.subTest(controls=controls):
+                result = self.execute(self.request(chat_template_kwargs=controls))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+        request = json.dumps(
+            self.request(chat_template_kwargs={"preserve_thinking": True})
+        )
+        request = request.replace(
+            '"preserve_thinking": true',
+            '"preserve_thinking": true, "preserve_thinking": true',
+        )
+        result = self.execute(request)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def history(self):
+        return [
+            {"role": "user", "content": "Old question."},
+            {
+                "role": "assistant",
+                "content": "Old answer.",
+                "reasoning_content": "  Old thought λ.  ",
+            },
+            {"role": "user", "content": "Current question."},
+            {
+                "role": "assistant",
+                "content": "Checking.",
+                "reasoning_content": "Current thought λ.",
+                "tool_calls": [
+                    {
+                        "id": "read_current",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": '{"path":"a.txt"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "read_current", "content": "Found it."},
+        ]
+
+    def test_history_trimming_keeps_current_tool_cycle_with_thinking_on_or_off(self):
+        for thinking in (False, True):
+            request = self.request(
+                enable_thinking=thinking, tools=TOOLS, messages=self.history()
+            )
+            preserved = self.success(self.execute(request))
+            request["preserve_thinking"] = True
+            self.assertEqual(self.success(self.execute(request)), preserved)
+            request["preserve_thinking"] = False
+            trimmed = self.success(self.execute(request))
+            expected = preserved["prompt"].replace(
+                "<|im_start|>assistant\n<think>\nOld thought λ.\n</think>\n\nOld answer.",
+                "<|im_start|>assistant\nOld answer.",
+                1,
+            )
+            self.assertNotEqual(expected, preserved["prompt"])
+            self.assertEqual(trimmed["prompt"], expected)
+            self.assertEqual(trimmed["request_options"], preserved["request_options"])
+            self.assertIn("<think>\nCurrent thought λ.\n</think>", trimmed["prompt"])
+
+    def test_user_form_tool_results_do_not_start_a_new_reasoning_cycle(self):
+        wrapped = " \n<tool_response>\nFound λ.\n</tool_response>\t"
+        for content in (
+            wrapped,
+            [{"type": "text", "text": text} for text in (wrapped[:8], wrapped[8:])],
+            [
+                {"type": "text", "text": "<tool_response>"},
+                self.image((1, 2, 3)),
+                {"type": "text", "text": "</tool_response>"},
+            ],
+        ):
+            request = self.request(tools=TOOLS, messages=self.history())
+            request["messages"][-1] = {"role": "user", "content": content}
+            preserved = self.success(self.execute(request))
+            request["preserve_thinking"] = False
+            trimmed = self.success(self.execute(request))
+            self.assertEqual(
+                trimmed["prompt"],
+                preserved["prompt"].replace(
+                    "<think>\nOld thought λ.\n</think>\n\n", "", 1
+                ),
+            )
+        for preserve in (False, True):
+            result = self.execute(
+                self.request(
+                    preserve_thinking=preserve,
+                    messages=[{"role": "user", "content": wrapped}],
+                )
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+
+    def test_real_user_parts_end_previous_reasoning_cycle_without_losing_images(self):
+        for content in (
+            "",
+            None,
+            [{"type": "text", "text": "New λ."}],
+            [self.image((1, 2, 3), width=640, height=320)],
+        ):
+            request = self.request(
+                tools=TOOLS,
+                messages=[*self.history(), {"role": "user", "content": content}],
+                model_options={"max_image_tokens": 128},
+            )
+            preserved = self.success(self.execute(request))
+            request["preserve_thinking"] = False
+            trimmed = self.success(self.execute(request))
+            expected = preserved["prompt"].replace(
+                "<think>\nOld thought λ.\n</think>\n\n", "", 1
+            )
+            expected = expected.replace(
+                "<think>\nCurrent thought λ.\n</think>\n\n", "", 1
+            )
+            self.assertEqual(trimmed["prompt"], expected)
+
+    def test_trimmed_history_retains_generated_tool_checkpoint_until_next_query(self):
+        request = self.request(
+            enable_thinking=True,
+            preserve_thinking=False,
+            tools=TOOLS,
+            messages=self.history()[:3],
+        )
+        response = (
+            "Current thought λ.\n</think>\n\nChecking.\n\n"
+            "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+        first = self.success(self.execute(request, response, chunk_size=7))
+        self.assertTrue(first["reusable"])
+        calls = [
+            {key: value for key, value in call.items() if key != "index"}
+            for call in first["tool_calls"]
+        ]
+        request["messages"].extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": first["content"],
+                    "reasoning_content": first["reasoning_content"],
+                    "tool_calls": calls,
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": calls[0]["id"],
+                    "content": "Found it.",
+                },
+            ]
+        )
+        following = self.success(self.execute(request))
+        self.assertTrue(following["prompt"].startswith(first["checkpoint"]))
+        request["messages"].append({"role": "user", "content": "Next question."})
+        next_query = self.success(self.execute(request))
+        self.assertNotIn("Current thought λ.", next_query["prompt"])
+        self.assertIn("Found it.", next_query["prompt"])
 
     def test_text_parts_preserve_order_and_have_no_media_spans(self):
         request = self.request()

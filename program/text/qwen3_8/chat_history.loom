@@ -1,0 +1,286 @@
+// Qwen's current tool cycle begins at the last real user query. User-form
+// tool_response wrappers continue that cycle instead of starting a new one.
+// Nested JSON records retain offsets into the original request; media payloads
+// are never copied while locating the boundary.
+func.decl import("json") @members_range(%source: buffer, %begin: i64, %length: i64) -> (buffer, i32, i64)
+
+func.decl import("json") @unescape(%source: buffer, %begin: i64, %length: i64, %target: buffer, %target_begin: i64) -> (i64)
+
+func.decl import("input") @require(%condition: i32, %diagnostic: buffer)
+
+global.rodata.def @role_key = bytes("726f6c65")
+
+global.rodata.def @content_key = bytes("636f6e74656e74")
+
+global.rodata.def @text_key = bytes("74657874")
+
+global.rodata.def @user_role = bytes("75736572")
+
+global.rodata.def @tool_open = bytes("3c746f6f6c5f726573706f6e73653e")
+
+global.rodata.def @tool_close = bytes("3c2f746f6f6c5f726573706f6e73653e")
+
+global.rodata.def @image = bytes("3c7c766973696f6e5f73746172747c3e3c7c696d6167655f7061647c3e3c7c766973696f6e5f656e647c3e")
+
+global.rodata.def @missing_query = bytes("5177656e20686973746f727920726571756972657320612075736572207175657279")
+
+func.def @equal_range(%source: buffer, %begin: i64, %length: i64, %expected: buffer) -> (i1) {
+  %expected_bytes = buffer.length %expected
+  %expected_length = index.cast %expected_bytes : offset to i64
+  %same_length = scalar.cmpi eq, %length, %expected_length : i64
+  %result = scf.if %same_length -> (i1) {
+    %bounded = scalar.assume %begin [range(%begin, 0, 9223372036854775807)] : i64
+    %position = index.cast %bounded : i64 to offset
+    %origin = index.constant 0 : offset
+    %order = buffer.compare %source[%position], %expected[%origin], %expected_bytes
+    %c0 = scalar.constant 0 : i32
+    %equal = scalar.cmpi eq, %order, %c0 : i32
+    scf.yield %equal : i1
+  } else {
+    %false = scalar.constant false : i1
+    scf.yield %false : i1
+  }
+  func.return %result : i1
+}
+
+func.def @is_space(%text: buffer, %position: offset) -> (i1) {
+  %byte = buffer.load.i8.u %text[%position]
+  %space = scalar.constant 32 : i32
+  %tab = scalar.constant 9 : i32
+  %return = scalar.constant 13 : i32
+  %is_space = scalar.cmpi eq, %byte, %space : i32
+  %after_tab = scalar.cmpi uge, %byte, %tab : i32
+  %before_return = scalar.cmpi ule, %byte, %return : i32
+  %control = scalar.andi %after_tab, %before_return : i1
+  %result = scalar.ori %is_space, %control : i1
+  func.return %result : i1
+}
+
+// Length can be smaller than the decode allocation's capacity. Empty queries
+// still count; only a complete, trimmed tool-response wrapper is excluded.
+func.def public @qwen38_chat_is_query(%text: buffer, %length: i64) -> (i1) {
+  %c0 = index.constant 0 : offset
+  %c1 = index.constant 1 : offset
+  %false = scalar.constant false : i1
+  %bounded = scalar.assume %length [range(%length, 0, 9223372036854775807)] : i64
+  %extent = index.cast %bounded : i64 to offset
+  %begin = scf.while(%position = %c0 : offset) -> (offset) {
+    %has_bytes = index.cmp ult, %position, %extent : offset
+    %advance = scf.if %has_bytes -> (i1) {
+      %space = func.call @is_space(%text, %position) : (buffer, offset) -> (i1)
+      scf.yield %space : i1
+    } else {
+      scf.yield %false : i1
+    }
+    scf.condition %advance, %position : i1, offset
+  } do(%position: offset) {
+    %next = index.add %position, %c1 : offset
+    scf.yield %next : offset
+  }
+  %end = scf.while(%position = %extent : offset) -> (offset) {
+    %has_bytes = index.cmp ugt, %position, %begin : offset
+    %retreat = scf.if %has_bytes -> (i1) {
+      %last = index.sub %position, %c1 : offset
+      %space = func.call @is_space(%text, %last) : (buffer, offset) -> (i1)
+      scf.yield %space : i1
+    } else {
+      scf.yield %false : i1
+    }
+    scf.condition %retreat, %position : i1, offset
+  } do(%position: offset) {
+    %next = index.sub %position, %c1 : offset
+    scf.yield %next : offset
+  }
+  %open = global.load @tool_open : buffer
+  %close = global.load @tool_close : buffer
+  %open_length = buffer.length %open
+  %close_length = buffer.length %close
+  %minimum = index.add %open_length, %close_length : offset
+  %trimmed = index.sub %end, %begin : offset
+  %fits = index.cmp uge, %trimmed, %minimum : offset
+  %wrapped = scf.if %fits -> (i1) {
+    %suffix = index.sub %end, %close_length : offset
+    %prefix_order = buffer.compare %text[%begin], %open[%c0], %open_length
+    %suffix_order = buffer.compare %text[%suffix], %close[%c0], %close_length
+    %zero32 = scalar.constant 0 : i32
+    %prefix_matches = scalar.cmpi eq, %prefix_order, %zero32 : i32
+    %suffix_matches = scalar.cmpi eq, %suffix_order, %zero32 : i32
+    %both = scalar.andi %prefix_matches, %suffix_matches : i1
+    scf.yield %both : i1
+  } else {
+    scf.yield %false : i1
+  }
+  %query = scalar.cmpi eq, %wrapped, %false : i1
+  func.return %query : i1
+}
+
+// Resolve a structured text part once. A zero start denotes a media marker;
+// native chat validation owns the complete content-part schema.
+func.def @text_part(%source: buffer, %begin: i64, %length: i64) -> (i64, i64) {
+  %fields, %type, %count = func.call @members_range(%source, %begin, %length) : (buffer, i64, i64) -> (buffer, i32, i64)
+  %bounded = scalar.assume %count [range(%count, 0, 2147483647)] : i64
+  %extent = index.cast %bounded : i64 to index
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %zero64 = scalar.constant 0 : i64
+  %records = buffer.view %fields[%origin] : buffer -> view<[%extent]x5xi64>
+  %key = global.load @text_key : buffer
+  %text_begin, %text_length = scf.for %i = [%c0 to %extent step %c1](%selected_begin = %zero64 : i64, %selected_length = %zero64 : i64) -> (i64, i64) {
+    %key_begin = view.load %records[%i, 0] : view<[%extent]x5xi64> -> i64
+    %key_length = view.load %records[%i, 1] : view<[%extent]x5xi64> -> i64
+    %matches = func.call @equal_range(%source, %key_begin, %key_length, %key) : (buffer, i64, i64, buffer) -> (i1)
+    %value_type = view.load %records[%i, 4] : view<[%extent]x5xi64> -> i64
+    %string = scalar.cmpi eq, %value_type, %zero64 : i64
+    %text = scalar.andi %matches, %string : i1
+    %value_begin = view.load %records[%i, 2] : view<[%extent]x5xi64> -> i64
+    %value_length = view.load %records[%i, 3] : view<[%extent]x5xi64> -> i64
+    %next_begin = scf.select %text, %value_begin, %selected_begin : i64
+    %next_length = scf.select %text, %value_length, %selected_length : i64
+    scf.yield %next_begin, %next_length : i64, i64
+  }
+  func.return %text_begin, %text_length : i64, i64
+}
+
+// Decode only user-visible text. The compact plan retains each part's range so
+// sizing and emission are linear, without reparsing or prefix concatenation.
+func.def @content_text(%source: buffer, %begin: i64, %length: i64, %type: i64) -> (buffer, i64) {
+  %zero64 = scalar.constant 0 : i64
+  %three64 = scalar.constant 3 : i64
+  %string = scalar.cmpi eq, %type, %zero64 : i64
+  %array = scalar.cmpi eq, %type, %three64 : i64
+  %result, %used = scf.if %string -> (buffer, i64) {
+    %bounded = scalar.assume %length [range(%length, 0, 9223372036854775807)] : i64
+    %capacity = index.cast %bounded : i64 to offset
+    %output = buffer.alloca<private> align(1) %capacity : buffer
+    %written = func.call @unescape(%source, %begin, %length, %output, %zero64) : (buffer, i64, i64, buffer, i64) -> (i64)
+    scf.yield %output, %written : buffer, i64
+  } else {
+    %output, %written = scf.if %array -> (buffer, i64) {
+      %fields, %container_type, %count = func.call @members_range(%source, %begin, %length) : (buffer, i64, i64) -> (buffer, i32, i64)
+      %bounded = scalar.assume %count [range(%count, 0, 2147483647)] : i64
+      %extent = index.cast %bounded : i64 to index
+      %origin = index.constant 0 : offset
+      %c0 = index.constant 0 : index
+      %c1 = index.constant 1 : index
+      %stride = index.constant 16 : offset
+      %plan_bytes = index.scale %extent, %stride : index, offset -> offset
+      %plan = buffer.alloca<private> align(8) %plan_bytes : buffer
+      %ranges = buffer.view %plan[%origin] : buffer -> view<[%extent]x2xi64>
+      %records = buffer.view %fields[%origin] : buffer -> view<[%extent]x5xi64>
+      %image = global.load @image : buffer
+      %image_bytes = buffer.length %image
+      %image_length = index.cast %image_bytes : offset to i64
+      %capacity64 = scf.for %i = [%c0 to %extent step %c1](%capacity = %zero64 : i64) -> (i64) {
+        %part_begin = view.load %records[%i, 2] : view<[%extent]x5xi64> -> i64
+        %part_length = view.load %records[%i, 3] : view<[%extent]x5xi64> -> i64
+        %text_begin, %text_length = func.call @text_part(%source, %part_begin, %part_length) : (buffer, i64, i64) -> (i64, i64)
+        view.store %text_begin, %ranges[%i, 0] : i64, view<[%extent]x2xi64>
+        view.store %text_length, %ranges[%i, 1] : i64, view<[%extent]x2xi64>
+        %media = scalar.cmpi eq, %text_begin, %zero64 : i64
+        %bytes = scf.select %media, %image_length, %text_length : i64
+        %next = scalar.addi %capacity, %bytes : i64
+        scf.yield %next : i64
+      }
+      %bounded_capacity = scalar.assume %capacity64 [range(%capacity64, 0, 9223372036854775807)] : i64
+      %capacity = index.cast %bounded_capacity : i64 to offset
+      %output = buffer.alloca<private> align(1) %capacity : buffer
+      %written = scf.for %i = [%c0 to %extent step %c1](%cursor = %zero64 : i64) -> (i64) {
+        %text_begin = view.load %ranges[%i, 0] : view<[%extent]x2xi64> -> i64
+        %text_length = view.load %ranges[%i, 1] : view<[%extent]x2xi64> -> i64
+        %media = scalar.cmpi eq, %text_begin, %zero64 : i64
+        %count = scf.if %media -> (i64) {
+          %bounded_cursor = scalar.assume %cursor [range(%cursor, 0, 9223372036854775807)] : i64
+          %position = index.cast %bounded_cursor : i64 to offset
+          buffer.copy %image[%origin], %output[%position], %image_bytes
+          scf.yield %image_length : i64
+        } else {
+          %decoded = func.call @unescape(%source, %text_begin, %text_length, %output, %cursor) : (buffer, i64, i64, buffer, i64) -> (i64)
+          scf.yield %decoded : i64
+        }
+        %next = scalar.addi %cursor, %count : i64
+        scf.yield %next : i64
+      }
+      scf.yield %output, %written : buffer, i64
+    } else {
+      %empty_size = index.constant 0 : offset
+      %empty = buffer.alloca<private> align(1) %empty_size : buffer
+      scf.yield %empty, %zero64 : buffer, i64
+    }
+    scf.yield %output, %written : buffer, i64
+  }
+  func.return %result, %used : buffer, i64
+}
+
+func.def @message_is_query(%source: buffer, %begin: i64, %length: i64) -> (i1) {
+  %fields, %type, %count = func.call @members_range(%source, %begin, %length) : (buffer, i64, i64) -> (buffer, i32, i64)
+  %bounded = scalar.assume %count [range(%count, 0, 2147483647)] : i64
+  %extent = index.cast %bounded : i64 to index
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %zero64 = scalar.constant 0 : i64
+  %null = scalar.constant 6 : i64
+  %false = scalar.constant false : i1
+  %records = buffer.view %fields[%origin] : buffer -> view<[%extent]x5xi64>
+  %role_key = global.load @role_key : buffer
+  %content_key = global.load @content_key : buffer
+  %user_role = global.load @user_role : buffer
+  %user, %content_begin, %content_length, %content_type = scf.for %i = [%c0 to %extent step %c1](%user = %false : i1, %selected_begin = %zero64 : i64, %selected_length = %zero64 : i64, %selected_type = %null : i64) -> (i1, i64, i64, i64) {
+    %key_begin = view.load %records[%i, 0] : view<[%extent]x5xi64> -> i64
+    %key_length = view.load %records[%i, 1] : view<[%extent]x5xi64> -> i64
+    %value_begin = view.load %records[%i, 2] : view<[%extent]x5xi64> -> i64
+    %value_length = view.load %records[%i, 3] : view<[%extent]x5xi64> -> i64
+    %value_type = view.load %records[%i, 4] : view<[%extent]x5xi64> -> i64
+    %role = func.call @equal_range(%source, %key_begin, %key_length, %role_key) : (buffer, i64, i64, buffer) -> (i1)
+    %is_user = func.call @equal_range(%source, %value_begin, %value_length, %user_role) : (buffer, i64, i64, buffer) -> (i1)
+    %next_user = scf.select %role, %is_user, %user : i1
+    %content = func.call @equal_range(%source, %key_begin, %key_length, %content_key) : (buffer, i64, i64, buffer) -> (i1)
+    %next_begin = scf.select %content, %value_begin, %selected_begin : i64
+    %next_length = scf.select %content, %value_length, %selected_length : i64
+    %next_type = scf.select %content, %value_type, %selected_type : i64
+    scf.yield %next_user, %next_begin, %next_length, %next_type : i1, i64, i64, i64
+  }
+  %query = scf.if %user -> (i1) {
+    %text, %length = func.call @content_text(%source, %content_begin, %content_length, %content_type) : (buffer, i64, i64, i64) -> (buffer, i64)
+    %real = func.call @qwen38_chat_is_query(%text, %length) : (buffer, i64) -> (i1)
+    scf.yield %real : i1
+  } else {
+    scf.yield %false : i1
+  }
+  func.return %query : i1
+}
+
+// One plus the last real user ordinal is the first assistant ordinal whose
+// thinking must be retained. Zero remains available to mean preserve all.
+func.def public @qwen38_chat_history_cutoff(%request: buffer, %begin: i64, %length: i64) -> (i64) {
+  %fields, %type, %count = func.call @members_range(%request, %begin, %length) : (buffer, i64, i64) -> (buffer, i32, i64)
+  %bounded = scalar.assume %count [range(%count, 0, 2147483647)] : i64
+  %extent = index.cast %bounded : i64 to index
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %zero64 = scalar.constant 0 : i64
+  %remaining, %cutoff = scf.while(%position = %extent : index, %selected = %zero64 : i64) -> (index, i64) {
+    %has_message = index.cmp ugt, %position, %c0 : index
+    %missing = scalar.cmpi eq, %selected, %zero64 : i64
+    %search = scalar.andi %has_message, %missing : i1
+    scf.condition %search, %position, %selected : i1, index, i64
+  } do(%position: index, %selected: i64) {
+    %i = index.sub %position, %c1 : index
+    // The counter starts at extent and only decreases while positive.
+    %current, %bound = index.assume %i, %extent [range(%i, 0, 2147483646), range(%extent, 1, 2147483647), lt(%i, %extent)] : index, index
+    %remaining_records = buffer.view %fields[%origin] : buffer -> view<[%bound]x5xi64>
+    %message_begin = view.load %remaining_records[%current, 2] : view<[%bound]x5xi64> -> i64
+    %message_length = view.load %remaining_records[%current, 3] : view<[%bound]x5xi64> -> i64
+    %query = func.call @message_is_query(%request, %message_begin, %message_length) : (buffer, i64, i64) -> (i1)
+    %ordinal = index.cast %position : index to i64
+    %next = scf.select %query, %ordinal, %zero64 : i64
+    scf.yield %i, %next : index, i64
+  }
+  %found = scalar.cmpi ne, %cutoff, %zero64 : i64
+  %found32 = scalar.extui %found : i1 to i32
+  %error = global.load @missing_query : buffer
+  func.call @require(%found32, %error) : (i32, buffer)
+  func.return %cutoff : i64
+}

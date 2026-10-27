@@ -15,6 +15,38 @@ remain withheld during streaming and are resolved at completion. Returned
 buffers have VM ownership; request-local scalar state remains opaque to the
 service caller.
 
+The model has one leading instruction envelope. Chat requests may spell that
+role `system` or `developer`; both render the same Qwen system tokens. A second
+instruction message or one after user/assistant history is rejected, since the
+checkpoint template has no corresponding role or priority boundary.
+
+`reasoning_effort` selects the checkpoint's trained prompt policy: `none` closes
+the thinking prefix, `low` requests brief reasoning, `medium` opens thinking
+without an extra instruction, and `xhigh` requests careful reasoning. The common
+client values `minimal`, `high`, and `max` alias `low`, `xhigh`, and `xhigh`,
+respectively; they do not introduce additional token budgets. Omitting both
+thinking controls keeps reasoning off. `enable_thinking=true` alone retains the
+checkpoint's xhigh policy. Explicit effort and enable/disable controls must
+agree. The sampling packet and device execution are independent of this prompt
+selection.
+
+The cold `text_chat_reasoning_v1` declaration advertises `none`, `low`, `medium`,
+and `xhigh` for model discovery, with `none` as the omission default. Accepted
+aliases do not appear as distinct trained policies in the client selector.
+
+`preserve_thinking` defaults to true. False removes thinking envelopes from
+completed exchanges while keeping them in the current tool cycle, independently
+of whether the next response enables reasoning. User-form `<tool_response>`
+wrappers continue the current cycle; an ordinary user message starts a new one.
+Both plain and ordered multimodal content use this boundary. The optional
+history scan follows ranges in the original request without copying history or
+image payloads, and normal preserving requests skip that scan.
+
+`chat_template_kwargs` accepts the same three controls. Top-level and nested
+values must agree after effort alias resolution; member order never overrides
+an explicit preference. Unknown keys, duplicate members within one object, and
+wrongly typed values reject.
+
 `epoch.loom` consumes consecutive first and continuation cohorts. Each record
 carries length, causal and source positions, resident row, known-input range,
 flags, output credit, and continuation owner.
