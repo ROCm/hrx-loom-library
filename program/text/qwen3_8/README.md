@@ -15,6 +15,11 @@ remain withheld during streaming and are resolved at completion. Returned
 buffers have VM ownership; request-local scalar state remains opaque to the
 service caller.
 
+The model has one leading instruction envelope. Chat requests may spell that
+role `system` or `developer`; both render the same Qwen system tokens. A second
+instruction message or one after user/assistant history is rejected, since the
+checkpoint template has no corresponding role or priority boundary.
+
 `epoch.loom` consumes consecutive first and continuation cohorts. Each record
 carries length, causal and source positions, resident row, known-input range,
 flags, output credit, and continuation owner.

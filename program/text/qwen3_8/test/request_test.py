@@ -163,6 +163,82 @@ class RequestCheckTest(unittest.TestCase):
                     self.assertFalse(value["reusable"])
                     self.assertTrue(value["checkpoint"].endswith("<|im_end|>\n"))
 
+    def test_leading_instruction_roles_share_the_model_envelope(self):
+        for thinking in (False, True):
+            for tools in ([], TOOLS):
+                with self.subTest(thinking=thinking, tools=bool(tools)):
+                    request = self.request(
+                        enable_thinking=thinking,
+                        tools=tools,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "  Follow the project rules.  ",
+                            },
+                            {"role": "user", "content": "Hello λ."},
+                        ],
+                    )
+                    expected = self.success(self.execute(request))
+                    request["messages"][0]["role"] = "developer"
+                    actual = self.success(self.execute(request))
+                    self.assertEqual(actual["prompt"], expected["prompt"])
+                    self.assertEqual(actual["tokens"], expected["tokens"])
+                    self.assertEqual(actual["prompt"].count("<|im_start|>system\n"), 1)
+                    self.assertIn(
+                        "Follow the project rules.<|im_end|>\n", actual["prompt"]
+                    )
+
+    def test_instruction_envelope_cannot_be_reintroduced(self):
+        for role in ("system", "developer"):
+            for preceding_role in ("system", "developer", "user"):
+                with self.subTest(role=role, preceding_role=preceding_role):
+                    result = self.execute(
+                        self.request(
+                            messages=[
+                                {"role": preceding_role, "content": "First."},
+                                {"role": role, "content": "Second."},
+                                {"role": "user", "content": "Hello λ."},
+                            ]
+                        )
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(
+                        "unsupported role, role fields, or message order", result.stderr
+                    )
+
+    def test_developer_tool_round_trip_with_omitted_thinking(self):
+        # Generic clients use developer for a reasoning-capable model even
+        # when the current turn leaves reasoning disabled by omission.
+        request = {
+            "model": "qwen3.8-policy-test",
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "store": False,
+            "max_completion_tokens": 16384,
+            "tools": TOOLS,
+            "messages": [
+                {"role": "developer", "content": "Follow the project rules."},
+                {"role": "user", "content": "Read a.txt."},
+            ],
+        }
+        response = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"
+        first = self.success(self.execute(request, response, chunk_size=7))
+        self.assertTrue(first["reusable"])
+        self.assertEqual(len(first["tool_calls"]), 1)
+        call = {
+            key: value
+            for key, value in first["tool_calls"][0].items()
+            if key != "index"
+        }
+        request["messages"] += [
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": call["id"], "content": "Found it."},
+        ]
+        following = self.success(self.execute(request))
+        self.assertTrue(following["prompt"].startswith(first["checkpoint"]))
+        self.assertTrue(following["prompt"].endswith("<think>\n\n</think>\n\n"))
+
     def test_thinking_defaults_off_and_remains_request_selectable(self):
         for tools in ([], TOOLS):
             with self.subTest(tools=bool(tools)):
