@@ -13,7 +13,8 @@ owned by this repository:
 - `loom_test` owns `*_test.loom` and `*_stress.loom` sources and delegates to
   HRX's root-owned linked test module. Test leaves declare execution profiles
   and depend on production providers. Scenarios own configuration and trial
-  fanout. The build's sanitizer configuration instruments the same test targets;
+  fanout. `--config=loom-asan`, `--config=loom-tsan`, and `--config=loom-ubsan`
+  instrument the same test targets independently of native tool instrumentation;
   sanitizer-specific execution profiles are rejected. Stress tests carry both
   `manual` and `stress` tags.
 - `loom_library` is confined to production `model/` and `program/` packages.

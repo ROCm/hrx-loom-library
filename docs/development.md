@@ -91,7 +91,7 @@ python dev.py build
 For focused iteration, select a package and its execution configuration:
 
 ```sh
-python dev.py test --target=//kernel/ggml/... -- --config=asan --config=amdgpu
+python dev.py test --target=//kernel/ggml/... -- --config=loom-asan --config=amdgpu
 ```
 
 `dev.py test` first checks formatting across the repository, including
@@ -121,11 +121,14 @@ The [CI maintenance guide](ci.md) describes SDK pins, runner coverage, and
 cache ownership.
 
 Each test has one declaration for its execution environment. Scenarios own
-compile-visible configurations and runtime trials. Select `--config=asan`,
-`--config=tsan`, or `--config=ubsan` to instrument the same test's JIT products;
-these modes also instrument native tools when building from HRX source. An
-installed SDK retains its own native instrumentation. Additional sanitizer
-execution profiles are rejected by the library rules.
+compile-visible configurations and runtime trials. Select `--config=loom-asan`,
+`--config=loom-tsan`, or `--config=loom-ubsan` to instrument the same test's JIT
+products. These aliases set the independent public flags
+`@hrx//loom/config/sanitizer:address`, `:thread`, and `:undefined` and can be
+combined. Native `--config=asan` instruments tools built from HRX source;
+`--config=asan --config=loom-asan` checks both the tools and their generated
+programs. An installed SDK retains its own native instrumentation. Additional
+sanitizer execution profiles are rejected by the library rules.
 
 Large regressions live in `_stress.loom` sources with `manual` and `stress`
 tags. Select their labels explicitly to run them with or without a sanitizer.

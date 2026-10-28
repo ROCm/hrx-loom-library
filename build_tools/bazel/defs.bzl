@@ -116,7 +116,7 @@ def _validate_execution_profiles(name, execution_profiles):
         fail("%s requires at least one execution profile" % name)
     for profile in execution_profiles:
         if any([argument.startswith("--sanitizer=") for argument in profile.runner_args]):
-            fail("%s: select sanitizers with the build configuration, not additional execution profiles" % name)
+            fail("%s: select Loom sanitizers with --config=loom-asan, --config=loom-tsan, or --config=loom-ubsan" % name)
 
 def _validate_kernel_qualification(name, targets):
     if not targets:

@@ -9,10 +9,11 @@ The host job rejects any C/C++ compilation or linking in the library graph.
 
 Release is the normal compiler/runtime profile. ASAN is an explicitly selected
 SDK for diagnosing native memory errors; Bazel's `--config=asan` cannot change
-an installed Release wheel. The build configuration also selects Loom JIT
-instrumentation on the same test targets: `--config=asan`, `--config=tsan`, or
-`--config=ubsan`. These flags instrument generated programs even when the SDK
-itself is a Release wheel. Ordinary CI uses the uninstrumented configuration.
+an installed Release wheel. Independent Loom flags select JIT instrumentation
+on the same test targets: `--config=loom-asan`, `--config=loom-tsan`, or
+`--config=loom-ubsan`. These flags instrument generated programs even when the
+SDK itself is a Release wheel. Native sanitizer configurations alone do not
+enable Loom checks. Ordinary CI leaves Loom instrumentation disabled.
 
 ## Jobs and ownership
 

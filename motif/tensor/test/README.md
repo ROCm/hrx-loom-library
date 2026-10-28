@@ -4,8 +4,10 @@ The adapter corpus uses the twelve original matrix shape families and the
 fused twelve-layer scalar contraction. Separate leaves supply metadata views
 to the reusable providers. Python standard-library generators create synthetic
 operands and independent scalar results in Bazel output; they use no model
-checkpoints. The same scenarios run on native, access-sanitized, and
-race-sanitized GPU profiles.
+checkpoints. The same GPU scenarios support optional Loom address and race
+checks through `--config=loom-asan` and `--config=loom-tsan`. Native tool
+instrumentation is independent; `--config=asan` alone does not select Loom
+checks. See [development](../../../docs/development.md) for configuration.
 
 Selections cover empty, single, odd/even, seven-bank, reordered, duplicate,
 canceling, zero, and fractional strengths. Dense and column-major layouts
@@ -19,10 +21,9 @@ the up contraction, and final base addition. A separate nonzero corpus stays
 exactly representable throughout. Scalar cases compare every bit. The reference
 test proves that 138 missing-bank, wrong-bank, and wrong-strength mutations
 exceed the accepted bounds; device observations never determine a tolerance.
-Each scenario also declares a benchmark over its initialized inputs. Normal
-tests execute a smoke iteration; optimized measurements use the same benchmark
-modules with the normal measurement lease. These correctness runs do not
-establish model throughput.
+Each scenario also declares a benchmark over its initialized inputs. Benchmarks
+run separately through the [benchmark workflow](../../../docs/development.md#sweep-repository-benchmarks).
+Correctness runs do not establish model throughput.
 
 ```sh
 bazel test --config=asan --config=amdgpu \
@@ -101,8 +102,8 @@ cancellation, signed zeros, and subnormals. Omission checks prove the corpus
 distinguishes bias conversion, delta rounding, scaled-delta rounding, and the
 zero-strength bypass. Both bias formats, nonzero tile origins, three physical
 layouts, and exact base/output aliasing are exercised. Every observed bit is
-exact, including the F32 result before final publication. Both corpora run with
-native, access, and race instrumentation and retain benchmark declarations.
+exact, including the F32 result before final publication. Both corpora support
+optional Loom address and race checks and retain benchmark declarations.
 
 ```sh
 python3 -B motif/tensor/test/generate_linear_oracle.py --check
@@ -174,8 +175,9 @@ references include both neighbors of BF16 context midpoints and gate values
 whose sigmoid conversion remains unambiguous under approximate math. Omitting
 either context or sigmoid rounding changes the expected bits. Ungated cases
 pass output as the unused gate, matching the production caller. Full immutable
-input storage and output guards compare bitwise in native, access, and race
-profiles. Every scenario includes a benchmark declaration.
+input storage and output guards compare bitwise with ordinary execution or
+optional Loom address and race checks. Every scenario includes a benchmark
+declaration.
 
 ```sh
 python3 -B motif/tensor/test/generate_shared_attention_oracle.py --check
@@ -276,8 +278,8 @@ requirements, independent of a device's observed error.
 
 All storage guards and immutable inputs are exact. Native, access-instrumented,
 and race-instrumented execution cover reduction and whole-row ownership;
-native and access profiles cover scalar arithmetic. Each scenario has a
-benchmark declaration.
+ordinary execution and optional address checks cover scalar arithmetic. Each
+scenario has a benchmark declaration.
 
 ```sh
 python3 -B motif/tensor/test/generate_rmsnorm_bf16_scalar_oracle.py --check
@@ -294,7 +296,7 @@ any one of the four intermediate BF16 product roundings changes the corpus.
 waves. Distinct token/head inputs and token coefficient rows detect table and
 pair-index errors. Every output, storage guard, and immutable buffer compares
 bitwise, including exact input/output aliasing. Native, access-instrumented,
-and race-instrumented profiles exercise the row cases.
+and race-instrumented modes exercise the row cases.
 
 The normalized cases derive a whole-row inverse from binary64 arithmetic,
 then enclose the RMS corpus's `2^-16` inverse accuracy requirement with
@@ -396,8 +398,8 @@ significant binary bits relative to the largest input value, including means
 that require more precision than BF16; zero output compares bitwise. The
 generator verifies sensitivity to each Q/K/V/probability conversion, omitted
 score/value channels, and premature BF16 output. Complete immutable inputs
-and output guards are bitwise checks under native, access, and race profiles.
-Every scenario includes a benchmark declaration.
+and output guards are bitwise checks with ordinary execution or optional Loom
+address and race checks. Every scenario includes a benchmark declaration.
 
 ```sh
 python3 -B motif/tensor/test/generate_image_attention_oracle.py --check
@@ -585,7 +587,7 @@ K64 and K128 panels, partial output tiles, grouped traversal, and the model's
 retain complete guard regions. All four input arrays also compare bitwise.
 Signed extremes, positive and negative scales, zero scales, large integer
 sums, and positive/negative BF16 midpoints exercise the arithmetic boundaries.
-Native, access-sanitized, and race-sanitized profiles use the same expected
+Ordinary execution and optional Loom address/race checks use the same expected
 values. The generator requires only Python's standard library:
 
 ```sh
