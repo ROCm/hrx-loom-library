@@ -7,7 +7,7 @@ blocks select ten of 512 experts plus a shared expert. This card describes the
 with an optional Q8_0 multi-token predictor.
 
 The composition includes native AMD RDNA providers for Loom's text service,
-with source, bytecode, and mixed program representations. Its source preset
+with source and bytecode program representations. Its source preset
 can be fetched and served using the installed SDK, without building this
 repository. For example, after installing the `hrx-loom` SDK with its `hf` extra:
 

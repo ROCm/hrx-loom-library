@@ -18,7 +18,7 @@ from typing import Iterable
 SOURCE_NON_CODE_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|//[^\r\n]*')
 LAYER_OPERATION_PATTERN = re.compile(
     r"(?<![\w.$%@#^-])"
-    r"(?:config\.[A-Za-z_][A-Za-z0-9_.]*|kernel\.def|"
+    r"(?:(?:config|check)\.[A-Za-z_][A-Za-z0-9_.]*|kernel\.def|"
     r"[A-Za-z_][A-Za-z0-9_.]*\.target|target\.generic)"
     r"(?![\w.-])"
 )
@@ -46,12 +46,24 @@ def check_sources(layer: str, sources: Iterable[tuple[str, str]]) -> list[str]:
         )
         for name, text in sources
     ]
+    violations = []
+    if layer != "test":
+        for name, operations in source_definitions:
+            if name.endswith("_test.loom"):
+                violations.append(f"{name}: test sources belong to loom_test")
+            for operation in sorted(operations):
+                if operation.startswith("check."):
+                    violations.append(
+                        f"{name}: {operation} belongs to loom_test, "
+                        "outside production libraries"
+                    )
     if layer == "motif":
-        violations = []
         for name, operations in source_definitions:
             if "kernel.def" in operations:
                 violations.append(f"{name}: motif sources cannot declare kernel.def")
             for operation in sorted(operations - {"kernel.def"}):
+                if operation.startswith("check."):
+                    continue
                 if operation.startswith("config."):
                     violations.append(
                         f"{name}: motif sources cannot use {operation}; "
@@ -67,8 +79,8 @@ def check_sources(layer: str, sources: Iterable[tuple[str, str]]) -> list[str]:
         "kernel.def" in operations for _, operations in source_definitions
     ):
         names = ", ".join(name for name, _ in source_definitions)
-        return [f"kernel package has no kernel.def declaration: {names}"]
-    return []
+        violations.append(f"kernel package has no kernel.def declaration: {names}")
+    return violations
 
 
 def _package_policy(layer: str, relative_directory: Path) -> tuple[str, str]:
@@ -126,11 +138,14 @@ def check_repository(repository_root: Path) -> list[str]:
         for source_directory, source_paths in sorted(sources_by_directory.items()):
             relative_directory = source_directory.relative_to(repository_root)
             source_layer, rule_name = _package_policy(layer, relative_directory)
-            named_sources = [
-                (str(path.relative_to(repository_root)), path.read_text())
-                for path in sorted(source_paths)
-            ]
-            violations.extend(check_sources(source_layer, named_sources))
+            sources_by_owner: dict[str, list[tuple[str, str]]] = defaultdict(list)
+            for path in sorted(source_paths):
+                owner = "test" if path.name.endswith("_test.loom") else source_layer
+                sources_by_owner[owner].append(
+                    (str(path.relative_to(repository_root)), path.read_text())
+                )
+            for owner, sources in sources_by_owner.items():
+                violations.extend(check_sources(owner, sources))
 
             build_path = source_directory / "BUILD.bazel"
             if not build_path.is_file():
@@ -147,12 +162,13 @@ def check_repository(repository_root: Path) -> list[str]:
                     f"{build_path.relative_to(repository_root)}: library "
                     "packages cannot bypass repository policy wrappers"
                 )
-            if not re.search(rf"\b{rule_name}\s*\(", build_text):
-                violations.append(
-                    f"{build_path.relative_to(repository_root)}: "
-                    f"{source_layer} packages "
-                    f"must declare {rule_name}"
-                )
+            for owner in sources_by_owner:
+                owner_rule = "loom_test" if owner == "test" else rule_name
+                if not re.search(rf"\b{owner_rule}\s*\(", build_text):
+                    violations.append(
+                        f"{build_path.relative_to(repository_root)}: "
+                        f"{owner} sources must declare {owner_rule}"
+                    )
             for source_path in sorted(source_paths):
                 source_literal = f'"{source_path.name}"'
                 if source_literal not in build_text:

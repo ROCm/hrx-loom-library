@@ -15,7 +15,7 @@ normal Bazel caching. They are explicit `manual` targets because their runner
 needs provisioned assets and an AMDGPU device.
 The [developer workflow](../README.md) shows build, fetch, and invocation.
 
-Source, archive, and mixed cases use the same exact reference. The checker
+Source and archive cases use the same exact reference. The checker
 verifies the input PCM digest, uploads the audio with deliberately odd HTTP
 chunk boundaries, and checks the exact transcript. It joins normal server
 retirement before publishing success. Bazel test outputs retain server

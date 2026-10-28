@@ -51,7 +51,9 @@ BUILD files and public Loom rule contracts are the same in each mode.
 With Lefthook installed, `python dev.py hook` enables the repository's
 pre-commit hook. It formats staged `.loom` files, stages their canonical form,
 and stops after any rewrite so the result can be reviewed. It refuses
-partially staged Loom files.
+partially staged Loom files. It also checks generated model-card compiler lists
+against Bazel analysis; [model authoring](model-authoring.md#derive-compiler-files-from-provider-dependencies)
+describes the check/fix workflow and staged-input requirements.
 
 ## Repository layers
 
@@ -79,6 +81,7 @@ correctness cases, benchmark plans, and target profiles to Loom's public rules:
 
 ```sh
 python dev.py format --check
+python dev.py model-card --check
 python dev.py lint
 python dev.py test
 python dev.py build
@@ -91,7 +94,9 @@ python dev.py test --target=//kernel/ggml/... -- --config=asan --config=amdgpu
 ```
 
 `dev.py test` first checks formatting across the repository, including
-experimental sources, then runs the selected tests. `format --fix` rewrites
+experimental sources, public Loom authoring lint, repository source policy,
+and managed model-card compiler lists,
+then runs the selected tests. `format --fix` rewrites
 sources through the selected compiler and verifies the result; passing paths
 limits formatting to those files. Direct `bazelisk test` invocations also retain
 the generated per-library checks. Hardware execution requires a matching device
@@ -105,9 +110,9 @@ the selected `loom-serve` through HTTP. This keeps internal API qualification
 available without rebuilding the compiler behind an installed SDK selection.
 
 `loom_motif_library` emits linkable bytecode and checks that its sources are
-non-launchable. `loom_kernel_library` adds concrete kernel products, test
-modules, target profiles, and compiler reports. `loom_test` exercises a private
-composition through the same test-module contract. The [Bazel rule guide](../build_tools/bazel/)
+non-launchable. `loom_kernel_library` adds concrete kernel products, target
+profiles, and compiler reports. `loom_test` owns correctness cases and benchmarks
+in a separate module that depends on production providers. The [Bazel rule guide](../build_tools/bazel/)
 explains their declarations; the [public Loom build guide](https://rocm.github.io/hrx-system/loom/workflows/build-with-bazel/)
 owns the underlying toolchain and linker behavior.
 
@@ -120,10 +125,10 @@ Build a quantization kernel together with its motif dependencies and test module
 
 ```shell
 bazelisk build --config=opt \
-  //kernel/ggml/quantize:q8_1_x4_f32_benchmark_module
+  //kernel/ggml/quantize:q8_1_x4_f32_checks_benchmark_module
 LOOM_MODULE="$(realpath bazel-bin/kernel/ggml/quantize/q8_1_x4_f32.loombc)"
 LOOM_LIBRARY="$(realpath bazel-bin/motif/format/ggml/q8_1_x4.loombc)"
-LOOM_TEST_MODULE="$(realpath bazel-bin/kernel/ggml/quantize/q8_1_x4_f32_test_module.loombc)"
+LOOM_TEST_MODULE="$(realpath bazel-bin/kernel/ggml/quantize/q8_1_x4_f32_checks_module.loombc)"
 ```
 
 The resolved paths keep these inputs stable when a later tool invocation changes
@@ -176,7 +181,7 @@ so its schemas and lifecycle remain independent. Benchmark sweep workspaces use
 
 ### Sweep repository benchmarks
 
-`dev.py benchmark` discovers every kernel and test module admitted to the
+`dev.py benchmark` discovers every test module admitted to the
 repository benchmark corpus, uses HRX's linked root-owned test module plus the
 public benchmark runner from the selected SDK or HRX source checkout, and
 maintains a local sweep workspace:
@@ -233,7 +238,7 @@ The workspace is rooted at
 measurement history.
 
 `--target` accepts Bazel target patterns. Recursive scopes select admitted
-benchmark modules below a package, exact library labels select one module, and
+benchmark modules below a package, exact test labels select one module, and
 repeating the option forms a union:
 
 ```shell

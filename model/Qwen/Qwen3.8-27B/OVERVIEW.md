@@ -6,8 +6,8 @@ uses Unsloth's mixed-format UD-Q5_K_XL checkpoint. Optional multi-token
 prediction uses the checkpoint's prediction block; DFlash2 instead adds a
 separate draft checkpoint. Drafting remains part of the text service.
 
-The composition contains native AMD text and image providers with source,
-relocatable-bytecode, and mixed representations. The source preset works with
+The composition contains native AMD text and image providers with source and
+relocatable-bytecode representations. The source preset works with
 the installed SDK without building the library. After installing `hrx-loom`
 with its `hf` extra, select text chat:
 
@@ -55,8 +55,8 @@ versioned `image` component of the text service, with separate preparation and
 request control. It is not an image-generation service. The DFlash2 checkpoint
 is additional model storage, not a request adapter.
 
-Text, checkpoint MTP, vision, and DFlash2 have native service checks for source,
-relocatable-bytecode, and mixed programs. The checks exercise concurrent
+Text, checkpoint MTP, vision, and DFlash2 have native service checks for source and
+relocatable-bytecode programs. The checks exercise concurrent
 requests, exact responses, checkpoint forks and continuation, parameter
 unload/reload, disconnected clients, and joined shutdown. Vision also checks
 independent projector residency. DFlash2 retains the eight-row preset and its

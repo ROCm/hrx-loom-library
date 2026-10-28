@@ -10,6 +10,7 @@ from unittest import mock
 
 from build_tools.py.hrx_loom_library import qualification
 from build_tools.py.hrx_loom_library.commands import format as format_command
+from build_tools.py.hrx_loom_library.commands import model_card
 from build_tools.py.hrx_loom_library.commands import test as test_command
 from build_tools.py.hrx_loom_library.context import RepositoryContext
 
@@ -37,11 +38,13 @@ class TestCommandTest(unittest.TestCase):
         with (
             mock.patch.object(format_command, "check_repository") as check_repository,
             mock.patch.object(qualification, "lint_repository") as lint_repository,
+            mock.patch.object(model_card, "check_repository") as check_model_cards,
         ):
             test_command._run(args, context)
 
         check_repository.assert_called_once_with(context)
         lint_repository.assert_called_once_with(context)
+        check_model_cards.assert_called_once_with(context)
         context.bazel.assert_called_once_with(
             [
                 "test",
@@ -59,10 +62,12 @@ class TestCommandTest(unittest.TestCase):
         with (
             mock.patch.object(format_command, "check_repository") as check_repository,
             mock.patch.object(qualification, "lint_repository"),
+            mock.patch.object(model_card, "check_repository") as check_model_cards,
         ):
             test_command._run(args, context)
 
         check_repository.assert_called_once_with(context)
+        check_model_cards.assert_called_once_with(context)
         context.bazel.assert_called_once_with(["test", "//..."])
 
 

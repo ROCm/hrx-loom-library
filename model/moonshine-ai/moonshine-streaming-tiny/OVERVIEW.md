@@ -7,11 +7,10 @@ on AMDGPU. It uses the original F32 checkpoint and tokenizer from the
 [pinned upstream snapshot](https://huggingface.co/moonshine-ai/moonshine-streaming-tiny/tree/f8e9dfd8c562c257c151a907b7b7f2fe8ff8511a).
 The file tables below identify the exact downloads and their local names.
 
-The `original` variant supports source, bytecode, and mixed program packages.
+The `original` variant supports source and bytecode program packages.
 These choices change the compiler inputs while sharing the same parameters and
-recognition behavior. A mixed package keeps preparation and control in Loom text
-and uses bytecode for the numerical programs. CPU and NPU execution require a
-port of the numerical kernels.
+recognition behavior. CPU and NPU execution require a port of the numerical
+kernels.
 
 ## Acquire and serve
 
@@ -36,7 +35,7 @@ Neither path requires a Bazel build.
 
 The checked-in lock covers assets independently of program representation. The
 server JIT compiles those authored Loom programs with the SDK's compiler.
-Bytecode and mixed packages are produced separately by model publishers and use
+Bytecode packages are produced separately by model publishers and use
 the same fetch-and-serve workflow. The `streaming` preset selects source here;
 its name does not imply a file format or a request transport.
 
@@ -92,7 +91,7 @@ workspace, idle allocator caches, tokenizer, compiler, and driver overhead are
 additional; an omitted transient estimate means its complete peak is unknown.
 Device placement and request admission belong to the host application.
 
-Source, bytecode, and mixed packages have been checked against an independently
+Source and bytecode packages have been checked against an independently
 generated transcript through the native recognition service. This correctness
 check does not establish an accuracy benchmark or a throughput guarantee.
 For the model's training data, evaluation, and intended use, see the

@@ -12,7 +12,7 @@ Loom SDK and build the small Moonshine package as a concrete starting point:
 
 ```sh
 python dev.py setup --sdk
-bazelisk build //model/moonshine-ai/moonshine-streaming-tiny:source //model/moonshine-ai/moonshine-streaming-tiny:archive //model/moonshine-ai/moonshine-streaming-tiny:mixed
+bazelisk build //model/moonshine-ai/moonshine-streaming-tiny:source //model/moonshine-ai/moonshine-streaming-tiny:archive
 ```
 
 The [development setup](development.md#select-a-compiler) lists prerequisites
@@ -58,7 +58,7 @@ name reusable acquisition locations, and each file can specify a different
 remote name and local destination. When remixing a package, update program
 origins to your fork while retaining the intended upstream checkpoint origins.
 
-Program sets describe linker inputs and libraries. Source, bytecode, and mixed
+Program sets describe linker inputs and libraries. Source and bytecode
 sets can implement the same service; bytecode still supports linking and
 runtime specialization. JIT `config` values select program behavior, while
 presets record canonical execution choices. Device placement and request-time
@@ -76,15 +76,89 @@ Keep architecture-specific parameter interpretation and orchestration in the
 model. Shared service policy belongs in `program/`, concrete launch contracts
 in `kernel/`, and reusable representations and algorithms in `motif/`.
 [Repository layers](development.md#repository-layers) explains these boundaries.
-The [component-authoring guide](component-authoring.md) follows real extractions
-and their small independent tests, including the separation of correctness
-checks from production-size benchmark workloads.
+The [component-authoring guide](component-authoring.md) shows production and
+test declarations, provider dependencies, and the local check commands.
 
 Model programs use `loom_library` from `//build_tools/bazel:defs.bzl`.
-A `loom_model` target selects a card preset, maps program files through `files`,
-and declares importer auxiliary inputs through `data`. External weights,
-tokenizers, and recordings retain their acquisition descriptors. Small fixtures
-and swatches can be declared build inputs.
+A `loom_model` target selects a card preset and its compiler composition.
+External weights, tokenizers, and recordings retain their acquisition
+descriptors. Small fixtures and swatches can be declared build inputs.
+
+### Derive compiler files from provider dependencies
+
+The [Qwen composition](../model/Qwen/Qwen3.8-27B/BUILD.bazel) declares primary
+`inputs` and independently selected `libraries` as Loom provider targets.
+For its text service, those roots are:
+
+```python
+inputs = [
+    "//model/Qwen/Qwen3.8-27B/program:prepare",
+    "//program/text/qwen3_8:chat",
+    "//model/Qwen/Qwen3.8-27B/program:identity",
+],
+libraries = [
+    "//model/Qwen/Qwen3.8-27B/program:commands",
+    "//program/text/qwen3_8:epoch",
+    "//model/Qwen/Qwen3.8-27B/program:vision_pixels",
+    "//model/Qwen/Qwen3.8-27B/program:vision_stages",
+],
+```
+
+Each provider owns its direct `deps`, original `srcs`, importer settings, and
+auxiliary `data`. Analysis carries their transitive closure into the package
+and the card. A shared template's new motif dependency therefore reaches every
+managed consumer without another flattened list in a model BUILD file.
+Runtime-selected stages still need declared dependencies: analysis cannot infer
+provider names constructed by a running preparation program. Production
+providers exclude check programs and independent test oracles; those belong
+to separate `loom_test` inputs.
+
+`form` selects `sources` or `module` for the complete provider closure.
+Sources are the original declared files, which may themselves be bytecode;
+module selects each provider's merged relocatable output. The program-set key
+has no format semantics. Qwen offers source and archive packages. An archive
+contains per-provider bytecode modules that are linked and specialized at
+runtime. Its `prepare` provider retains the auxiliary weight policies in both
+forms.
+
+Refresh the checked-in compiler lists after changing the graph:
+
+```sh
+python dev.py model-card --check
+python dev.py model-card --fix
+```
+
+`--check` prints a unified diff and fails when the card differs. `--fix` writes
+that diff; running it again leaves the file untouched.
+`--target=//model/Qwen/Qwen3.8-27B:all` restricts the query and can be repeated.
+Both modes use
+Bazel analysis, without running the compiler, downloading weights, or building
+the listed bytecode. The normal authoring test command and commit hook check
+managed cards. Hook checks require complete staged build/card changes and a
+matching file inventory, so they cannot validate an unstaged glob addition.
+
+Only `inputs`, `libraries`, and their compiler annotations are generated.
+Origins and per-file acquisition locations, model facts, services, variants,
+presets, execution configuration, and asset locks remain authored. Several
+preset targets may name one program set only when they describe the same
+compiler closure. Explicit `files`/`data` mappings remain available for
+compositions whose cards are maintained by hand.
+
+Generated paths are relative to the repository root. A nested checked-in card
+uses a program-set `"origin": "@library/"` to acquire those paths from its
+declared publication root. Fetch places `model.json` at the installation root
+and preserves the selected repository-relative tree beneath it. The authored
+`directory` follows that layout, such as `model/Qwen/Qwen3.8-27B/program`.
+Runtime paths remain relative to the installed card; serving does not discover
+a Git root. A bytecode publication must provide its generated modules at the
+declared origin; synchronization does not publish them.
+
+Provider-derived composition currently requires providers in the same Bazel
+repository and literal importer options. A source importer using
+`$(location ...)` options cannot yet be projected to a portable card and fails
+analysis. The explicit mapping form can still describe such a composition.
+
+### Exercise the model
 
 Run the small program and numerical tests during iteration:
 

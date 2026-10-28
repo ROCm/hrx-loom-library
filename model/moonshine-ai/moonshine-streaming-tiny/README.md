@@ -17,8 +17,7 @@ From the repository root:
 ```sh
 bazel build --config=amdgpu \
   //model/moonshine-ai/moonshine-streaming-tiny:source \
-  //model/moonshine-ai/moonshine-streaming-tiny:archive \
-  //model/moonshine-ai/moonshine-streaming-tiny:mixed
+  //model/moonshine-ai/moonshine-streaming-tiny:archive
 ```
 
 These targets build program files and a portable selected card without acquiring
@@ -31,7 +30,6 @@ is a Bazel repository, action input, output, or runfile.
 | --- | --- | --- |
 | `source` | Loom text | Loom text |
 | `archive` | Loom bytecode | Loom bytecode |
-| `mixed` | Loom text | Loom bytecode |
 
 Each target emits `model.json` and a separate `serve.json` selecting the served
 name and preset. The source card supplies the exact provider closure;
@@ -75,7 +73,7 @@ selected files have been acquired successfully. Default materialization copies
 programs and shares assets rather than making one weight copy per provider
 choice.
 The installed card serves directly; its model ID is the request selector.
-Use `archive` and `mixed` to install the other representations independently.
+Use `archive` to install the bytecode representation independently.
 
 ## Checks
 
@@ -89,15 +87,14 @@ bazel test --config=amdgpu \
 
 Learned transcription checks are ordinary cacheable tests. They are tagged
 `manual` because their runner needs provisioned weights. After the preceding
-fetch, run all three representations against that installation:
+fetch, run both representations against that installation:
 
 ```sh
 bazel test --config=asan --config=amdgpu \
   --strategy=TestRunner=standalone \
   --test_env=LOOM_MODEL_ASSETS="$INSTALL" \
   //model/moonshine-ai/moonshine-streaming-tiny/test:transcription_source_test \
-  //model/moonshine-ai/moonshine-streaming-tiny/test:transcription_archive_test \
-  //model/moonshine-ai/moonshine-streaming-tiny/test:transcription_mixed_test
+  //model/moonshine-ai/moonshine-streaming-tiny/test:transcription_archive_test
 ```
 
 This example executes tests locally while leaving the build execution strategy
@@ -107,7 +104,7 @@ use the shared Loom execution profile.
 
 Each test combines its current built providers and auxiliary files with shared
 parameters and tokenizers from `LOOM_MODEL_ASSETS`. Installed program files are
-ignored, so one installation supports all three tests and compiler iteration
+ignored, so one installation supports both tests and compiler iteration
 requires no refetch. Model files are linked into temporary storage; retained
 test outputs contain only server diagnostics and `result.json`.
 

@@ -24,21 +24,19 @@ projection columns into their final device allocations. The model owns that
 layout; the runtime owns asynchronous reads, bounded staging, and lifetime.
 No transformed checkpoint is produced or required.
 
-## Build source, bytecode, and mixed programs
+## Build source and bytecode programs
 
 ```sh
 bazel build \
   //model/Qwen/Qwen3-Embedding-0.6B:source \
   //model/Qwen/Qwen3-Embedding-0.6B:archive \
-  //model/Qwen/Qwen3-Embedding-0.6B:mixed \
   //model/Qwen/Qwen3-Embedding-0.6B:reference
 ```
 
 The selected outputs live below
 `bazel-bin/model/Qwen/Qwen3-Embedding-0.6B/`. `source` retains Loom text;
-`archive` uses bytecode; `mixed` keeps preparation and control in text while
-using bytecode numerical and motif providers. All three retain `policy.loom`
-as an explicit auxiliary compiler input. They remain inputs to runtime linking
+`archive` uses bytecode. Both retain `policy.loom` as an explicit auxiliary
+compiler input. They remain inputs to runtime linking
 and JIT specialization.
 
 Each package contains a selected `model.json`, deployment `serve.json`, and
@@ -62,8 +60,7 @@ bazel test --config=asan --config=amdgpu \
   --strategy=TestRunner=standalone \
   --test_env=LOOM_MODEL_ASSETS="$HOME/models/qwen3-embedding" \
   //model/Qwen/Qwen3-Embedding-0.6B/test:embedding_source_test \
-  //model/Qwen/Qwen3-Embedding-0.6B/test:embedding_archive_test \
-  //model/Qwen/Qwen3-Embedding-0.6B/test:embedding_mixed_test
+  //model/Qwen/Qwen3-Embedding-0.6B/test:embedding_archive_test
 ```
 
 The repository's `amdgpu` build configuration enables the native AMD HAL,

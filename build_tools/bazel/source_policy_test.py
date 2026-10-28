@@ -144,17 +144,43 @@ class SourcePolicyTest(unittest.TestCase):
         )
         self.assertEqual(violations, [])
 
+    def test_production_sources_reject_embedded_checks(self):
+        for layer in ("motif", "program", "model", "kernel"):
+            with self.subTest(layer=layer):
+                source = "check.scenario @case { check.return }\n"
+                if layer == "kernel":
+                    source += "kernel.def @entry() {} launch() { kernel.return }\n"
+                self.assertEqual(
+                    source_policy.check_sources(layer, [("production.loom", source)]),
+                    [
+                        f"production.loom: check.{operation} belongs to loom_test, "
+                        "outside production libraries"
+                        for operation in ("return", "scenario")
+                    ],
+                )
+                self.assertEqual(
+                    source_policy.check_sources("test", [("cases.loom", source)]), []
+                )
+
+    def test_test_helper_cannot_be_archived_as_production(self):
+        self.assertEqual(
+            source_policy.check_sources(
+                "motif", [("reference_test.loom", "func.def @oracle() { func.return }")]
+            ),
+            ["reference_test.loom: test sources belong to loom_test"],
+        )
+
     def test_kernel_requires_definition_across_package_sources(self):
         violations = source_policy.check_sources(
             "kernel",
             [
                 ("helpers.loom", "func.def @helper() {\n  func.return\n}\n"),
-                ("checks.loom", "check.case public @case {\n  check.return\n}\n"),
+                ("declarations.loom", "kernel.decl @entry() launch()\n"),
             ],
         )
         self.assertEqual(
             violations,
-            ["kernel package has no kernel.def declaration: helpers.loom, checks.loom"],
+            ["kernel package has no kernel.def declaration: helpers.loom, declarations.loom"],
         )
 
     def test_comments_do_not_satisfy_kernel_requirement(self):
@@ -208,6 +234,36 @@ class SourcePolicyTest(unittest.TestCase):
             )
             self.assertEqual(source_policy.check_repository(repository_root), [])
 
+    def test_repository_requires_adjacent_checks_to_have_test_rule(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            package = root / "kernel" / "example"
+            package.mkdir(parents=True)
+            for directory in (root / "kernel", package):
+                (directory / "README.md").write_text("# Scope\n")
+            (package / "projection.loom").write_text(
+                "kernel.def @projection() {} launch() { kernel.return }\n"
+            )
+            (package / "projection_test.loom").write_text(
+                "check.scenario @tail { check.return }\n"
+            )
+            build = package / "BUILD.bazel"
+            build.write_text(
+                'load("//build_tools/bazel:defs.bzl", "loom_kernel_library", "loom_test")\n'
+                'loom_kernel_library(name = "projection", srcs = ["projection.loom"])\n'
+                '# projection_test.loom needs an owner\n'
+            )
+            self.assertIn(
+                "kernel/example/BUILD.bazel: test sources must declare loom_test",
+                source_policy.check_repository(root),
+            )
+            build.write_text(
+                build.read_text()
+                + 'loom_test(name = "checks", srcs = ["projection_test.loom"], '
+                + 'deps = [":projection"])\n'
+            )
+            self.assertEqual(source_policy.check_repository(root), [])
+
     def test_repository_leaves_experimental_sources_to_public_rules(self):
         with TemporaryDirectory() as temporary_directory:
             repository_root = Path(temporary_directory)
@@ -250,7 +306,7 @@ class SourcePolicyTest(unittest.TestCase):
             self.assertEqual(
                 source_policy.check_repository(repository_root),
                 [
-                    "motif/format/weird/test/BUILD.bazel: test packages must "
+                    "motif/format/weird/test/BUILD.bazel: test sources must "
                     "declare loom_test",
                 ],
             )
@@ -369,7 +425,7 @@ class SourcePolicyTest(unittest.TestCase):
                 source_policy.check_repository(repository_root),
                 [
                     "model/publisher/recognizer/program/BUILD.bazel: "
-                    "model packages must declare loom_library"
+                    "model sources must declare loom_library"
                 ],
             )
 
@@ -437,7 +493,7 @@ class SourcePolicyTest(unittest.TestCase):
                 source_policy.check_repository(repository_root),
                 [
                     "program/text/example/BUILD.bazel: "
-                    "program packages must declare loom_library"
+                    "program sources must declare loom_library"
                 ],
             )
 

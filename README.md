@@ -50,8 +50,8 @@ Hugging Face, or another HTTPS host and used directly with `loom-fetch`.
 
 - [Author or adapt a model](docs/model-authoring.md): start from a fork, build
   and test a package, iterate with a local compiler, and publish your own card.
-- [Develop reusable components](docs/development.md): repository layers, kernel
-  checks, benchmarks, and compiler reports.
+- [Develop reusable components](docs/component-authoring.md): placement,
+  production/test declarations, dependencies, and local checks.
 - [Contribute to the official library](CONTRIBUTING.md): scope and review
   expectations. Model additions are coordinated with maintainers while the
   library's organization and contribution workflow are being established.

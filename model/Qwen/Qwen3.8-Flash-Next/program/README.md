@@ -128,9 +128,8 @@ orders device launches. Model commands compose complete layers and epochs.
 Neither lower library calls back into a model command. The `config` provider
 owns fixed checkpoint facts and default specialization values.
 
-`source`, `archive`, and `mixed` select the same public roots. Archive inputs
+`source` and `archive` select the same public roots. Archive inputs
 are independently linked relocatable bytecode, still specialized at runtime.
-Mixed inputs keep preparation, identity, and shared chat control as text and
-use bytecode for numerical and command providers. All representations retain
-the weight policy as an auxiliary input. Full checkpoints never enter the
+Both representations retain the weight policy as an auxiliary input. Full
+checkpoints never enter the
 Bazel payload graph.

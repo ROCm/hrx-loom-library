@@ -56,8 +56,8 @@ a cached result. The parent README gives provisioned execution commands.
 ## Original adapter regression
 
 `adapter_check.py` loads the original softwatercolor checkpoint named in
-`reference.json` through the real runtime preparation policy. Its six manual
-targets cover source, bytecode, and mixed providers with BF16 and INT8 base
+`reference.json` through the real runtime preparation policy. Its four manual
+targets cover source and bytecode providers with BF16 and INT8 base
 checkpoints. Supply `LOOM_KREA_SOFTWATERCOLOR` as the absolute checkpoint path,
 alongside `LOOM_MODEL_ASSETS` for the selected base installation.
 
@@ -89,7 +89,7 @@ cache. Its payload, like the base checkpoints, never enters Bazel.
 
 The `_banks` and `_pressure` targets additionally use the original retroanime
 file through `LOOM_KREA_RETROANIME`. They exercise two distinct banks with the
-BF16 base in all three provider representations. The bank check covers mixed
+BF16 base in both provider representations. The bank check covers mixed
 strengths, source order, repeated selections, cancellation, and replay. The
 pressure check rejects an oversized union before the first successful capture,
 alternates the two originals in space for one bank, rejects the union again,

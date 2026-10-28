@@ -172,7 +172,7 @@ does not duplicate its factors. Banks can be evicted and prepared again from
 their original files. Selection count determines small rank-activation
 scratch, while the GPU kernel interface stays fixed. The model imposes no
 separate adapter-count cap. These settings work with either base checkpoint
-variant and with source, bytecode, or mixed provider packages.
+variant and with source or bytecode provider packages.
 
 ## Geometry and program choices
 
@@ -183,9 +183,8 @@ positions must fit within 65,536 positions. Unsupported image geometry fails
 instead of silently resizing the output.
 
 The source publication contains Loom text providers and an acquisition lock.
-Fetch selects it automatically. Authors can also build bytecode and mixed
-publications; all retain multiple linkable providers and use the same runtime
-specialization contract. A mixed publication keeps preparation and request
-control as text while using bytecode numerical providers. `--programs` chooses
-among published sets; `--preset` chooses execution settings and checkpoint
+Fetch selects it automatically. Authors can also build bytecode publications;
+both retain multiple linkable providers and use the same runtime specialization
+contract. `--programs` chooses among published sets; `--preset` chooses execution
+settings and checkpoint
 precision. Consumers of the source publication do not need to build bytecode.

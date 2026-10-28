@@ -13,10 +13,11 @@ load(
 
 _BENCHMARK_MODULE_TAG = "loom-benchmark-module"
 _BENCHMARK_MODULE_SUFFIX = "_benchmark_module"
-_MOTIF_ADMISSION_TAG = "loom-admission-motif"
-_MOTIF_ADMISSION_SUFFIX = "_admission_motif"
+_BENCHMARK_ADMISSION_TAG = "loom-benchmark-admission"
+_BENCHMARK_ADMISSION_SUFFIX = "_benchmark_admission"
 
 loom_model_documentation = _loom_model_documentation
+
 # Final linked products compose providers admitted by their owning source rule.
 loom_module = _loom_module
 
@@ -102,11 +103,11 @@ def _declare_benchmark_module(name, module, tags):
         visibility = ["//visibility:private"],
     )
 
-def _declare_motif_admission(name, tags):
+def _declare_benchmark_admission(name, tags):
     native.filegroup(
-        name = name + _MOTIF_ADMISSION_SUFFIX,
+        name = name + _BENCHMARK_ADMISSION_SUFFIX,
         srcs = [":" + name],
-        tags = tags + [_MOTIF_ADMISSION_TAG],
+        tags = tags + [_BENCHMARK_ADMISSION_TAG],
         visibility = ["//visibility:private"],
     )
 
@@ -114,10 +115,9 @@ def _validate_execution_profiles(name, execution_profiles):
     if not execution_profiles:
         fail("%s requires at least one execution profile" % name)
 
-def _validate_kernel_qualification(name, targets, execution_profiles):
+def _validate_kernel_qualification(name, targets):
     if not targets:
         fail("%s requires at least one target profile" % name)
-    _validate_execution_profiles(name, execution_profiles)
 
 def loom_library(
         name,
@@ -157,10 +157,13 @@ def loom_model(
         card,
         preset,
         model_name,
-        files,
+        files = {},
         lockfile = None,
         assets = {},
         data = {},
+        inputs = [],
+        libraries = [],
+        form = "sources",
         programs = "",
         partition = "",
         encoding = "bc",
@@ -180,6 +183,9 @@ def loom_model(
         files = files,
         assets = assets,
         data = data,
+        inputs = inputs,
+        libraries = libraries,
+        form = form,
         programs = programs,
         partition = partition,
         encoding = encoding,
@@ -207,7 +213,7 @@ def loom_motif_library(
         visibility = visibility,
     )
     if srcs:
-        _declare_motif_admission(name, tags)
+        _declare_benchmark_admission(name, tags)
         _declare_source_policy_test(name, "motif", srcs, tags)
 
 def loom_kernel_library(
@@ -215,7 +221,6 @@ def loom_kernel_library(
         srcs,
         deps = [],
         targets = [],
-        execution_profiles = [],
         tags = [],
         visibility = None):
     """Declares a launchable kernel package with enforced layer dependencies."""
@@ -223,21 +228,17 @@ def loom_kernel_library(
     if not _is_package_or_subpackage(package, "kernel"):
         fail("loom_kernel_library must be declared below kernel/, got //%s" % package)
     _validate_kernel_dependencies(package, deps)
-    _validate_kernel_qualification(name, targets, execution_profiles)
+    _validate_kernel_qualification(name, targets)
     _loom_kernel_library(
         name = name,
         srcs = srcs,
         deps = deps,
-        execution_profiles = execution_profiles,
         targets = targets,
+        benchmark_smoke = False,
         tags = tags,
         visibility = visibility,
     )
-    _declare_benchmark_module(
-        name,
-        ":" + name + "_test_module",
-        tags,
-    )
+    _declare_benchmark_admission(name, tags)
     _declare_source_policy_test(name, "kernel", srcs, tags)
 
 def loom_test(
@@ -251,13 +252,13 @@ def loom_test(
         size = "small",
         tags = [],
         visibility = None):
-    """Declares private wrapper programs in an explicit test package."""
+    """Owns test sources and their production dependencies."""
     package = native.package_name()
-    if "test" not in package.split("/"):
-        fail(
-            "loom_test must be declared below an explicit test/ " +
-            "package, got //%s" % package,
-        )
+    if "test" not in package.split("/") and not any([
+        str(source).endswith("_test.loom")
+        for source in srcs
+    ]):
+        fail("//%s: adjacent loom_test sources require a _test.loom owner" % package)
     if _is_package_or_subpackage(package, "motif"):
         _validate_motif_dependencies(package, deps)
     if _is_package_or_subpackage(package, "program"):

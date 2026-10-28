@@ -10,11 +10,11 @@ block access, and reusable encode/decode computation. Keeping that boundary
 explicit lets compatibility entry points and native fused kernels share the
 same representation code without sharing an execution contract.
 
-Each `.loom` source is a self-contained deployment and validation unit: its
-header documents the exact upstream reference and ABI, its `check.case`
-declarations exercise correctness, and its `check.benchmark` declarations name
-representative workloads. BUILD declarations add linkage and target
-qualification without moving shape configuration into package-global state.
+The production source documents its upstream reference and ABI. Adjacent
+[`q8_1_x4_f32_test.loom`](q8_1_x4_f32_test.loom) owns the nonzero correctness
+cases and representative benchmarks through a `loom_test` dependency on the
+production library. BUILD declarations keep those test inputs out of reusable
+archives and model closures, with target coverage independent of execution.
 
 The [quantization checks](test/) add exact byte-level oracles for rounding,
 scale/sum metadata, and physical ordering through the production launch ABI.
