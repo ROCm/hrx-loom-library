@@ -94,7 +94,8 @@ python dev.py test --target=//kernel/ggml/... -- --config=asan --config=amdgpu
 ```
 
 `dev.py test` first checks formatting across the repository, including
-experimental sources, source policy, and managed model-card compiler lists,
+experimental sources, public Loom authoring lint, repository source policy,
+and managed model-card compiler lists,
 then runs the selected tests. `format --fix` rewrites
 sources through the selected compiler and verifies the result; passing paths
 limits formatting to those files. Direct `bazelisk test` invocations also retain

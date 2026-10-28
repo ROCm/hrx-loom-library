@@ -99,7 +99,7 @@ python dev.py format --fix kernel/ggml/quantize/q8_1_x4_f32.loom kernel/ggml/qua
 python dev.py test --target=//kernel/ggml/quantize:all -- --config=asan --config=amdgpu
 ```
 
-`dev.py test` checks repository formatting, layer policy, benchmark
+`dev.py test` checks repository formatting, authoring lint, layer policy, benchmark
 reachability, and generated cards before running the selected Bazel tests.
 `python dev.py hook` installs the pre-commit checks for staged Loom formatting
 and generated cards. Small component checks use fixtures rather than full

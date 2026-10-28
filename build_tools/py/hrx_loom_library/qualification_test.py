@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,32 @@ from build_tools.py.hrx_loom_library.context import RepositoryContext, UserError
 
 
 class QualificationTest(unittest.TestCase):
+    def test_repository_lint_uses_selected_sdk_and_propagates_failures(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository_root = Path(temporary_directory)
+            sources = [
+                repository_root / "kernel/example.loom",
+                repository_root / "program/test/example.loom-test",
+            ]
+            for source in sources:
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text("// authored source\n", encoding="utf-8")
+            (repository_root / "kernel/README.md").write_text("# Example\n")
+            (repository_root / "kernel/BUILD.bazel").write_text("# Package\n")
+            context = mock.Mock(spec=RepositoryContext)
+            context.repository_root = repository_root
+            context.bazel.return_value = ""
+
+            qualification.lint_repository(context)
+
+            lint_command = ["run", "@loom_sdk//:loom-lint", "--", *map(str, sources)]
+            self.assertEqual(context.bazel.call_args_list[0], mock.call(lint_command))
+            context.bazel.reset_mock()
+            context.bazel.side_effect = subprocess.CalledProcessError(1, lint_command)
+            with self.assertRaises(subprocess.CalledProcessError):
+                qualification.lint_repository(context)
+            context.bazel.assert_called_once_with(lint_command)
+
     def test_benchmark_query_uses_only_populated_authoring_roots(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository_root = Path(temporary_directory)
@@ -54,7 +81,7 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(
             expression,
             'labels(srcs, attr(tags, "loom-benchmark-admission", '
-            '//kernel/... union //motif/...)) '
+            "//kernel/... union //motif/...)) "
             "except "
             'deps(attr(tags, "loom-benchmark-module", '
             "//kernel/... union //motif/...))",

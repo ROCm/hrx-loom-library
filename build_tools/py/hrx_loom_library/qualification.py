@@ -78,4 +78,12 @@ def lint_repository(context: RepositoryContext) -> None:
             f"--repository-root={context.repository_root}",
         ]
     )
+    sources = sorted(
+        str(source)
+        for root in (*LOOM_BENCHMARK_ROOTS, "target")
+        for source in (context.repository_root / root).rglob("*")
+        if source.is_file() and source.suffix in (".loom", ".loom-test")
+    )
+    if sources:
+        context.bazel(["run", "@loom_sdk//:loom-lint", "--", *sources])
     _check_library_qualification(context)
