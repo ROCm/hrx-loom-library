@@ -36,6 +36,8 @@ The image presets acquire `mmproj-BF16.gguf` directly into the separate `vision`
 
 `source` and `archive` describe provider representations. A source package retains `.loom` files; an archive package contains `.loombc` providers for runtime linking. Both retain the explicit weight-preparation source as auxiliary compiler data. The programs share the same public service contracts and parameter identities.
 
+The model BUILD file names preparation inputs and runtime-selected library roots; their provider dependencies supply the complete source or bytecode closure. After changing those dependencies, `python dev.py model-card --fix` refreshes the checked-in card.
+
 ```sh
 bazel build //model/Qwen/Qwen3.8-Flash-Next:source \
   //model/Qwen/Qwen3.8-Flash-Next:archive
@@ -45,6 +47,6 @@ bazel test --config=asan --config=amdgpu \
 
 Each representation also has `_mtp`, `_mtp_continuation`, `_long_context`, and `_long_context_mtp` targets. For example, `:archive_mtp` builds the compiled provider package selected by the `mtp` preset. Bazel builds program artifacts and records the card and asset lock as regression inputs; checkpoint bytes stay outside its graph. Editing programs or shared providers requires no lock update. An immutable publication can additionally seal its built program bytes with `loom-fetch --update-lock --lock-scope=all`; that generated lock stays with the published artifacts.
 
-Image compositions use `_vision` and `_vision_mtp` targets, such as `:archive_vision_mtp`. They add the shared image service and model-specific projector to the same text provider closure. The service checks exercise all three representations, including image recall through a retained partial sparse-attention pool and replay after a server restart.
+Image compositions use `_vision` and `_vision_mtp` targets, such as `:archive_vision_mtp`. They add the shared image service and model-specific projector to the same text provider closure. The service checks exercise both representations, including image recall through a retained partial sparse-attention pool and replay after a server restart.
 
 The manual learned service tests accept a provisioned installation through `LOOM_MODEL_ASSETS` or `--assets`. They compare independent original-model responses, simultaneous checkpoint forks, continuation across a page boundary, fresh-history replay, weight deactivation/reactivation, client disconnect recovery, and joined shutdown. The [test guide](test/README.md) distinguishes those checks from the small numerical fixtures. The [program guide](program/README.md) describes preparation, recurrent ownership, sparse attention, and speculative publication.

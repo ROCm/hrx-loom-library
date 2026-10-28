@@ -91,10 +91,9 @@ task quality or isolated throughput.
 
 ## Image service checks
 
-`serve_source_vision_test`, `serve_archive_vision_test`, and
-`serve_mixed_vision_test` use original BF16 projector parameters in addition to
-the text assets. Each has a `_vision_mtp_test` counterpart for Q8 MTP. The
-provisioned installation also supplies `parameter/mmproj.gguf` from the card's
+`serve_source_vision_test` and `serve_archive_vision_test` use original BF16
+projector parameters in addition to the text assets. Each has a
+`_vision_mtp_test` counterpart for Q8 MTP. The provisioned installation also supplies `parameter/mmproj.gguf` from the card's
 asset lock. The same staging and joined-server harness serves all these checks.
 
 `vision_check.py` constructs small, lossless solid-color PNGs with independent
