@@ -3,7 +3,7 @@
 Small fixtures exercise the production model providers without acquiring
 checkpoints. Each public case or scenario has a benchmark declaration. The
 same workload can therefore be checked, planned, and measured with ordinary
-Loom tools; benchmark smoke establishes execution, not performance.
+Loom tools. Correctness runs and benchmark measurements are separate commands.
 
 | Checks | Contract and reference |
 | --- | --- |
@@ -27,12 +27,12 @@ Zero-workload output guards remain bitwise checks.
 
 The ordinary `q6_metadata` target checks code/scale staging, F32/F16 inputs,
 fused residuals, token tails, and inactive outputs. Full-width FFN and attention
-performance workloads live in the manual `q6_metadata_performance` target. They
+performance workloads live in the manual `q6_metadata_stress` target. They
 remain part of benchmark discovery and can be measured explicitly:
 
 ```sh
 python dev.py benchmark \
-  --target=//model/Qwen/Qwen3.8-27B/test:q6_metadata_performance \
+  --target=//model/Qwen/Qwen3.8-27B/test:q6_metadata_stress \
   --config=amdgpu --device=amdgpu://0 \
   --output-dir=.reports/benchmark/q6-metadata
 ```
@@ -42,13 +42,20 @@ use the Release SDK or canonical optimized source configuration and an idle,
 qualified measurement device, as described in the
 [benchmark workflow](../../../../docs/development.md#sweep-repository-benchmarks).
 
+The full-vocabulary `output_projection_stress` target retains the eight-row,
+32-row, and live-prefix comparisons. Its generated weight fixture occupies
+about 1 GiB. Both stress targets use `_stress.loom` sources and carry `manual`
+and `stress` tags, so ordinary CI excludes them. Explicit runs may select the
+same sanitizer configurations as the smaller tests.
+
 Test-only reference kernels remain root-owned. Checks of private convolution
 or coefficient helpers include the unchanged implementation source as a test
 root, preserving the production export boundary. Shared Philox, GGML carrier,
 text-policy, geometry, acceptance, proposal, and continuation contracts remain
 with their shared library owners.
 
-Native AMD and access-instrumented profiles exercise device behavior. The
+The native AMD profile exercises device behavior; the selected build
+configuration enables access or race instrumentation on that same target. The
 portable normalization, feature capture, and preparation checks also retain
 Vulkan profiles. Target requirements select the appropriate RDNA/CDNA cases;
 a run on one architecture does not qualify another architecture's entries.
