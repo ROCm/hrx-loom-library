@@ -1019,7 +1019,7 @@ class RequestCheckTest(unittest.TestCase):
 
     def test_capacity_and_model_identity_rejections_are_atomic(self):
         for request, capacity, diagnostic in (
-            (self.request(), 1, "complete input exceeds token capacity"),
+            (self.request(), 1, "input exceeds the available context size"),
             (self.request(model="another-model"), 4096, "select model"),
         ):
             with self.subTest(capacity=capacity, request=request):
