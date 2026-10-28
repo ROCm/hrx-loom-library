@@ -80,7 +80,7 @@ def render_fixture(case, arrays, expected, kernel, *, absolute_tolerance=None):
     if absolute_tolerance is None:
         comparison = f"check.expect.bitwise actual({output}) expected({output}) : tensor<{count}xf32>"
     else:
-        comparison = f"check.expect.close actual({output}) expected({output}) atol({absolute_tolerance:.17g}) rtol(0.0) nan(different) : tensor<{count}xf32>"
+        comparison = f"check.expect.approximate actual({output}) expected({output}) atol({absolute_tolerance:.17g}) rtol(0.0) nan(different) : tensor<{count}xf32>, tensor<{count}xf32>"
     return f"""
 {declarations}
 

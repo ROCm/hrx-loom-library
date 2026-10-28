@@ -184,7 +184,7 @@ def render_case(case, observation):
                  if exact else "")
     comparison = (f"check.expect.bitwise actual(%output_bits) expected(%output_bits) : tensor<{count}xi32>"
                   if exact else
-                  f"check.expect.close actual(%output) expected(%output) atol({tolerance:.17g}) rtol(0.0) nan(different) : tensor<{count}xf32>")
+                  f"check.expect.approximate actual(%output) expected(%output) atol({tolerance:.17g}) rtol(0.0) nan(different) : tensor<{count}xf32>, tensor<{count}xf32>")
     return f'''
 global.rodata.def @{name}_input = align(16) bytes("{encode(packed, 'f32')}")
 

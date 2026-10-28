@@ -97,7 +97,7 @@ def render_case(case):
     comparison = (
         f"check.expect.bitwise actual(%output) expected(%output) : tensor<{elements}xf32>"
         if case.exact else
-        f"check.expect.close actual(%output) expected(%output) atol({absolute:.17g}) rtol(0.00390625) nan(different) : tensor<{elements}xf32>"
+        f"check.expect.approximate actual(%output) expected(%output) atol({absolute:.17g}) rtol(0.00390625) nan(different) : tensor<{elements}xf32>, tensor<{elements}xf32>"
     )
     padding_view = padding_check = ""
     if case.capacity > count:

@@ -132,7 +132,7 @@ def render_case(shape, kind):
     if shape.pattern in ('zero', 'unit') and kind != 'inverse':
         comparison = f'check.expect.bitwise actual({output}) expected({output}) : tensor<{output_count}x{dtype}>'
     else:
-        comparison = f'check.expect.close actual({output}) expected({output}) atol(0.0) rtol({literal(tolerance)}) nan(different) : tensor<{output_count}x{dtype}>'
+        comparison = f'check.expect.approximate actual({output}) expected({output}) atol(0.0) rtol({literal(tolerance)}) nan(different) : tensor<{output_count}x{dtype}>, tensor<{output_count}x{dtype}>'
     return f'''
 global.rodata.def @{name}_input = align(2) bytes("{encode(inputs, 'bf16')}")
 

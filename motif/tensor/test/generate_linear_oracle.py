@@ -150,7 +150,7 @@ def render_case(shape):
     if shape.precision:
         expectation = f"check.expect.bitwise actual(%wide) expected(%wide) : tensor<{wide_count}xf32>"
     else:
-        expectation = f"check.expect.close actual(%wide) expected(%wide) atol({format(tolerance, '.17g')}) rtol(0.0) nan(different) : tensor<{wide_count}xf32>"
+        expectation = f"check.expect.approximate actual(%wide) expected(%wide) atol({format(tolerance, '.17g')}) rtol(0.0) nan(different) : tensor<{wide_count}xf32>, tensor<{wide_count}xf32>"
     return f'''
 {rodata}
 

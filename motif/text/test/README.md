@@ -4,8 +4,8 @@
 and digit member, their immediate neighbors, and UTF-8 width boundaries. Its
 3,293 rows come independently from CPython 3.12's Unicode 15.0 implementation.
 Each row checks the three uppercase results, both properties, and forward and
-backward UTF-8 round trips. The generated oracle is separate from the UCD
-parser that supplies the production tables.
+backward UTF-8 round trips. The generated oracle is independent of the shared
+runtime implementation; these properties agree across Unicode 15.0 and 15.1.
 
 `utf8_test.loom` compares literal encodings at both ends of all four UTF-8 widths,
 including NUL, against the produced bytes and decoded scalars. Trim cases
@@ -24,5 +24,5 @@ python3.12 -B motif/text/test/generate_unicode_oracle.py
 ```
 
 Regeneration requires Unicode 15.0.0 and fails on a different Python UCD
-version. A data-version change updates the production tables, oracle, and
-documented semantic version together.
+version. Changes to the runtime's Unicode properties are checked against this
+pinned behavior before updating the oracle's version.

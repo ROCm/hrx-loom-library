@@ -231,7 +231,7 @@ def render_fixture(name, arrays, expected, exact, absolute, relative, launch, bo
     types = ", ".join(f"tensor<{len(values)}x{dtype}>" for _, dtype, values in arrays)
     count = len(expected)
     comparison = (f"check.expect.bitwise actual(%output) expected(%output) : tensor<{count}xbf16>"
-                  if exact else f"check.expect.close actual(%output) expected(%output) atol({absolute:.17g}) rtol({relative:.17g}) nan(different) : tensor<{count}xbf16>")
+                  if exact else f"check.expect.approximate actual(%output) expected(%output) atol({absolute:.17g}) rtol({relative:.17g}) nan(different) : tensor<{count}xbf16>, tensor<{count}xbf16>")
     return "\n\n".join(data) + f'''
 
 func.def @initialize_{name}({", ".join(f"%{label}: buffer" for label in names)}) {{
