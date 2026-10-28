@@ -549,3 +549,12 @@ storage, without transferring that storage's ownership to the motif.
 ```sh
 bazel test --config=asan --config=amdgpu //motif/tensor/...
 ```
+
+`matrix_publication.loom` publishes bounded row-major BF16 tiles from native
+RDNA wave32 F32 accumulator fragments. Complete tiles use fragment stores;
+partial tiles preserve every element outside the live view. Unlike the complete,
+layout-parameterized `projection.store_bf16`, this entry accepts ragged row and
+column bounds and tiles wholly beyond those bounds. The caller supplies the
+view relative to its full-width byte origin, owns disjoint tiles, and retains
+any synchronization. Dense projections, fused predictor epilogues, residual
+mixing, and sparse index projections share this publication contract.

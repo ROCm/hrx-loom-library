@@ -1,0 +1,95 @@
+// Publish native accumulator fragments without a contraction. An independent
+// scalar oracle repeats one 16x16 input tile across the output matrix. Partial
+// and wholly inactive tiles must preserve every byte outside the live matrix.
+amdgpu.target<gfx11-generic> @publication_wave32 {subgroup_size = 32}
+
+template.decl @tensor.matrix.store_bf16_wave32(%remaining_rows: index, %outputs: index, %fragment_row: index, %result_column: index, %result: vector<8xf32>, %output_view: view<[%remaining_rows]x[%outputs]xbf16>)
+
+kernel.def target(@publication_wave32) @publish() {
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%c3, %c3, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%row_count: index, %column_count: index, %input: buffer, %output: buffer) {
+  %rows = index.assume %row_count [range(%row_count, 1, 33)] : index
+  %columns = index.assume %column_count [range(%column_count, 1, 37)] : index
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %tile = index.constant 16 : index
+  %group_row = kernel.workgroup.id<y> : index
+  %group_column = kernel.workgroup.id<x> : index
+  %row = index.mul %group_row, %tile : index
+  %column = index.mul %group_column, %tile : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<16x16xf32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%columns]xbf16>
+  %fragment = vector.fragment.load<result> %input_view[%c0, %c0] shape [%tile, %tile] : view<16x16xf32> -> vector<8xf32>
+  template.apply<@tensor.matrix.store_bf16_wave32>(%rows, %columns, %row, %column, %fragment, %output_view) : (index, index, index, index, vector<8xf32>, view<[%rows]x[%columns]xbf16>)
+  kernel.return
+}
+
+func.def @reference(%rows: index, %columns: index, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %tile = index.constant 16 : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<16x16xf32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%columns]xbf16>
+  scf.for %row = [%c0 to %rows step %c1] {
+    %input_row = index.rem %row, %tile : index
+    scf.for %column = [%c0 to %columns step %c1] {
+      %input_column = index.rem %column, %tile : index
+      %value = view.load %input_view[%input_row, %input_column] : view<16x16xf32> -> f32
+      %packed = scalar.fptrunc %value : f32 to bf16
+      view.store %packed, %output_view[%row, %column] : bf16, view<[%rows]x[%columns]xbf16>
+    }
+  }
+  func.return
+}
+
+// Binary fractions place both midpoint parities around one. The rest of the
+// tile has distinct random values, making row/column permutations observable.
+func.def @initialize_publication_values(%input: buffer) {
+  %origin = index.constant 0 : offset
+  %view = buffer.view %input[%origin] : buffer -> view<16x16xf32>
+  %even = scalar.constant 1.00390625 : f32
+  %odd = scalar.constant 1.01171875 : f32
+  view.store %even, %view[0, 0] : f32, view<16x16xf32>
+  view.store %odd, %view[0, 1] : f32, view<16x16xf32>
+  func.return
+}
+
+func.def @geometry(%trial: index) -> (index, index) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %c16 = index.constant 16 : index
+  %c33 = index.constant 33 : index
+  %c37 = index.constant 37 : index
+  %shape = index.rem %trial, %c3 : index
+  %single = index.cmp eq, %shape, %c0 : index
+  %full = index.cmp eq, %shape, %c1 : index
+  %multiple = scf.select %full, %c16, %c33 : index
+  %rows = scf.select %single, %c1, %multiple : index
+  %partial_columns = index.cmp uge, %trial, %c3 : index
+  %columns = scf.select %partial_columns, %c37, %c16 : index
+  func.return %rows, %columns : index, index
+}
+
+check.scenario public @bounded_matrix_publication {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[6](%trial: index, %entropy: check.entropy) {
+    %rows, %columns = check.generate<@geometry>(%trial) : (index) -> (index, index)
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-8.0 to 8.0) : tensor<16x16xf32>
+    check.generate<@initialize_publication_values>(%input) : (tensor<16x16xf32>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<1237xbf16>
+    %output = check.tensor.view %storage offset(16) : tensor<1237xbf16> -> tensor<[%rows]x[%columns]xbf16>
+    check.compare<@publish, @reference>(%rows, %columns, %input, %output) : (index, index, tensor<16x16xf32>, tensor<[%rows]x[%columns]xbf16>) -> () {
+      check.expect.bitwise actual(%storage) expected(%storage) : tensor<1237xbf16>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<16x16xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@bounded_matrix_publication> @bounded_matrix_publication_benchmark
