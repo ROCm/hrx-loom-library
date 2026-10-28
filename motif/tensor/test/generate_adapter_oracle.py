@@ -156,7 +156,7 @@ def matrix_fixture(leaf, exact, options):
             )
         else:
             parts.append(
-                f"      check.expect.close actual(%output_values) expected(%output_values) atol({tolerance!r}) rtol(0.0) nan(different) : tensor<{sizes['output'] // 2}xbf16>\n"
+                f"      check.expect.approximate actual(%output_values) expected(%output_values) atol({tolerance!r}) rtol(0.0) nan(different) : tensor<{sizes['output'] // 2}xbf16>, tensor<{sizes['output'] // 2}xbf16>\n"
             )
             parts.append(
                 "      check.expect.bitwise actual(%output_prefix) expected(%output_prefix) : tensor<16xi8>\n      check.expect.bitwise actual(%output_suffix) expected(%output_suffix) : tensor<16xi8>\n"
@@ -230,7 +230,7 @@ def matrix_fixture(leaf, exact, options):
             )
         else:
             parts.append(
-                f"      check.expect.close actual(%low_values) expected(%low_values) atol({tolerance!r}) rtol(0.0) nan(different) : tensor<{sizes['low'] // 2}xbf16>\n"
+                f"      check.expect.approximate actual(%low_values) expected(%low_values) atol({tolerance!r}) rtol(0.0) nan(different) : tensor<{sizes['low'] // 2}xbf16>, tensor<{sizes['low'] // 2}xbf16>\n"
             )
             parts.append(
                 "      check.expect.bitwise actual(%low_prefix) expected(%low_prefix) : tensor<16xi8>\n      check.expect.bitwise actual(%low_suffix) expected(%low_suffix) : tensor<16xi8>\n"
@@ -370,7 +370,7 @@ def cohort_fixture(leaf):
                 f"      check.expect.bitwise actual(%{key}_storage) expected(%{key}_storage) : tensor<{sizes[key] + 32}xi8>\n"
             )
         for item in range(2):
-            parts.append(f"""      check.expect.close actual(%values{item}) expected(%values{item}) atol({tolerances[item]!r}) rtol(0.0) nan(different) : tensor<{sizes["output" + str(item)] // 2}xbf16>
+            parts.append(f"""      check.expect.approximate actual(%values{item}) expected(%values{item}) atol({tolerances[item]!r}) rtol(0.0) nan(different) : tensor<{sizes["output" + str(item)] // 2}xbf16>, tensor<{sizes["output" + str(item)] // 2}xbf16>
           check.expect.bitwise actual(%prefix{item}) expected(%prefix{item}) : tensor<16xi8>
           check.expect.bitwise actual(%suffix{item}) expected(%suffix{item}) : tensor<16xi8>
     """)

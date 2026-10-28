@@ -130,7 +130,7 @@ def render_case(name, pixels, channels, threads, silu, in_place, minimum_norm):
     else:
         absolute = "4.9999999999999998e-07" if silu else "0.0"
         relative = 2e-6 if silu else 2**-20
-        comparison = f"check.expect.close actual({output}) expected({output}) atol({absolute}) rtol({relative:.17g}) nan(different) : tensor<{count}xf32>"
+        comparison = f"check.expect.approximate actual({output}) expected({output}) atol({absolute}) rtol({relative:.17g}) nan(different) : tensor<{count}xf32>, tensor<{count}xf32>"
     unchanged_input = "" if in_place else f"""      check.expect.bitwise actual(%input_storage) expected(%input_storage) : tensor<{storage_count}xf32>
 """
     return f"""

@@ -238,7 +238,7 @@ def render_case(case, observation):
     count = len(expected)
     provider = "shared_four_head_bf16" if case.tile == 16 else "shared_four_head_k32_bf16"
     output_check = (f"check.expect.bitwise actual(%output) expected(%output) : tensor<{count}xbf16>"
-                    if exact else f"check.expect.close actual(%output) expected(%output) atol({tolerance:.17g}) rtol(0.0) nan(different) : tensor<{count}xbf16>")
+                    if exact else f"check.expect.approximate actual(%output) expected(%output) atol({tolerance:.17g}) rtol(0.0) nan(different) : tensor<{count}xbf16>, tensor<{count}xbf16>")
     return "\n\n".join(data) + f'''
 
 func.def @initialize_{name}({", ".join(f"%{label}: buffer" for label in names)}) {{

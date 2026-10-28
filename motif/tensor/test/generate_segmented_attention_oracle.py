@@ -162,7 +162,7 @@ def render_case(case, observation):
         for key, _ in named[:3])
     comparison = (f"check.expect.bitwise actual(%output) expected(%output) : tensor<{count}xbf16>"
                   if exact else
-                  f"check.expect.close actual(%output) expected(%output) atol({absolute:.17g}) rtol({relative:.17g}) nan(different) : tensor<{count}xbf16>")
+                  f"check.expect.approximate actual(%output) expected(%output) atol({absolute:.17g}) rtol({relative:.17g}) nan(different) : tensor<{count}xbf16>, tensor<{count}xbf16>")
     return f'''
 {rodata}
 
