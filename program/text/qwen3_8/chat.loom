@@ -1310,35 +1310,45 @@ func.def public @text_chat_begin_v1(%request: buffer, %tools: buffer) -> (buffer
 // Renders ordered user content with one logical image-input slot per projected
 // row. Marker ranges cover only the repeated image-pad tokens; the surrounding
 // vision delimiters remain ordinary language-model inputs.
-func.def @chat_ordered_content(%content: buffer, %parts: buffer, %part_count: i64, %images_allowed: i1, %maximum_tokens: i32) -> (buffer, buffer, i64) {
+func.def @chat_ordered_content(%content: buffer, %parts: buffer, %frames: buffer, %part_count: i64, %images_allowed: i1, %maximum_tokens: i32) -> (buffer, buffer, i64) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
-  %c24 = index.constant 24 : index
+  %record_bytes = index.constant 28 : index
   %text_kind = scalar.constant 0 : i32
+  %image_kind = scalar.constant 1 : i32
+  %one32 = scalar.constant 1 : i32
+  %frame_stride = index.constant 16 : offset
   %shape_capacity = index.constant 32 : offset
   %shapes = buffer.alloca<private> align(4) %shape_capacity : buffer
   %shape_records = buffer.view %shapes[%origin] : buffer -> view<4x2xi32>
   %token_pixels = scalar.constant 1024 : i32
   %bounded_part_count = scalar.assume %part_count [range(%part_count, 1, 4096)] : i64
   %part_extent = index.cast %bounded_part_count : i64 to index
-  %records = buffer.view %parts[%origin] : buffer -> view<[%part_extent]x7xi32>
+  %records = buffer.view %parts[%origin] : buffer -> view<[%part_extent]x6xi32>
   %image_count_value, %total_rows = scf.for %i = [%c0 to %part_extent step %c1](%count = %c0 : index, %rows = %c0 : index) -> (index, index) {
-    %kind = view.load %records[%i, 0] : view<[%part_extent]x7xi32> -> i32
+    %kind = view.load %records[%i, 0] : view<[%part_extent]x6xi32> -> i32
     %is_text = scalar.cmpi eq, %kind, %text_kind : i32
     %next, %next_rows = scf.if %is_text -> (index, index) {
       scf.yield %count, %rows : index, index
     } else {
-      %width = view.load %records[%i, 4] : view<[%part_extent]x7xi32> -> i32
-      %height = view.load %records[%i, 5] : view<[%part_extent]x7xi32> -> i32
+      %is_image = scalar.cmpi eq, %kind, %image_kind : i32
+      %image_allowed = scalar.andi %images_allowed, %is_image : i1
+      %allowed32 = scalar.extui %image_allowed : i1 to i32
+      %error = global.load @chat_image_invalid : buffer
+      func.call @require(%allowed32, %error) : (i32, buffer)
+      %frame_begin32 = view.load %records[%i, 3] : view<[%part_extent]x6xi32> -> i32
+      %frame_begin = index.cast %frame_begin32 : i32 to index
+      %frame_offset = index.scale %frame_begin, %frame_stride : index, offset -> offset
+      %geometry = buffer.view %frames[%frame_offset] : buffer -> view<2xi32>
+      %width = view.load %geometry[0] : view<2xi32> -> i32
+      %height = view.load %geometry[1] : view<2xi32> -> i32
       %short_axis = scalar.minui %width, %height : i32
       %long_axis = scalar.maxui %width, %height : i32
       %ratio_limit = scalar.constant 200 : i32
       %long_limit = scalar.muli %short_axis, %ratio_limit : i32
       %aspect_valid = scalar.cmpi ule, %long_axis, %long_limit : i32
-      %valid = scalar.andi %images_allowed, %aspect_valid : i1
-      %valid32 = scalar.extui %valid : i1 to i32
-      %error = global.load @chat_image_invalid : buffer
+      %valid32 = scalar.extui %aspect_valid : i1 to i32
       func.call @require(%valid32, %error) : (i32, buffer)
       %selected_width, %selected_height = func.call @qwen38_vision_geometry(%width, %height, %maximum_tokens) : (i32, i32, i32) -> (i32, i32)
       %shape_index = index.assume %count [range(%count, 0, 3)] : index
@@ -1369,22 +1379,22 @@ func.def @chat_ordered_content(%content: buffer, %parts: buffer, %part_count: i6
   %content_length = buffer.length %content
   %output_capacity = index.add %content_length, %all_image_bytes : offset
   %scratch = buffer.alloca<private> align(1) %output_capacity : buffer
-  %plan_size = index.mul %image_count, %c24 : index
+  %plan_size = index.mul %image_count, %record_bytes : index
   %plan_size64_value = index.cast %plan_size : index to i64
-  %plan_size64 = scalar.assume %plan_size64_value [range(%plan_size64_value, 0, 96)] : i64
+  %plan_size64 = scalar.assume %plan_size64_value [range(%plan_size64_value, 0, 112)] : i64
   %metadata_begin = index.cast %plan_size64 : i64 to offset
   %shape_stride = index.constant 8 : offset
   %metadata_bytes = index.scale %image_count, %shape_stride : index, offset -> offset
   %plan_bytes = index.add %metadata_begin, %metadata_bytes : offset
   %plan = buffer.alloca<private> align(4) %plan_bytes : buffer
   buffer.copy %shapes[%origin], %plan[%metadata_begin], %metadata_bytes
-  %markers = buffer.view %plan[%origin] : buffer -> view<[%image_count]x6xi32>
+  %markers = buffer.view %plan[%origin] : buffer -> view<[%image_count]x7xi32>
   %used, %final_image = scf.for %i = [%c0 to %part_extent step %c1](%cursor = %origin : offset, %image = %c0 : index) -> (offset, index) {
-    %kind = view.load %records[%i, 0] : view<[%part_extent]x7xi32> -> i32
+    %kind = view.load %records[%i, 0] : view<[%part_extent]x6xi32> -> i32
     %is_text = scalar.cmpi eq, %kind, %text_kind : i32
     %next_cursor, %next_image = scf.if %is_text -> (offset, index) {
-      %source32 = view.load %records[%i, 1] : view<[%part_extent]x7xi32> -> i32
-      %length32 = view.load %records[%i, 2] : view<[%part_extent]x7xi32> -> i32
+      %source32 = view.load %records[%i, 1] : view<[%part_extent]x6xi32> -> i32
+      %length32 = view.load %records[%i, 2] : view<[%part_extent]x6xi32> -> i32
       %source64 = scalar.extui %source32 : i32 to i64
       %length64 = scalar.extui %length32 : i32 to i64
       %source_value = scalar.assume %source64 [range(%source64, 0, 4294967295)] : i64
@@ -1410,24 +1420,25 @@ func.def @chat_ordered_content(%content: buffer, %parts: buffer, %part_count: i6
       }
       buffer.copy %vision_end[%origin], %scratch[%after_pads], %vision_end_length
       %after_image = index.add %after_pads, %vision_end_length : offset
-      %image_index = view.load %records[%i, 3] : view<[%part_extent]x7xi32> -> i32
+      %image_index = view.load %records[%i, 3] : view<[%part_extent]x6xi32> -> i32
       %marker_begin64 = index.cast %marker_begin : offset to i64
       %marker_begin32 = scalar.trunci %marker_begin64 : i64 to i32
       %marker_length = index.sub %after_pads, %marker_begin : offset
       %marker_length64 = index.cast %marker_length : offset to i64
       %marker_length32 = scalar.trunci %marker_length64 : i64 to i32
       %bounded_image, %bounded_image_count = index.assume %image, %image_count [range(%image, 0, 3), range(%image_count, 1, 4), lt(%image, %image_count)] : index, index
-      %bounded_markers = buffer.view %plan[%origin] : buffer -> view<[%bounded_image_count]x6xi32>
-      view.store %image_index, %bounded_markers[%bounded_image, 0] : i32, view<[%bounded_image_count]x6xi32>
-      view.store %marker_begin32, %bounded_markers[%bounded_image, 1] : i32, view<[%bounded_image_count]x6xi32>
-      view.store %marker_length32, %bounded_markers[%bounded_image, 2] : i32, view<[%bounded_image_count]x6xi32>
-      view.store %feature_count, %bounded_markers[%bounded_image, 3] : i32, view<[%bounded_image_count]x6xi32>
+      %bounded_markers = buffer.view %plan[%origin] : buffer -> view<[%bounded_image_count]x7xi32>
+      view.store %image_index, %bounded_markers[%bounded_image, 0] : i32, view<[%bounded_image_count]x7xi32>
+      view.store %one32, %bounded_markers[%bounded_image, 1] : i32, view<[%bounded_image_count]x7xi32>
+      view.store %marker_begin32, %bounded_markers[%bounded_image, 2] : i32, view<[%bounded_image_count]x7xi32>
+      view.store %marker_length32, %bounded_markers[%bounded_image, 3] : i32, view<[%bounded_image_count]x7xi32>
+      view.store %feature_count, %bounded_markers[%bounded_image, 4] : i32, view<[%bounded_image_count]x7xi32>
       %shape_offset = index.scale %image, %shape_stride : index, offset -> offset
       %metadata_position = index.add %metadata_begin, %shape_offset : offset
       %metadata_offset = index.cast %metadata_position : offset to i32
       %metadata_length = scalar.constant 8 : i32
-      view.store %metadata_offset, %bounded_markers[%bounded_image, 4] : i32, view<[%bounded_image_count]x6xi32>
-      view.store %metadata_length, %bounded_markers[%bounded_image, 5] : i32, view<[%bounded_image_count]x6xi32>
+      view.store %metadata_offset, %bounded_markers[%bounded_image, 5] : i32, view<[%bounded_image_count]x7xi32>
+      view.store %metadata_length, %bounded_markers[%bounded_image, 6] : i32, view<[%bounded_image_count]x7xi32>
       %after_image_index = index.add %image, %c1 : index
       scf.yield %after_image, %after_image_index : offset, index
     }
@@ -1437,9 +1448,9 @@ func.def @chat_ordered_content(%content: buffer, %parts: buffer, %part_count: i6
   %trim_begin64 = index.cast %trim_begin : offset to i64
   %trim_begin32 = scalar.trunci %trim_begin64 : i64 to i32
   scf.for %i = [%c0 to %image_count step %c1] {
-    %absolute = view.load %markers[%i, 1] : view<[%image_count]x6xi32> -> i32
+    %absolute = view.load %markers[%i, 2] : view<[%image_count]x7xi32> -> i32
     %relative = scalar.subi %absolute, %trim_begin32 : i32
-    view.store %relative, %markers[%i, 1] : i32, view<[%image_count]x6xi32>
+    view.store %relative, %markers[%i, 2] : i32, view<[%image_count]x7xi32>
   }
   %trimmed_length = index.sub %trim_end, %trim_begin : offset
   %ordered = buffer.alloca<private> align(1) %trimmed_length : buffer
@@ -1453,13 +1464,13 @@ func.def @chat_shift_markers(%plan: buffer, %image_count64: i64, %base: offset) 
   %c1 = index.constant 1 : index
   %bounded_count = scalar.assume %image_count64 [range(%image_count64, 0, 4)] : i64
   %image_count = index.cast %bounded_count : i64 to index
-  %markers = buffer.view %plan[%origin] : buffer -> view<[%image_count]x6xi32>
+  %markers = buffer.view %plan[%origin] : buffer -> view<[%image_count]x7xi32>
   %base64 = index.cast %base : offset to i64
   %base32 = scalar.trunci %base64 : i64 to i32
   scf.for %i = [%c0 to %image_count step %c1] {
-    %relative = view.load %markers[%i, 1] : view<[%image_count]x6xi32> -> i32
+    %relative = view.load %markers[%i, 2] : view<[%image_count]x7xi32> -> i32
     %absolute = scalar.addi %relative, %base32 : i32
-    view.store %absolute, %markers[%i, 1] : i32, view<[%image_count]x6xi32>
+    view.store %absolute, %markers[%i, 2] : i32, view<[%image_count]x7xi32>
   }
   func.return
 }
@@ -1468,7 +1479,7 @@ func.def @chat_shift_markers(%plan: buffer, %image_count64: i64, %base: offset) 
 // bit 4 selects thinking, bits 5..19 hold the per-image token budget, and bits
 // 20..63 hold the first assistant ordinal retaining thinking (zero keeps all).
 // This is source-private state. Native code carries it without interpreting it.
-func.def public @text_chat_message_v1(%raw: buffer, %role: buffer, %content: buffer, %parts: buffer, %reasoning: buffer, %calls: buffer, %state: i64, %ordinal: i64, %fields: i64, %part_count: i64) -> (buffer, i64, buffer) {
+func.def public @text_chat_message_v1(%raw: buffer, %role: buffer, %content: buffer, %parts: buffer, %frames: buffer, %reasoning: buffer, %calls: buffer, %state: i64, %ordinal: i64, %fields: i64, %part_count: i64) -> (buffer, i64, buffer, i64) {
   %zero64 = scalar.constant 0 : i64
   %one64 = scalar.constant 1 : i64
   %two64 = scalar.constant 2 : i64
@@ -1523,7 +1534,7 @@ func.def public @text_chat_message_v1(%raw: buffer, %role: buffer, %content: buf
     %budget_mask = scalar.constant 32767 : i64
     %budget = scalar.andi %shifted, %budget_mask : i64
     %maximum_tokens = scalar.trunci %budget : i64 to i32
-    %ordered, %markers, %images = func.call @chat_ordered_content(%content, %parts, %part_count, %user, %maximum_tokens) : (buffer, buffer, i64, i1, i32) -> (buffer, buffer, i64)
+    %ordered, %markers, %images = func.call @chat_ordered_content(%content, %parts, %frames, %part_count, %user, %maximum_tokens) : (buffer, buffer, buffer, i64, i1, i32) -> (buffer, buffer, i64)
     scf.yield %ordered, %markers, %images : buffer, buffer, i64
   } else {
     %trimmed = func.call @chat_trim(%content) : (buffer) -> (buffer)
@@ -1612,7 +1623,7 @@ func.def public @text_chat_message_v1(%raw: buffer, %role: buffer, %content: buf
   %user_bit = scf.select %real_user, %eight64, %zero64 : i64
   %new_bits = scalar.ori %retained_bits, %user_bit : i64
   %next = scalar.ori %new_bits, %new_role : i64
-  func.return %result, %next, %plan : buffer, i64, buffer
+  func.return %result, %next, %plan, %image_count : buffer, i64, buffer, i64
 }
 
 func.def public @text_chat_end_v1(%state: i64) -> (buffer, i64) {
