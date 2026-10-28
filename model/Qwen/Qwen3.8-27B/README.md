@@ -1,7 +1,7 @@
 # Qwen3.8-27B
 
 This package composes quantized text chat, checkpoint multi-token prediction,
-DFlash2 drafting, and image-conditioned chat through Loom's text service.
+DFlash2 drafting, images, and timestamped video frames through Loom's text service.
 [The model overview](OVERVIEW.md) describes the exact upstream files, presets,
 and installed-SDK workflow. [model.json](model.json) and its
 [acquisition lock](model.json.lock) are the portable installation inputs.

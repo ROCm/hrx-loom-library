@@ -9,7 +9,7 @@ New precision, target, and shape coverage belongs here once for all consumers.
 | Target | Independent reference and coverage |
 | --- | --- |
 | `patch` | Coordinate-coded RGB8 with repeated or distinct frames, signed sparse temporal convolutions, last-K taps, and a nonzero source origin. F16/BF16 compute crosses half/F32 weight storage at 4, 64, and 72 patches. |
-| `normalization` | Analytical spatial planes and population moments cover interpolation, merge order, affine normalization, and zero variance. Minimum, square, landscape, and portrait geometries share one fixture. |
+| `normalization` | Analytical spatial planes and population moments cover interpolation, merge order, affine normalization, and zero variance. Minimum, square, landscape, portrait, and maximum video-axis geometries share one fixture. |
 | `key_value` | Signed sparse products and scalar 2D rotary check every head, concurrent cohort banks, and transposed values at 4, 32, and 36 patches in both half formats. |
 | `attention` | Scalar rotary/dots and complete-row softmax check nonuniform attention. A separate sparse projection oracle isolates output errors. Both formats cover 4, 64, and 72 patches. |
 | `ffn` | Analytical statistics, signed three-tap projections, and scalar GELU check intermediate activation and residual output at 4, 64, and 68 rows, including the 4304-column reduction tail. |
