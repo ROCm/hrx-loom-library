@@ -2,6 +2,8 @@
 // selected output rows are compacted, preserving history for requests whose
 // current chunk produces no sampled output.
 
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
 func.decl pure @flash_next_finish_capacity() -> (index)
@@ -26,9 +28,9 @@ kernel.decl @hc_combine_normalize_inject() launch(%span: buffer, %residual: buff
 
 kernel.decl @hc_combine(%neural_enabled: i1) launch(%span: buffer, %residual: buffer, %projected: buffer, %injection: buffer, %output: buffer)
 
-command.program.decl @flash_next_qsa_append(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %capture: buffer)
+command.program.decl @flash_next_qsa_append(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset, %mixed_inputs: index, %remapped: i1, %origin_capacity: index) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %capture: buffer, %inputs: buffer, %origins: buffer)
 
-command.program.decl @flash_next_qsa_queries(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %output: buffer, %capture: buffer)
+command.program.decl @flash_next_qsa_queries(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset, %mixed_inputs: index, %remapped: i1, %origin_capacity: index) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %output: buffer, %capture: buffer, %inputs: buffer, %origins: buffer)
 
 command.program.decl @flash_next_hc_mix_normalized(%down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>) launch(%span: buffer, %normalized: buffer, %mixed: buffer)
 
@@ -39,9 +41,13 @@ command.program.decl @flash_next_experts(%neural_enabled: i1, %layer: index) lau
 // The output-only epoch reaches this boundary after the final input mixer.
 // Append every cache row before compacting scratch: later requests need all
 // K/V/indexer history, including chunks that produce no sampled output.
-command.program.def public @flash_next_finish_output(%layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %epoch: buffer, %mapping: buffer, %rows: buffer, %arena: buffer, %residual: buffer, %mixed: buffer, %injection: buffer, %output: buffer, %capture: buffer) {
+command.program.def public @flash_next_finish_output(%layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %epoch: buffer, %mapping: buffer, %rows: buffer, %arena: buffer, %residual: buffer, %mixed: buffer, %injection: buffer, %output: buffer, %capture: buffer, %inputs: buffer) {
   %neural_enabled = scalar.constant true : i1
-  command.program.launch @flash_next_qsa_append[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %epoch, %mapping, %rows, %mixed, %arena, %capture) : [i1, index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
+  %identity = scalar.constant false : i1
+  %remapped = scalar.constant true : i1
+  %source_capacity = config.get @flash_next.token_count : index
+  command.program.launch @flash_next_qsa_append[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin, %mixed_inputs, %identity, %source_capacity](%parameters, %epoch, %mapping, %rows, %mixed, %arena, %capture, %inputs, %epoch) : [i1, index, offset, offset, offset, offset, index, i1, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   %spans = config.get @flash_next.span_capacity : index
   %capacity = func.call pure @flash_next_finish_capacity() : () -> (index)
   %header_bytes = index.constant 12 : offset
@@ -73,7 +79,7 @@ command.program.def public @flash_next_finish_output(%layer: index, %key_origin:
   %selection_bytes = index.scale %tokens, %selection_stride : index, offset -> offset
   %gate_bytes = index.scale %tokens, %gate_stride : index, offset -> offset
   %projected = buffer.alloca<global> align(256) %hidden_bytes : buffer
-  command.program.launch @flash_next_qsa_queries[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %compact, %mapping, %rows, %mixed, %arena, %projected, %capture) : [i1, index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.program.launch @flash_next_qsa_queries[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin, %mixed_inputs, %remapped, %capacity](%parameters, %compact, %mapping, %rows, %mixed, %arena, %projected, %capture, %inputs, %origins) : [i1, index, offset, offset, offset, offset, index, i1, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   %attention = buffer.alloca<global> align(256) %residual_bytes : buffer
   %normalized = buffer.alloca<global> align(256) %residual_bytes : buffer
   %ffn_injection = buffer.alloca<global> align(256) %injection_bytes : buffer

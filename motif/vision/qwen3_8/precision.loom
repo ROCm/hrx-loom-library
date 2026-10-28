@@ -1,0 +1,112 @@
+// Half-precision interpretation for Qwen3.8 vision matrix panels.
+//
+// Stored values retain their original 16 bits. The compile-known bf16 fact
+// selects IEEE F16 or BF16 only at rounding and matrix-product boundaries.
+// Rounding uses the ordinary fptrunc semantics; no checkpoint conversion or
+// runtime precision dispatch is required. Scalar and four-value packet forms
+// match tail publication and vector panel staging respectively. Native input
+// loads and eight-value result rounding preserve the matrix fragment order.
+//
+// product requires complete RDNA wave32 16x16x16 fragments: sixteen half
+// elements per lane for each operand and eight F32 accumulator elements.
+// The caller supplies the fragment layout, target, and synchronization.
+// Arithmetic follows native half-input/F32-accumulator matrix semantics.
+// These helpers allocate no storage and introduce no memory ordering.
+
+// Round one vectorized panel packet and preserve the resulting half bits.
+func.def public inline @qwen38_vision_round_packet(%bf16: i1, %values: vector<4xf32>) -> (vector<4xi16>) {
+  %bits = scf.if %bf16 -> (vector<4xi16>) {
+    %rounded = vector.fptrunc %values : vector<4xf32> to vector<4xbf16>
+    %result = vector.bitcast %rounded : vector<4xbf16> to vector<4xi16>
+    scf.yield %result : vector<4xi16>
+  } else {
+    %rounded = vector.fptrunc %values : vector<4xf32> to vector<4xf16>
+    %result = vector.bitcast %rounded : vector<4xf16> to vector<4xi16>
+    scf.yield %result : vector<4xi16>
+  }
+  func.return %bits : vector<4xi16>
+}
+
+func.def public inline @qwen38_vision_round_scalar(%bf16: i1, %value: f32) -> (i16) {
+  %bits = scf.if %bf16 -> (i16) {
+    %rounded = scalar.fptrunc %value : f32 to bf16
+    %result = scalar.bitcast %rounded : bf16 to i16
+    scf.yield %result : i16
+  } else {
+    %rounded = scalar.fptrunc %value : f32 to f16
+    %result = scalar.bitcast %rounded : f16 to i16
+    scf.yield %result : i16
+  }
+  func.return %bits : i16
+}
+
+func.def public inline @qwen38_vision_product(%bf16: i1, %left: vector<16xi16>, %right: vector<16xi16>, %accumulator: vector<8xf32>) -> (vector<8xf32>) {
+  %tile = index.constant 16 : index
+  %result = scf.if %bf16 -> (vector<8xf32>) {
+    %left_values = vector.bitcast %left : vector<16xi16> to vector<16xbf16>
+    %right_values = vector.bitcast %right : vector<16xi16> to vector<16xbf16>
+    %lhs = vector.fragment<lhs> %left_values shape [%tile, %tile] : vector<16xbf16>
+    %rhs = vector.fragment<rhs> %right_values shape [%tile, %tile] : vector<16xbf16>
+    %initial = vector.fragment<init> %accumulator shape [%tile, %tile] : vector<8xf32>
+    %product = vector.mma %lhs, %rhs, %initial : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+    scf.yield %product : vector<8xf32>
+  } else {
+    %left_values = vector.bitcast %left : vector<16xi16> to vector<16xf16>
+    %right_values = vector.bitcast %right : vector<16xi16> to vector<16xf16>
+    %lhs = vector.fragment<lhs> %left_values shape [%tile, %tile] : vector<16xf16>
+    %rhs = vector.fragment<rhs> %right_values shape [%tile, %tile] : vector<16xf16>
+    %initial = vector.fragment<init> %accumulator shape [%tile, %tile] : vector<8xf32>
+    %product = vector.mma %lhs, %rhs, %initial : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    scf.yield %product : vector<8xf32>
+  }
+  func.return %result : vector<8xf32>
+}
+
+// Round and publish a complete native result fragment. Rows and columns name
+// the contiguous output view; the caller proves the complete 16x16 tile valid.
+func.def public inline @qwen38_vision_store_result(%bf16: i1, %rows: index, %columns: index, %output: buffer, %row: index, %column: index, %values: vector<8xf32>) {
+  %origin = index.constant 0 : offset
+  %tile = index.constant 16 : index
+  scf.if %bf16 {
+    %view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%columns]xbf16>
+    vector.fragment.store<result> %values, %view[%row, %column] shape [%tile, %tile] : vector<8xf32>, view<[%rows]x[%columns]xbf16>
+  } else {
+    %view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%columns]xf16>
+    vector.fragment.store<result> %values, %view[%row, %column] shape [%tile, %tile] : vector<8xf32>, view<[%rows]x[%columns]xf16>
+  }
+  func.return
+}
+
+// Round a native eight-value result fragment while retaining its lane order.
+func.def public inline @qwen38_vision_round_fragment(%bf16: i1, %values: vector<8xf32>) -> (vector<8xi16>) {
+  %bits = scf.if %bf16 -> (vector<8xi16>) {
+    %rounded = vector.fptrunc %values : vector<8xf32> to vector<8xbf16>
+    %result = vector.bitcast %rounded : vector<8xbf16> to vector<8xi16>
+    scf.yield %result : vector<8xi16>
+  } else {
+    %rounded = vector.fptrunc %values : vector<8xf32> to vector<8xf16>
+    %result = vector.bitcast %rounded : vector<8xf16> to vector<8xi16>
+    scf.yield %result : vector<8xi16>
+  }
+  func.return %bits : vector<8xi16>
+}
+
+// Load a complete native left fragment from a row-major half view. The caller
+// supplies the physical row stride as columns, including any resident padding,
+// and proves the 16x16 region valid. Returned bits retain native fragment order.
+func.def public inline @qwen38_vision_load_input(%bf16: i1, %rows: index, %columns: index, %input: buffer, %row: index, %column: index) -> (vector<16xi16>) {
+  %origin = index.constant 0 : offset
+  %tile = index.constant 16 : index
+  %bits = scf.if %bf16 -> (vector<16xi16>) {
+    %view = buffer.view %input[%origin] : buffer -> view<[%rows]x[%columns]xbf16>
+    %values = vector.fragment.load<lhs> %view[%row, %column] shape [%tile, %tile] : view<[%rows]x[%columns]xbf16> -> vector<16xbf16>
+    %result = vector.bitcast %values : vector<16xbf16> to vector<16xi16>
+    scf.yield %result : vector<16xi16>
+  } else {
+    %view = buffer.view %input[%origin] : buffer -> view<[%rows]x[%columns]xf16>
+    %values = vector.fragment.load<lhs> %view[%row, %column] shape [%tile, %tile] : view<[%rows]x[%columns]xf16> -> vector<16xf16>
+    %result = vector.bitcast %values : vector<16xf16> to vector<16xi16>
+    scf.yield %result : vector<16xi16>
+  }
+  func.return %bits : vector<16xi16>
+}

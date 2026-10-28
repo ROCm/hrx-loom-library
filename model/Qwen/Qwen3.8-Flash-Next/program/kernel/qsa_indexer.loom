@@ -2,6 +2,8 @@
 // blocks, and partial tails. Immutable anchors supply old prefixes; only the
 // selected writer publishes the next retained tail.
 
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
 config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 8)]
 
 config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
@@ -15,6 +17,12 @@ func.decl @flash_next_span_count(%epoch: buffer) -> (index)
 func.decl pure @flash_next_span_workers(%capacity: index) -> (index)
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
+
+func.decl @flash_next_token_rotary(%mapping: buffer, %token: index) -> (index)
+
+func.decl @flash_next_token_coordinate(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %mapping: buffer, %inputs: buffer, %origins: buffer, %token: index, %lane: index) -> (index)
+
+func.decl @qsa_group_coordinate(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %coordinate_origin: offset, %logical: index, %first: index, %source_first: index, %begin: index, %row: index, %axis: index, %inputs: buffer, %origins: buffer, %rows: buffer, %arena: buffer) -> (index)
 
 func.decl @flash_next_token_binding(%mapping: buffer, %token: index) -> (index, index, index, index)
 
@@ -289,23 +297,19 @@ func.def public inline @qsa_normalize_rotate(%width_arg: index, %position: index
   func.return
 }
 
-// Both indexer and main queries have compact append rows and absolute RoPE.
-kernel.def target(@qsa_wave32) @qsa_prepare_queries(%neural_enabled: i1, %heads: index) {
-  %count = index.assume %heads [range(%heads, 4, 24)] : index
-  %tokens = config.get @flash_next.token_count : index
-  %threads = index.constant 32 : index
-  %c1 = index.constant 1 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %count, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+// Indexer and main queries use source coordinates independently of causal
+// cache positions. Static entries erase packet and origins access for text.
+template.decl @flash_next.qsa_prepare_queries(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer)
+
+template.def<@flash_next.qsa_prepare_queries> device @qsa_prepare_queries_body(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
   %token = kernel.workgroup.id<y> : index
   %active = index.cmp ult, %token, %end : index
   scf.if %active {
     %head = kernel.workgroup.id<x> : index
-    %position, %row, %begin, %first = func.call @flash_next_token_binding(%mapping, %token) : (buffer, index) -> (index, index, index, index)
+    %lane = kernel.subgroup.lane.id : index
+    %position = func.call @flash_next_token_coordinate(%mixed, %remapped, %source_capacity, %origin_capacity, %mapping, %inputs, %origins, %token, %lane) : (index, i1, index, index, buffer, buffer, buffer, index, index) -> (index)
     %linear_head = index.madd %token, %heads, %head : index
     %input_element = index.mul %linear_head, %head_stride : index
     %output_element = index.mul %linear_head, %width : index
@@ -315,6 +319,52 @@ kernel.def target(@qsa_wave32) @qsa_prepare_queries(%neural_enabled: i1, %heads:
     %output_group_stride = index.constant 16 : index
     func.call @qsa_normalize_rotate(%width, %position, %input, %input_origin, %weight, %output, %output_origin, %output_group_stride) : (index, index, buffer, offset, buffer, buffer, offset, index)
   }
+  template.return
+}
+
+kernel.def target(@qsa_wave32) @qsa_prepare_queries(%neural_enabled: i1, %heads: index) {
+  %count = index.assume %heads [range(%heads, 4, 24)] : index
+  %tokens = config.get @flash_next.token_count : index
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %count, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %mixed = index.constant 0 : index
+  %remapped = scalar.constant false : i1
+  %capacity = config.get @flash_next.token_count : index
+  template.apply<@flash_next.qsa_prepare_queries>(%mixed, %remapped, %capacity, %capacity, %span, %span, %width, %heads, %head_stride, %span, %mapping, %input, %weight, %output) : (index, i1, index, index, buffer, buffer, index, index, index, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@qsa_wave32) @qsa_prepare_queries_mixed(%neural_enabled: i1, %heads: index) {
+  %count = index.assume %heads [range(%heads, 4, 24)] : index
+  %tokens = config.get @flash_next.token_count : index
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %count, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %mixed = index.constant 1 : index
+  %remapped = scalar.constant false : i1
+  template.apply<@flash_next.qsa_prepare_queries>(%mixed, %remapped, %source_capacity, %origin_capacity, %inputs, %origins, %width, %heads, %head_stride, %span, %mapping, %input, %weight, %output) : (index, i1, index, index, buffer, buffer, index, index, index, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@qsa_wave32) @qsa_prepare_queries_remapped(%neural_enabled: i1, %heads: index) {
+  %count = index.assume %heads [range(%heads, 4, 24)] : index
+  %tokens = config.get @flash_next.token_count : index
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %count, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %mixed = index.constant 1 : index
+  %remapped = scalar.constant true : i1
+  template.apply<@flash_next.qsa_prepare_queries>(%mixed, %remapped, %source_capacity, %origin_capacity, %inputs, %origins, %width, %heads, %head_stride, %span, %mapping, %input, %weight, %output) : (index, i1, index, index, buffer, buffer, index, index, index, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }
 
@@ -377,14 +427,9 @@ kernel.def target(@qsa_wave32) @qsa_pool_blocks(%neural_enabled: i1) {
   kernel.return
 }
 
-kernel.def target(@qsa_wave32) @qsa_prepare_blocks(%neural_enabled: i1) {
-  %tokens = config.get @flash_next.token_count : index
-  %threads = index.constant 32 : index
-  %c1 = index.constant 1 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %tokens, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer) {
+template.decl @flash_next.qsa_prepare_blocks(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %coordinate_origin: offset, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer)
+
+template.def<@flash_next.qsa_prepare_blocks> device @qsa_prepare_blocks_body(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %coordinate_origin: offset, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%epoch, %tokens) : (buffer, index) -> (index)
   %token = kernel.workgroup.id<x> : index
@@ -396,7 +441,10 @@ kernel.def target(@qsa_wave32) @qsa_prepare_blocks(%neural_enabled: i1) {
     %member = index.rem %position, %c4 : index
     %complete = index.cmp eq, %member, %c3 : index
     scf.if %complete {
-      %logical = index.sub %position, %c3 : index
+      // The fourth member cannot precede position three. Preserve that bound
+      // when selecting retained coordinates for packets shorter than a group.
+      %complete_position = index.assume %position [ge(%position, 3)] : index
+      %logical = index.sub %complete_position, %c3 : index
       %physical = func.call @flash_next_physical_token(%rows, %row, %logical) : (buffer, index, index) -> (index)
       %block = index.div %physical, %c4 : index
       %base = func.call @flash_next_cache_origin(%rows, %row, %index_origin) : (buffer, index, offset) -> (offset)
@@ -406,17 +454,66 @@ kernel.def target(@qsa_wave32) @qsa_prepare_blocks(%neural_enabled: i1) {
       %output_origin = index.add %base, %output_relative : offset
       %width = index.constant 128 : index
       %output_group_stride = index.constant 16 : index
-      func.call @qsa_normalize_rotate(%width, %logical, %pooled, %input_origin, %weight, %arena, %output_origin, %output_group_stride) : (index, index, buffer, offset, buffer, buffer, offset, index)
+      %source = func.call @flash_next_token_rotary(%mapping, %token) : (buffer, index) -> (index)
+      %relative = index.sub %token, %begin : index
+      %source_first = index.sub %source, %relative : index
+      %lane = kernel.subgroup.lane.id : index
+      %axis = index.rem %lane, %c3 : index
+      %coordinate = func.call @qsa_group_coordinate(%mixed, %remapped, %source_capacity, %origin_capacity, %coordinate_origin, %logical, %first, %source_first, %begin, %row, %axis, %inputs, %origins, %rows, %arena) : (index, i1, index, index, offset, index, index, index, index, index, index, buffer, buffer, buffer, buffer) -> (index)
+      func.call @qsa_normalize_rotate(%width, %coordinate, %pooled, %input_origin, %weight, %arena, %output_origin, %output_group_stride) : (index, index, buffer, offset, buffer, buffer, offset, index)
     }
   }
+  template.return
+}
+
+kernel.def target(@qsa_wave32) @qsa_prepare_blocks(%neural_enabled: i1) {
+  %tokens = config.get @flash_next.token_count : index
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %tokens, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%coordinate_origin: offset, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer) {
+  %mixed = index.constant 0 : index
+  %remapped = scalar.constant false : i1
+  %capacity = config.get @flash_next.token_count : index
+  template.apply<@flash_next.qsa_prepare_blocks>(%mixed, %remapped, %capacity, %capacity, %epoch, %epoch, %coordinate_origin, %index_origin, %epoch, %mapping, %rows, %pooled, %weight, %arena) : (index, i1, index, index, buffer, buffer, offset, offset, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@qsa_wave32) @qsa_prepare_blocks_mixed(%neural_enabled: i1) {
+  %tokens = config.get @flash_next.token_count : index
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %tokens, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %coordinate_origin: offset, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer) {
+  %mixed = index.constant 1 : index
+  %remapped = scalar.constant false : i1
+  template.apply<@flash_next.qsa_prepare_blocks>(%mixed, %remapped, %source_capacity, %origin_capacity, %inputs, %origins, %coordinate_origin, %index_origin, %epoch, %mapping, %rows, %pooled, %weight, %arena) : (index, i1, index, index, buffer, buffer, offset, offset, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@qsa_wave32) @qsa_prepare_blocks_remapped(%neural_enabled: i1) {
+  %tokens = config.get @flash_next.token_count : index
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %tokens, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %coordinate_origin: offset, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer) {
+  %mixed = index.constant 1 : index
+  %remapped = scalar.constant true : i1
+  template.apply<@flash_next.qsa_prepare_blocks>(%mixed, %remapped, %source_capacity, %origin_capacity, %inputs, %origins, %coordinate_origin, %index_origin, %epoch, %mapping, %rows, %pooled, %weight, %arena) : (index, i1, index, index, buffer, buffer, offset, offset, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }
 
 // Only the live incomplete block is retained. No read touches uninitialized
 // history on a fresh span, and a fork publishes exclusively to its own writer.
-template.decl @flash_next.qsa_publish_tail.body(%capacity: index, %verification: index, %tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer)
+template.decl @flash_next.qsa_publish_tail.body(%capacity: index, %verification: index, %publish_coordinates: i1, %mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %coordinate_origin: offset, %inputs: buffer, %origins: buffer, %tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer)
 
-template.def<@flash_next.qsa_publish_tail.body> device @qsa_publish_tail_body(%capacity: index, %verification: index, %tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer) {
+template.def<@flash_next.qsa_publish_tail.body> device @qsa_publish_tail_body(%capacity: index, %verification: index, %publish_coordinates: i1, %mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %coordinate_origin: offset, %source_inputs: buffer, %origins: buffer, %tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer) {
   %first_span = kernel.workgroup.id<x> : index
   %span_stride = kernel.workgroup.count<x> : index
   %span_count = func.call @flash_next_span_count(%epoch) : (buffer) -> (index)
@@ -444,6 +541,30 @@ template.def<@flash_next.qsa_publish_tail.body> device @qsa_publish_tail_body(%c
       %c4 = index.constant 4 : index
       %tail_length = index.rem %logical_end, %c4 : index
       %tail_begin = index.sub %logical_end, %tail_length : index
+      scf.if %publish_coordinates {
+        %coordinate_lane = kernel.subgroup.lane.id : index
+        %empty_tail = index.constant 0 : index
+        %has_tail = index.cmp ne, %tail_length, %empty_tail : index
+        %record_lane = index.cmp ult, %coordinate_lane, %c4 : index
+        %publishes = scalar.andi %has_tail, %record_lane : i1
+        scf.if %publishes {
+          %axes = index.constant 3 : index
+          %is_axis = index.cmp ult, %coordinate_lane, %axes : index
+          %coordinate_word = scf.if %is_axis -> (i32) {
+            %source_word = view.load %record[4] : view<6xi32> -> i32
+            %source_first = index.cast %source_word : i32 to index
+            %coordinate = func.call @qsa_group_coordinate(%mixed, %remapped, %source_capacity, %origin_capacity, %coordinate_origin, %tail_begin, %first, %source_first, %begin, %row, %coordinate_lane, %source_inputs, %origins, %rows, %arena) : (index, i1, index, index, offset, index, index, index, index, index, index, buffer, buffer, buffer, buffer) -> (index)
+            %word = index.cast %coordinate : index to i32
+            scf.yield %word : i32
+          } else {
+            %padding = scalar.constant 0 : i32
+            scf.yield %padding : i32
+          }
+          %coordinate_reader, %coordinate_writer = func.call @flash_next_row_state(%rows, %row, %first, %coordinate_origin) : (buffer, index, index, offset) -> (offset, offset)
+          %coordinates = buffer.view %arena[%coordinate_writer] : buffer -> view<4xi32>
+          view.store %coordinate_word, %coordinates[%coordinate_lane] : i32, view<4xi32>
+        }
+      }
       %origin = index.constant 0 : offset
       %inputs = buffer.view %raw[%origin] : buffer -> view<[%capacity]x128xbf16>
       %previous = buffer.view %arena[%reader] : buffer -> view<3x128xbf16>
@@ -483,7 +604,10 @@ kernel.def target(@qsa_wave32) @qsa_publish_tail(%neural_enabled: i1) {
 } launch(%tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %verification = config.get @flash_next.verification_width : index
-  template.apply<@flash_next.qsa_publish_tail.body>(%capacity, %verification, %tail_origin, %epoch, %rows, %raw, %arena) : (index, index, offset, buffer, buffer, buffer, buffer)
+  %publish_coordinates = scalar.constant false : i1
+  %mixed = index.constant 0 : index
+  %remapped = scalar.constant false : i1
+  template.apply<@flash_next.qsa_publish_tail.body>(%capacity, %verification, %publish_coordinates, %mixed, %remapped, %capacity, %capacity, %tail_origin, %epoch, %epoch, %tail_origin, %epoch, %rows, %raw, %arena) : (index, index, i1, index, i1, index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
   kernel.return
 }
 
@@ -496,6 +620,83 @@ kernel.def target(@qsa_wave32) @qsa_publish_tail_commit() {
 } launch(%tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %verification = index.constant 0 : index
-  template.apply<@flash_next.qsa_publish_tail.body>(%capacity, %verification, %tail_origin, %epoch, %rows, %raw, %arena) : (index, index, offset, buffer, buffer, buffer, buffer)
+  %publish_coordinates = scalar.constant false : i1
+  %mixed = index.constant 0 : index
+  %remapped = scalar.constant false : i1
+  template.apply<@flash_next.qsa_publish_tail.body>(%capacity, %verification, %publish_coordinates, %mixed, %remapped, %capacity, %capacity, %tail_origin, %epoch, %epoch, %tail_origin, %epoch, %rows, %raw, %arena) : (index, index, i1, index, i1, index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+// Every indexer layer consumes the old coordinate. Only the final layer uses
+// these entries, fusing one shared coordinate update into raw-tail publication.
+// Replay supplies original packed starts and source positions in descriptors;
+// it needs neither a surviving token map nor a retained input allocation.
+kernel.def target(@qsa_wave32) @qsa_publish_coordinates_text(%neural_enabled: i1) {
+  %span_capacity = config.get @flash_next.span_capacity : index
+  %spans = func.call pure @flash_next_span_workers(%span_capacity) : (index) -> (index)
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %c0 = index.constant 0 : index
+  %active = scf.select %neural_enabled, %spans, %c0 : index
+  kernel.launch.config workgroups(%active, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%source_capacity: index, %origin_capacity: index, %coordinate_origin: offset, %inputs: buffer, %origins: buffer, %tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer) {
+  %capacity = config.get @flash_next.token_count : index
+  %verification = config.get @flash_next.verification_width : index
+  %publish_coordinates = scalar.constant true : i1
+  %mixed = index.constant 0 : index
+  %remapped = scalar.constant false : i1
+  template.apply<@flash_next.qsa_publish_tail.body>(%capacity, %verification, %publish_coordinates, %mixed, %remapped, %source_capacity, %origin_capacity, %coordinate_origin, %inputs, %origins, %tail_origin, %epoch, %rows, %raw, %arena) : (index, index, i1, index, i1, index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@qsa_wave32) @qsa_publish_coordinates_mixed(%neural_enabled: i1) {
+  %span_capacity = config.get @flash_next.span_capacity : index
+  %spans = func.call pure @flash_next_span_workers(%span_capacity) : (index) -> (index)
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %c0 = index.constant 0 : index
+  %active = scf.select %neural_enabled, %spans, %c0 : index
+  kernel.launch.config workgroups(%active, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%source_capacity: index, %origin_capacity: index, %coordinate_origin: offset, %inputs: buffer, %origins: buffer, %tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer) {
+  %capacity = config.get @flash_next.token_count : index
+  %verification = config.get @flash_next.verification_width : index
+  %publish_coordinates = scalar.constant true : i1
+  %mixed = index.constant 1 : index
+  %remapped = scalar.constant false : i1
+  template.apply<@flash_next.qsa_publish_tail.body>(%capacity, %verification, %publish_coordinates, %mixed, %remapped, %source_capacity, %origin_capacity, %coordinate_origin, %inputs, %origins, %tail_origin, %epoch, %rows, %raw, %arena) : (index, index, i1, index, i1, index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@qsa_wave32) @qsa_publish_coordinates_remapped(%neural_enabled: i1) {
+  %span_capacity = config.get @flash_next.span_capacity : index
+  %spans = func.call pure @flash_next_span_workers(%span_capacity) : (index) -> (index)
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %c0 = index.constant 0 : index
+  %active = scf.select %neural_enabled, %spans, %c0 : index
+  kernel.launch.config workgroups(%active, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%source_capacity: index, %origin_capacity: index, %coordinate_origin: offset, %inputs: buffer, %origins: buffer, %tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer) {
+  %capacity = config.get @flash_next.token_count : index
+  %verification = config.get @flash_next.verification_width : index
+  %publish_coordinates = scalar.constant true : i1
+  %mixed = index.constant 1 : index
+  %remapped = scalar.constant true : i1
+  template.apply<@flash_next.qsa_publish_tail.body>(%capacity, %verification, %publish_coordinates, %mixed, %remapped, %source_capacity, %origin_capacity, %coordinate_origin, %inputs, %origins, %tail_origin, %epoch, %rows, %raw, %arena) : (index, index, i1, index, i1, index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@qsa_wave32) @qsa_publish_coordinates_commit() {
+  %span_capacity = config.get @flash_next.span_capacity : index
+  %spans = func.call pure @flash_next_span_workers(%span_capacity) : (index) -> (index)
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%spans, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%source_capacity: index, %origin_capacity: index, %coordinate_origin: offset, %inputs: buffer, %origins: buffer, %tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer) {
+  %capacity = config.get @flash_next.token_count : index
+  %verification = index.constant 0 : index
+  %publish_coordinates = scalar.constant true : i1
+  %mixed = config.get @runner.qwen38.mixed_inputs : index
+  %remapped = scalar.constant false : i1
+  template.apply<@flash_next.qsa_publish_tail.body>(%capacity, %verification, %publish_coordinates, %mixed, %remapped, %source_capacity, %origin_capacity, %coordinate_origin, %inputs, %origins, %tail_origin, %epoch, %rows, %raw, %arena) : (index, index, i1, index, i1, index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
   kernel.return
 }

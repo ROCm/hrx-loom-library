@@ -2,6 +2,10 @@
 // publication. Fresh spans use the PLE padding token; ordinary and accepted-
 // prefix replay share the same retained layout.
 
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
+func.decl @qwen38_input_token(%mixed: index, %capacity: index, %inputs: buffer, %input: index) -> (i32)
+
 config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 8)]
 
 config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
@@ -118,6 +122,7 @@ kernel.def @flash_next_ple_hash_ids() {
   %groups = index.div %padded, %threads : index
   kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%history_origin: offset, %span_arg: buffer, %mapping: buffer, %origins: buffer, %tokens_arg: buffer, %history_arg: buffer, %rows_arg: buffer) {
+  %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %span, %tokens, %history, %output = buffer.assume.noalias %span_arg, %tokens_arg, %history_arg, %rows_arg : buffer, buffer, buffer, buffer
   %capacity = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%span, %capacity) : (buffer, index) -> (index)
@@ -136,16 +141,15 @@ kernel.def @flash_next_ple_hash_ids() {
     %c0 = index.constant 0 : index
     %c1 = index.constant 1 : index
     %c2 = index.constant 2 : index
-    %input = buffer.view %tokens[%origin] : buffer -> view<[%capacity]xi32>
     %retained = buffer.view %history[%reader] : buffer -> view<2xi32>
     %rows = buffer.view %output[%origin] : buffer -> view<[%capacity]x16xi32>
     %second = index.add %begin, %c1 : index
     %has_previous = index.cmp ugt, %token, %begin : index
     %has_older = index.cmp ugt, %token, %second : index
-    %current_raw = view.load %input[%token] : view<[%capacity]xi32> -> i32
+    %current_raw = func.call @qwen38_input_token(%mixed_inputs, %capacity, %tokens, %token) : (index, index, buffer, index) -> (i32)
     %previous_raw = scf.if %has_previous -> (i32) {
       %position = index.sub %token, %c1 : index
-      %value = view.load %input[%position] : view<[%capacity]xi32> -> i32
+      %value = func.call @qwen38_input_token(%mixed_inputs, %capacity, %tokens, %position) : (index, index, buffer, index) -> (i32)
       scf.yield %value : i32
     } else {
       %value = scf.if %fresh -> (i32) {
@@ -158,7 +162,7 @@ kernel.def @flash_next_ple_hash_ids() {
     }
     %older_raw = scf.if %has_older -> (i32) {
       %position = index.sub %token, %c2 : index
-      %value = view.load %input[%position] : view<[%capacity]xi32> -> i32
+      %value = func.call @qwen38_input_token(%mixed_inputs, %capacity, %tokens, %position) : (index, index, buffer, index) -> (i32)
       scf.yield %value : i32
     } else {
       %position = scf.select %has_previous, %c1, %c0 : index
@@ -256,9 +260,9 @@ kernel.def @flash_next_ple_hash_ids() {
 
 // One owner publishes after all hash readers complete. A one-token span shifts
 // the last actual ID, without substituting the EOS-masked hash context.
-template.decl @flash_next.ple_publish_history.body(%capacity: index, %verification: index, %history_origin: offset, %span: buffer, %origins: buffer, %tokens: buffer, %arena: buffer)
+template.decl @flash_next.ple_publish_history.body(%capacity: index, %verification: index, %mixed_inputs: index, %history_origin: offset, %span: buffer, %origins: buffer, %tokens: buffer, %arena: buffer)
 
-template.def<@flash_next.ple_publish_history.body> device @flash_next_ple_publish_history_body(%capacity: index, %verification: index, %history_origin: offset, %span: buffer, %origins: buffer, %tokens: buffer, %arena: buffer) {
+template.def<@flash_next.ple_publish_history.body> device @flash_next_ple_publish_history_body(%capacity: index, %verification: index, %mixed_inputs: index, %history_origin: offset, %span: buffer, %origins: buffer, %tokens: buffer, %arena: buffer) {
   %first_span = kernel.workgroup.id<x> : index
   %span_stride = kernel.workgroup.count<x> : index
   %span_count = func.call @flash_next_span_count(%span) : (buffer) -> (index)
@@ -268,15 +272,14 @@ template.def<@flash_next.ple_publish_history.body> device @flash_next_ple_publis
       %begin, %end, %fresh, %reader, %writer = func.call @flash_next_span_state(%span, %origins, %slot, %history_origin, %capacity) : (buffer, buffer, index, offset, index) -> (index, index, i1, offset, offset)
       %origin = index.constant 0 : offset
       %c1 = index.constant 1 : index
-      %input = buffer.view %tokens[%origin] : buffer -> view<[%capacity]xi32>
       %previous = buffer.view %arena[%reader] : buffer -> view<2xi32>
       %output = buffer.view %arena[%writer] : buffer -> view<2xi32>
       %last = index.sub %end, %c1 : index
       %has_two = index.cmp ugt, %last, %begin : index
-      %newest = view.load %input[%last] : view<[%capacity]xi32> -> i32
+      %newest = func.call @qwen38_input_token(%mixed_inputs, %capacity, %tokens, %last) : (index, index, buffer, index) -> (i32)
       %older = scf.if %has_two -> (i32) {
         %position = index.sub %last, %c1 : index
-        %value = view.load %input[%position] : view<[%capacity]xi32> -> i32
+        %value = func.call @qwen38_input_token(%mixed_inputs, %capacity, %tokens, %position) : (index, index, buffer, index) -> (i32)
         scf.yield %value : i32
       } else {
         %value = scf.if %fresh -> (i32) {
@@ -303,7 +306,8 @@ kernel.def @flash_next_ple_publish_history() {
 } launch(%history_origin: offset, %span: buffer, %origins: buffer, %tokens: buffer, %arena: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %verification = config.get @flash_next.verification_width : index
-  template.apply<@flash_next.ple_publish_history.body>(%capacity, %verification, %history_origin, %span, %origins, %tokens, %arena) : (index, index, offset, buffer, buffer, buffer, buffer)
+  %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
+  template.apply<@flash_next.ple_publish_history.body>(%capacity, %verification, %mixed_inputs, %history_origin, %span, %origins, %tokens, %arena) : (index, index, index, offset, buffer, buffer, buffer, buffer)
   kernel.return
 }
 
@@ -315,6 +319,7 @@ kernel.def @flash_next_ple_publish_history_commit() {
 } launch(%history_origin: offset, %span: buffer, %origins: buffer, %tokens: buffer, %arena: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %verification = index.constant 0 : index
-  template.apply<@flash_next.ple_publish_history.body>(%capacity, %verification, %history_origin, %span, %origins, %tokens, %arena) : (index, index, offset, buffer, buffer, buffer, buffer)
+  %mixed_inputs = index.constant 0 : index
+  template.apply<@flash_next.ple_publish_history.body>(%capacity, %verification, %mixed_inputs, %history_origin, %span, %origins, %tokens, %arena) : (index, index, index, offset, buffer, buffer, buffer, buffer)
   kernel.return
 }

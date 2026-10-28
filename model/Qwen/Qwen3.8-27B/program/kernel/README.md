@@ -35,10 +35,45 @@ They retain the trained patch/merge order and explicit scratch ownership.
 The command owner can reuse intermediates across a cohort while preserving
 each image's output feature range.
 
+`vision_patch_embedding.loom` selects original F16 weights and the launch for
+shared direct RGB8 projection. The same motif supports BF16 operands and F32
+checkpoint weights, converting only the resident panel. Its two temporal
+contractions remain independent until the F32 epilogue adds them and the bias.
+
+`vision_key_value.loom` selects the four-head cohort launch for the shared K/V
+projection and rotary algorithm. The dense command reuses its key/value banks
+after each attention dispatch. The motif takes the logical cohort and output
+byte origin separately, allowing concurrent cohorts to use distinct regions
+without changing matrix precision, resident layouts, or projection arithmetic.
+
+`vision_attention.loom` binds the same cohort bank to shared query projection
+and online softmax, followed by the shared residual projection. The first
+launch owns only its context columns; the output matrix and bias belong to
+the second launch. Both preserve F32 accumulation and the original F16 operands.
+
+`vision_merger.loom` supplies the shared merger with original F16 matrices and
+the dense model's 5120-wide output contract. It shares the FFN's resident panel
+layouts and overlaps down-projection panel loads with matrix work. The command
+preserves the postnormalized input before allowing the final feature range to
+replace the earlier residual bank.
+
+`vision_ffn.loom` specializes the [shared vision FFN](../../../../../motif/vision/qwen3_8/README.md)
+with image geometry and original F16 matrix storage. The motif owns normalized
+input staging, LDS permutations, read-ahead, and F32 matrix accumulation. The
+model leaf owns the wave32 launch and existing up/down buffer ABI.
+The motif's BF16 specialization uses the same schedule without converting
+checkpoints.
+
+`vision_normalization.loom` supplies the shared F32 position/statistics/apply
+algorithms with geometry and launches. Learned-position addition computes the
+first layer's moments while updating the residual; subsequent layers use the
+ordinary statistics entry. These algorithms retain the same eight-byte row
+record across the dense and MoE matrix representations.
+
 ### Pixel filtering
 
 `vision_resize.loom` consumes the packet layout owned by
-[`vision_pixels.loom`](../vision_pixels.loom). Its specialization arguments are
+the shared [pixel provider](../../../../../program/text/qwen3_8/vision_pixels.loom). Its specialization arguments are
 the two workgroup counts; launch arguments select a directory entry from zero
 through three, the packed input, and a distinct RGB8 output buffer. The caller
 launches `ceil(width / 32)` by `ceil(height / 16)` groups.

@@ -1,0 +1,280 @@
+// Independent two-tap reference for both complete vision merger projections.
+// Minimum, full-tile, and tail cases share one oracle. Inputs encode row
+// and column; signed output-dependent taps include the last reduction column.
+// The reference uses scalar products and F64 GELU algebra with F32 exponential,
+// and checks rounded activation separately from the final F32 features.
+// F16 and BF16 exercise the same public motifs at both feature widths.
+
+func.decl @vision_round(%bf16: i1, %value: f32) -> (i16)
+
+func.decl @vision_widen(%bf16: i1, %bits: i16) -> (f32)
+
+func.decl @vision_gelu(%input: f32) -> (f32)
+
+config.decl @vision_merger_test.bf16 : i1
+
+config.decl @vision_merger_test.rows : %value: index where [range(%value, 1, 70)]
+
+config.decl @vision_merger_test.columns : %value: index where [range(%value, 128, 5120), multiple_of(%value, 128)]
+
+func.def pure inline @merger_shape() -> (index, index) {
+  %rows = config.get @vision_merger_test.rows : index
+  %columns = config.get @vision_merger_test.columns : index
+  func.return %rows, %columns : index, index
+}
+
+amdgpu.target<gfx11-generic> @vision_merger_test_wave32 {subgroup_size = 32}
+
+template.decl @qwen38.vision.merger_up(%rows_value: index, %bf16: i1, %input: buffer, %weight: buffer, %bias: buffer, %activation: buffer)
+
+kernel.def target(@vision_merger_test_wave32) @merger_up() {
+  %c1 = index.constant 1 : index
+  %rows = config.get @vision_merger_test.rows : index
+  %tile = index.constant 64 : index
+  %tail = index.constant 63 : index
+  %rounded_rows = index.add %rows, %tail : index
+  %row_tiles = index.div %rounded_rows, %tile : index
+  %column_tiles = index.constant 36 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %column_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %bias: buffer, %activation: buffer) {
+  %rows = config.get @vision_merger_test.rows : index
+  %bf16 = config.get @vision_merger_test.bf16 : i1
+  template.apply<@qwen38.vision.merger_up>(%rows, %bf16, %input, %weight, %bias, %activation) : (index, i1, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+template.decl @qwen38.vision.merger_down(%rows_value: index, %bf16: i1, %output_columns: index, %activation: buffer, %weight: buffer, %bias: buffer, %output: buffer)
+
+kernel.def target(@vision_merger_test_wave32) @merger_down() {
+  %columns = config.get @vision_merger_test.columns : index
+  %c1 = index.constant 1 : index
+  %rows = config.get @vision_merger_test.rows : index
+  %tile = index.constant 64 : index
+  %tail = index.constant 63 : index
+  %rounded_rows = index.add %rows, %tail : index
+  %row_tiles = index.div %rounded_rows, %tile : index
+  %tile_width = index.constant 128 : index
+  %column_tiles = index.div %columns, %tile_width : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %column_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%activation: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %rows = config.get @vision_merger_test.rows : index
+  %bf16 = config.get @vision_merger_test.bf16 : i1
+  %output_columns = config.get @vision_merger_test.columns : index
+  template.apply<@qwen38.vision.merger_down>(%rows, %bf16, %output_columns, %activation, %weight, %bias, %output) : (index, i1, index, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+func.def @merger_sample(%row: index, %column: index) -> (f32) {
+  %c13 = index.constant 13 : index
+  %c17 = index.constant 17 : index
+  %c127 = index.constant 127 : index
+  %row_phase = index.mul %row, %c17 : index
+  %phase = index.madd %column, %c13, %row_phase : index
+  %modulo = index.rem %phase, %c127 : index
+  %integer = index.cast %modulo : index to i32
+  %wide = scalar.uitofp %integer : i32 to f32
+  %step = scalar.constant 0.015625 : f32
+  %c1_f32 = scalar.constant 1.0 : f32
+  %scaled = scalar.mulf %wide, %step : f32
+  %sample = scalar.subf %scaled, %c1_f32 : f32
+  func.return %sample : f32
+}
+
+// Fixture definition: exact half coefficients and two distinct source columns.
+func.def inline @merger_taps(%channel: index) -> (index, f32, f32, f32) {
+  %c2 = index.constant 2 : index
+  %c7 = index.constant 7 : index
+  %c9 = index.constant 9 : index
+  %c29 = index.constant 29 : index
+  %c4607 = index.constant 4607 : index
+  %key = index.mul %channel, %c29 : index
+  %first = index.rem %key, %c4607 : index
+  %mod7 = index.rem %channel, %c7 : index
+  %mod2 = index.rem %channel, %c2 : index
+  %mod9 = index.rem %channel, %c9 : index
+  %a_i32 = index.cast %mod7 : index to i32
+  %b_i32 = index.cast %mod2 : index to i32
+  %bias_i32 = index.cast %mod9 : index to i32
+  %a_f32 = scalar.uitofp %a_i32 : i32 to f32
+  %b_f32 = scalar.uitofp %b_i32 : i32 to f32
+  %bias_f32 = scalar.uitofp %bias_i32 : i32 to f32
+  %c3_f32 = scalar.constant 3.0 : f32
+  %c4_f32 = scalar.constant 4.0 : f32
+  %half = scalar.constant 0.5 : f32
+  %first_step = scalar.constant 0.0625 : f32
+  %last_step = scalar.constant 0.25 : f32
+  %bias_step = scalar.constant 0.0078125 : f32
+  %first_centered = scalar.subf %a_f32, %c3_f32 : f32
+  %last_centered = scalar.subf %b_f32, %half : f32
+  %bias_centered = scalar.subf %bias_f32, %c4_f32 : f32
+  %first_coefficient = scalar.mulf %first_centered, %first_step : f32
+  %last_coefficient = scalar.mulf %last_centered, %last_step : f32
+  %bias = scalar.mulf %bias_centered, %bias_step : f32
+  func.return %first, %first_coefficient, %last_coefficient, %bias : index, f32, f32, f32
+}
+
+func.def @merger_weights(%bf16: i1, %columns: index, %weight: buffer, %bias: buffer) where [range(%columns, 1, 5120)] {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %last = index.constant 4607 : index
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<[%columns]x4608xi16>
+  %bias_view = buffer.view %bias[%origin] : buffer -> view<[%columns]xf32>
+  scf.for %channel = [%c0 to %columns step %c1] {
+    %first, %a, %b, %shift = func.call @merger_taps(%channel) : (index) -> (index, f32, f32, f32)
+    %a_bits = func.call @vision_round(%bf16, %a) : (i1, f32) -> (i16)
+    %b_bits = func.call @vision_round(%bf16, %b) : (i1, f32) -> (i16)
+    view.store %a_bits, %weight_view[%channel, %first] : i16, view<[%columns]x4608xi16>
+    view.store %b_bits, %weight_view[%channel, %last] : i16, view<[%columns]x4608xi16>
+    view.store %shift, %bias_view[%channel] : f32, view<[%columns]xf32>
+  }
+  func.return
+}
+
+func.def @merger_fixture(%bf16: i1, %columns: index, %input: buffer, %up_weight: buffer, %up_bias: buffer, %down_weight: buffer, %down_bias: buffer) where [range(%columns, 1, 5120)] {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %rows = config.get @vision_merger_test.rows : index
+  %width = index.constant 4608 : index
+  %view = buffer.view %input[%origin] : buffer -> view<[%rows]x4608xf32>
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %column = [%c0 to %width step %c1] {
+      %sample = func.call @merger_sample(%row, %column) : (index, index) -> (f32)
+      view.store %sample, %view[%row, %column] : f32, view<[%rows]x4608xf32>
+    }
+  }
+  func.call @merger_weights(%bf16, %width, %up_weight, %up_bias) : (i1, index, buffer, buffer)
+  func.call @merger_weights(%bf16, %columns, %down_weight, %down_bias) : (i1, index, buffer, buffer)
+  func.return
+}
+
+func.def @merger_reference(%bf16: i1, %columns: index, %activation: buffer, %output: buffer) where [range(%columns, 1, 5120)] {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %rows = config.get @vision_merger_test.rows : index
+  %hidden = index.constant 4608 : index
+  %last = index.constant 4607 : index
+  %activation_view = buffer.view %activation[%origin] : buffer -> view<[%rows]x4608xi16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%columns]xf32>
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %channel = [%c0 to %hidden step %c1] {
+      %first, %a, %b, %bias = func.call @merger_taps(%channel) : (index) -> (index, f32, f32, f32)
+      %x = func.call @merger_sample(%row, %first) : (index, index) -> (f32)
+      %y = func.call @merger_sample(%row, %last) : (index, index) -> (f32)
+      %ax = scalar.mulf %a, %x : f32
+      %by = scalar.mulf %b, %y : f32
+      %sum = scalar.addf %ax, %by : f32
+      %biased = scalar.addf %sum, %bias : f32
+      %gelu_f32 = func.call @vision_gelu(%biased) : (f32) -> (f32)
+      %bits = func.call @vision_round(%bf16, %gelu_f32) : (i1, f32) -> (i16)
+      view.store %bits, %activation_view[%row, %channel] : i16, view<[%rows]x4608xi16>
+    }
+    scf.for %channel = [%c0 to %columns step %c1] {
+      %first, %a, %b, %bias = func.call @merger_taps(%channel) : (index) -> (index, f32, f32, f32)
+      %x_bits = view.load %activation_view[%row, %first] : view<[%rows]x4608xi16> -> i16
+      %y_bits = view.load %activation_view[%row, %last] : view<[%rows]x4608xi16> -> i16
+      %x = func.call @vision_widen(%bf16, %x_bits) : (i1, i16) -> (f32)
+      %y = func.call @vision_widen(%bf16, %y_bits) : (i1, i16) -> (f32)
+      %ax = scalar.mulf %a, %x : f32
+      %by = scalar.mulf %b, %y : f32
+      %sum = scalar.addf %ax, %by : f32
+      %result = scalar.addf %sum, %bias : f32
+      view.store %result, %output_view[%row, %channel] : f32, view<[%rows]x[%columns]xf32>
+    }
+  }
+  func.return
+}
+
+command.program.def @merger_complete() launch(%input: buffer, %up_weight: buffer, %up_bias: buffer, %down_weight: buffer, %down_bias: buffer, %activation: buffer, %output: buffer) {
+  kernel.launch @merger_up(%input, %up_weight, %up_bias, %activation) : (buffer, buffer, buffer, buffer)
+  kernel.launch @merger_down(%activation, %down_weight, %down_bias, %output) : (buffer, buffer, buffer, buffer)
+  command.return
+}
+
+func.def @merger_f16_reference(%input: buffer, %up_weight: buffer, %up_bias: buffer, %down_weight: buffer, %down_bias: buffer, %activation: buffer, %output: buffer) {
+  %bf16 = scalar.constant false : i1
+  %columns = config.get @vision_merger_test.columns : index
+  func.call @merger_reference(%bf16, %columns, %activation, %output) : (i1, index, buffer, buffer)
+  func.return
+}
+
+// Activation tolerance permits one half ULP at this fixture's bounded scale;
+// output tolerance propagates it through the two signed coefficients.
+check.scenario public @vision_merger_f16 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %bf16 = check.literal value(false) : i1
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %rows, %columns = check.generate<@merger_shape>() : () -> (index, index)
+    %input = check.generate.fill value(0.0) : tensor<[%rows]x4608xf32>
+    %up_weight = check.generate.fill value(0.0) : tensor<4608x4608xf16>
+    %up_bias = check.generate.fill value(0.0) : tensor<4608xf32>
+    %down_weight = check.generate.fill value(0.0) : tensor<[%columns]x4608xf16>
+    %down_bias = check.generate.fill value(0.0) : tensor<[%columns]xf32>
+    check.generate<@merger_fixture>(%bf16, %columns, %input, %up_weight, %up_bias, %down_weight, %down_bias) : (i1, index, tensor<[%rows]x4608xf32>, tensor<4608x4608xf16>, tensor<4608xf32>, tensor<[%columns]x4608xf16>, tensor<[%columns]xf32>) -> ()
+    %activation = check.generate.fill value(99.0) : tensor<[%rows]x4608xf16>
+    %storage = check.generate.fill value(99.0) : tensor<358432xf32>
+    %output = check.tensor.view %storage offset(64) : tensor<358432xf32> -> tensor<[%rows]x[%columns]xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<358432xf32> -> tensor<16xf32>
+    %suffix = check.tensor.view %storage offset(1433664) : tensor<358432xf32> -> tensor<16xf32>
+    check.compare<@merger_complete, @merger_f16_reference>(%input, %up_weight, %up_bias, %down_weight, %down_bias, %activation, %output) : (tensor<[%rows]x4608xf32>, tensor<4608x4608xf16>, tensor<4608xf32>, tensor<[%columns]x4608xf16>, tensor<[%columns]xf32>, tensor<[%rows]x4608xf16>, tensor<[%rows]x[%columns]xf32>) -> () {
+      check.expect.close actual(%activation) expected(%activation) atol(0.00025000000000000001) rtol(0.0) nan(different) : tensor<[%rows]x4608xf16>
+      check.expect.close actual(%output) expected(%output) atol(0.0001) rtol(0.0) nan(different) : tensor<[%rows]x[%columns]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<16xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<16xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x4608xf32>
+      check.expect.bitwise actual(%up_weight) expected(%up_weight) : tensor<4608x4608xf16>
+      check.expect.bitwise actual(%up_bias) expected(%up_bias) : tensor<4608xf32>
+      check.expect.bitwise actual(%down_weight) expected(%down_weight) : tensor<[%columns]x4608xf16>
+      check.expect.bitwise actual(%down_bias) expected(%down_bias) : tensor<[%columns]xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@vision_merger_f16> @vision_merger_f16_complete
+
+func.def @merger_bf16_reference(%input: buffer, %up_weight: buffer, %up_bias: buffer, %down_weight: buffer, %down_bias: buffer, %activation: buffer, %output: buffer) {
+  %bf16 = scalar.constant true : i1
+  %columns = config.get @vision_merger_test.columns : index
+  func.call @merger_reference(%bf16, %columns, %activation, %output) : (i1, index, buffer, buffer)
+  func.return
+}
+
+// Activation tolerance permits one half ULP at this fixture's bounded scale;
+// output tolerance propagates it through the two signed coefficients.
+check.scenario public @vision_merger_bf16 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %bf16 = check.literal value(true) : i1
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %rows, %columns = check.generate<@merger_shape>() : () -> (index, index)
+    %input = check.generate.fill value(0.0) : tensor<[%rows]x4608xf32>
+    %up_weight = check.generate.fill value(0.0) : tensor<4608x4608xbf16>
+    %up_bias = check.generate.fill value(0.0) : tensor<4608xf32>
+    %down_weight = check.generate.fill value(0.0) : tensor<[%columns]x4608xbf16>
+    %down_bias = check.generate.fill value(0.0) : tensor<[%columns]xf32>
+    check.generate<@merger_fixture>(%bf16, %columns, %input, %up_weight, %up_bias, %down_weight, %down_bias) : (i1, index, tensor<[%rows]x4608xf32>, tensor<4608x4608xbf16>, tensor<4608xf32>, tensor<[%columns]x4608xbf16>, tensor<[%columns]xf32>) -> ()
+    %activation = check.generate.fill value(99.0) : tensor<[%rows]x4608xbf16>
+    %storage = check.generate.fill value(99.0) : tensor<358432xf32>
+    %output = check.tensor.view %storage offset(64) : tensor<358432xf32> -> tensor<[%rows]x[%columns]xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<358432xf32> -> tensor<16xf32>
+    %suffix = check.tensor.view %storage offset(1433664) : tensor<358432xf32> -> tensor<16xf32>
+    check.compare<@merger_complete, @merger_bf16_reference>(%input, %up_weight, %up_bias, %down_weight, %down_bias, %activation, %output) : (tensor<[%rows]x4608xf32>, tensor<4608x4608xbf16>, tensor<4608xf32>, tensor<[%columns]x4608xbf16>, tensor<[%columns]xf32>, tensor<[%rows]x4608xbf16>, tensor<[%rows]x[%columns]xf32>) -> () {
+      check.expect.close actual(%activation) expected(%activation) atol(0.002) rtol(0.0) nan(different) : tensor<[%rows]x4608xbf16>
+      check.expect.close actual(%output) expected(%output) atol(0.00069999999999999999) rtol(0.0) nan(different) : tensor<[%rows]x[%columns]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<16xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<16xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x4608xf32>
+      check.expect.bitwise actual(%up_weight) expected(%up_weight) : tensor<4608x4608xbf16>
+      check.expect.bitwise actual(%up_bias) expected(%up_bias) : tensor<4608xf32>
+      check.expect.bitwise actual(%down_weight) expected(%down_weight) : tensor<[%columns]x4608xbf16>
+      check.expect.bitwise actual(%down_bias) expected(%down_bias) : tensor<[%columns]xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@vision_merger_bf16> @vision_merger_bf16_complete

@@ -1,0 +1,367 @@
+// Independent sparse-product oracle for vision K/V and two-dimensional rotary.
+// Minimum, full 32-row, and full-plus-tail cases share this oracle. Every output
+// channel has two signed taps, one at the last reduction column. Residual rows
+// permute balanced +/-1 values around row/8; supplied moments are exact. Affine
+// terms and weights are dyadic, making the real projection exactly known.
+// The reference uses logical head/channel coordinates, never fragment or LDS
+// layouts. Both half formats run all cohorts concurrently into separate banks.
+// Both outputs have guards, and inputs must remain unchanged. Keys admit one
+// half ULP plus 1e-7 for native arithmetic
+// and trigonometric approximation. F16 values agree exactly. Native BF16 WMMA
+// can shift the F32 result by one ULP even when the only nonzero product is
+// exact: negative zero products affect its rounding. At a BF16 midpoint that
+// changes the rounded neighbor; values admit one BF16 ULP and the same small
+// cancellation floor. This does not relax the ordinary fptrunc contract.
+
+func.decl @vision_round(%bf16: i1, %value: f32) -> (i16)
+
+config.decl @vision_test.image_height : index
+
+config.decl @vision_test.image_width : index
+
+func.def pure inline @key_value_shape() -> (index, index, index) {
+  %height = config.get @vision_test.image_height : index
+  %width = config.get @vision_test.image_width : index
+  %patch = index.constant 16 : index
+  %patch_height = index.div %height, %patch : index
+  %patch_width = index.div %width, %patch : index
+  %rows = index.mul %patch_height, %patch_width : index
+  func.return %patch_height, %patch_width, %rows : index, index, index
+}
+
+amdgpu.target<gfx11-generic> @key_value_test_wave32 {subgroup_size = 32}
+
+template.decl @qwen38.vision.key_value(%patch_height: index, %patch_width: index, %bf16: i1, %cohort: index, %output_offset: offset, %residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer)
+
+kernel.def target(@key_value_test_wave32) @key_value() {
+  %c1 = index.constant 1 : index
+  %height = config.get @vision_test.image_height : index
+  %width = config.get @vision_test.image_width : index
+  %area = index.mul %height, %width : index
+  %patch_area = index.constant 256 : index
+  %rows = index.div %area, %patch_area : index
+  %tail = index.constant 31 : index
+  %tile = index.constant 32 : index
+  %rounded_rows = index.add %rows, %tail : index
+  %row_tiles = index.div %rounded_rows, %tile : index
+  %projections = index.constant 2 : index
+  %cohorts = index.constant 4 : index
+  %threads = index.constant 384 : index
+  kernel.launch.config workgroups(%row_tiles, %projections, %cohorts) workgroup_size(%threads, %c1, %c1) : index
+} launch(%bf16: i1, %residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer) {
+  %patch_height, %patch_width, %rows = func.call pure @key_value_shape() : () -> (index, index, index)
+  %cohort = kernel.workgroup.id<z> : index
+  %row_bytes = index.constant 576 : index
+  %bank_bytes = index.mul %rows, %row_bytes : index
+  %byte_index = index.mul %cohort, %bank_bytes : index
+  %offset = index.cast %byte_index : index to offset
+  template.apply<@qwen38.vision.key_value>(%patch_height, %patch_width, %bf16, %cohort, %offset, %residual, %statistics, %scale, %shift, %weight, %bias, %key, %value) : (index, index, i1, index, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+func.def @key_value_sample(%row: index, %column: index) -> (f32, f32) {
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %phase = index.madd %column, %c7, %row : index
+  %position = index.rem %phase, %c16 : index
+  %positive = index.cmp ult, %position, %c8 : index
+  %unit_value = scalar.constant 1.0 : f32
+  %negative_value = scalar.constant -1.0 : f32
+  %centered = scf.select %positive, %unit_value, %negative_value : f32
+  %row_i32 = index.cast %row : index to i32
+  %row_f32 = scalar.uitofp %row_i32 : i32 to f32
+  %mean_step = scalar.constant 0.125 : f32
+  %mean = scalar.mulf %row_f32, %mean_step : f32
+  func.return %centered, %mean : f32, f32
+}
+
+func.def @key_value_affine(%column: index) -> (f32, f32) {
+  %c5 = index.constant 5 : index
+  %c7 = index.constant 7 : index
+  %scale_index = index.rem %column, %c5 : index
+  %shift_index = index.rem %column, %c7 : index
+  %scale_i32 = index.cast %scale_index : index to i32
+  %shift_i32 = index.cast %shift_index : index to i32
+  %scale_f32 = scalar.uitofp %scale_i32 : i32 to f32
+  %shift_f32 = scalar.uitofp %shift_i32 : i32 to f32
+  %unit_value = scalar.constant 1.0 : f32
+  %midpoint = scalar.constant 3.0 : f32
+  %scale_step = scalar.constant 0.0625 : f32
+  %shift_step = scalar.constant 0.015625 : f32
+  %scale_delta = scalar.mulf %scale_f32, %scale_step : f32
+  %scale = scalar.addf %unit_value, %scale_delta : f32
+  %centered_shift = scalar.subf %shift_f32, %midpoint : f32
+  %shift = scalar.mulf %centered_shift, %shift_step : f32
+  func.return %scale, %shift : f32, f32
+}
+
+// The first column excludes column 1151, so the two coefficients never collide.
+func.def inline @key_value_taps(%channel: index) -> (index, f32, f32, f32) {
+  %c3 = index.constant 3 : index
+  %c7 = index.constant 7 : index
+  %c11 = index.constant 11 : index
+  %c13 = index.constant 13 : index
+  %last = index.constant 1151 : index
+  %phase = index.mul %channel, %c7 : index
+  %first = index.rem %phase, %last : index
+  %a_index = index.rem %channel, %c11 : index
+  %b_index = index.rem %channel, %c3 : index
+  %bias_index = index.rem %channel, %c13 : index
+  %a_i32 = index.cast %a_index : index to i32
+  %b_i32 = index.cast %b_index : index to i32
+  %bias_i32 = index.cast %bias_index : index to i32
+  %a_f32 = scalar.uitofp %a_i32 : i32 to f32
+  %b_f32 = scalar.uitofp %b_i32 : i32 to f32
+  %bias_f32 = scalar.uitofp %bias_i32 : i32 to f32
+  %a_midpoint = scalar.constant 5.0 : f32
+  %b_midpoint = scalar.constant 1.0 : f32
+  %bias_midpoint = scalar.constant 6.0 : f32
+  %a_step = scalar.constant 0.015625 : f32
+  %b_step = scalar.constant 0.125 : f32
+  %bias_step = scalar.constant 0.0078125 : f32
+  %a_centered = scalar.subf %a_f32, %a_midpoint : f32
+  %b_centered = scalar.subf %b_f32, %b_midpoint : f32
+  %bias_centered = scalar.subf %bias_f32, %bias_midpoint : f32
+  %a = scalar.mulf %a_centered, %a_step : f32
+  %b = scalar.mulf %b_centered, %b_step : f32
+  %bias = scalar.mulf %bias_centered, %bias_step : f32
+  func.return %first, %a, %b, %bias : index, f32, f32, f32
+}
+
+func.def @key_value_fixture(%bf16: i1, %residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %patch_height, %patch_width, %rows = func.call pure @key_value_shape() : () -> (index, index, index)
+  %width = index.constant 1152 : index
+  %last = index.constant 1151 : index
+  %channels = index.constant 3456 : index
+  %unit_value = scalar.constant 1.0 : f32
+  %residual_view = buffer.view %residual[%origin] : buffer -> view<[%rows]x1152xf32>
+  %statistics_view = buffer.view %statistics[%origin] : buffer -> view<[%rows]x2xf32>
+  %scale_view = buffer.view %scale[%origin] : buffer -> view<1152xf32>
+  %shift_view = buffer.view %shift[%origin] : buffer -> view<1152xf32>
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<3456x1152xi16>
+  %bias_view = buffer.view %bias[%origin] : buffer -> view<3456xf32>
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %column = [%c0 to %width step %c1] {
+      %centered, %mean = func.call @key_value_sample(%row, %column) : (index, index) -> (f32, f32)
+      %sample = scalar.addf %centered, %mean : f32
+      view.store %sample, %residual_view[%row, %column] : f32, view<[%rows]x1152xf32>
+    }
+    %unused, %mean = func.call @key_value_sample(%row, %c0) : (index, index) -> (f32, f32)
+    view.store %mean, %statistics_view[%row, %c0] : f32, view<[%rows]x2xf32>
+    view.store %unit_value, %statistics_view[%row, %c1] : f32, view<[%rows]x2xf32>
+  }
+  scf.for %column = [%c0 to %width step %c1] {
+    %scale_value, %shift_value = func.call @key_value_affine(%column) : (index) -> (f32, f32)
+    view.store %scale_value, %scale_view[%column] : f32, view<1152xf32>
+    view.store %shift_value, %shift_view[%column] : f32, view<1152xf32>
+  }
+  scf.for %channel = [%c0 to %channels step %c1] {
+    %first, %a, %b, %bias_value = func.call @key_value_taps(%channel) : (index) -> (index, f32, f32, f32)
+    %a_bits = func.call @vision_round(%bf16, %a) : (i1, f32) -> (i16)
+    %b_bits = func.call @vision_round(%bf16, %b) : (i1, f32) -> (i16)
+    view.store %a_bits, %weight_view[%channel, %first] : i16, view<3456x1152xi16>
+    view.store %b_bits, %weight_view[%channel, %last] : i16, view<3456x1152xi16>
+    view.store %bias_value, %bias_view[%channel] : f32, view<3456xf32>
+  }
+  func.return
+}
+
+// These affine inputs are exactly representable in F16 and BF16. The sparse
+// scalar sum therefore needs no fragment mapping or emulated reduction tree.
+func.def @key_value_projection(%row: index, %channel: index) -> (f32) {
+  %last = index.constant 1151 : index
+  %first, %a, %b, %bias = func.call @key_value_taps(%channel) : (index) -> (index, f32, f32, f32)
+  %x, %mean_x = func.call @key_value_sample(%row, %first) : (index, index) -> (f32, f32)
+  %y, %mean_y = func.call @key_value_sample(%row, %last) : (index, index) -> (f32, f32)
+  %scale_x, %shift_x = func.call @key_value_affine(%first) : (index) -> (f32, f32)
+  %scale_y, %shift_y = func.call @key_value_affine(%last) : (index) -> (f32, f32)
+  %scaled_x = scalar.mulf %x, %scale_x : f32
+  %scaled_y = scalar.mulf %y, %scale_y : f32
+  %affine_x = scalar.addf %scaled_x, %shift_x : f32
+  %affine_y = scalar.addf %scaled_y, %shift_y : f32
+  %ax = scalar.mulf %a, %affine_x : f32
+  %by = scalar.mulf %b, %affine_y : f32
+  %sum = scalar.addf %ax, %by : f32
+  %output = scalar.addf %sum, %bias : f32
+  func.return %output : f32
+}
+
+func.def @key_value_reference(%bf16: i1, %key: buffer, %value: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %axis_pairs = index.constant 18 : index
+  %pairs = index.constant 36 : index
+  %patch_height, %patch_width, %rows = func.call pure @key_value_shape() : () -> (index, index, index)
+  %head_width = index.constant 72 : index
+  %heads = index.constant 16 : index
+  %width = index.constant 1152 : index
+  %value_base = index.constant 2304 : index
+  %log_base = scalar.constant 9.2103403719761836 : f32
+  %inverse_axis_pairs = scalar.constant 0.055555555555555552 : f32
+  %key_view = buffer.view %key[%origin] : buffer -> view<4x[%rows]x288xi16>
+  %value_view = buffer.view %value[%origin] : buffer -> view<4x288x[%rows]xi16>
+  scf.for %row = [%c0 to %rows step %c1] {
+    %block = index.div %row, %c4 : index
+    %within = index.rem %row, %c4 : index
+    %block_width = index.div %patch_width, %c2 : index
+    %block_y = index.div %block, %block_width : index
+    %block_x = index.rem %block, %block_width : index
+    %within_y = index.div %within, %c2 : index
+    %within_x = index.rem %within, %c2 : index
+    %y = index.madd %block_y, %c2, %within_y : index
+    %x = index.madd %block_x, %c2, %within_x : index
+    scf.for %head = [%c0 to %heads step %c1] {
+      %cohort = index.div %head, %c4 : index
+      %cohort_head = index.rem %head, %c4 : index
+      %cohort_base = index.mul %cohort_head, %head_width : index
+      %head_base = index.mul %head, %head_width : index
+      scf.for %pair = [%c0 to %pairs step %c1] {
+        %left = index.add %head_base, %pair : index
+        %right = index.add %left, %pairs : index
+        %key_left = index.add %width, %left : index
+        %key_right = index.add %width, %right : index
+        %a = func.call @key_value_projection(%row, %key_left) : (index, index) -> (f32)
+        %b = func.call @key_value_projection(%row, %key_right) : (index, index) -> (f32)
+        %axis_pair = index.rem %pair, %axis_pairs : index
+        %uses_y = index.cmp ult, %pair, %axis_pairs : index
+        %coordinate = scf.select %uses_y, %y, %x : index
+        %pair_i32 = index.cast %axis_pair : index to i32
+        %coordinate_i32 = index.cast %coordinate : index to i32
+        %pair_f32 = scalar.uitofp %pair_i32 : i32 to f32
+        %coordinate_f32 = scalar.uitofp %coordinate_i32 : i32 to f32
+        %fraction = scalar.mulf %pair_f32, %inverse_axis_pairs : f32
+        %exponent = scalar.mulf %fraction, %log_base : f32
+        %negative_exponent = scalar.negf %exponent : f32
+        %frequency = scalar.expf<afn> %negative_exponent : f32
+        %angle = scalar.mulf %coordinate_f32, %frequency : f32
+        %sine = scalar.sinf<afn> %angle : f32
+        %cosine = scalar.cosf<afn> %angle : f32
+        %ac = scalar.mulf %a, %cosine : f32
+        %bs = scalar.mulf %b, %sine : f32
+        %as = scalar.mulf %a, %sine : f32
+        %bc = scalar.mulf %b, %cosine : f32
+        %rotated_left = scalar.subf %ac, %bs : f32
+        %rotated_right = scalar.addf %as, %bc : f32
+        %left_bits = func.call @vision_round(%bf16, %rotated_left) : (i1, f32) -> (i16)
+        %right_bits = func.call @vision_round(%bf16, %rotated_right) : (i1, f32) -> (i16)
+        %local_left = index.add %cohort_base, %pair : index
+        %local_right = index.add %local_left, %pairs : index
+        view.store %left_bits, %key_view[%cohort, %row, %local_left] : i16, view<4x[%rows]x288xi16>
+        view.store %right_bits, %key_view[%cohort, %row, %local_right] : i16, view<4x[%rows]x288xi16>
+        %value_left = index.add %value_base, %left : index
+        %value_right = index.add %value_base, %right : index
+        %va = func.call @key_value_projection(%row, %value_left) : (index, index) -> (f32)
+        %vb = func.call @key_value_projection(%row, %value_right) : (index, index) -> (f32)
+        %va_bits = func.call @vision_round(%bf16, %va) : (i1, f32) -> (i16)
+        %vb_bits = func.call @vision_round(%bf16, %vb) : (i1, f32) -> (i16)
+        view.store %va_bits, %value_view[%cohort, %local_left, %row] : i16, view<4x288x[%rows]xi16>
+        view.store %vb_bits, %value_view[%cohort, %local_right, %row] : i16, view<4x288x[%rows]xi16>
+      }
+    }
+  }
+  func.return
+}
+
+command.program.def @key_value_complete(%bf16: i1) launch(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer) {
+  kernel.launch @key_value(%bf16, %residual, %statistics, %scale, %shift, %weight, %bias, %key, %value) : (i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+func.def @key_value_f16_reference(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer) {
+  %bf16 = scalar.constant false : i1
+  func.call @key_value_reference(%bf16, %key, %value) : (i1, buffer, buffer)
+  func.return
+}
+
+check.scenario public @vision_key_value_f16 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %bf16 = check.literal value(false) : i1
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %patch_height, %patch_width, %rows = check.generate<@key_value_shape>() : () -> (index, index, index)
+    %residual = check.generate.fill value(0.0) : tensor<[%rows]x1152xf32>
+    %statistics = check.generate.fill value(0.0) : tensor<[%rows]x2xf32>
+    %scale = check.generate.fill value(0.0) : tensor<1152xf32>
+    %shift = check.generate.fill value(0.0) : tensor<1152xf32>
+    %weight = check.generate.fill value(0.0) : tensor<3456x1152xf16>
+    %bias = check.generate.fill value(0.0) : tensor<3456xf32>
+    check.generate<@key_value_fixture>(%bf16, %residual, %statistics, %scale, %shift, %weight, %bias) : (i1, tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xf16>, tensor<3456xf32>) -> ()
+    %key_storage = check.generate.fill value(99.0) : tensor<41536xf16>
+    %value_storage = check.generate.fill value(99.0) : tensor<41536xf16>
+    %key = check.tensor.view %key_storage offset(64) : tensor<41536xf16> -> tensor<4x[%rows]x288xf16>
+    %value = check.tensor.view %value_storage offset(64) : tensor<41536xf16> -> tensor<4x288x[%rows]xf16>
+    %key_prefix = check.tensor.view %key_storage offset(0) : tensor<41536xf16> -> tensor<32xf16>
+    %key_suffix = check.tensor.view %key_storage offset(83008) : tensor<41536xf16> -> tensor<32xf16>
+    %value_prefix = check.tensor.view %value_storage offset(0) : tensor<41536xf16> -> tensor<32xf16>
+    %value_suffix = check.tensor.view %value_storage offset(83008) : tensor<41536xf16> -> tensor<32xf16>
+    check.compare<@key_value_complete, @key_value_f16_reference>[%bf16](%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value) : [i1](tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xf16>, tensor<3456xf32>, tensor<4x[%rows]x288xf16>, tensor<4x288x[%rows]xf16>) -> () {
+      check.expect.close actual(%key) expected(%key) atol(9.9999999999999995e-08) rtol(0.001) nan(different) : tensor<4x[%rows]x288xf16>
+      check.expect.close actual(%value) expected(%value) atol(0.0) rtol(0.0) nan(different) : tensor<4x288x[%rows]xf16>
+      check.expect.bitwise actual(%key_prefix) expected(%key_prefix) : tensor<32xf16>
+      check.expect.bitwise actual(%key_suffix) expected(%key_suffix) : tensor<32xf16>
+      check.expect.bitwise actual(%value_prefix) expected(%value_prefix) : tensor<32xf16>
+      check.expect.bitwise actual(%value_suffix) expected(%value_suffix) : tensor<32xf16>
+      check.expect.bitwise actual(%residual) expected(%residual) : tensor<[%rows]x1152xf32>
+      check.expect.bitwise actual(%statistics) expected(%statistics) : tensor<[%rows]x2xf32>
+      check.expect.bitwise actual(%scale) expected(%scale) : tensor<1152xf32>
+      check.expect.bitwise actual(%shift) expected(%shift) : tensor<1152xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<3456x1152xf16>
+      check.expect.bitwise actual(%bias) expected(%bias) : tensor<3456xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@vision_key_value_f16> @vision_key_value_f16_all_heads_and_row_tail
+
+func.def @key_value_bf16_reference(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer) {
+  %bf16 = scalar.constant true : i1
+  func.call @key_value_reference(%bf16, %key, %value) : (i1, buffer, buffer)
+  func.return
+}
+
+check.scenario public @vision_key_value_bf16 {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %bf16 = check.literal value(true) : i1
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %patch_height, %patch_width, %rows = check.generate<@key_value_shape>() : () -> (index, index, index)
+    %residual = check.generate.fill value(0.0) : tensor<[%rows]x1152xf32>
+    %statistics = check.generate.fill value(0.0) : tensor<[%rows]x2xf32>
+    %scale = check.generate.fill value(0.0) : tensor<1152xf32>
+    %shift = check.generate.fill value(0.0) : tensor<1152xf32>
+    %weight = check.generate.fill value(0.0) : tensor<3456x1152xbf16>
+    %bias = check.generate.fill value(0.0) : tensor<3456xf32>
+    check.generate<@key_value_fixture>(%bf16, %residual, %statistics, %scale, %shift, %weight, %bias) : (i1, tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xbf16>, tensor<3456xf32>) -> ()
+    %key_storage = check.generate.fill value(99.0) : tensor<41536xbf16>
+    %value_storage = check.generate.fill value(99.0) : tensor<41536xbf16>
+    %key = check.tensor.view %key_storage offset(64) : tensor<41536xbf16> -> tensor<4x[%rows]x288xbf16>
+    %value = check.tensor.view %value_storage offset(64) : tensor<41536xbf16> -> tensor<4x288x[%rows]xbf16>
+    %key_prefix = check.tensor.view %key_storage offset(0) : tensor<41536xbf16> -> tensor<32xbf16>
+    %key_suffix = check.tensor.view %key_storage offset(83008) : tensor<41536xbf16> -> tensor<32xbf16>
+    %value_prefix = check.tensor.view %value_storage offset(0) : tensor<41536xbf16> -> tensor<32xbf16>
+    %value_suffix = check.tensor.view %value_storage offset(83008) : tensor<41536xbf16> -> tensor<32xbf16>
+    check.compare<@key_value_complete, @key_value_bf16_reference>[%bf16](%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value) : [i1](tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xbf16>, tensor<3456xf32>, tensor<4x[%rows]x288xbf16>, tensor<4x288x[%rows]xbf16>) -> () {
+      check.expect.close actual(%key) expected(%key) atol(9.9999999999999995e-08) rtol(0.0080000000000000002) nan(different) : tensor<4x[%rows]x288xbf16>
+      check.expect.close actual(%value) expected(%value) atol(9.9999999999999995e-08) rtol(0.0080000000000000002) nan(different) : tensor<4x288x[%rows]xbf16>
+      check.expect.bitwise actual(%key_prefix) expected(%key_prefix) : tensor<32xbf16>
+      check.expect.bitwise actual(%key_suffix) expected(%key_suffix) : tensor<32xbf16>
+      check.expect.bitwise actual(%value_prefix) expected(%value_prefix) : tensor<32xbf16>
+      check.expect.bitwise actual(%value_suffix) expected(%value_suffix) : tensor<32xbf16>
+      check.expect.bitwise actual(%residual) expected(%residual) : tensor<[%rows]x1152xf32>
+      check.expect.bitwise actual(%statistics) expected(%statistics) : tensor<[%rows]x2xf32>
+      check.expect.bitwise actual(%scale) expected(%scale) : tensor<1152xf32>
+      check.expect.bitwise actual(%shift) expected(%shift) : tensor<1152xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<3456x1152xbf16>
+      check.expect.bitwise actual(%bias) expected(%bias) : tensor<3456xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@vision_key_value_bf16> @vision_key_value_bf16_all_heads_and_row_tail

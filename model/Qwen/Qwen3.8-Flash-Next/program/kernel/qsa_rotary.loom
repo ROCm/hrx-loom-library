@@ -26,3 +26,29 @@ func.def public inline @qsa_rotary_coefficients(%position: index, %pair_arg: ind
   %cosine_packed = scalar.fptrunc %cosine : f32 to bf16
   func.return %sine_packed, %cosine_packed : bf16, bf16
 }
+
+func.decl @flash_next_row_state(%rows: buffer, %row: index, %position: index, %layer_origin: offset) -> (offset, offset)
+
+func.decl @flash_next_input_coordinate(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %begin: index, %relative: index, %linear: index, %lane: index, %inputs: buffer, %origins: buffer) -> (index)
+
+// A pooled key rotates at its first causal member's source coordinate. That
+// member can precede this epoch, including a text-only continuation of an image.
+// The twelve indexer layers share one immutable old coordinate until their last
+// publisher replaces it. No per-layer or per-context coordinate history exists.
+func.def public inline @qsa_group_coordinate(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %coordinate_origin: offset, %logical: index, %first: index, %source_first: index, %begin: index, %row: index, %axis_arg: index, %inputs: buffer, %origins: buffer, %rows: buffer, %arena: buffer) -> (index) {
+  %axis = index.assume %axis_arg [range(%axis_arg, 0, 2)] : index
+  %prior = index.cmp ult, %logical, %first : index
+  %coordinate = scf.if %prior -> (index) {
+    %reader, %writer = func.call @flash_next_row_state(%rows, %row, %first, %coordinate_origin) : (buffer, index, index, offset) -> (offset, offset)
+    %retained = buffer.view %arena[%reader] : buffer -> view<4xi32>
+    %word = view.load %retained[%axis] : view<4xi32> -> i32
+    %value = index.cast %word : i32 to index
+    scf.yield %value : index
+  } else {
+    %relative = index.sub %logical, %first : index
+    %linear = index.add %source_first, %relative : index
+    %value = func.call @flash_next_input_coordinate(%mixed, %remapped, %source_capacity, %origin_capacity, %begin, %relative, %linear, %axis, %inputs, %origins) : (index, i1, index, index, index, index, index, index, buffer, buffer) -> (index)
+    scf.yield %value : index
+  }
+  func.return %coordinate : index
+}

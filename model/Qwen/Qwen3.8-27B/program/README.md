@@ -43,25 +43,30 @@ image packet and the output dimensions chosen by the shared
 image preprocessing specification is published in its
 [processor configuration](https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/preprocessor_config.json).
 
-`vision_pixels.loom` prepares antialiased bicubic coefficient tables, preserving
+The shared [pixel provider](../../../../program/text/qwen3_8/vision_pixels.loom)
+prepares antialiased bicubic coefficient tables, preserving
 the decoded RGB/RGBA plane and display orientation. A packet begins with a
 64-byte reserved directory followed by a 64-byte resize header. Header-relative
 offsets address the two axis plans and aligned decoded pixels. F32 weights use
 the specified F64 sampling-center evaluation before explicit rounding. The
 [device leaf](kernel/README.md) performs the pixel filtering.
 
-`vision_control.loom` provides `text_image_prepare_request_v1`,
+`vision_control.loom` binds the model's feature width and projector capacity to
+the shared image service and provides `text_image_prepare_request_v1`,
 `text_image_prepare_batch_v1`, and `text_image_run_v1`. The request callback tags
 compatible images by selected dimensions. Batch preparation fills the native
 packer's directory in place for one to four images and describes their output
 feature ranges. Each 32×32 output pixel block becomes one 5120-element F32 row.
-`vision_stages.loom` declares the geometry-specific projector stage through the
+The shared stage provider declares the geometry-specific projector through the
 prepare host; the runner owns device execution and storage. There is no second
 cohort-sized pixel copy.
 
 Cold preparation registers a descriptor-only memory forecast for bounded
 serving. It accounts for the projector bank, the upload ceiling, and the largest
-image's shared private workspace. Retained output estimates include a full
+image's shared private workspace. Command composition and forecasting use the
+same shared vision workspace query. The 5120-column final output temporarily
+holds a residual bank, then receives features after post-normalization has
+preserved the merger input. Retained output estimates include a full
 four-image cohort for each image in the request because peer requests can share
 the allocation. Expanded feature storage counts only this request's rows.
 The forecast needs neither decoded pixels nor activated weights; it lets the

@@ -3,8 +3,8 @@
 [Qwen3.8 Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) combines
 36 recurrent layers and 12 sparse-attention layers. Its mixture-of-experts
 blocks select ten of 512 experts plus a shared expert. This card describes the
-48-layer text composition using the original packed Unsloth UD-Q4_K_XL files,
-with an optional Q8_0 multi-token predictor.
+48-layer composition using the original packed Unsloth UD-Q4_K_XL files,
+with an optional BF16 image projector and Q8_0 multi-token predictor.
 
 The composition includes native AMD RDNA providers for Loom's text service,
 with source and bytecode program representations. Its source preset
@@ -38,11 +38,65 @@ The tokenizer comes from the
 [original training repository](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/de4b8e4d43b917e7706784d8bb445c9af86a3540/tokenizer.json).
 Only these four weight shards and the tokenizer are required for target-only
 text execution. The presence of other files in the upstream repository does
-not make them inputs to this model selection. No image projector is declared.
+not make them inputs to the text-only selection.
 
 The base model uses the
 [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/de4b8e4d43b917e7706784d8bb445c9af86a3540/LICENSE).
 The quantized repository retains that model license.
+
+## Image-conditioned chat
+
+The `vision` and `vision-mtp` presets add the matching original
+[`mmproj-BF16.gguf`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6/mmproj-BF16.gguf)
+in a separate `vision` parameter scope. The same source, bytecode, and mixed
+representations support target-only and speculative image input. No offline
+weight conversion is required.
+
+```sh
+loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/Qwen/Qwen3.8-Flash-Next/model.json \
+  --preset vision-mtp --output "$HOME/models/qwen3.8-flash-next-vision"
+loom-serve --model="$HOME/models/qwen3.8-flash-next-vision/model.json" \
+  --device=amdgpu://0
+```
+
+Send an image as a data URL through the chat endpoint:
+
+```python
+import base64
+import json
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+image = base64.b64encode(Path("photo.png").read_bytes()).decode("ascii")
+body = {
+    "model": "Qwen/Qwen3.8-Flash-Next",
+    "messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image}},
+        {"type": "text", "text": "Describe this image."},
+    ]}],
+    "enable_thinking": False,
+    "max_tokens": 128,
+}
+request = Request("http://127.0.0.1:8080/v1/chat/completions",
+                  data=json.dumps(body).encode(),
+                  headers={"Content-Type": "application/json"})
+print(json.load(urlopen(request)))
+```
+
+Up to four images may appear in a conversation. Each compressed image is
+bounded to 64 MiB and 4096 pixels per dimension. Processing aligns dimensions
+to 32 pixels and defaults to at most 1024 image tokens; `max_image_tokens`
+can select 128 through 16384. Image tokens, chat text, and generated output
+share the selected text context capacity. These image presets start with
+the same 16,384-position context as `chat`.
+
+The projector uses 27 transformer blocks and produces 2560-wide F32 language
+features from original BF16 matrix and F32 affine parameters. Its parameter
+bank occupies 907,530,240 bytes. It activates on the first image request and
+can release that storage independently of retained image-conditioned
+conversations. Encoder workspace, uploaded pixels, and retained features
+are separate from the parameter bank. The text-only presets do not acquire
+the projector or prepare image-specific stages.
 
 ## Optional multi-token prediction
 
@@ -101,8 +155,8 @@ The card rounds those estimates upward to 104 and 107 GiB. It does not infer a
 hardware fit or reserve memory from those figures.
 
 Mutable storage is additional: 25,344 bytes per pooled KV token and
-115,651,840 bytes per recurrent endpoint. MTP adds 44,032 bytes of carry per
-retained owner, 2,116 bytes per pooled token, and a 768-byte working tail per
+115,652,096 bytes per recurrent endpoint. MTP adds 44,032 bytes of carry per
+retained owner, 2,116 bytes per pooled token, and a 1,024-byte working tail per
 execution row. The retained carry includes 22,784 bytes for draft-vocabulary
 membership and history. Allocation granularity, workspace, compiler,
 tokenizer, and driver overhead are also additional, so no complete transient

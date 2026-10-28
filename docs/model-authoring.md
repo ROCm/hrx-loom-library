@@ -99,8 +99,8 @@ inputs = [
 libraries = [
     "//model/Qwen/Qwen3.8-27B/program:commands",
     "//program/text/qwen3_8:epoch",
-    "//model/Qwen/Qwen3.8-27B/program:vision_pixels",
-    "//model/Qwen/Qwen3.8-27B/program:vision_stages",
+    "//program/text/qwen3_8:vision_pixels",
+    "//program/text/qwen3_8:vision_stages",
 ],
 ```
 

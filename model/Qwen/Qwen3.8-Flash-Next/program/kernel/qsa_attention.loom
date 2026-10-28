@@ -12,6 +12,8 @@ func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
 func.decl @flash_next_token_binding(%mapping: buffer, %token: index) -> (index, index, index, index)
 
+func.decl @flash_next_token_coordinate(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %mapping: buffer, %inputs: buffer, %origins: buffer, %token: index, %lane: index) -> (index)
+
 func.decl @flash_next_physical_token(%rows: buffer, %row: index, %position: index) -> (index)
 
 func.decl @flash_next_cache_origin(%rows: buffer, %row: index, %plane_origin: offset) -> (offset)
@@ -25,15 +27,9 @@ func.decl @qsa_normalize_rotate(%width: index, %position: index, %input: buffer,
 // [block, head, channel, member]. This permits contiguous matrix operand loads
 // without a second cache or a repacking pass. Page byte size, copy-on-write,
 // and retention ownership are unchanged. Each appender writes only its member.
-kernel.def target(@qsa_attention_wave32) @qsa_append_kv(%neural_enabled: i1) {
-  %heads = index.constant 2 : index
-  %tokens = config.get @flash_next.token_count : index
-  %threads = index.constant 32 : index
-  %c1 = index.constant 1 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %heads, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer) {
+template.decl @flash_next.qsa_append_kv(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer)
+
+template.def<@flash_next.qsa_append_kv> device @qsa_append_kv_body(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %capacity = config.get @flash_next.context_capacity : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
@@ -63,7 +59,9 @@ kernel.def target(@qsa_attention_wave32) @qsa_append_kv(%neural_enabled: i1) {
     %input_origin = index.scale %input_head, %head_bytes : index, offset -> offset
     %output_relative = index.add %output_block_relative, %member_relative : offset
     %output_origin = index.add %key_base, %output_relative : offset
-    func.call @qsa_normalize_rotate(%width, %position, %keys, %input_origin, %weight, %arena, %output_origin, %output_group_stride) : (index, index, buffer, offset, buffer, buffer, offset, index)
+    %rotary_lane = kernel.subgroup.lane.id : index
+    %coordinate = func.call @flash_next_token_coordinate(%mixed, %remapped, %source_capacity, %origin_capacity, %mapping, %inputs, %origins, %token, %rotary_lane) : (index, i1, index, index, buffer, buffer, buffer, index, index) -> (index)
+    func.call @qsa_normalize_rotate(%width, %coordinate, %keys, %input_origin, %weight, %arena, %output_origin, %output_group_stride) : (index, index, buffer, offset, buffer, buffer, offset, index)
     %origin = index.constant 0 : offset
     %input_view = buffer.view %values[%origin] : buffer -> view<[%tokens]x2x256xbf16>
     %value_layout = encoding.layout.strided [2048, 1024, 1, 4] : encoding<layout>
@@ -74,5 +72,51 @@ kernel.def target(@qsa_attention_wave32) @qsa_append_kv(%neural_enabled: i1) {
     %packed = vector.load %input_view[%token, %head, %channel] : view<[%tokens]x2x256xbf16> -> vector<8xbf16>
     vector.store %packed, %output_view[%physical_block, %head, %physical_member, %channel] : vector<8xbf16>, view<[%blocks]x2x4x256xbf16, %value_layout>
   }
+  template.return
+}
+
+kernel.def target(@qsa_attention_wave32) @qsa_append_kv(%neural_enabled: i1) {
+  %heads = index.constant 2 : index
+  %tokens = config.get @flash_next.token_count : index
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %heads, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer) {
+  %mixed = index.constant 0 : index
+  %remapped = scalar.constant false : i1
+  %capacity = config.get @flash_next.token_count : index
+  template.apply<@flash_next.qsa_append_kv>(%mixed, %remapped, %capacity, %capacity, %span, %span, %key_origin, %value_origin, %span, %mapping, %rows, %keys, %values, %weight, %arena) : (index, i1, index, index, buffer, buffer, offset, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@qsa_attention_wave32) @qsa_append_kv_mixed(%neural_enabled: i1) {
+  %heads = index.constant 2 : index
+  %tokens = config.get @flash_next.token_count : index
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %heads, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer) {
+  %mixed = index.constant 1 : index
+  %remapped = scalar.constant false : i1
+  template.apply<@flash_next.qsa_append_kv>(%mixed, %remapped, %source_capacity, %origin_capacity, %inputs, %origins, %key_origin, %value_origin, %span, %mapping, %rows, %keys, %values, %weight, %arena) : (index, i1, index, index, buffer, buffer, offset, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@qsa_attention_wave32) @qsa_append_kv_remapped(%neural_enabled: i1) {
+  %heads = index.constant 2 : index
+  %tokens = config.get @flash_next.token_count : index
+  %threads = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %c0_index = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %heads, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer) {
+  %mixed = index.constant 1 : index
+  %remapped = scalar.constant true : i1
+  template.apply<@flash_next.qsa_append_kv>(%mixed, %remapped, %source_capacity, %origin_capacity, %inputs, %origins, %key_origin, %value_origin, %span, %mapping, %rows, %keys, %values, %weight, %arena) : (index, i1, index, index, buffer, buffer, offset, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }

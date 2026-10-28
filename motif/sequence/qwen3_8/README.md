@@ -14,6 +14,9 @@ records retain temporal, height, and width coordinates in words 2–4; the
 halves use the same coordinate. The caller selects which lanes undergo
 rotation. Position lookup, token lookup, and mutation use the caller's positive
 record capacity; token mutation preserves every other record field.
+Feature lookup returns the byte offset in word 1, or zero for vocabulary
+lookup. Offsets remain relative to the original input allocation when accepted
+rows are selected through a compact origin map.
 
 `span.loom` interprets the three-word epoch header and six-word descriptors:
 length, causal position, packed-token begin, resident identity, source position,

@@ -10,6 +10,10 @@ config.decl @qwen38.vision.image_height : %value: index where [range(%value, 32,
 
 config.decl @qwen38.vision.image_width : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
 
+func.decl pure @qwen38_vision_workspace(%rows: index, %feature_columns: index) -> (offset, offset, offset, offset, offset) where [range(%rows, 4, 65536), multiple_of(%rows, 4)]
+
+func.decl pure @qwen38_vision_attention_offsets(%rows: index, %cohorts: index) -> (offset, offset) where [range(%rows, 4, 65536), multiple_of(%rows, 4), range(%cohorts, 1, 4)]
+
 kernel.decl @qwen38_vision_resize(%groups_x: index, %groups_y: index) launch(%image: index, %input: buffer, %output: buffer) where [range(%image, 0, 3)]
 
 kernel.decl @qwen38_vision_patch_embedding() launch(%source_offset: offset, %source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer)
@@ -20,7 +24,7 @@ kernel.decl @qwen38_vision_statistics() launch(%residual: buffer, %statistics: b
 
 kernel.decl @qwen38_vision_key_value_cohort(%cohort: index) launch(%cohort_argument: index, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer) where [range(%cohort_argument, 0, 3)]
 
-kernel.decl @qwen38_vision_attention_cohort(%cohort: index) launch(%cohort_argument: index, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output_weight: buffer, %output_bias: buffer, %output: buffer) where [range(%cohort_argument, 0, 3)]
+kernel.decl @qwen38_vision_attention_cohort(%cohort: index) launch(%cohort_argument: index, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer) where [range(%cohort_argument, 0, 3)]
 
 kernel.decl @qwen38_vision_attention_output() launch(%context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer)
 
@@ -57,7 +61,7 @@ template.def<@qwen38_vision_block> @qwen38_vision_block_impl(%layer: index, %row
   %c4 = index.constant 4 : index
   scf.for %cohort = [%c0 to %c4 step %c1] unroll {
     kernel.launch @qwen38_vision_key_value_cohort[%cohort](%cohort, %input, %statistics, %ln1_weight, %ln1_bias, %qkv_weight, %qkv_bias, %key, %value) : [index](index, view<[%rows]x1152xf32>, buffer, view<1152xf32>, view<1152xf32>, view<3456x1152xf16>, view<3456xf32>, view<[%rows]x288xf16>, view<288x[%rows]xf16>)
-    kernel.launch @qwen38_vision_attention_cohort[%cohort](%cohort, %input, %statistics, %ln1_weight, %ln1_bias, %qkv_weight, %qkv_bias, %key, %value, %attention_weight, %attention_bias, %context) : [index](index, view<[%rows]x1152xf32>, buffer, view<1152xf32>, view<1152xf32>, view<3456x1152xf16>, view<3456xf32>, view<[%rows]x288xf16>, view<288x[%rows]xf16>, view<1152x1152xf16>, view<1152xf32>, view<[%rows]x1152xf16>)
+    kernel.launch @qwen38_vision_attention_cohort[%cohort](%cohort, %input, %statistics, %ln1_weight, %ln1_bias, %qkv_weight, %qkv_bias, %key, %value, %context) : [index](index, view<[%rows]x1152xf32>, buffer, view<1152xf32>, view<1152xf32>, view<3456x1152xf16>, view<3456xf32>, view<[%rows]x288xf16>, view<288x[%rows]xf16>, view<[%rows]x1152xf16>)
   }
   kernel.launch @qwen38_vision_attention_output(%context, %attention_weight, %attention_bias, %input, %output) : (view<[%rows]x1152xf16>, view<1152x1152xf16>, view<1152xf32>, view<[%rows]x1152xf32>, view<[%rows]x1152xf32>)
   kernel.launch @qwen38_vision_statistics(%output, %statistics) : (view<[%rows]x1152xf32>, buffer)
@@ -90,16 +94,9 @@ command.program.def public @qwen38_vision_projector() launch(%parameters: buffer
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %image_count = config.get @qwen38.vision.image_count : index
-  %context_row_bytes = index.constant 2304 : offset
-  %context_key_row_bytes = index.constant 2880 : offset
-  %residual_row_bytes = index.constant 4608 : offset
-  %statistics_row_bytes = index.constant 8 : offset
-  %activation_row_bytes = index.constant 8608 : offset
-  %key_offset = index.scale %rows, %context_row_bytes : index, offset -> offset
-  %value_offset = index.scale %rows, %context_key_row_bytes : index, offset -> offset
-  %residual_bytes = index.scale %rows, %residual_row_bytes : index, offset -> offset
-  %statistics_bytes = index.scale %rows, %statistics_row_bytes : index, offset -> offset
-  %activation_bytes = index.scale %rows, %activation_row_bytes : index, offset -> offset
+  %feature_columns = index.constant 5120 : index
+  %residual_bytes, %secondary_bytes, %statistics_bytes, %activation_bytes, %workspace_bytes = func.call pure @qwen38_vision_workspace(%rows, %feature_columns) : (index, index) -> (offset, offset, offset, offset, offset)
+  %key_offset, %value_offset = func.call pure @qwen38_vision_attention_offsets(%rows, %c1) : (index, index) -> (offset, offset)
   %state = buffer.alloca<global> align(256) %residual_bytes : buffer
   %statistics = buffer.alloca<global> align(256) %statistics_bytes : buffer
   %activation = buffer.alloca<global> align(256) %activation_bytes : buffer

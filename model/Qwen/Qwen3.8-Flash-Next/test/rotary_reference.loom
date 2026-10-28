@@ -1,0 +1,51 @@
+// Independent radians reference: successive frequencies multiply by
+// 10000000^(-1/32), in F64. Reduce positive angles in F64 before the VM
+// trigonometry. Both checkpoint BF16 rounding boundaries remain explicit;
+// this never calls the production turn table or coordinate helpers.
+func.def @rotate_unit(%channel: index, %temporal: i32, %height: i32, %width: i32) -> (bf16) {
+  %half = index.constant 32 : index
+  %rotary = index.constant 64 : index
+  %c3_value = index.constant 3 : index
+  %c0_value = index.constant 0 : index
+  %c1_value = index.constant 1 : index
+  %rotates = index.cmp ult, %channel, %rotary : index
+  %result = scf.if %rotates -> (bf16) {
+    %pair = index.rem %channel, %half : index
+    %axis = index.rem %pair, %c3_value : index
+    %is_temporal = index.cmp eq, %axis, %c0_value : index
+    %is_height = index.cmp eq, %axis, %c1_value : index
+    %other = scf.select %is_height, %height, %width : i32
+    %position = scf.select %is_temporal, %temporal, %other : i32
+    %position_f64 = scalar.uitofp %position : i32 to f64
+    %initial = scalar.constant 1.0 : f64
+    %ratio = scalar.constant 0.60429639023813286 : f64
+    %frequency = scf.for %step = [%c0_value to %pair step %c1_value](%value = %initial : f64) -> (f64) {
+      %next = scalar.mulf %value, %ratio : f64
+      scf.yield %next : f64
+    }
+    %radians = scalar.mulf %position_f64, %frequency : f64
+    %period = scalar.constant 6.2831853071795862 : f64
+    %turns = scalar.divf %radians, %period : f64
+    %whole = scalar.fptoui %turns : f64 to i32
+    %whole_f64 = scalar.uitofp %whole : i32 to f64
+    %removed = scalar.mulf %whole_f64, %period : f64
+    %reduced = scalar.subf %radians, %removed : f64
+    %angle = scalar.fptrunc %reduced : f64 to f32
+    %sine = scalar.sinf<afn> %angle : f32
+    %cosine = scalar.cosf<afn> %angle : f32
+    %sine_bf16 = scalar.fptrunc %sine : f32 to bf16
+    %cosine_bf16 = scalar.fptrunc %cosine : f32 to bf16
+    %s = scalar.extf %sine_bf16 : bf16 to f32
+    %c = scalar.extf %cosine_bf16 : bf16 to f32
+    %low = index.cmp ult, %channel, %half : index
+    %left = scalar.subf %c, %s : f32
+    %right = scalar.addf %c, %s : f32
+    %value = scf.select %low, %left, %right : f32
+    %packed = scalar.fptrunc %value : f32 to bf16
+    scf.yield %packed : bf16
+  } else {
+    %unit = scalar.constant 1.0 : bf16
+    scf.yield %unit : bf16
+  }
+  func.return %result : bf16
+}

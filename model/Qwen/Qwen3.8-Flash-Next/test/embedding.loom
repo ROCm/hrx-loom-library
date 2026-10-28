@@ -1,0 +1,168 @@
+// Actual target, accepted-input, and proposal embedding with independent exact
+// values. The immutable media packet has a different extent than working rows.
+kernel.decl @flash_next_embedding_q8_0() launch(%span: buffer, %inputs: buffer, %weight: buffer, %residual: buffer)
+
+kernel.decl @flash_next_mtp_embedding(%enabled: i1) launch(%span: buffer, %ids: buffer, %weight: buffer, %residual: buffer)
+
+kernel.decl @flash_next_mtp_embedding_warm() launch(%source_capacity: index, %span: buffer, %mapping: buffer, %origins: buffer, %inputs: buffer, %weight: buffer, %residual: buffer)
+
+kernel.decl @flash_next_map_tokens(%enabled: i1) launch(%epoch: buffer, %mapping: buffer)
+
+// Three live rows, a poisoned inactive output, and accepted origins 1, 2, 6.
+// Image IDs exceed the two-row weight fixture: a feature row must never read
+// vocabulary storage. Feature offsets remain relative to the eight-record
+// source allocation while the compact working allocation holds four tokens.
+kernel.def @embedding_fixture() {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%packet: buffer, %epoch: buffer, %origins: buffer, %weight: buffer, %target: buffer, %warm: buffer, %draft: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %width = index.constant 2560 : index
+  %block_width = index.constant 32 : index
+  %period = index.constant 17 : index
+  %threads = index.constant 128 : index
+  %thread = kernel.workitem.id<x> : index
+  %origin = index.constant 0 : offset
+  %feature_start = index.constant 256 : offset
+  %block_bytes = index.constant 34 : offset
+  %row_bytes = index.constant 2720 : offset
+  %scale_bytes = index.constant 2 : offset
+  %records = buffer.view %packet[%origin] : buffer -> view<8x8xi32>
+  %features = buffer.view %packet[%feature_start] : buffer -> view<3x2560xf32>
+  %header = buffer.view %epoch[%origin] : buffer -> view<15xi32>
+  %sources = buffer.view %origins[%origin] : buffer -> view<4xi32>
+  %expected_target = buffer.view %target[%origin] : buffer -> view<4x4x2560xbf16>
+  %expected_warm = buffer.view %warm[%origin] : buffer -> view<4x2560xbf16>
+  %expected_draft = buffer.view %draft[%origin] : buffer -> view<4x2560xbf16>
+  %leader = index.cmp eq, %thread, %c0 : index
+  scf.if %leader {
+    %c0_i32 = scalar.constant 0 : i32
+    %c1_i32 = scalar.constant 1 : i32
+    %c2_i32 = scalar.constant 2 : i32
+    %c3_i32 = scalar.constant 3 : i32
+    %c6_i32 = scalar.constant 6 : i32
+    %c7_i32 = scalar.constant 7 : i32
+    %image_id = scalar.constant 100001 : i32
+    %first_feature = scalar.constant 256 : i32
+    %second_feature = scalar.constant 10496 : i32
+    %rejected_feature = scalar.constant 20736 : i32
+    view.store %c0_i32, %records[0, 0] : i32, view<8x8xi32>
+    view.store %c0_i32, %records[0, 1] : i32, view<8x8xi32>
+    view.store %image_id, %records[1, 0] : i32, view<8x8xi32>
+    view.store %first_feature, %records[1, 1] : i32, view<8x8xi32>
+    view.store %c1_i32, %records[2, 0] : i32, view<8x8xi32>
+    view.store %c0_i32, %records[2, 1] : i32, view<8x8xi32>
+    view.store %image_id, %records[3, 0] : i32, view<8x8xi32>
+    view.store %rejected_feature, %records[3, 1] : i32, view<8x8xi32>
+    view.store %image_id, %records[6, 0] : i32, view<8x8xi32>
+    view.store %second_feature, %records[6, 1] : i32, view<8x8xi32>
+    view.store %c3_i32, %header[0] : i32, view<15xi32>
+    view.store %c2_i32, %header[1] : i32, view<15xi32>
+    view.store %c2_i32, %header[2] : i32, view<15xi32>
+    // Two contiguous accepted spans: compact [0,2) from source [1,3),
+    // then compact [2,3) from source [6,7). The origin hole stays poisoned.
+    view.store %c2_i32, %header[3] : i32, view<15xi32>
+    view.store %c0_i32, %header[4] : i32, view<15xi32>
+    view.store %c0_i32, %header[5] : i32, view<15xi32>
+    view.store %c0_i32, %header[6] : i32, view<15xi32>
+    view.store %c7_i32, %header[7] : i32, view<15xi32>
+    view.store %c0_i32, %header[8] : i32, view<15xi32>
+    view.store %c1_i32, %header[9] : i32, view<15xi32>
+    view.store %c7_i32, %header[10] : i32, view<15xi32>
+    view.store %c2_i32, %header[11] : i32, view<15xi32>
+    view.store %c1_i32, %header[12] : i32, view<15xi32>
+    view.store %c6_i32, %header[13] : i32, view<15xi32>
+    view.store %c1_i32, %header[14] : i32, view<15xi32>
+    view.store %c1_i32, %sources[0] : i32, view<4xi32>
+    view.store %c6_i32, %sources[2] : i32, view<4xi32>
+  }
+  %c8_i32 = scalar.constant 8 : i32
+  %row0_scale = scalar.constant 0.125 : f16
+  %row1_scale = scalar.constant -0.25 : f16
+  %row0_factor = scalar.constant 0.125 : f32
+  %row1_factor = scalar.constant -0.25 : f32
+  %feature_a = scalar.constant 1.5 : f32
+  %feature_b = scalar.constant -2.25 : f32
+  %rejected = scalar.constant 7.0 : f32
+  %feature_a_bf16 = scalar.constant 1.5 : bf16
+  %feature_b_bf16 = scalar.constant -2.25 : bf16
+  scf.for %channel = [%thread to %width step %threads] {
+    %remainder = index.rem %channel, %period : index
+    %word = index.cast %remainder : index to i32
+    %signed = scalar.subi %word, %c8_i32 : i32
+    %code = scalar.trunci %signed : i32 to i8
+    %value = scalar.sitofp %signed : i32 to f32
+    %first = scalar.mulf %value, %row0_factor : f32
+    %second = scalar.mulf %value, %row1_factor : f32
+    // These scaled integers are exactly representable in BF16.
+    %first_packed = scalar.fptrunc %first : f32 to bf16
+    %second_packed = scalar.fptrunc %second : f32 to bf16
+    %block = index.div %channel, %block_width : index
+    %within = index.rem %channel, %block_width : index
+    %base = index.scale %block, %block_bytes : index, offset -> offset
+    %second_base = index.add %row_bytes, %base : offset
+    %first_scale = buffer.view %weight[%base] : buffer -> view<1xf16>
+    %second_scale = buffer.view %weight[%second_base] : buffer -> view<1xf16>
+    %first_codes_origin = index.add %base, %scale_bytes : offset
+    %second_codes_origin = index.add %second_base, %scale_bytes : offset
+    %first_codes = buffer.view %weight[%first_codes_origin] : buffer -> view<32xi8>
+    %second_codes = buffer.view %weight[%second_codes_origin] : buffer -> view<32xi8>
+    %starts_block = index.cmp eq, %within, %c0 : index
+    scf.if %starts_block {
+      view.store %row0_scale, %first_scale[0] : f16, view<1xf16>
+      view.store %row1_scale, %second_scale[0] : f16, view<1xf16>
+    }
+    view.store %code, %first_codes[%within] : i8, view<32xi8>
+    view.store %code, %second_codes[%within] : i8, view<32xi8>
+    view.store %feature_a, %features[0, %channel] : f32, view<3x2560xf32>
+    view.store %feature_b, %features[1, %channel] : f32, view<3x2560xf32>
+    view.store %rejected, %features[2, %channel] : f32, view<3x2560xf32>
+    scf.for %stream = [%c0 to %c4 step %c1] {
+      view.store %first_packed, %expected_target[0, %stream, %channel] : bf16, view<4x4x2560xbf16>
+      view.store %feature_a_bf16, %expected_target[1, %stream, %channel] : bf16, view<4x4x2560xbf16>
+      view.store %second_packed, %expected_target[2, %stream, %channel] : bf16, view<4x4x2560xbf16>
+    }
+    view.store %feature_a_bf16, %expected_warm[0, %channel] : bf16, view<4x2560xbf16>
+    view.store %second_packed, %expected_warm[1, %channel] : bf16, view<4x2560xbf16>
+    view.store %feature_b_bf16, %expected_warm[2, %channel] : bf16, view<4x2560xbf16>
+    view.store %first_packed, %expected_draft[0, %channel] : bf16, view<4x2560xbf16>
+    view.store %first_packed, %expected_draft[1, %channel] : bf16, view<4x2560xbf16>
+    view.store %first_packed, %expected_draft[2, %channel] : bf16, view<4x2560xbf16>
+  }
+  kernel.return
+}
+
+check.case public @immutable_image_embedding {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %enabled = check.literal value(true) : i1
+  %source_capacity = check.literal value(8) : index
+  %packet = check.generate.fill value(12345) : tensor<7744xi32>
+  %expected_packet = check.generate.fill value(12345) : tensor<7744xi32>
+  %epoch = check.generate.fill value(-7) : tensor<15xi32>
+  %origins = check.generate.fill value(-7) : tensor<4xi32>
+  %mapping = check.generate.fill value(-7) : tensor<4x4xi32>
+  %weight = check.generate.fill value(0) : tensor<2x80x34xi8>
+  %target = check.generate.fill value(-7.0) : tensor<4x4x2560xbf16>
+  %expected_target = check.generate.fill value(-7.0) : tensor<4x4x2560xbf16>
+  %warm = check.generate.fill value(-7.0) : tensor<4x2560xbf16>
+  %expected_warm = check.generate.fill value(-7.0) : tensor<4x2560xbf16>
+  %draft = check.generate.fill value(-7.0) : tensor<4x2560xbf16>
+  %expected_draft = check.generate.fill value(-7.0) : tensor<4x2560xbf16>
+  %draft_ids = check.generate.fill value(0) : tensor<4xi32>
+  kernel.launch @embedding_fixture(%packet, %epoch, %origins, %weight, %expected_target, %expected_warm, %expected_draft) : (tensor<7744xi32>, tensor<15xi32>, tensor<4xi32>, tensor<2x80x34xi8>, tensor<4x4x2560xbf16>, tensor<4x2560xbf16>, tensor<4x2560xbf16>)
+  kernel.launch @embedding_fixture(%expected_packet, %epoch, %origins, %weight, %expected_target, %expected_warm, %expected_draft) : (tensor<7744xi32>, tensor<15xi32>, tensor<4xi32>, tensor<2x80x34xi8>, tensor<4x4x2560xbf16>, tensor<4x2560xbf16>, tensor<4x2560xbf16>)
+  kernel.launch @flash_next_map_tokens[%enabled](%epoch, %mapping) : [i1](tensor<15xi32>, tensor<4x4xi32>)
+  kernel.launch @flash_next_embedding_q8_0(%epoch, %packet, %weight, %target) : (tensor<15xi32>, tensor<7744xi32>, tensor<2x80x34xi8>, tensor<4x4x2560xbf16>)
+  kernel.launch @flash_next_mtp_embedding_warm(%source_capacity, %epoch, %mapping, %origins, %packet, %weight, %warm) : (index, tensor<15xi32>, tensor<4x4xi32>, tensor<4xi32>, tensor<7744xi32>, tensor<2x80x34xi8>, tensor<4x2560xbf16>)
+  kernel.launch @flash_next_mtp_embedding[%enabled](%epoch, %draft_ids, %weight, %draft) : [i1](tensor<15xi32>, tensor<4xi32>, tensor<2x80x34xi8>, tensor<4x2560xbf16>)
+  check.expect.bitwise actual(%target) expected(%expected_target) : tensor<4x4x2560xbf16>
+  check.expect.bitwise actual(%warm) expected(%expected_warm) : tensor<4x2560xbf16>
+  check.expect.bitwise actual(%draft) expected(%expected_draft) : tensor<4x2560xbf16>
+  check.expect.bitwise actual(%packet) expected(%expected_packet) : tensor<7744xi32>
+  check.return
+}
+
+check.benchmark<@immutable_image_embedding> @immutable_image_embedding_benchmark

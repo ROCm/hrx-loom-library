@@ -2,9 +2,13 @@
 // and hidden projections round independently before BF16 addition; catch-up
 // reads committed carry before publishing its replacement.
 
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
 kernel.decl @flash_next_mtp_embedding(%neural_enabled: i1) launch(%span: buffer, %token_ids: buffer, %weight: buffer, %residual: buffer)
+
+kernel.decl @flash_next_mtp_embedding_warm() launch(%source_capacity: index, %span: buffer, %mapping: buffer, %origins: buffer, %token_ids: buffer, %weight: buffer, %residual: buffer)
 
 kernel.decl @flash_next_mtp_normalize(%neural_enabled: i1) launch(%width_value: index, %epoch: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
@@ -40,7 +44,7 @@ command.program.def @flash_next_mtp_project(%neural_enabled: i1) launch(%paramet
 
 // Both input owners share embedding lookup, normalization, and projection.
 // The embedding table is byte-identical to the target's and shares its bank.
-command.program.def @flash_next_mtp_embed_project(%neural_enabled: i1) launch(%parameters: buffer, %target_parameters: buffer, %epoch: buffer, %ids: buffer, %normalized_hidden: buffer, %residual: buffer) {
+command.program.def @flash_next_mtp_embed_project(%neural_enabled: i1, %remapped: i1) launch(%parameters: buffer, %target_parameters: buffer, %epoch: buffer, %mapping: buffer, %origins: buffer, %ids: buffer, %normalized_hidden: buffer, %residual: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %embedding_stride = index.constant 5120 : offset
   %embedding_bytes = index.scale %tokens, %embedding_stride : index, offset -> offset
@@ -49,7 +53,11 @@ command.program.def @flash_next_mtp_embed_project(%neural_enabled: i1) launch(%p
   %embedding_weight = command.parameter %target_parameters, "token_embd.weight" : view<675430400xi8>
   %embedding_norm = command.parameter %parameters, "blk.48.nextn.enorm.weight" : view<2560xf32>
   %embedding_width = index.constant 2560 : index
-  kernel.launch @flash_next_mtp_embedding[%neural_enabled](%epoch, %ids, %embedding_weight, %embedding) : [i1](buffer, buffer, view<675430400xi8>, buffer)
+  scf.if %remapped {
+    kernel.launch @flash_next_mtp_embedding_warm(%tokens, %epoch, %mapping, %origins, %ids, %embedding_weight, %embedding) : (index, buffer, buffer, buffer, buffer, view<675430400xi8>, buffer)
+  } else {
+    kernel.launch @flash_next_mtp_embedding[%neural_enabled](%epoch, %ids, %embedding_weight, %embedding) : [i1](buffer, buffer, view<675430400xi8>, buffer)
+  }
   kernel.launch @flash_next_mtp_normalize[%neural_enabled](%embedding_width, %epoch, %embedding, %embedding_norm, %normalized_embedding) : [i1](index, buffer, buffer, view<2560xf32>, buffer)
   command.program.launch @flash_next_mtp_project[%neural_enabled](%parameters, %epoch, %normalized_embedding, %normalized_hidden, %residual) : [i1](buffer, buffer, buffer, buffer, buffer)
   command.return
@@ -64,7 +72,8 @@ command.program.def public @flash_next_mtp_input(%neural_enabled: i1) launch(%pa
   %hidden_norm = command.parameter %parameters, "blk.48.nextn.hnorm.weight" : view<10240xf32>
   %hidden_width = index.constant 10240 : index
   kernel.launch @flash_next_mtp_normalize[%neural_enabled](%hidden_width, %epoch, %hidden, %hidden_norm, %normalized_hidden) : [i1](index, buffer, buffer, view<10240xf32>, buffer)
-  command.program.launch @flash_next_mtp_embed_project[%neural_enabled](%parameters, %target_parameters, %epoch, %ids, %normalized_hidden, %residual) : [i1](buffer, buffer, buffer, buffer, buffer, buffer)
+  %remapped = scalar.constant false : i1
+  command.program.launch @flash_next_mtp_embed_project[%neural_enabled, %remapped](%parameters, %target_parameters, %epoch, %epoch, %epoch, %ids, %normalized_hidden, %residual) : [i1, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   command.return
 }
 
@@ -78,7 +87,10 @@ command.program.def @flash_next_mtp_warm_input() launch(%parameters: buffer, %ta
   %normalized_hidden = buffer.alloca<global> align(256) %hidden_bytes : buffer
   %hidden_norm = command.parameter %parameters, "blk.48.nextn.hnorm.weight" : view<10240xf32>
   kernel.launch @flash_next_mtp_normalize_warm(%epoch, %mapping, %origins, %residual, %target, %hidden_norm, %normalized_hidden) : (buffer, buffer, buffer, buffer, buffer, view<10240xf32>, buffer)
-  command.program.launch @flash_next_mtp_embed_project[%neural_enabled](%parameters, %target_parameters, %epoch, %ids, %normalized_hidden, %residual) : [i1](buffer, buffer, buffer, buffer, buffer, buffer)
+  %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
+  %ordinary = index.constant 0 : index
+  %remapped = index.cmp ne, %mixed_inputs, %ordinary : index
+  command.program.launch @flash_next_mtp_embed_project[%neural_enabled, %remapped](%parameters, %target_parameters, %epoch, %mapping, %origins, %ids, %normalized_hidden, %residual) : [i1, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   command.return
 }
 
@@ -98,7 +110,7 @@ kernel.decl @flash_next_map_tokens(%neural_enabled: i1) launch(%epoch: buffer, %
 
 command.program.decl @flash_next_hc_attn(%neural_enabled: i1, %layer: index) launch(%parameters: buffer, %span: buffer, %residual: buffer, %injection: buffer, %mixed: buffer)
 
-command.program.decl @flash_next_qsa_append(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %capture: buffer)
+command.program.decl @flash_next_qsa_append(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset, %mixed_inputs: index, %remapped: i1, %origin_capacity: index) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %capture: buffer, %inputs: buffer, %origins: buffer)
 
 // Catch-up consumes accepted target rows, not recursive draft hidden. Restore
 // the committed partial block before replacing rejected entries. The first
@@ -134,7 +146,13 @@ command.program.def public @flash_next_mtp_warm() launch(%input_parameters: buff
   kernel.launch @flash_next_mtp_restore(%epoch, %rows, %carry, %cache, %residual) : (buffer, buffer, buffer, buffer, buffer)
   kernel.launch @flash_next_mtp_ids(%epoch, %origins, %target_tokens, %ids, %rows, %cache) : (buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.launch @flash_next_map_tokens[%neural_enabled](%epoch, %mapping) : [i1](buffer, buffer)
-  command.program.launch @flash_next_mtp_warm_input(%input_parameters, %embedding_parameters, %epoch, %mapping, %origins, %ids, %target_hidden, %residual) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  // Text catch-up reuses its compact IDs. Mixed catch-up keeps the original
+  // feature allocation; descriptor compaction only changes the origin map.
+  %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
+  %ordinary = index.constant 0 : index
+  %is_mixed = index.cmp ne, %mixed_inputs, %ordinary : index
+  %embedding_inputs = scf.select %is_mixed, %target_tokens, %ids : buffer
+  command.program.launch @flash_next_mtp_warm_input(%input_parameters, %embedding_parameters, %epoch, %mapping, %origins, %embedding_inputs, %target_hidden, %residual) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   %layer = index.constant 48 : index
   %key_origin = index.constant 0 : offset
   %tail_origin = index.constant 0 : offset
@@ -144,7 +162,7 @@ command.program.def public @flash_next_mtp_warm() launch(%input_parameters: buff
   command.program.launch @flash_next_hc_attn[%neural_enabled, %layer](%mixer_parameters, %epoch, %residual, %injection, %mixed) : [i1, index](buffer, buffer, buffer, buffer, buffer)
   // Warm stages specialize verification_width to zero, erasing capture. The
   // residual supplies that unused binding without reserving a capture plane.
-  command.program.launch @flash_next_qsa_append[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin](%append_parameters, %epoch, %mapping, %rows, %mixed, %cache, %residual) : [i1, index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.program.launch @flash_next_qsa_append[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin, %mixed_inputs, %is_mixed, %tokens](%append_parameters, %epoch, %mapping, %rows, %mixed, %cache, %residual, %target_tokens, %origins) : [i1, index, offset, offset, offset, offset, index, i1, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.launch @flash_next_mtp_commit(%epoch, %rows, %origins, %target_hidden, %cache, %ids, %carry) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   command.return
 }

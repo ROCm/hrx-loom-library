@@ -19,6 +19,7 @@ The projection template forwards this argument to every shape-selected entry.
 
 | Family | Storage and numerical contract |
 | --- | --- |
+| Embedding | Original Q8 vocabulary rows or F32 image features publish one predictor or four target BF16 streams. Accepted source origins select records without rebasing feature offsets; recursive proposals always use ordinary IDs. |
 | Q8 projection | Original 32-code GGML blocks, BF16 activations, and F32 block-scaled reductions. Long reductions use paired K64 stages from capacity 256, with F16 operands and F32 accumulators. Prepared K2560 QKV weights use four-channel code/scale planes in the original allocation. |
 | Hyperconnection | Four BF16 residual streams, F32 normalization scales, rank-320 Q8 projections, and target F32 or predictor Q8 injection weights. |
 | GDN | BF16 convolution publication and F32 recurrence over 128 keys per head. Ordinary, windowed, fused, and replay paths share the retained-state layout and reader/writer ownership. |

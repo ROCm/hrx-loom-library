@@ -35,3 +35,31 @@ all four view roles, partial and full zeroing extents, empty attention views,
 64-bit byte quantities, reordered stores, and replacement of an existing record.
 Separate VM case benchmarks exercise the same writers and exact comparisons.
 The largest allocation is 296 bytes; no represented payload is materialized.
+
+`vision_pixels.loom` checks the actual shared axis planner against independent
+bicubic coefficients, clipped support, negative lobes, and identity, reduced,
+magnified, and degenerate axes. Nonintegral sampling covers independently rounded
+opposite edges. The source root exposes its private helper to this test without
+making it part of the public linking contract.
+
+`vision_control.loom` checks one-to-four-image cohorts, square and rectangular
+geometry, both feature widths, stage arguments, and exact output plans. An
+independent upload snapshot checks in-place directory writes and preservation
+of every source byte. Descriptor-only forecasts cover nonzero padded offsets,
+mixed geometries, private workspace reuse, retained peers, and quantities above
+32 bits without allocating the represented storage. Only the native stage
+registration sink is substituted; the shared preparation and forecasting code
+runs on the VM.
+
+`vision_resize.loom` joins the CPU packet producer with the public GPU filter
+template. Thirty-two trials check complete RGB8 output and input preservation
+across all eight orientations, RGB/RGBA input, identity filtering, and extreme
+scale changes. Analytical coordinate colors expose reflection and transposition
+errors; constant colors isolate filtering and alpha composition. Native AMD GPU
+and access-instrumented profiles run the same cases and benchmark smoke.
+
+These packages run without model dependencies or checkpoints:
+
+```sh
+bazelisk test --config=asan --config=amdgpu //program/text/qwen3_8/test:all
+```

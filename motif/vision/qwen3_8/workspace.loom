@@ -1,0 +1,62 @@
+// Workspace lifetimes for the 1152-wide Qwen3.8 vision encoder.
+//
+// A patch row has 1152 F32 residuals, two F32 statistics, and 4304 half FFN
+// activations. Four patch rows merge into one F32 language feature. An output
+// width of at least 4608 can hold a residual bank until post-normalization
+// moves the merger input elsewhere. Narrower outputs require two private
+// residual banks; their final output never aliases live encoder state.
+//
+// workspace returns the first residual bytes, optional second residual bytes
+// (zero means use the final output), statistics bytes, activation bytes, and
+// the private total after independently aligning each allocation to 256 bytes.
+// The first four results are logical lengths, not padded buffer lengths.
+// Commands and forecasts share this query. Rows are positive multiples of
+// four through 65536; feature columns come from the admitted model geometry.
+// One workspace serves sequential images; retained outputs are separate.
+//
+// Activation storage changes roles only at completed dispatch boundaries:
+// resized RGB8 (768 bytes/patch), context plus resident K/V (at most 6912),
+// FFN activation (8608), and merger activation (2304). attention_offsets
+// returns K and V byte origins after the complete context, with 1..4 resident
+// four-head cohorts. Keys are [cohorts,rows,288] and values [cohorts,288,rows].
+// All functions are allocation-free and independent of matrix precision.
+
+func.def pure inline @qwen38_vision_workspace_align(%bytes: offset) -> (offset) {
+  %length = index.cast %bytes : offset to i64
+  %padding = scalar.constant 255 : i64
+  %mask = scalar.constant -256 : i64
+  %padded = scalar.addi %length, %padding : i64
+  %aligned = scalar.andi %padded, %mask : i64
+  %result = index.cast %aligned : i64 to offset
+  func.return %result : offset
+}
+
+func.def public pure inline @qwen38_vision_workspace(%rows: index, %feature_columns: index) -> (offset, offset, offset, offset, offset) where [range(%rows, 4, 65536), multiple_of(%rows, 4)] {
+  %empty = index.constant 0 : offset
+  %residual_stride = index.constant 4608 : offset
+  %statistics_stride = index.constant 8 : offset
+  %activation_stride = index.constant 8608 : offset
+  %merged_residual_columns = index.constant 4608 : index
+  %residual = index.scale %rows, %residual_stride : index, offset -> offset
+  %statistics = index.scale %rows, %statistics_stride : index, offset -> offset
+  %activation = index.scale %rows, %activation_stride : index, offset -> offset
+  %output_fits = index.cmp uge, %feature_columns, %merged_residual_columns : index
+  %secondary = scf.select %output_fits, %empty, %residual : offset
+  // Residual banks are already aligned: four rows occupy 18432 bytes.
+  %statistics_aligned = func.call pure @qwen38_vision_workspace_align(%statistics) : (offset) -> (offset)
+  %activation_aligned = func.call pure @qwen38_vision_workspace_align(%activation) : (offset) -> (offset)
+  %residuals = index.add %residual, %secondary : offset
+  %intermediates = index.add %statistics_aligned, %activation_aligned : offset
+  %private_bytes = index.add %residuals, %intermediates : offset
+  func.return %residual, %secondary, %statistics, %activation, %private_bytes : offset, offset, offset, offset, offset
+}
+
+func.def public pure inline @qwen38_vision_attention_offsets(%rows: index, %cohorts: index) -> (offset, offset) where [range(%rows, 4, 65536), multiple_of(%rows, 4), range(%cohorts, 1, 4)] {
+  %context_stride = index.constant 2304 : offset
+  %cohort_stride = index.constant 576 : offset
+  %key_offset = index.scale %rows, %context_stride : index, offset -> offset
+  %cohort_bytes = index.scale %rows, %cohort_stride : index, offset -> offset
+  %key_bytes = index.scale %cohorts, %cohort_bytes : index, offset -> offset
+  %value_offset = index.add %key_offset, %key_bytes : offset
+  func.return %key_offset, %value_offset : offset, offset
+}

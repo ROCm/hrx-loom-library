@@ -1,0 +1,362 @@
+// Qwen3.8 vision merger: four ordered 1152-wide patches become one feature.
+//
+// Up consumes F32 [rows,4608], half [4608,4608] weights, and F32 [4608] bias,
+// producing half [rows,4608] after tanh GELU. Down consumes that activation,
+// half [output_columns,4608] weights, and F32 [output_columns] bias, publishing
+// F32 [rows,output_columns]. Rows are 1..16384; output_columns is positive and
+// divisible by 128. Dense supplies 5120, Flash-Next 2560. All views are contiguous
+// row-major, and all buffers within an invocation are disjoint. The caller owns
+// output lifetime and any reuse of a preceding residual allocation.
+//
+// The compile-known bf16 value selects original F16/BF16 matrix and activation
+// bits. Residual input, accumulators, bias, and final output remain F32. Each
+// launch uses ceil(rows/64) by (36 or output_columns/128) workgroups of 256
+// threads, wave32; other extents are one. Four native 16x16x16 accumulators
+// reuse a 64x64 input panel across 128 outputs and weights across 64 rows.
+// XOR input and cyclic weight layouts occupy 8+16 KiB of LDS. Down and BF16 up
+// use two-stage read-ahead. F16 up keeps conversion live ranges within one
+// panel, avoiding the extra queued registers. Tail rows are zero-staged;
+// only valid rows publish. No merged-patch copy or converted checkpoint exists.
+
+func.decl @qwen38_vision_panel_input_store(%stage: buffer, %row: index, %column: index, %values: vector<4xi16>)
+
+func.decl @qwen38_vision_panel_input_fragment(%stage: buffer, %block_row: index, %lane_row: index, %column: index) -> (vector<16xi16>)
+
+func.decl @qwen38_vision_panel_weight_fragment(%stage_rows: index, %stage: buffer, %row: index, %fragment_column: index) -> (vector<16xi16>)
+
+func.decl @qwen38_vision_store_result(%bf16: i1, %rows: index, %columns: index, %output: buffer, %row: index, %column: index, %values: vector<8xf32>)
+
+func.decl @qwen38_vision_round_packet(%bf16: i1, %values: vector<4xf32>) -> (vector<4xi16>)
+
+func.decl @qwen38_vision_round_scalar(%bf16: i1, %value: f32) -> (i16)
+
+func.decl @qwen38_vision_product(%bf16: i1, %left: vector<16xi16>, %right: vector<16xi16>, %accumulator: vector<8xf32>) -> (vector<8xf32>)
+
+func.def inline @qwen38_vision_merger_gelu_fragment(%input: vector<8xf32>) -> (vector<8xf32>) {
+  %half = vector.constant 0.5 : vector<8xf32>
+  %c1_f32x8 = vector.constant 1.0 : vector<8xf32>
+  %coefficient = vector.constant 0.044714999999999998 : vector<8xf32>
+  %scale = vector.constant 0.79788456080286541 : vector<8xf32>
+  %square = vector.mulf %input, %input : vector<8xf32>
+  %cubic = vector.mulf %square, %input : vector<8xf32>
+  %scaled_cubic = vector.mulf %coefficient, %cubic : vector<8xf32>
+  %inner = vector.addf %input, %scaled_cubic : vector<8xf32>
+  %angle = vector.mulf %scale, %inner : vector<8xf32>
+  %hyperbolic_tangent = vector.tanhf<afn> %angle : vector<8xf32>
+  %factor = vector.addf %c1_f32x8, %hyperbolic_tangent : vector<8xf32>
+  %half_input = vector.mulf %half, %input : vector<8xf32>
+  %output = vector.mulf %half_input, %factor : vector<8xf32>
+  func.return %output : vector<8xf32>
+}
+
+template.decl @qwen38.vision.merger_up(%rows_value: index, %bf16: i1, %input: buffer, %weight: buffer, %bias: buffer, %activation: buffer)
+
+template.def<@qwen38.vision.merger_up> device @qwen38_vision_merger_up_body(%rows_value: index, %bf16: i1, %input: buffer, %weight: buffer, %bias: buffer, %activation: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %c4608 = index.constant 4608 : index
+  %input_stage_bytes = index.constant 8192 : offset
+  %weight_stage_bytes = index.constant 16384 : offset
+  %c0_f32x8 = vector.constant 0.0 : vector<8xf32>
+
+  %rows = index.assume %rows_value [range(%rows_value, 1, 16384)] : index
+  %pipeline_depth = scf.select %bf16, %c2, %c1 : index
+  %tail_rows = index.rem %rows, %c64 : index
+  %all_tiles_full = index.cmp eq, %tail_rows, %c0 : index
+  %row_tile = kernel.workgroup.id<x> : index
+  %row_origin = index.mul %row_tile, %c64 : index
+  %output_tile = kernel.workgroup.id<y> : index
+  %workitem = kernel.workitem.id<x> : index
+  %subgroup = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %lane_column = index.rem %lane, %c16 : index
+  %wave_row_group = index.div %subgroup, %c2 : index
+  %wave_output_group = index.rem %subgroup, %c2 : index
+  %wave_row = index.mul %wave_row_group, %c16 : index
+  %result_row = index.add %row_origin, %wave_row : index
+  %wave_output = index.mul %wave_output_group, %c64 : index
+  %weight_stage_row0 = index.add %wave_output, %lane_column : index
+  %weight_stage_row1 = index.add %weight_stage_row0, %c16 : index
+  %weight_stage_row2 = index.add %weight_stage_row1, %c16 : index
+  %weight_stage_row3 = index.add %weight_stage_row2, %c16 : index
+  %output_origin = index.mul %output_tile, %c128 : index
+  %result_column0 = index.add %output_origin, %wave_output : index
+  %result_column1 = index.add %result_column0, %c16 : index
+  %result_column2 = index.add %result_column1, %c16 : index
+  %result_column3 = index.add %result_column2, %c16 : index
+
+  %input_noalias, %weight_noalias, %bias_noalias, %activation_noalias = buffer.assume.noalias %input, %weight, %bias, %activation : buffer, buffer, buffer, buffer
+  %input_view = buffer.view %input_noalias[%origin] : buffer -> view<[%rows]x4608xf32>
+  %weight_view = buffer.view %weight_noalias[%origin] : buffer -> view<4608x4608xi16>
+  %bias_view = buffer.view %bias_noalias[%origin] : buffer -> view<4608xf32>
+  %activation_view = buffer.view %activation_noalias[%origin] : buffer -> view<[%rows]x4608xi16>
+  %input_stage = buffer.alloca<workgroup> align(16) %input_stage_bytes : buffer
+  %weight_stage = buffer.alloca<workgroup> align(16) %weight_stage_bytes : buffer
+  %weight_stage_view = buffer.view %weight_stage[%origin] : buffer -> view<128x64xi16>
+
+  %initial = vector.fragment<init> %c0_f32x8 shape [%c16, %c16] : vector<8xf32>
+  %accumulated0, %accumulated1, %accumulated2, %accumulated3 = scf.for %column_origin = [%c0 to %c4608 step %c64](%current0 = %initial : vector<8xf32>, %current1 = %initial : vector<8xf32>, %current2 = %initial : vector<8xf32>, %current3 = %initial : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) pipeline(%pipeline_depth) {
+    scf.for %input_round = [%c0 to %c4 step %c1] unroll {
+      %input_packet = index.madd %input_round, %c256, %workitem : index
+      %input_stage_row = index.div %input_packet, %c16 : index
+      %input_stage_packet = index.rem %input_packet, %c16 : index
+      %input_stage_column = index.mul %input_stage_packet, %c4 : index
+      %global_input_column = index.add %column_origin, %input_stage_column : index
+      %global_input_row = index.add %row_origin, %input_stage_row : index
+      %input_row_valid = index.cmp ult, %global_input_row, %rows : index
+      %input_available = scalar.ori %all_tiles_full, %input_row_valid : i1
+      %values = scf.if %input_available -> (vector<4xi16>) {
+        %loaded = vector.load %input_view[%global_input_row, %global_input_column] : view<[%rows]x4608xf32> -> vector<4xf32>
+        %converted = func.call @qwen38_vision_round_packet(%bf16, %loaded) : (i1, vector<4xf32>) -> (vector<4xi16>)
+        scf.yield %converted : vector<4xi16>
+      } else {
+        %padding = vector.constant 0 : vector<4xi16>
+        scf.yield %padding : vector<4xi16>
+      }
+      func.call @qwen38_vision_panel_input_store(%input_stage, %input_stage_row, %input_stage_column, %values) : (buffer, index, index, vector<4xi16>)
+    }
+
+    scf.for %weight_round = [%c0 to %c8 step %c1] unroll {
+      %packet = index.madd %weight_round, %c256, %workitem : index
+      %stage_row = index.div %packet, %c16 : index
+      %stage_packet = index.rem %packet, %c16 : index
+      %stage_column = index.mul %stage_packet, %c4 : index
+      %global_weight_row = index.add %output_origin, %stage_row : index
+      %global_weight_column = index.add %column_origin, %stage_column : index
+      %weight_values = vector.load %weight_view[%global_weight_row, %global_weight_column] : view<4608x4608xi16> -> vector<4xi16>
+      %row_lane = index.rem %stage_row, %c8 : index
+      %rotation = index.mul %row_lane, %c8 : index
+      %physical_column0 = index.add %stage_column, %rotation : index
+      %physical_column_raw = index.rem %physical_column0, %c64 : index
+      %physical_column = index.assume %physical_column_raw [range(%physical_column_raw, 0, 60), multiple_of(%physical_column_raw, 4)] : index
+      vector.store %weight_values, %weight_stage_view[%stage_row, %physical_column] : vector<4xi16>, view<128x64xi16>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+    %next0, %next1, %next2, %next3 = scf.for %fragment_column = [%c0 to %c64 step %c16](%fragment0 = %current0 : vector<8xf32>, %fragment1 = %current1 : vector<8xf32>, %fragment2 = %current2 : vector<8xf32>, %fragment3 = %current3 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll {
+      %input_values = func.call @qwen38_vision_panel_input_fragment(%input_stage, %wave_row, %lane_column, %fragment_column) : (buffer, index, index, index) -> (vector<16xi16>)
+      %weight_values0 = func.call @qwen38_vision_panel_weight_fragment(%c128, %weight_stage, %weight_stage_row0, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %weight_values1 = func.call @qwen38_vision_panel_weight_fragment(%c128, %weight_stage, %weight_stage_row1, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %weight_values2 = func.call @qwen38_vision_panel_weight_fragment(%c128, %weight_stage, %weight_stage_row2, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %weight_values3 = func.call @qwen38_vision_panel_weight_fragment(%c128, %weight_stage, %weight_stage_row3, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %updated0 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values0, %fragment0) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
+      %updated1 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values1, %fragment1) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
+      %updated2 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values2, %fragment2) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
+      %updated3 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values3, %fragment3) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
+      scf.yield %updated0, %updated1, %updated2, %updated3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %next0, %next1, %next2, %next3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+  }
+
+  %bias_column0 = index.add %result_column0, %lane_column : index
+  %bias_column1 = index.add %result_column1, %lane_column : index
+  %bias_column2 = index.add %result_column2, %lane_column : index
+  %bias_column3 = index.add %result_column3, %lane_column : index
+  %bias0 = view.load %bias_view[%bias_column0] : view<4608xf32> -> f32
+  %bias1 = view.load %bias_view[%bias_column1] : view<4608xf32> -> f32
+  %bias2 = view.load %bias_view[%bias_column2] : view<4608xf32> -> f32
+  %bias3 = view.load %bias_view[%bias_column3] : view<4608xf32> -> f32
+  %bias_vector0 = vector.splat %bias0 : vector<8xf32>
+  %bias_vector1 = vector.splat %bias1 : vector<8xf32>
+  %bias_vector2 = vector.splat %bias2 : vector<8xf32>
+  %bias_vector3 = vector.splat %bias3 : vector<8xf32>
+  %biased0 = vector.addf %accumulated0, %bias_vector0 : vector<8xf32>
+  %biased1 = vector.addf %accumulated1, %bias_vector1 : vector<8xf32>
+  %biased2 = vector.addf %accumulated2, %bias_vector2 : vector<8xf32>
+  %biased3 = vector.addf %accumulated3, %bias_vector3 : vector<8xf32>
+  %activated0 = func.call @qwen38_vision_merger_gelu_fragment(%biased0) : (vector<8xf32>) -> (vector<8xf32>)
+  %activated1 = func.call @qwen38_vision_merger_gelu_fragment(%biased1) : (vector<8xf32>) -> (vector<8xf32>)
+  %activated2 = func.call @qwen38_vision_merger_gelu_fragment(%biased2) : (vector<8xf32>) -> (vector<8xf32>)
+  %activated3 = func.call @qwen38_vision_merger_gelu_fragment(%biased3) : (vector<8xf32>) -> (vector<8xf32>)
+  %result_end = index.add %result_row, %c16 : index
+  %fragment_full = index.cmp ule, %result_end, %rows : index
+  %output_full = scalar.ori %all_tiles_full, %fragment_full : i1
+  scf.if %output_full {
+    func.call @qwen38_vision_store_result(%bf16, %rows, %c4608, %activation_noalias, %result_row, %result_column0, %activated0) : (i1, index, index, buffer, index, index, vector<8xf32>)
+    func.call @qwen38_vision_store_result(%bf16, %rows, %c4608, %activation_noalias, %result_row, %result_column1, %activated1) : (i1, index, index, buffer, index, index, vector<8xf32>)
+    func.call @qwen38_vision_store_result(%bf16, %rows, %c4608, %activation_noalias, %result_row, %result_column2, %activated2) : (i1, index, index, buffer, index, index, vector<8xf32>)
+    func.call @qwen38_vision_store_result(%bf16, %rows, %c4608, %activation_noalias, %result_row, %result_column3, %activated3) : (i1, index, index, buffer, index, index, vector<8xf32>)
+  } else {
+    %lane_row_parity = index.div %lane, %c16 : index
+    scf.for %element = [%c0 to %c8 step %c1] unroll {
+      %row_delta = index.madd %element, %c2, %lane_row_parity : index
+      %row = index.add %result_row, %row_delta : index
+      %row_valid = index.cmp ult, %row, %rows : index
+      scf.if %row_valid {
+        %value0 = vector.extract %activated0[%element] : vector<8xf32> -> f32
+        %rounded0 = func.call @qwen38_vision_round_scalar(%bf16, %value0) : (i1, f32) -> (i16)
+        view.store %rounded0, %activation_view[%row, %bias_column0] : i16, view<[%rows]x4608xi16>
+        %value1 = vector.extract %activated1[%element] : vector<8xf32> -> f32
+        %rounded1 = func.call @qwen38_vision_round_scalar(%bf16, %value1) : (i1, f32) -> (i16)
+        view.store %rounded1, %activation_view[%row, %bias_column1] : i16, view<[%rows]x4608xi16>
+        %value2 = vector.extract %activated2[%element] : vector<8xf32> -> f32
+        %rounded2 = func.call @qwen38_vision_round_scalar(%bf16, %value2) : (i1, f32) -> (i16)
+        view.store %rounded2, %activation_view[%row, %bias_column2] : i16, view<[%rows]x4608xi16>
+        %value3 = vector.extract %activated3[%element] : vector<8xf32> -> f32
+        %rounded3 = func.call @qwen38_vision_round_scalar(%bf16, %value3) : (i1, f32) -> (i16)
+        view.store %rounded3, %activation_view[%row, %bias_column3] : i16, view<[%rows]x4608xi16>
+      }
+    }
+  }
+  template.return
+}
+
+template.decl @qwen38.vision.merger_down(%rows_value: index, %bf16: i1, %output_columns: index, %activation: buffer, %weight: buffer, %bias: buffer, %output: buffer)
+
+template.def<@qwen38.vision.merger_down> device @qwen38_vision_merger_down_body(%rows_value: index, %bf16: i1, %output_columns: index, %activation: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %c4608 = index.constant 4608 : index
+  %input_stage_bytes = index.constant 8192 : offset
+  %weight_stage_bytes = index.constant 16384 : offset
+  %c0_f32x8 = vector.constant 0.0 : vector<8xf32>
+
+  %rows = index.assume %rows_value [range(%rows_value, 1, 16384)] : index
+  %tail_rows = index.rem %rows, %c64 : index
+  %all_tiles_full = index.cmp eq, %tail_rows, %c0 : index
+  %row_tile = kernel.workgroup.id<x> : index
+  %row_origin = index.mul %row_tile, %c64 : index
+  %output_tile = kernel.workgroup.id<y> : index
+  %workitem = kernel.workitem.id<x> : index
+  %subgroup = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %lane_column = index.rem %lane, %c16 : index
+  %wave_row_group = index.div %subgroup, %c2 : index
+  %wave_output_group = index.rem %subgroup, %c2 : index
+  %wave_row = index.mul %wave_row_group, %c16 : index
+  %result_row = index.add %row_origin, %wave_row : index
+  %wave_output = index.mul %wave_output_group, %c64 : index
+  %weight_stage_row0 = index.add %wave_output, %lane_column : index
+  %weight_stage_row1 = index.add %weight_stage_row0, %c16 : index
+  %weight_stage_row2 = index.add %weight_stage_row1, %c16 : index
+  %weight_stage_row3 = index.add %weight_stage_row2, %c16 : index
+  %output_origin = index.mul %output_tile, %c128 : index
+  %result_column0 = index.add %output_origin, %wave_output : index
+  %result_column1 = index.add %result_column0, %c16 : index
+  %result_column2 = index.add %result_column1, %c16 : index
+  %result_column3 = index.add %result_column2, %c16 : index
+
+  %activation_noalias, %weight_noalias, %bias_noalias, %output_noalias = buffer.assume.noalias %activation, %weight, %bias, %output : buffer, buffer, buffer, buffer
+  %activation_view = buffer.view %activation_noalias[%origin] : buffer -> view<[%rows]x4608xi16>
+  %weight_view = buffer.view %weight_noalias[%origin] : buffer -> view<[%output_columns]x4608xi16>
+  %bias_view = buffer.view %bias_noalias[%origin] : buffer -> view<[%output_columns]xf32>
+  %output_view = buffer.view %output_noalias[%origin] : buffer -> view<[%rows]x[%output_columns]xf32>
+  %input_stage = buffer.alloca<workgroup> align(16) %input_stage_bytes : buffer
+  %weight_stage = buffer.alloca<workgroup> align(16) %weight_stage_bytes : buffer
+  %weight_stage_view = buffer.view %weight_stage[%origin] : buffer -> view<128x64xi16>
+
+  %initial = vector.fragment<init> %c0_f32x8 shape [%c16, %c16] : vector<8xf32>
+  %accumulated0, %accumulated1, %accumulated2, %accumulated3 = scf.for %column_origin = [%c0 to %c4608 step %c64](%current0 = %initial : vector<8xf32>, %current1 = %initial : vector<8xf32>, %current2 = %initial : vector<8xf32>, %current3 = %initial : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) pipeline(%c2) {
+    scf.for %input_round = [%c0 to %c4 step %c1] unroll {
+      %input_packet = index.madd %input_round, %c256, %workitem : index
+      %input_stage_row = index.div %input_packet, %c16 : index
+      %input_stage_packet = index.rem %input_packet, %c16 : index
+      %input_stage_column = index.mul %input_stage_packet, %c4 : index
+      %global_input_column = index.add %column_origin, %input_stage_column : index
+      %global_input_row = index.add %row_origin, %input_stage_row : index
+      %input_row_valid = index.cmp ult, %global_input_row, %rows : index
+      %input_available = scalar.ori %all_tiles_full, %input_row_valid : i1
+      %values = scf.if %input_available -> (vector<4xi16>) {
+        %loaded = vector.load %activation_view[%global_input_row, %global_input_column] : view<[%rows]x4608xi16> -> vector<4xi16>
+        scf.yield %loaded : vector<4xi16>
+      } else {
+        %padding = vector.constant 0 : vector<4xi16>
+        scf.yield %padding : vector<4xi16>
+      }
+      func.call @qwen38_vision_panel_input_store(%input_stage, %input_stage_row, %input_stage_column, %values) : (buffer, index, index, vector<4xi16>)
+    }
+
+    scf.for %weight_round = [%c0 to %c8 step %c1] unroll {
+      %packet = index.madd %weight_round, %c256, %workitem : index
+      %stage_row = index.div %packet, %c16 : index
+      %stage_packet = index.rem %packet, %c16 : index
+      %stage_column = index.mul %stage_packet, %c4 : index
+      %global_weight_row = index.add %output_origin, %stage_row : index
+      %global_weight_column = index.add %column_origin, %stage_column : index
+      %weight_values = vector.load %weight_view[%global_weight_row, %global_weight_column] : view<[%output_columns]x4608xi16> -> vector<4xi16>
+      %row_lane = index.rem %stage_row, %c8 : index
+      %rotation = index.mul %row_lane, %c8 : index
+      %physical_column0 = index.add %stage_column, %rotation : index
+      %physical_column_raw = index.rem %physical_column0, %c64 : index
+      %physical_column = index.assume %physical_column_raw [range(%physical_column_raw, 0, 60), multiple_of(%physical_column_raw, 4)] : index
+      vector.store %weight_values, %weight_stage_view[%stage_row, %physical_column] : vector<4xi16>, view<128x64xi16>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+    %next0, %next1, %next2, %next3 = scf.for %fragment_column = [%c0 to %c64 step %c16](%fragment0 = %current0 : vector<8xf32>, %fragment1 = %current1 : vector<8xf32>, %fragment2 = %current2 : vector<8xf32>, %fragment3 = %current3 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll {
+      %input_values = func.call @qwen38_vision_panel_input_fragment(%input_stage, %wave_row, %lane_column, %fragment_column) : (buffer, index, index, index) -> (vector<16xi16>)
+      %weight_values0 = func.call @qwen38_vision_panel_weight_fragment(%c128, %weight_stage, %weight_stage_row0, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %weight_values1 = func.call @qwen38_vision_panel_weight_fragment(%c128, %weight_stage, %weight_stage_row1, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %weight_values2 = func.call @qwen38_vision_panel_weight_fragment(%c128, %weight_stage, %weight_stage_row2, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %weight_values3 = func.call @qwen38_vision_panel_weight_fragment(%c128, %weight_stage, %weight_stage_row3, %fragment_column) : (index, buffer, index, index) -> (vector<16xi16>)
+      %updated0 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values0, %fragment0) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
+      %updated1 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values1, %fragment1) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
+      %updated2 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values2, %fragment2) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
+      %updated3 = func.call @qwen38_vision_product(%bf16, %input_values, %weight_values3, %fragment3) : (i1, vector<16xi16>, vector<16xi16>, vector<8xf32>) -> (vector<8xf32>)
+      scf.yield %updated0, %updated1, %updated2, %updated3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %next0, %next1, %next2, %next3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+  }
+
+  %bias_column0 = index.add %result_column0, %lane_column : index
+  %bias_column1 = index.add %result_column1, %lane_column : index
+  %bias_column2 = index.add %result_column2, %lane_column : index
+  %bias_column3 = index.add %result_column3, %lane_column : index
+  %bias0 = view.load %bias_view[%bias_column0] : view<[%output_columns]xf32> -> f32
+  %bias1 = view.load %bias_view[%bias_column1] : view<[%output_columns]xf32> -> f32
+  %bias2 = view.load %bias_view[%bias_column2] : view<[%output_columns]xf32> -> f32
+  %bias3 = view.load %bias_view[%bias_column3] : view<[%output_columns]xf32> -> f32
+  %bias_vector0 = vector.splat %bias0 : vector<8xf32>
+  %bias_vector1 = vector.splat %bias1 : vector<8xf32>
+  %bias_vector2 = vector.splat %bias2 : vector<8xf32>
+  %bias_vector3 = vector.splat %bias3 : vector<8xf32>
+  %result0 = vector.addf %accumulated0, %bias_vector0 : vector<8xf32>
+  %result1 = vector.addf %accumulated1, %bias_vector1 : vector<8xf32>
+  %result2 = vector.addf %accumulated2, %bias_vector2 : vector<8xf32>
+  %result3 = vector.addf %accumulated3, %bias_vector3 : vector<8xf32>
+  %result_end = index.add %result_row, %c16 : index
+  %fragment_full = index.cmp ule, %result_end, %rows : index
+  %output_full = scalar.ori %all_tiles_full, %fragment_full : i1
+  scf.if %output_full {
+    vector.fragment.store<result> %result0, %output_view[%result_row, %result_column0] shape [%c16, %c16] : vector<8xf32>, view<[%rows]x[%output_columns]xf32>
+    vector.fragment.store<result> %result1, %output_view[%result_row, %result_column1] shape [%c16, %c16] : vector<8xf32>, view<[%rows]x[%output_columns]xf32>
+    vector.fragment.store<result> %result2, %output_view[%result_row, %result_column2] shape [%c16, %c16] : vector<8xf32>, view<[%rows]x[%output_columns]xf32>
+    vector.fragment.store<result> %result3, %output_view[%result_row, %result_column3] shape [%c16, %c16] : vector<8xf32>, view<[%rows]x[%output_columns]xf32>
+  } else {
+    %lane_row_parity = index.div %lane, %c16 : index
+    scf.for %element = [%c0 to %c8 step %c1] unroll {
+      %row_delta = index.madd %element, %c2, %lane_row_parity : index
+      %row = index.add %result_row, %row_delta : index
+      %row_valid = index.cmp ult, %row, %rows : index
+      scf.if %row_valid {
+        %value0 = vector.extract %result0[%element] : vector<8xf32> -> f32
+        view.store %value0, %output_view[%row, %bias_column0] : f32, view<[%rows]x[%output_columns]xf32>
+        %value1 = vector.extract %result1[%element] : vector<8xf32> -> f32
+        view.store %value1, %output_view[%row, %bias_column1] : f32, view<[%rows]x[%output_columns]xf32>
+        %value2 = vector.extract %result2[%element] : vector<8xf32> -> f32
+        view.store %value2, %output_view[%row, %bias_column2] : f32, view<[%rows]x[%output_columns]xf32>
+        %value3 = vector.extract %result3[%element] : vector<8xf32> -> f32
+        view.store %value3, %output_view[%row, %bias_column3] : f32, view<[%rows]x[%output_columns]xf32>
+      }
+    }
+  }
+  template.return
+}

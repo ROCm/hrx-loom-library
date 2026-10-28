@@ -38,6 +38,12 @@ _MODEL_TARGETS = [
     ]
 ]
 
+_VISION_MODEL_TARGETS = [
+    representation + suffix
+    for representation in ["source", "archive"]
+    for suffix in ["_vision", "_vision_mtp"]
+]
+
 AMD_GPU_ACCESS_PROFILE = amd_gpu_execution_profile(
     name = "amd_gpu_access",
     runner_args = ["--sanitizer=access"],
@@ -50,7 +56,7 @@ AMD_GPU_ACCESS_PROFILE = amd_gpu_execution_profile(
         srcs = ["//model/Qwen/Qwen3.8-Flash-Next:" + representation],
         output_group = "model_card",
     )
-    for representation in _MODEL_TARGETS
+    for representation in _MODEL_TARGETS + _VISION_MODEL_TARGETS
 ]
 
 _SERVICE_REQUIREMENTS = apply_test_requirements(
@@ -64,18 +70,19 @@ _SERVICE_REQUIREMENTS = apply_test_requirements(
 # and current providers carry the regression's trusted content identity.
 [
     iree_py_test(
-        name = "serve_" + representation + ("_native_test" if native_context else "_test"),
+        name = "serve_" + representation + ("_native_test" if scenario == "native-context" else "_test"),
         size = "large",
         srcs = [
             "context_check.py",
             "serve_check.py",
+            "vision_check.py",
         ],
         args = [
             "--server=$(location @loom_sdk//:loom-serve)",
             "--model=$(location :" + representation + "_card)",
             "--reference=$(location reference.json)",
             "--device=amdgpu://0",
-        ] + (["--native-context"] if native_context else []),
+        ] + (["--" + scenario] if scenario != "text" else []),
         data = [
             ":" + representation + "_card",
             "reference.json",
@@ -91,9 +98,9 @@ _SERVICE_REQUIREMENTS = apply_test_requirements(
             "@hrx//loom/src/loom/serve/testing:model_staging",
         ],
     )
-    for representation, native_context in [(name, False) for name in _MODEL_TARGETS] + [
-        ("source_long_context", True),
-        ("archive_long_context_mtp", True),
+    for representation, scenario in [(name, "text") for name in _MODEL_TARGETS] + [(name, "vision") for name in _VISION_MODEL_TARGETS] + [
+        ("source_long_context", "native-context"),
+        ("archive_long_context_mtp", "native-context"),
     ]
 ]
 
@@ -178,6 +185,7 @@ loom_test(
     name = "retained",
     srcs = [
         "retained.loom",
+        "input_fixture.loom",
     ],
     configs = {
         "qwen38.packet_capacity": "128",
@@ -191,6 +199,10 @@ loom_test(
         AMD_GPU_HARDWARE_PROFILE,
         AMD_GPU_ACCESS_PROFILE,
     ],
+    variants = {
+        "ordinary": {},
+        "media": {"configs": {"runner.qwen38.mixed_inputs": "1"}},
+    },
     deps = [
         "//model/Qwen/Qwen3.8-Flash-Next/program/kernel:numerics",
     ],
@@ -1222,9 +1234,26 @@ loom_test(
 )
 
 loom_test(
+    name = "embedding",
+    srcs = ["embedding.loom"],
+    configs = {
+        "flash_next.context_capacity": "64",
+        "flash_next.span_capacity": "2",
+        "flash_next.token_count": "4",
+        "runner.qwen38.mixed_inputs": "1",
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-Flash-Next/program/kernel:numerics"],
+)
+
+loom_test(
     name = "mtp_state",
     srcs = [
         "mtp_state.loom",
+        "input_fixture.loom",
     ],
     configs = {
         "flash_next.context_capacity": "128",
@@ -1238,6 +1267,10 @@ loom_test(
         AMD_GPU_ACCESS_PROFILE,
         AMD_GPU_TSAN_PROFILE,
     ],
+    variants = {
+        "ordinary": {},
+        "media": {"configs": {"runner.qwen38.mixed_inputs": "1"}},
+    },
     deps = [
         "//model/Qwen/Qwen3.8-Flash-Next/program/kernel:numerics",
     ],
@@ -1247,6 +1280,7 @@ loom_test(
     name = "speculation",
     srcs = [
         "speculation.loom",
+        "input_fixture.loom",
     ],
     configs = {
         "qwen38.packet_capacity": "128",
@@ -1258,9 +1292,58 @@ loom_test(
         AMD_GPU_HARDWARE_PROFILE,
         AMD_GPU_ACCESS_PROFILE,
     ],
+    variants = {
+        "ordinary": {},
+        "media": {"configs": {"runner.qwen38.mixed_inputs": "1"}},
+    },
     deps = [
         "//kernel/sequence/qwen3_8:accept",
         "//model/Qwen/Qwen3.8-Flash-Next/program:config",
         "//model/Qwen/Qwen3.8-Flash-Next/program/kernel:numerics",
     ],
+)
+
+loom_test(
+    name = "rotary_retained",
+    srcs = [
+        "rotary_retained.loom",
+        "rotary_reference.loom",
+    ],
+    configs = {
+        "flash_next.context_capacity": "128",
+        "flash_next.pool_capacity": "128",
+        "flash_next.span_capacity": "3",
+        "flash_next.token_count": "16",
+        "flash_next.verification_width": "0",
+        "runner.qwen38.mixed_inputs": "1",
+        "qwen38.packet_capacity": "128",
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+        AMD_GPU_TSAN_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-Flash-Next/program/kernel:numerics"],
+)
+
+loom_test(
+    name = "rotary_boundary",
+    srcs = [
+        "rotary_boundary.loom",
+        "rotary_reference.loom",
+    ],
+    configs = {
+        "flash_next.context_capacity": "64",
+        "flash_next.pool_capacity": "64",
+        "flash_next.span_capacity": "1",
+    },
+    variants = {
+        str(count): {"configs": {"flash_next.token_count": str(count)}}
+        for count in [1, 2, 3, 4]
+    },
+    execution_profiles = [
+        AMD_GPU_HARDWARE_PROFILE,
+        AMD_GPU_ACCESS_PROFILE,
+    ],
+    deps = ["//model/Qwen/Qwen3.8-Flash-Next/program/kernel:numerics"],
 )

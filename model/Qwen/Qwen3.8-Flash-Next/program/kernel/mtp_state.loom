@@ -2,6 +2,10 @@
 // restore, token selection, and commit consume packed span ownership and
 // preserve immutable anchors used by retained forks.
 
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
+func.decl @qwen38_input_token(%mixed: index, %capacity: index, %inputs: buffer, %input: index) -> (i32)
+
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
 config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
@@ -91,7 +95,8 @@ func.def public inline @flash_next_mtp_span(%epoch: buffer, %span: index) -> (in
 }
 
 // Carry begins with 1280 raw-hidden packets and 48 partial-index packets,
-// each sixteen bytes, followed by request-owned draft vocabulary. Only
+// each sixteen bytes, followed by request-owned draft vocabulary. An aligned
+// coordinate record at byte 43952 shares the existing 44032-byte stride. Only
 // position%4 index rows are live. Restore them to the working cache before
 // proposing or replacing rejected speculative entries. The row directory
 // supplies the writable tail address independently of the KV plane layout.
@@ -131,6 +136,18 @@ kernel.def @flash_next_mtp_restore() {
     }
     %tail_rows = index.rem %position, %c4 : index
     %tail_packets = index.mul %tail_rows, %c16 : index
+    // The aligned coordinate record is live exactly when the raw tail is.
+    %has_tail = index.cmp ne, %tail_rows, %c0 : index
+    %first_thread = index.cmp eq, %thread, %c0 : index
+    %copies_coordinate = scalar.andi %has_tail, %first_thread : i1
+    scf.if %copies_coordinate {
+      %coordinate_offset = index.constant 768 : offset
+      %reader, %writer = func.call @flash_next_row_state(%rows, %row, %position, %coordinate_offset) : (buffer, index, index, offset) -> (offset, offset)
+      %working_coordinate = buffer.view %cache[%writer] : buffer -> view<4xi32>
+      %carry_coordinate = index.constant 2747 : index
+      %coordinate = vector.load %source[%carry_coordinate, %c0] : view<2752x4xi32> -> vector<4xi32>
+      vector.store %coordinate, %working_coordinate[%c0] : vector<4xi32>, view<4xi32>
+    }
     %copies_tail = index.cmp ult, %thread, %tail_packets : index
     scf.if %copies_tail {
       %reader, %writer = func.call @flash_next_row_state(%rows, %row, %position, %origin) : (buffer, index, index, offset) -> (offset, offset)
@@ -161,7 +178,7 @@ kernel.def @flash_next_mtp_ids() {
     %mapping = buffer.view %origins[%origin] : buffer -> view<[%capacity]xi32>
     %source_begin_word = view.load %mapping[%begin] : view<[%capacity]xi32> -> i32
     %source_begin = index.cast %source_begin_word : i32 to index
-    %source_ids = buffer.view %target_tokens[%origin] : buffer -> view<[%capacity]xi32>
+    %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
     %output_ids = buffer.view %tokens[%origin] : buffer -> view<[%capacity]xi32>
     %pool = config.get @flash_next.pool_capacity : index
     %history_origin = func.call @flash_next_lookup_history_origin(%rows, %row) : (buffer, index) -> (offset)
@@ -173,7 +190,7 @@ kernel.def @flash_next_mtp_ids() {
       %source_index = index.assume %source_index_value [range(%source_index_value, 0, 32767), lt(%source_index_value, %capacity)] : index
       %output_index_value = index.add %begin, %relative : index
       %output_index = index.assume %output_index_value [range(%output_index_value, 0, 32767), lt(%output_index_value, %capacity)] : index
-      %id = view.load %source_ids[%source_index] : view<[%capacity]xi32> -> i32
+      %id = func.call @qwen38_input_token(%mixed_inputs, %capacity, %target_tokens, %source_index) : (index, index, buffer, index) -> (i32)
       view.store %id, %output_ids[%output_index] : i32, view<[%capacity]xi32>
       %logical = index.add %position, %relative : index
       %physical = func.call @flash_next_physical_token(%rows, %row, %logical) : (buffer, index, index) -> (index)
@@ -223,6 +240,18 @@ kernel.def @flash_next_mtp_commit() {
     %end = index.add %position, %length : index
     %tail_rows = index.rem %end, %c4 : index
     %tail_packets = index.mul %tail_rows, %c16 : index
+    // The aligned coordinate record is live exactly when the raw tail is.
+    %has_tail = index.cmp ne, %tail_rows, %c0 : index
+    %first_thread = index.cmp eq, %thread, %c0 : index
+    %copies_coordinate = scalar.andi %has_tail, %first_thread : i1
+    scf.if %copies_coordinate {
+      %coordinate_offset = index.constant 768 : offset
+      %reader, %writer = func.call @flash_next_row_state(%rows, %row, %position, %coordinate_offset) : (buffer, index, index, offset) -> (offset, offset)
+      %working_coordinate = buffer.view %cache[%writer] : buffer -> view<4xi32>
+      %carry_coordinate = index.constant 2747 : index
+      %coordinate = vector.load %working_coordinate[%c0] : view<4xi32> -> vector<4xi32>
+      vector.store %coordinate, %output[%carry_coordinate, %c0] : vector<4xi32>, view<2752x4xi32>
+    }
     %copies_tail = index.cmp ult, %thread, %tail_packets : index
     scf.if %copies_tail {
       %reader, %writer = func.call @flash_next_row_state(%rows, %row, %position, %origin) : (buffer, index, index, offset) -> (offset, offset)

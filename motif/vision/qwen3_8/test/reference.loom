@@ -1,0 +1,59 @@
+// Independent scalar arithmetic for vision numerical references. These helpers
+// are test roots, never production dependencies. Half conversion follows the
+// language's rounding contract; GELU uses F64 algebra and exp-based tanh rather
+// than the device implementation's vector tanh instruction. Bounded fixtures
+// keep F32 exponential error below each declared activation tolerance.
+
+func.def @vision_round(%bf16: i1, %value: f32) -> (i16) {
+  %bits = scf.if %bf16 -> (i16) {
+    %rounded = scalar.fptrunc %value : f32 to bf16
+    %bits = scalar.bitcast %rounded : bf16 to i16
+    scf.yield %bits : i16
+  } else {
+    %rounded = scalar.fptrunc %value : f32 to f16
+    %bits = scalar.bitcast %rounded : f16 to i16
+    scf.yield %bits : i16
+  }
+  func.return %bits : i16
+}
+
+func.def @vision_widen(%bf16: i1, %bits: i16) -> (f32) {
+  %value = scf.if %bf16 -> (f32) {
+    %half = scalar.bitcast %bits : i16 to bf16
+    %value = scalar.extf %half : bf16 to f32
+    scf.yield %value : f32
+  } else {
+    %half = scalar.bitcast %bits : i16 to f16
+    %value = scalar.extf %half : f16 to f32
+    scf.yield %value : f32
+  }
+  func.return %value : f32
+}
+
+func.def @vision_gelu(%input: f32) -> (f32) {
+  %half = scalar.constant 0.5 : f64
+  %c1_f = scalar.constant 1.0 : f64
+  %c2_f = scalar.constant 2.0 : f64
+  %cubic_scale = scalar.constant 0.044714999999999998 : f64
+  %sqrt_two_over_pi = scalar.constant 0.79788456080286541 : f64
+  %value = scalar.extf %input : f32 to f64
+  %square = scalar.mulf %value, %value : f64
+  %cube = scalar.mulf %square, %value : f64
+  %cubic_term = scalar.mulf %cube, %cubic_scale : f64
+  %inner = scalar.addf %value, %cubic_term : f64
+  %angle = scalar.mulf %inner, %sqrt_two_over_pi : f64
+  // tanh(x) = (exp(2*x) - 1) / (exp(2*x) + 1). The fixture's bounded
+  // inputs avoid overflow; F32 exp rounding is below the activation budget.
+  %twice_angle = scalar.mulf %angle, %c2_f : f64
+  %exponent = scalar.fptrunc %twice_angle : f64 to f32
+  %exponential_f32 = scalar.expf<afn> %exponent : f32
+  %exponential = scalar.extf %exponential_f32 : f32 to f64
+  %numerator = scalar.subf %exponential, %c1_f : f64
+  %denominator = scalar.addf %exponential, %c1_f : f64
+  %tangent = scalar.divf %numerator, %denominator : f64
+  %factor = scalar.addf %c1_f, %tangent : f64
+  %half_value = scalar.mulf %half, %value : f64
+  %gelu = scalar.mulf %half_value, %factor : f64
+  %gelu_f32 = scalar.fptrunc %gelu : f64 to f32
+  func.return %gelu_f32 : f32
+}

@@ -1,9 +1,22 @@
-// Independent Qwen image-input contract checks and workload plans.
-// Production packet preparation, callbacks, and filtering remain providers.
+// Shared CPU packet preparation and GPU bicubic filtering.
+// Independent pixel oracles cover orientation, alpha, and scale changes.
 
 func.decl @qwen38_vision_pixel_packet(%request: buffer) -> (buffer)
 
-kernel.decl @qwen38_vision_resize(%groups_x: index, %groups_y: index) launch(%image: index, %input: buffer, %output: buffer) where [range(%image, 0, 3)]
+amdgpu.target<gfx11-generic> @resize_test_wave32 {subgroup_size = 32}
+
+// Each group owns 32 columns and sixteen destination rows. Eight horizontal
+// source rows are staged at a time; no image-sized intermediate is allocated.
+template.decl @qwen38.vision.resize(%image: index, %input: buffer, %output: buffer)
+
+kernel.def target(@resize_test_wave32) @resize_test(%groups_x: index, %groups_y: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups_x, %groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%image: index, %input: buffer, %output: buffer) where [range(%image, 0, 3)] {
+  template.apply<@qwen38.vision.resize>(%image, %input, %output) : (index, buffer, buffer)
+  kernel.return
+}
 
 // Coordinate-dependent channels distinguish every reflection and transposition.
 // Constant images independently exercise both filter axes at extreme scales.
@@ -51,9 +64,12 @@ func.def @resize_sample(%x: i32, %y: i32, %channel: i32, %constant: i1) -> (i32)
   func.return %result : i32
 }
 
-func.def @resize_packet_fixture(%trial_value: index, %portrait_value: index, %packet: buffer, %expected: buffer) -> (index) {
-  %trial = index.assume %trial_value [range(%trial_value, 0, 15)] : index
-  %portrait = index.assume %portrait_value [range(%portrait_value, 0, 1)] : index
+func.def @resize_packet_fixture(%trial_value: index, %packet: buffer, %expected: buffer) -> (index, index, index) {
+  %variant = index.assume %trial_value [range(%trial_value, 0, 31)] : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %trial = index.rem %variant, %c16 : index
+  %portrait = index.div %variant, %c16 : index
   %origin = index.constant 0 : offset
   %pixel_offset = index.constant 80 : offset
   %metadata_offset = index.constant 64 : offset
@@ -191,7 +207,9 @@ func.def @resize_packet_fixture(%trial_value: index, %portrait_value: index, %pa
       }
     }
   }
-  func.return %image : index
+  %groups_x = index.div %target_x, %c32 : index
+  %groups_y = index.div %target_y, %c16 : index
+  func.return %image, %groups_x, %groups_y : index, index, index
 }
 
 // The fixture supplies analytical expected pixels in a separate observation.
@@ -201,40 +219,19 @@ func.def @resize_expected(%image: index, %packet: buffer, %output: buffer) {
   func.return
 }
 
-check.scenario public @landscape_packets_filter_on_device {
+check.scenario public @oriented_packets_filter_on_device {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
-  check.trial[16](%trial: index, %entropy: check.entropy) {
-    %portrait = check.literal value(0) : index
-    %groups_x = check.literal value(2) : index
-    %groups_y = check.literal value(2) : index
+  check.trial[32](%trial: index, %entropy: check.entropy) {
     %packet = check.generate.fill value(-1) : tensor<65536xi8>
     %expected = check.generate.fill value(-1) : tensor<6144xi8>
-    %image = check.generate<@resize_packet_fixture>(%trial, %portrait, %packet, %expected) : (index, index, tensor<65536xi8>, tensor<6144xi8>) -> (index)
+    %image, %groups_x, %groups_y = check.generate<@resize_packet_fixture>(%trial, %packet, %expected) : (index, tensor<65536xi8>, tensor<6144xi8>) -> (index, index, index)
     %output = check.generate.fill value(-1) : tensor<6144xi8>
-    check.compare<@qwen38_vision_resize, @resize_expected>[%groups_x, %groups_y](%image, %packet, %output) : [index, index](index, tensor<65536xi8>, tensor<6144xi8>) -> () {
+    check.compare<@resize_test, @resize_expected>[%groups_x, %groups_y](%image, %packet, %output) : [index, index](index, tensor<65536xi8>, tensor<6144xi8>) -> () {
       check.expect.bitwise actual(%output) expected(%expected) : tensor<6144xi8>
+      check.expect.bitwise actual(%packet) expected(%packet) : tensor<65536xi8>
     }
   }
   check.return
 }
 
-check.scenario public @portrait_packets_filter_on_device {
-  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
-  check.trial[16](%trial: index, %entropy: check.entropy) {
-    %portrait = check.literal value(1) : index
-    %groups_x = check.literal value(1) : index
-    %groups_y = check.literal value(4) : index
-    %packet = check.generate.fill value(-1) : tensor<65536xi8>
-    %expected = check.generate.fill value(-1) : tensor<6144xi8>
-    %image = check.generate<@resize_packet_fixture>(%trial, %portrait, %packet, %expected) : (index, index, tensor<65536xi8>, tensor<6144xi8>) -> (index)
-    %output = check.generate.fill value(-1) : tensor<6144xi8>
-    check.compare<@qwen38_vision_resize, @resize_expected>[%groups_x, %groups_y](%image, %packet, %output) : [index, index](index, tensor<65536xi8>, tensor<6144xi8>) -> () {
-      check.expect.bitwise actual(%output) expected(%expected) : tensor<6144xi8>
-    }
-  }
-  check.return
-}
-
-check.benchmark<@landscape_packets_filter_on_device> @landscape_oriented_rgb_and_rgba_resize
-
-check.benchmark<@portrait_packets_filter_on_device> @portrait_oriented_rgb_and_rgba_resize
+check.benchmark<@oriented_packets_filter_on_device> @oriented_rgb_and_rgba_resize

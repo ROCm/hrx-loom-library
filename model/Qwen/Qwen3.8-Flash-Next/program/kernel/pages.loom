@@ -1,6 +1,8 @@
 // Packed token ownership and physical cache addressing. One producer
 // materializes token-to-span facts; consumers use the immutable map and host-
-// owned page IDs directly throughout the layer stack.
+// owned page IDs directly throughout the layer stack. Each four-word row holds
+// causal position, resident row, packed span beginning, and source position.
+// Images advance causal storage independently of their rotary coordinates.
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
@@ -37,6 +39,7 @@ kernel.def @flash_next_map_tokens(%neural_enabled: i1) {
     %position_word = view.load %record[1] : view<6xi32> -> i32
     %begin_word = view.load %record[2] : view<6xi32> -> i32
     %row_word = view.load %record[3] : view<6xi32> -> i32
+    %source_word = view.load %record[4] : view<6xi32> -> i32
     %length_value = index.cast %length_word : i32 to index
     %length = index.assume %length_value [range(%length_value, 1, %tokens)] : index
     %begin_value = index.cast %begin_word : i32 to index
@@ -48,12 +51,13 @@ kernel.def @flash_next_map_tokens(%neural_enabled: i1) {
     scf.for %relative = [%thread to %length step %threads] {
       %relative_word = index.cast %relative : index to i32
       %position = scalar.addi %position_word, %relative_word : i32
+      %source = scalar.addi %source_word, %relative_word : i32
       %token_value = index.add %begin, %relative : index
       %token = index.assume %token_value [range(%token_value, 0, 32767), lt(%token_value, %tokens)] : index
       view.store %position, %outputs[%token, 0] : i32, view<[%tokens]x4xi32>
       view.store %row_word, %outputs[%token, 1] : i32, view<[%tokens]x4xi32>
       view.store %begin_word, %outputs[%token, 2] : i32, view<[%tokens]x4xi32>
-      view.store %position_word, %outputs[%token, 3] : i32, view<[%tokens]x4xi32>
+      view.store %source, %outputs[%token, 3] : i32, view<[%tokens]x4xi32>
     }
   }
   kernel.return
@@ -68,16 +72,70 @@ func.def public inline @flash_next_token_binding(%mapping: buffer, %token_arg: i
   %position_word = view.load %view[%token, 0] : view<[%tokens]x4xi32> -> i32
   %row_word = view.load %view[%token, 1] : view<[%tokens]x4xi32> -> i32
   %begin_word = view.load %view[%token, 2] : view<[%tokens]x4xi32> -> i32
-  %first_word = view.load %view[%token, 3] : view<[%tokens]x4xi32> -> i32
   %position_value = index.cast %position_word : i32 to index
   %position = index.assume %position_value [range(%position_value, 0, 262143), lt(%position_value, %capacity)] : index
   %row_value = index.cast %row_word : i32 to index
   %row = index.assume %row_value [range(%row_value, 0, 2147483647)] : index
   %begin_value = index.cast %begin_word : i32 to index
-  %first_value = index.cast %first_word : i32 to index
   %begin = index.assume %begin_value [range(%begin_value, 0, 32767), lt(%begin_value, %tokens)] : index
+  %relative = index.sub %token, %begin : index
+  %first_value = index.sub %position, %relative : index
   %first = index.assume %first_value [range(%first_value, 0, 262143), lt(%first_value, %capacity)] : index
   func.return %position, %row, %begin, %first : index, index, index, index
+}
+
+func.def public inline @flash_next_token_rotary(%mapping: buffer, %token_arg: index) -> (index) {
+  %tokens = config.get @flash_next.token_count : index
+  %token = index.assume %token_arg [ge(%token_arg, 0), lt(%token_arg, %tokens)] : index
+  %origin = index.constant 0 : offset
+  %view = buffer.view %mapping[%origin] : buffer -> view<[%tokens]x4xi32>
+  %word = view.load %view[%token, 3] : view<[%tokens]x4xi32> -> i32
+  %value = index.cast %word : i32 to index
+  func.return %value : index
+}
+
+func.decl @qwen38_input_position(%mixed: index, %capacity: index, %inputs: buffer, %record: index, %lane: index, %linear_position: i32) -> (i32)
+
+// A compact span owns contiguous original records, but not a new input
+// allocation. Finish compaction and accepted-prefix compaction have different
+// origin-table extents; neither changes the original packet's extent or base.
+func.def public inline @flash_next_input_coordinate(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %begin: index, %relative: index, %linear: index, %lane: index, %inputs: buffer, %origins: buffer) -> (index) {
+  %ordinary_inputs = index.constant 0 : index
+  %is_mixed = index.cmp ne, %mixed, %ordinary_inputs : index
+  %coordinate = scf.if %is_mixed -> (index) {
+    %source_begin = scf.if %remapped -> (index) {
+      %origin = index.constant 0 : offset
+      %capacity = index.assume %origin_capacity [range(%origin_capacity, 1, 32768)] : index
+      %slot = index.assume %begin [ge(%begin, 0), lt(%begin, %capacity)] : index
+      %view = buffer.view %origins[%origin] : buffer -> view<[%capacity]xi32>
+      %word = view.load %view[%slot] : view<[%capacity]xi32> -> i32
+      %value = index.cast %word : i32 to index
+      scf.yield %value : index
+    } else {
+      scf.yield %begin : index
+    }
+    %record = index.add %source_begin, %relative : index
+    %linear_word = index.cast %linear : index to i32
+    %word = func.call @qwen38_input_position(%mixed, %source_capacity, %inputs, %record, %lane, %linear_word) : (index, index, buffer, index, index, i32) -> (i32)
+    %value = index.cast %word : i32 to index
+    scf.yield %value : index
+  } else {
+    scf.yield %linear : index
+  }
+  func.return %coordinate : index
+}
+
+func.def public inline @flash_next_token_coordinate(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %mapping: buffer, %inputs: buffer, %origins: buffer, %token_arg: index, %lane: index) -> (index) {
+  %tokens = config.get @flash_next.token_count : index
+  %token = index.assume %token_arg [ge(%token_arg, 0), lt(%token_arg, %tokens)] : index
+  %origin = index.constant 0 : offset
+  %view = buffer.view %mapping[%origin] : buffer -> view<[%tokens]x4xi32>
+  %begin_word = view.load %view[%token, 2] : view<[%tokens]x4xi32> -> i32
+  %begin = index.cast %begin_word : i32 to index
+  %relative = index.sub %token, %begin : index
+  %linear = func.call @flash_next_token_rotary(%mapping, %token) : (buffer, index) -> (index)
+  %coordinate = func.call @flash_next_input_coordinate(%mixed, %remapped, %source_capacity, %origin_capacity, %begin, %relative, %linear, %lane, %inputs, %origins) : (index, i1, index, index, index, index, index, index, buffer, buffer) -> (index)
+  func.return %coordinate : index
 }
 
 // Page IDs are owned by the host pool. Compression divides positions within a
