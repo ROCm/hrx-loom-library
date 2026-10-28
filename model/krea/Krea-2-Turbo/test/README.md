@@ -6,9 +6,16 @@ including negative and oversized inputs, alignment, the exact combined-token
 limit, and the tile-policy threshold. These are the functions used by both
 cold preparation and request-specific stage declarations.
 
-`vae_tile_axis_test.loom` is generated from an independent coordinate reference.
-It checks the overlap, last-tile anchoring, midpoint ownership, and complete
-axis partition. `vae_tiles_test.loom` checks actual extraction and stitching with
+`vae_tile_axis_test.loom` runs 76 extent/tile pairs through the production planner
+templates and an independent integer reference in Loom's VM. The reference walks
+pixel centers to establish ownership, including ties, without using the
+production midpoint formula. Complete-buffer comparisons cover the stride,
+interval count, last-tile anchoring, full axis partition, unused capacity, and
+sentinel guards.
+An authored receptive-field check establishes the decoder's 15-pixel radius.
+The family needs no generated source or binary fixture.
+
+`vae_tiles_test.loom` checks actual extraction and stitching with
 full-image pitches, independent input/output storage, and untouched sentinel
 regions. Its seven configurations cover untiled, minimum-overlap, landscape,
 portrait, 1024-image, one-axis, and long-axis partitions. Native, access-sanitized,
