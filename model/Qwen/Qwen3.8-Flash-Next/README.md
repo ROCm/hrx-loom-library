@@ -8,13 +8,13 @@ With the `hrx-loom` SDK and its optional `hf` extra installed, run these command
 
 ```sh
 loom-fetch model/Qwen/Qwen3.8-Flash-Next/model.json \
-  --preset chat --origin "library=$PWD" \
+  --preset chat \
   --output "$HOME/models/qwen3.8-flash-next"
 loom-serve --model="$HOME/models/qwen3.8-flash-next/model.json" \
   --device=amdgpu://0
 ```
 
-Fetching selects the source providers and the four required GGUF shards, verifies their acquisition identities, and materializes one selected card. The library origin override uses this checkout's shared providers; omitting it uses the pinned library revision. Both flows use the installed SDK without a Bazel build. A published card URL can replace the local card path.
+Fetching selects the source providers and the four required GGUF shards, verifies their acquisition identities, and materializes one selected card. Shared providers follow the same checkout or published snapshot as the model card. A published card URL can replace the local card path; neither flow needs an origin override or a Bazel build.
 
 The target bank occupies approximately 103.68 GiB before request state, compiler memory, or workspace. MTP adds about 2.59 GiB. The [standalone model overview](OVERVIEW.md) explains the checkpoint layout, exact upstream links, capacities, and additional retained storage. Changing a preset does not require another copy of the same checkpoint files.
 

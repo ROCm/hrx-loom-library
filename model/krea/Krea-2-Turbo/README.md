@@ -51,10 +51,10 @@ loom-fetch model/krea/Krea-2-Turbo/model.json \
 ```
 
 The authored lock covers both checkpoint variants and the tokenizer. Shared
-motifs use a pinned library origin. `--origin=library="$PWD"` selects the current
-checkout while iterating, with no program checksums to update and full asset
-verification retained. Bazel builds the current declared sources using the
-pinned SDK or the local HRX override.
+motifs follow the model card's checkout or published snapshot through relative
+source paths, with no library pins, program checksums, or origin overrides to
+maintain. Asset verification is unchanged. Bazel builds the current declared
+sources using the pinned SDK or the local HRX override.
 
 Geometry, numerical, and tile tests require no learned weights:
 

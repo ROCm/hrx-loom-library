@@ -49,12 +49,11 @@ loom-fetch model/kyutai/pocket-tts/model.json \
   --preset=streaming --output=../pocket-tts
 ```
 
-The authored lock covers both voice variants' source programs and runtime
-assets. Shared Unicode, UTF-8, and sampling motifs come from an immutable
-library origin. `--origin=library="$PWD"` selects the current checkout when
-iterating on those sources; their bytes must match the lock unless an explicit
-development lock mode is selected. The pinned compiler or local HRX override
-used by Bazel always builds the current declared motif sources directly.
+The authored lock covers both voice variants' runtime assets. Shared Unicode,
+UTF-8, and sampling motifs follow the model card's checkout or published snapshot
+through relative source paths. Program edits need no library pin, origin override,
+or checksum update; asset verification remains intact. The pinned compiler or
+local HRX override used by Bazel builds the current declared motif sources.
 
 Hermetic numerical, text, and state cases need no learned checkpoint:
 

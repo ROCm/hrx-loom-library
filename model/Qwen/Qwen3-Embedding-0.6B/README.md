@@ -10,7 +10,7 @@ checkpoint with the checked-in lock:
 
 ```sh
 loom-fetch model/Qwen/Qwen3-Embedding-0.6B/model.json \
-  --preset=embedding --origin=library="$PWD" \
+  --preset=embedding \
   --output=~/models/qwen3-embedding
 
 loom-serve --model=~/models/qwen3-embedding/model.json \
