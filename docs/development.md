@@ -49,7 +49,8 @@ package. `.bazelrc.local` remains available for other local settings. The model
 BUILD files and public Loom rule contracts are the same in each mode.
 
 With Lefthook installed, `python dev.py hook` enables the repository's
-pre-commit hook. It formats staged `.loom` files, stages their canonical form,
+pre-commit hook. It checks source ownership in the Git index, then formats
+staged `.loom` files, stages their canonical form,
 and stops after any rewrite so the result can be reviewed. It refuses
 partially staged Loom files. It also checks generated model-card compiler lists
 against Bazel analysis; [model authoring](model-authoring.md#derive-compiler-files-from-provider-dependencies)

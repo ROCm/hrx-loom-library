@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -24,6 +25,7 @@ LAYER_OPERATION_PATTERN = re.compile(
 )
 LOCAL_RULES_LABEL = '"//build_tools/bazel:defs.bzl"'
 UPSTREAM_RULES_LABEL = '"@hrx//loom/build_tools/bazel:defs.bzl"'
+TEST_SOURCE_SUFFIXES = ("_test.loom", "_stress.loom")
 
 
 def _layer_operations(source: str) -> set[str]:
@@ -37,6 +39,24 @@ def _starlark_without_line_comments(source: str) -> str:
     return "\n".join(line.partition("#")[0] for line in source.splitlines())
 
 
+def _source_ownership_violations(name: str, operations: set[str]) -> list[str]:
+    if name.endswith(TEST_SOURCE_SUFFIXES):
+        return []
+    violations = []
+    if any(operation.startswith("check.") for operation in operations):
+        violations.append(
+            f"{name}: check.* operations require a _test.loom or _stress.loom file"
+        )
+    if "motif" in Path(name).parts and any(
+        operation.startswith("config.") for operation in operations
+    ):
+        violations.append(
+            f"{name}: motif config.* operations require a _test.loom or "
+            "_stress.loom leaf; pass values into production motifs"
+        )
+    return violations
+
+
 def check_sources(layer: str, sources: Iterable[tuple[str, str]]) -> list[str]:
     """Returns policy violations for named Loom source strings."""
     source_definitions = [
@@ -46,10 +66,14 @@ def check_sources(layer: str, sources: Iterable[tuple[str, str]]) -> list[str]:
         )
         for name, text in sources
     ]
-    violations = []
+    violations = [
+        violation
+        for name, operations in source_definitions
+        for violation in _source_ownership_violations(name, operations)
+    ]
     if layer != "test":
         for name, operations in source_definitions:
-            if name.endswith("_test.loom"):
+            if name.endswith(TEST_SOURCE_SUFFIXES):
                 violations.append(f"{name}: test sources belong to loom_test")
             for operation in sorted(operations):
                 if operation.startswith("check."):
@@ -140,7 +164,9 @@ def check_repository(repository_root: Path) -> list[str]:
             source_layer, rule_name = _package_policy(layer, relative_directory)
             sources_by_owner: dict[str, list[tuple[str, str]]] = defaultdict(list)
             for path in sorted(source_paths):
-                owner = "test" if path.name.endswith("_test.loom") else source_layer
+                owner = (
+                    "test" if path.name.endswith(TEST_SOURCE_SUFFIXES) else source_layer
+                )
                 sources_by_owner[owner].append(
                     (str(path.relative_to(repository_root)), path.read_text())
                 )
@@ -226,12 +252,35 @@ def check_repository(repository_root: Path) -> list[str]:
     return violations
 
 
+def check_staged_sources(repository_root: Path) -> list[str]:
+    """Checks the committed source contents, including partially staged files."""
+    changed = subprocess.check_output(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"],
+        cwd=repository_root,
+    )
+    violations = []
+    for entry in changed.split(b"\0"):
+        if not entry:
+            continue
+        name = entry.decode()
+        if not name.endswith(".loom"):
+            continue
+        source = subprocess.check_output(
+            ["git", "show", ":" + name], cwd=repository_root, text=True
+        )
+        violations.extend(_source_ownership_violations(name, _layer_operations(source)))
+    return violations
+
+
 def _create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--layer", choices=["kernel", "model", "motif", "program", "test"]
     )
     parser.add_argument("--repository-root", type=Path)
+    parser.add_argument(
+        "--staged", action="store_true", help="Check source ownership in the Git index."
+    )
     parser.add_argument("sources", metavar="SOURCE", nargs="*")
     return parser
 
@@ -239,7 +288,11 @@ def _create_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = _create_parser()
     args = parser.parse_args()
-    if args.repository_root:
+    if args.staged:
+        if args.layer or args.sources:
+            parser.error("--staged cannot be combined with source checks")
+        violations = check_staged_sources(args.repository_root or Path.cwd())
+    elif args.repository_root:
         if args.layer or args.sources:
             parser.error("--repository-root cannot be combined with source checks")
         violations = check_repository(args.repository_root.resolve())

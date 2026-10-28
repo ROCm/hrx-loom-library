@@ -369,8 +369,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    for name, content in (("attention_expanded.loom", render()),
-                          ("attention_expanded_epilogue.loom", render_epilogue())):
+    for name, content in (("attention_expanded_test.loom", render()),
+                          ("attention_expanded_epilogue_test.loom", render_epilogue())):
         path = Path(__file__).with_name(name)
         if args.check:
             if path.read_text(encoding="utf-8") != content:

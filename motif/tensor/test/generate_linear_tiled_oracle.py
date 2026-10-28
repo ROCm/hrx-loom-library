@@ -198,8 +198,8 @@ template.decl @projection.linear_tiled_coordinates(%row_tiles: index, %output_ti
 
 ''' + GROUP_REFERENCE
     return {
-        "linear_tiled.loom": matrix_header + "".join(render_matrix(shape, group) for shape, group in SHAPES),
-        "linear_coordinates.loom": coordinate_header + "".join(render_grid(*grid) for grid in GRIDS),
+        "linear_tiled_test.loom": matrix_header + "".join(render_matrix(shape, group) for shape, group in SHAPES),
+        "linear_coordinates_test.loom": coordinate_header + "".join(render_grid(*grid) for grid in GRIDS),
     }
 
 

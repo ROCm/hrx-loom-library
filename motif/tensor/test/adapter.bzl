@@ -51,13 +51,13 @@ def adapter_tests(matrix_leaf, scalar_leaf):
             name = name + "_fixture",
             testonly = True,
             srcs = [leaf],
-            outs = [name + ".loom"],
+            outs = [name + "_test.loom"],
             cmd = "$(location :generate_adapter_oracle) --output=$@ --leaf=$(location %s) --mode=%s --options='%s' %s && $(location @loom_sdk//:loom-format) --in-place $@" % (leaf, mode, json.encode(options), "--exact" if exact else ""),
             tools = [":generate_adapter_oracle", "@loom_sdk//:loom-format"],
         )
         loom_test(
             name = name,
-            srcs = [name + ".loom"],
+            srcs = [name + "_test.loom"],
             deps = ["//motif/tensor:layer_mix" if mode == "scalar" else "//motif/tensor:adapter"],
             execution_profiles = [
                 AMD_GPU_HARDWARE_PROFILE,

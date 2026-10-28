@@ -217,7 +217,7 @@ def main():
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
     for suffix, kinds in (('inverse', ('inverse',)), ('rows', ('zero_centered', 'scaled'))):
-        path = Path(__file__).with_name(f'rmsnorm_bf16_{suffix}.loom')
+        path = Path(__file__).with_name(f'rmsnorm_bf16_{suffix}_test.loom')
         content = render(kinds)
         if args.check:
             if path.read_text(encoding='utf-8') != content:

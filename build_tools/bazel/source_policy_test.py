@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -153,14 +154,73 @@ class SourcePolicyTest(unittest.TestCase):
                 self.assertEqual(
                     source_policy.check_sources(layer, [("production.loom", source)]),
                     [
+                        "production.loom: check.* operations require a _test.loom "
+                        "or _stress.loom file",
+                    ]
+                    + [
                         f"production.loom: check.{operation} belongs to loom_test, "
                         "outside production libraries"
                         for operation in ("return", "scenario")
                     ],
                 )
                 self.assertEqual(
-                    source_policy.check_sources("test", [("cases.loom", source)]), []
+                    source_policy.check_sources("test", [("cases_test.loom", source)]),
+                    [],
                 )
+
+    def test_checks_require_suffix_even_inside_test_directory(self):
+        source = "check.scenario @case { check.return }"
+        for suffix in ("_test.loom", "_stress.loom"):
+            self.assertEqual(
+                source_policy.check_sources(
+                    "test", [("motif/example/test/case" + suffix, source)]
+                ),
+                [],
+            )
+        self.assertEqual(
+            source_policy.check_sources(
+                "test", [("motif/example/test/case.loom", source)]
+            ),
+            [
+                "motif/example/test/case.loom: check.* operations require a _test.loom or _stress.loom file"
+            ],
+        )
+
+    def test_motif_configuration_requires_explicit_test_leaf(self):
+        source = "config.decl @size : %value: index"
+        self.assertEqual(
+            source_policy.check_sources(
+                "test", [("motif/example/test/helper.loom", source)]
+            ),
+            [
+                "motif/example/test/helper.loom: motif config.* operations require a _test.loom or _stress.loom leaf; pass values into production motifs"
+            ],
+        )
+        self.assertEqual(
+            source_policy.check_sources(
+                "test", [("motif/example/test/helper_test.loom", source)]
+            ),
+            [],
+        )
+
+    def test_staged_policy_reads_index_instead_of_working_copy(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+            source = root / "motif" / "example.loom"
+            source.parent.mkdir()
+            source.write_text("config.decl @size : %value: index\n")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            source.write_text("func.decl @valid()\n")
+            self.assertEqual(
+                source_policy.check_staged_sources(root),
+                [
+                    "motif/example.loom: motif config.* operations require a _test.loom or _stress.loom leaf; pass values into production motifs"
+                ],
+            )
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            source.write_text("check.scenario @invalid { check.return }\n")
+            self.assertEqual(source_policy.check_staged_sources(root), [])
 
     def test_test_helper_cannot_be_archived_as_production(self):
         self.assertEqual(
@@ -180,7 +240,9 @@ class SourcePolicyTest(unittest.TestCase):
         )
         self.assertEqual(
             violations,
-            ["kernel package has no kernel.def declaration: helpers.loom, declarations.loom"],
+            [
+                "kernel package has no kernel.def declaration: helpers.loom, declarations.loom"
+            ],
         )
 
     def test_comments_do_not_satisfy_kernel_requirement(self):
@@ -251,7 +313,7 @@ class SourcePolicyTest(unittest.TestCase):
             build.write_text(
                 'load("//build_tools/bazel:defs.bzl", "loom_kernel_library", "loom_test")\n'
                 'loom_kernel_library(name = "projection", srcs = ["projection.loom"])\n'
-                '# projection_test.loom needs an owner\n'
+                "# projection_test.loom needs an owner\n"
             )
             self.assertIn(
                 "kernel/example/BUILD.bazel: test sources must declare loom_test",
@@ -408,12 +470,12 @@ class SourcePolicyTest(unittest.TestCase):
                 'load("//build_tools/bazel:defs.bzl", "loom_library")\n'
                 'loom_library(name = "control", srcs = ["control.loom"])\n'
             )
-            (test_root / "cases.loom").write_text(
+            (test_root / "cases_test.loom").write_text(
                 "check.case public @case { check.return }\n"
             )
             (test_root / "BUILD.bazel").write_text(
                 'load("//build_tools/bazel:defs.bzl", "loom_test")\n'
-                'loom_test(name = "cases", srcs = ["cases.loom"])\n'
+                'loom_test(name = "cases", srcs = ["cases_test.loom"])\n'
             )
             self.assertEqual(source_policy.check_repository(repository_root), [])
 
@@ -476,12 +538,12 @@ class SourcePolicyTest(unittest.TestCase):
                 'load("//build_tools/bazel:defs.bzl", "loom_library")\n'
                 'loom_library(name = "control", srcs = ["control.loom"])\n'
             )
-            (test_root / "cases.loom").write_text(
+            (test_root / "cases_test.loom").write_text(
                 "check.case public @case { check.return }\n"
             )
             (test_root / "BUILD.bazel").write_text(
                 'load("//build_tools/bazel:defs.bzl", "loom_test")\n'
-                'loom_test(name = "cases", srcs = ["cases.loom"])\n'
+                'loom_test(name = "cases", srcs = ["cases_test.loom"])\n'
             )
             self.assertEqual(source_policy.check_repository(repository_root), [])
 

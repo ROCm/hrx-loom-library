@@ -100,7 +100,7 @@ def main() -> None:
         declarations.append(
             f'global.rodata.def @normalization_{name} = align(4) bytes("{data.hex()}")'
         )
-    path = Path(__file__).with_name("text_normalization.loom")
+    path = Path(__file__).with_name("text_normalization_test.loom")
     prefix, body = path.read_text().split("// BEGIN GENERATED POCKET ORACLE\n", 1)
     _, suffix = body.split("// END GENERATED POCKET ORACLE", 1)
     path.write_text(

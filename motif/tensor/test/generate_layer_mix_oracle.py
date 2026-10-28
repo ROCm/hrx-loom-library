@@ -258,7 +258,7 @@ def main():
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     content = render()
-    path = Path(__file__).with_name("layer_mix.loom")
+    path = Path(__file__).with_name("layer_mix_test.loom")
     if args.check:
         if path.read_text(encoding="utf-8") != content:
             raise SystemExit(f"{path} differs from its independent reference")

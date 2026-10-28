@@ -1,13 +1,13 @@
 # Text correctness and benchmark workloads
 
-`unicode.loom` checks every changed uppercase codepoint and every whitespace
+`unicode_test.loom` checks every changed uppercase codepoint and every whitespace
 and digit member, their immediate neighbors, and UTF-8 width boundaries. Its
 3,293 rows come independently from CPython 3.12's Unicode 15.0 implementation.
 Each row checks the three uppercase results, both properties, and forward and
 backward UTF-8 round trips. The generated oracle is separate from the UCD
 parser that supplies the production tables.
 
-`utf8.loom` compares literal encodings at both ends of all four UTF-8 widths,
+`utf8_test.loom` compares literal encodings at both ends of all four UTF-8 widths,
 including NUL, against the produced bytes and decoded scalars. Trim cases
 cover empty input, all-whitespace input, mixed-width leading/trailing spaces,
 and preserved interior whitespace. These explicit byte checks prevent a pair

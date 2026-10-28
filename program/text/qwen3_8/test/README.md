@@ -29,20 +29,20 @@ capacity. Only the small descriptor tables are created; represented model
 storage is never materialized. These cases and their VM benchmarks need no
 weights or device.
 
-`storage_records.loom` checks the shared record writers directly against literal
+`storage_records_test.loom` checks the shared record writers directly against literal
 I64 tables. Guarded, nonzero-origin subviews cover first/interior/last records,
 all four view roles, partial and full zeroing extents, empty attention views,
 64-bit byte quantities, reordered stores, and replacement of an existing record.
 Separate VM case benchmarks exercise the same writers and exact comparisons.
 The largest allocation is 296 bytes; no represented payload is materialized.
 
-`vision_pixels.loom` checks the actual shared axis planner against independent
+`vision_pixels_test.loom` checks the actual shared axis planner against independent
 bicubic coefficients, clipped support, negative lobes, and identity, reduced,
 magnified, and degenerate axes. Nonintegral sampling covers independently rounded
 opposite edges. The source root exposes its private helper to this test without
 making it part of the public linking contract.
 
-`vision_control.loom` checks one-to-four-image cohorts, square and rectangular
+`vision_control_test.loom` checks one-to-four-image cohorts, square and rectangular
 geometry, both feature widths, stage arguments, and exact output plans. An
 independent upload snapshot checks in-place directory writes and preservation
 of every source byte. Descriptor-only forecasts cover nonzero padded offsets,
@@ -51,7 +51,7 @@ mixed geometries, private workspace reuse, retained peers, and quantities above
 registration sink is substituted; the shared preparation and forecasting code
 runs on the VM.
 
-`vision_resize.loom` joins the CPU packet producer with the public GPU filter
+`vision_resize_test.loom` joins the CPU packet producer with the public GPU filter
 template. Thirty-two trials check complete RGB8 output and input preservation
 across all eight orientations, RGB/RGBA input, identity filtering, and extreme
 scale changes. Analytical coordinate colors expose reflection and transposition

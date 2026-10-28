@@ -248,7 +248,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--output", type=Path,
-                        default=Path(__file__).with_name("q8_1.loom"))
+                        default=Path(__file__).with_name("q8_1_test.loom"))
     args = parser.parse_args()
     content = render()
     if args.check:

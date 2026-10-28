@@ -255,10 +255,13 @@ def loom_test(
     """Owns test sources and their production dependencies."""
     package = native.package_name()
     if "test" not in package.split("/") and not any([
-        str(source).endswith("_test.loom")
+        str(source).endswith("_test.loom") or str(source).endswith("_stress.loom")
         for source in srcs
     ]):
-        fail("//%s: adjacent loom_test sources require a _test.loom owner" % package)
+        fail("//%s: adjacent loom_test sources require a _test.loom or _stress.loom owner" % package)
+    if any([str(source).endswith("_stress.loom") for source in srcs]):
+        if "manual" not in tags or "stress" not in tags:
+            fail("%s: _stress.loom tests require tags = [\"manual\", \"stress\"]" % name)
     if _is_package_or_subpackage(package, "motif"):
         _validate_motif_dependencies(package, deps)
     if _is_package_or_subpackage(package, "program"):

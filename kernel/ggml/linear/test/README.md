@@ -26,7 +26,7 @@ select gfx9-4 hardware; a run that skips those cases is not qualification.
 These tests qualify numerical behavior and specialization. Their one-iteration
 benchmark smoke results do not establish comparative performance.
 
-`q8_matrix.loom` qualifies the BF16-input Q8 panels directly, without any model
+`q8_matrix_test.loom` qualifies the BF16-input Q8 panels directly, without any model
 provider or checkpoint. One parameterized suite covers the production tile and
 wave geometries, both read-ahead depths, F32 block scaling, and K32/K64 F16
 reconstruction. Four-stream variants exercise per-wave stream panels. Six
