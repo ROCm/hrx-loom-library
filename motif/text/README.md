@@ -11,9 +11,10 @@ backward traversal requires a nonzero, codepoint-aligned end. Writing requires
 four bytes of available storage. Trimming an empty string returns `(0, 0)`;
 trimming an all-whitespace string returns `(length, length)`.
 
-`unicode.loom` calls the Loom runtime's shared `unicode` capability for full
-uppercase, whitespace membership, and digit membership. Models carry no Unicode
-tables. The runtime supplies [Unicode 15.1](https://www.unicode.org/versions/Unicode15.1.0/)
+`unicode.loom` calls the Loom runtime's `string` module through its `codepoint.*`
+operations for full uppercase, whitespace membership, and digit membership.
+Models carry no Unicode tables. The runtime supplies
+[Unicode 15.1](https://www.unicode.org/versions/Unicode15.1.0/)
 through native imports in both serving and standalone VM execution.
 Uppercase returns up to three codepoints, with zero in unused expansion slots.
 Whitespace follows Python's category Zs or bidi classes WS, B, and S, including
