@@ -1,6 +1,6 @@
 """Original adapter shapes, layout ownership, and mixed-selection coverage."""
 
-load("@hrx//loom/target/amdgpu:execution_profiles.bzl", "AMD_GPU_HARDWARE_PROFILE", "AMD_GPU_TSAN_PROFILE", "amd_gpu_execution_profile")
+load("@hrx//loom/target/amdgpu:execution_profiles.bzl", "AMD_GPU_HARDWARE_PROFILE")
 load("//build_tools/bazel:defs.bzl", "loom_test")
 
 def adapter_tests(matrix_leaf, scalar_leaf):
@@ -51,17 +51,13 @@ def adapter_tests(matrix_leaf, scalar_leaf):
             name = name + "_fixture",
             testonly = True,
             srcs = [leaf],
-            outs = [name + ".loom"],
+            outs = [name + "_test.loom"],
             cmd = "$(location :generate_adapter_oracle) --output=$@ --leaf=$(location %s) --mode=%s --options='%s' %s && $(location @loom_sdk//:loom-format) --in-place $@" % (leaf, mode, json.encode(options), "--exact" if exact else ""),
             tools = [":generate_adapter_oracle", "@loom_sdk//:loom-format"],
         )
         loom_test(
             name = name,
-            srcs = [name + ".loom"],
+            srcs = [name + "_test.loom"],
             deps = ["//motif/tensor:layer_mix" if mode == "scalar" else "//motif/tensor:adapter"],
-            execution_profiles = [
-                AMD_GPU_HARDWARE_PROFILE,
-                amd_gpu_execution_profile(name = "amd_gpu_access", runner_args = ["--sanitizer=access"], tags = ["notsan"]),
-                AMD_GPU_TSAN_PROFILE,
-            ],
+            execution_profiles = [AMD_GPU_HARDWARE_PROFILE],
         )

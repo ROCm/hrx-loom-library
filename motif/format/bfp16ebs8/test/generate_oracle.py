@@ -111,7 +111,7 @@ def main() -> None:
     encoded = [encode_block(block) for block in blocks]
     high = b"".join(record[0] for record in encoded)
     residual = b"".join(record[1] for record in encoded)
-    path = Path(__file__).with_name("aie2p.loom")
+    path = Path(__file__).with_name("aie2p_test.loom")
     source = path.read_text()
     start = source.index("// BEGIN GENERATED ORACLE")
     end = source.index("// END GENERATED ORACLE", start) + len("// END GENERATED ORACLE")

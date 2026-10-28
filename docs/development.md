@@ -49,7 +49,8 @@ package. `.bazelrc.local` remains available for other local settings. The model
 BUILD files and public Loom rule contracts are the same in each mode.
 
 With Lefthook installed, `python dev.py hook` enables the repository's
-pre-commit hook. It formats staged `.loom` files, stages their canonical form,
+pre-commit hook. It checks source ownership in the Git index, then formats
+staged `.loom` files, stages their canonical form,
 and stops after any rewrite so the result can be reviewed. It refuses
 partially staged Loom files. It also checks generated model-card compiler lists
 against Bazel analysis; [model authoring](model-authoring.md#derive-compiler-files-from-provider-dependencies)
@@ -90,7 +91,7 @@ python dev.py build
 For focused iteration, select a package and its execution configuration:
 
 ```sh
-python dev.py test --target=//kernel/ggml/... -- --config=asan --config=amdgpu
+python dev.py test --target=//kernel/ggml/... -- --config=loom-asan --config=amdgpu
 ```
 
 `dev.py test` first checks formatting across the repository, including
@@ -118,6 +119,23 @@ owns the underlying toolchain and linker behavior.
 
 The [CI maintenance guide](ci.md) describes SDK pins, runner coverage, and
 cache ownership.
+
+Each test has one declaration for its execution environment. Scenarios own
+compile-visible configurations and runtime trials. Select `--config=loom-asan`,
+`--config=loom-tsan`, or `--config=loom-ubsan` to instrument the same test's JIT
+products. These aliases set the independent public flags
+`@hrx//loom/config/sanitizer:address`, `:thread`, and `:undefined` and can be
+combined. Native `--config=asan` instruments tools built from HRX source;
+`--config=asan --config=loom-asan` checks both the tools and their generated
+programs. An installed SDK retains its own native instrumentation. Additional
+sanitizer execution profiles are rejected by the library rules.
+
+Large regressions live in `_stress.loom` sources with `manual` and `stress`
+tags. Select their labels explicitly to run them with or without a sanitizer.
+The `stress` tag allows a scheduled runner to discover this set; Bazel's
+wildcard expansion excludes manual targets even with `--test_tag_filters=stress`.
+Correctness runs execute scenarios once. Their benchmark declarations remain
+available through the separate benchmark workflow below.
 
 ## Check a kernel and inspect its cost
 

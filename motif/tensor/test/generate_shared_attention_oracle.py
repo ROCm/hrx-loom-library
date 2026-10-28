@@ -421,8 +421,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    for name, content in (("attention_shared.loom", render()),
-                          ("attention_shared_store.loom", render_store())):
+    for name, content in (("attention_shared_test.loom", render()),
+                          ("attention_shared_store_test.loom", render_store())):
         path = Path(__file__).with_name(name)
         if args.check:
             if path.read_text(encoding="utf-8") != content:

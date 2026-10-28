@@ -39,7 +39,7 @@ def main() -> None:
         f'global.rodata.def @normal_words = align(4) bytes("{inputs.hex()}")\n\n'
         f'global.rodata.def @normal_values = align(4) bytes("{outputs.hex()}")\n\n'
     )
-    filename = Path(__file__).with_name("random_gpu.loom")
+    filename = Path(__file__).with_name("random_gpu_test.loom")
     prefix, rest = filename.read_text().split("// BEGIN GENERATED NORMAL ORACLE\n", 1)
     _, suffix = rest.split("// END GENERATED NORMAL ORACLE", 1)
     filename.write_text(

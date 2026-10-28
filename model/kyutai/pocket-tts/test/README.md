@@ -63,7 +63,7 @@ Regenerate the normalization literals from the pinned upstream implementation:
 
 ```sh
 uv run model/kyutai/pocket-tts/test/generate_text_oracle.py
-python dev.py format model/kyutai/pocket-tts/test/text_normalization.loom
+python dev.py format model/kyutai/pocket-tts/test/text_normalization_test.loom
 ```
 
 The generator requires Pocket TTS 3.3.0 and Unicode 15.0.0, imports only prompt

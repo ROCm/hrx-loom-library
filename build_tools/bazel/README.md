@@ -10,12 +10,13 @@ owned by this repository:
   entry points as leaf launch surfaces, confines dependencies to motifs,
   requires at least one typed target profile, and checks production source
   formatting and final-product compilation. Its archive excludes test inputs.
-- `loom_test` owns adjacent `*_test.loom` sources or explicit `test/` packages
-  and delegates to HRX's root-owned linked test module. Test leaves require one
-  execution profile and semantic benchmark planning, and depend on production
-  providers. They do not manufacture standalone target products. `configs` and
-  named `variants` use the public workload-selection contract, so one source module can qualify
-  each specialization with independent cached execution results.
+- `loom_test` owns `*_test.loom` and `*_stress.loom` sources and delegates to
+  HRX's root-owned linked test module. Test leaves declare execution profiles
+  and depend on production providers. Scenarios own configuration and trial
+  fanout. `--config=loom-asan`, `--config=loom-tsan`, and `--config=loom-ubsan`
+  instrument the same test targets independently of native tool instrumentation;
+  sanitizer-specific execution profiles are rejected. Stress tests carry both
+  `manual` and `stress` tags.
 - `loom_library` is confined to production `model/` and `program/` packages.
   It delegates source verification, lint, strict linking, and relocatable bytecode to HRX,
   and applies the model source policy without requiring host/control programs
@@ -37,8 +38,9 @@ Each test declaration emits a private filegroup carrying the stable
 `loom-benchmark-module` tag. It forwards HRX's linked test module, which retains
 cases and benchmarks owned by the root while excluding test-only symbols from
 dependencies. The marker adds discovery metadata without introducing another
-link or re-export boundary. Generated format, plan, compile, and execution tests
-do not carry benchmark-discovery metadata.
+link or re-export boundary. Generated format, compile, and execution tests do
+not carry benchmark-discovery metadata. Correctness tests run cases and
+scenarios; benchmark execution is selected separately with `dev.py benchmark`.
 
 [`source_policy.py`](source_policy.py) verifies the filesystem-level portion of
 the contract. Every motif, kernel, and model source package has an adjacent `BUILD.bazel`,
@@ -46,10 +48,11 @@ explicitly declares each `.loom` source, loads the repository wrappers, and has
 a scoped README chain up to its layer root. Motif sources contain no
 `kernel.def`, `config.*`, or concrete target records; kernel packages contain
 at least one `kernel.def`. External target declarations and contextual target
-queries remain valid in motifs. Adjacent `*_test.loom` sources and sources below
-an explicit `test/` component use `loom_test` and may declare private wrapper
-kernels without weakening the production motif contract. Production declarations
-reject `check.*` operations and test source files.
+queries remain valid in motifs. Only `*_test.loom` and `*_stress.loom` sources
+may contain `check.*` operations, or `config.*` operations under `motif/`.
+They use `loom_test` and may declare private wrapper kernels without weakening
+the production motif contract. Production declarations reject test source files.
+The pre-commit source-policy check enforces operation ownership on staged files.
 
 A `model.json` has an adjacent repository `loom_model` or
 `loom_model_documentation` declaration. A description can precede its executable

@@ -149,7 +149,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
-    path = Path(__file__).with_name('rmsnorm_bf16_scalar.loom')
+    path = Path(__file__).with_name('rmsnorm_bf16_scalar_test.loom')
     content = render()
     if args.check:
         if path.read_text(encoding='utf-8') != content:

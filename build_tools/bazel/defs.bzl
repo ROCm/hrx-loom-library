@@ -114,6 +114,9 @@ def _declare_benchmark_admission(name, tags):
 def _validate_execution_profiles(name, execution_profiles):
     if not execution_profiles:
         fail("%s requires at least one execution profile" % name)
+    for profile in execution_profiles:
+        if any([argument.startswith("--sanitizer=") for argument in profile.runner_args]):
+            fail("%s: select Loom sanitizers with --config=loom-asan, --config=loom-tsan, or --config=loom-ubsan" % name)
 
 def _validate_kernel_qualification(name, targets):
     if not targets:
@@ -255,10 +258,13 @@ def loom_test(
     """Owns test sources and their production dependencies."""
     package = native.package_name()
     if "test" not in package.split("/") and not any([
-        str(source).endswith("_test.loom")
+        str(source).endswith("_test.loom") or str(source).endswith("_stress.loom")
         for source in srcs
     ]):
-        fail("//%s: adjacent loom_test sources require a _test.loom owner" % package)
+        fail("//%s: adjacent loom_test sources require a _test.loom or _stress.loom owner" % package)
+    if any([str(source).endswith("_stress.loom") for source in srcs]):
+        if "manual" not in tags or "stress" not in tags:
+            fail("%s: _stress.loom tests require tags = [\"manual\", \"stress\"]" % name)
     if _is_package_or_subpackage(package, "motif"):
         _validate_motif_dependencies(package, deps)
     if _is_package_or_subpackage(package, "program"):
@@ -272,6 +278,7 @@ def loom_test(
         variants = variants,
         deps = deps,
         execution_profiles = execution_profiles,
+        benchmark_smoke = False,
         size = size,
         tags = tags,
         visibility = visibility,

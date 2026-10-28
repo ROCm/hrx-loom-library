@@ -25,7 +25,7 @@ This repository admits reusable compiler inputs and complete model compositions.
 | `motif/` | Target-neutral data representations and algorithms expressed as `func.def`, `template.def`, encodings, and related declarations. | Canonical and lint-clean source, scoped documentation, no launch surface, and reachability from a qualified kernel or test leaf. |
 | `kernel/` | Concrete `kernel.def` entry points implementing one operation contract and ABI. | At least one target profile, reachability from an executing benchmark test, and dependencies confined to production motifs. |
 | `program/` | Shared service policy and executable compositions used by multiple models. | Explicit `loom_library` providers, scoped documentation, real service or command callers, and dependencies that do not point back to a model. |
-| Adjacent `*_test.loom` or `test/` below each layer | Test-only programs that exercise production contracts. | Private root-owned test module, semantic benchmarks and correctness cases, and one execution profile. |
+| `*_test.loom` and `*_stress.loom`, adjacent to production sources or in `test/` | Test-only programs that exercise production contracts. | Private root-owned test module, scenario coverage, and an execution environment. Stress tests carry `manual` and `stress` tags. |
 | `target/` | Genuinely repository-specific target or execution policy. | A concrete policy difference that cannot be expressed by canonical HRX profiles; upstream profiles are consumed directly otherwise. |
 | `model/` descriptions | Portable model facts, asset variants, service contracts, and provider composition. | A card validated through `loom_model_documentation`, a standalone overview with exact upstream links, and a precise supported-variant and hardware contract. |
 | `model/` executable ports | Model-specific programs and portable serving compositions. | Explicit `loom_library` providers, a card published through `loom_model`, and an independently checked native service output for each supported representation. |
@@ -56,6 +56,13 @@ Promotion moves the reusable sources into their durable layer, and the ordinary
 complete build proves that no required experimental package was left behind.
 
 ## Source contract
+
+Files containing `check.*` operations end in `_test.loom` or `_stress.loom`,
+including files inside `test/`. Production archives exclude those sources.
+Under `motif/`, global `config.*` operations also belong only in these explicit
+test leaves; reusable motifs receive values through their arguments. The source
+policy check enforces this ownership in presubmit and on staged source contents
+in precommit.
 
 Each `.loom` file stands on its own as an implementation artifact. Its leading documentation establishes the represented format or operation, public symbol contract, parameter and shape meaning, storage layout, ABI ownership, and any specification or oracle used to establish behavior. Package READMEs carry information that cannot be recovered from `ls`: scope boundaries, external specifications, ABI relationships, supported behavior, and the intended composition layer. Per-symbol inventories remain beside the source so they cannot drift from it.
 

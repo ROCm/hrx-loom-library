@@ -112,7 +112,7 @@ def main() -> None:
         declarations.append(
             f'global.rodata.def @{name} = align(4) bytes("{encoded}")\n\n'
         )
-    filename = Path(__file__).with_name("pointwise.loom")
+    filename = Path(__file__).with_name("pointwise_test.loom")
     begin = "// BEGIN GENERATED POINTWISE ORACLE\n"
     end = "// END GENERATED POINTWISE ORACLE"
     prefix, remainder = filename.read_text().split(begin, 1)

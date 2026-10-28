@@ -176,8 +176,8 @@ template.decl @projection.temporal_coordinates(%rows: index, %outputs: index, %g
 
 ''' + GROUP_REFERENCE
     return {
-        "linear_temporal.loom": matrix_header + "".join(render_matrix(*shape) for shape in SHAPES),
-        "linear_temporal_coordinates.loom": coordinate_header + "".join(render_grid(*grid) for grid in GRIDS),
+        "linear_temporal_test.loom": matrix_header + "".join(render_matrix(*shape) for shape in SHAPES),
+        "linear_temporal_coordinates_test.loom": coordinate_header + "".join(render_grid(*grid) for grid in GRIDS),
     }
 
 

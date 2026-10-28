@@ -314,7 +314,7 @@ def main():
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     for name, render in (("convrot_rows", render_rows), ("convrot_digits", render_digits)):
-        path = Path(__file__).with_name(name + ".loom")
+        path = Path(__file__).with_name(name + "_test.loom")
         content = render()
         if args.check:
             if path.read_text(encoding="utf-8") != content:

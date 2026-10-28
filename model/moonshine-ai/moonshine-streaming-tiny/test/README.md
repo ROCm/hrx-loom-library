@@ -1,8 +1,8 @@
 # Moonshine checks and independent reference
 
-`numerics.loom` uses closed-form F64 expressions for shared-weight projection
+`numerics_test.loom` uses closed-form F64 expressions for shared-weight projection
 and frame normalization; it does not reuse the device reduction loop.
-`state.loom` checks two resident histories through lookahead, reordered batch
+`state_test.loom` checks two resident histories through lookahead, reordered batch
 membership, and EOF. Their benchmark declarations name these same bounded
 workloads without claiming measured performance.
 

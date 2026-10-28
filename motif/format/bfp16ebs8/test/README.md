@@ -20,7 +20,7 @@ From the repository root:
 
 ```sh
 python motif/format/bfp16ebs8/test/generate_oracle.py
-loom-format --in-place motif/format/bfp16ebs8/test/aie2p.loom
+loom-format --in-place motif/format/bfp16ebs8/test/aie2p_test.loom
 bazel test --config=asan \
   //motif/format/bfp16ebs8/test:aie2p_execute_xdna_hardware_test
 ```

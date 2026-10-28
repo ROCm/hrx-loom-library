@@ -23,10 +23,10 @@ comparison even when signed contributions cancel. Nonzero analytical
 workloads cover K through 32,768 and cohorts through 512. Its requirements
 select gfx9-4 hardware; a run that skips those cases is not qualification.
 
-These tests qualify numerical behavior and specialization. Their one-iteration
-benchmark smoke results do not establish comparative performance.
+These tests check numerical behavior and specialization. Benchmarks run
+separately through the [benchmark workflow](../../../../docs/development.md#sweep-repository-benchmarks).
 
-`q8_matrix.loom` qualifies the BF16-input Q8 panels directly, without any model
+`q8_matrix_test.loom` qualifies the BF16-input Q8 panels directly, without any model
 provider or checkpoint. One parameterized suite covers the production tile and
 wave geometries, both read-ahead depths, F32 block scaling, and K32/K64 F16
 reconstruction. Four-stream variants exercise per-wave stream panels. Six
@@ -41,5 +41,4 @@ model tests can reuse the oracle while retaining their own protocol adapters.
 The reference never consumes the prepared storage checked by the matrix path.
 Native GPU execution checks these bounded cases. Each trial launches four
 workgroups over three K32 blocks, with at most 130 live rows and 144 output
-channels across all streams. The benchmark smoke uses one iteration per case
-without warmup; these timings do not establish throughput.
+channels across all streams. Correctness timings do not establish throughput.

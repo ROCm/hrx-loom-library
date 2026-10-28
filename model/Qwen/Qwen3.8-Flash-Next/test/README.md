@@ -39,11 +39,18 @@ bazel test --config=asan --config=amdgpu \
   //model/Qwen/Qwen3.8-Flash-Next/test/...
 ```
 
-The hardware execution profiles exercise the native AMD HAL. Access checking
-and GPU race instrumentation are additional profiles on the configurations
-that declare them. Test-runner benchmark rows are one-iteration execution
-checks, not performance evidence. The tests retain complete output comparisons
-and their declared numerical tolerances.
+The hardware execution profile exercises the native AMD HAL. The build
+configuration selects instrumentation on the same test targets: `asan` enables
+access checks, and `tsan` enables race checks. Omitting those configurations runs
+without instrumentation. Correctness tests retain complete output comparisons
+and their declared numerical tolerances. Benchmarks run separately through
+`dev.py benchmark`.
+
+`vocabulary_stress` and `draft_head_stress` exercise the complete vocabulary,
+including compact-vocabulary fallback and canonical sampling. Each generates
+more than 600 MiB of Q8 weights. Their `_stress.loom` sources and `manual, stress`
+tags keep these regressions available for explicit runs without including them
+in ordinary CI.
 
 Learned service qualification is a separate boundary: it uses the full
 provisioned checkpoint and a built model representation. Numerical fixtures

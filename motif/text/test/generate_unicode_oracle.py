@@ -48,7 +48,7 @@ def main() -> None:
                 f'global.rodata.def @oracle_{name}_rows = align(4) bytes("{data.hex()}")',
             ]
         )
-    path = Path(__file__).with_name("unicode.loom")
+    path = Path(__file__).with_name("unicode_test.loom")
     prefix, body = path.read_text().split("// BEGIN GENERATED UNICODE ORACLE\n", 1)
     _, suffix = body.split("// END GENERATED UNICODE ORACLE", 1)
     path.write_text(

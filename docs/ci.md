@@ -9,21 +9,24 @@ The host job rejects any C/C++ compilation or linking in the library graph.
 
 Release is the normal compiler/runtime profile. ASAN is an explicitly selected
 SDK for diagnosing native memory errors; Bazel's `--config=asan` cannot change
-an installed Release wheel. Loom's device access and race instrumentation are
-separate execution profiles and can run with the Release SDK.
+an installed Release wheel. Independent Loom flags select JIT instrumentation
+on the same test targets: `--config=loom-asan`, `--config=loom-tsan`, or
+`--config=loom-ubsan`. These flags instrument generated programs even when the
+SDK itself is a Release wheel. Native sanitizer configurations alone do not
+enable Loom checks. Ordinary CI leaves Loom instrumentation disabled.
 
 ## Jobs and ownership
 
 | Job suffix | Work |
 | --- | --- |
 | `Host` | Source policy, formatting, linking, model-card checks, generated oracles, and CPU/VM tests. |
-| `AMD gfx942`, `AMD gfx110x`, `AMD gfx1151`, `AMD gfx120x` | Native AMD GPU correctness, instrumentation, and benchmark-smoke tests. |
+| `AMD gfx942`, `AMD gfx110x`, `AMD gfx1151`, `AMD gfx120x` | Native AMD GPU correctness scenarios. |
 | `AMD gfx1150 GPU + NPU4` | The GPU checks plus native XDNA tests, with both device classes exposed. |
 
 Hardware jobs are advisory while the runner/model combinations are qualified.
 Jobs select tests through the public `iree-run-requirement` tags. Host runs
 tests without special resource requirements; GPU and NPU jobs run profiles
-whose required resources are all available, including instrumented profiles.
+whose required resources are all available.
 Source and compile checks remain in Host. Each lane tests `//...` with
 `--build_tests_only` and one `--test_tag_filters` argument. The CI resource
 selector reads the actual query tags, excludes every unavailable resource,
@@ -52,6 +55,12 @@ Adding a model or motif with an existing resource requires no workflow edit.
 A new device family needs an SDK containing its runtime, an appropriate runner, and its execution
 profile in the matrix. Full learned-model checks stay manual and use externally
 provisioned assets; no model weights are downloaded by these CI jobs.
+
+Stress sources end in `_stress.loom`, and their tests carry both `manual` and
+`stress`. Ordinary wildcard runs exclude them. An explicit stress run selects
+their labels by the `stress` tag, with the same optional sanitizer configuration
+as ordinary tests. Benchmarks remain separately available through
+`dev.py benchmark`; correctness runs do not execute an additional benchmark loop.
 
 The Qwen internal request-API check remains automatic in source mode, as
 [described in the development guide](development.md#build-and-check). It is
