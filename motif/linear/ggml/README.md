@@ -55,3 +55,34 @@ These are reusable Loom schedules, qualified for correctness through the
 [`linear` kernels](../../../kernel/ggml/linear/). The native tests establish
 packed-byte semantics, addressing, and numerical results; they do not establish
 a throughput comparison against another implementation.
+
+## Q8_0 panels with BF16 storage
+
+`q8_0_bf16_matrix.loom` retains a tile of F32 accumulator fragments for a
+caller-owned epilogue. The three numerical contracts make operand rounding
+explicit:
+
+| Contract | Matrix operands | Scale application | Staging |
+| --- | --- | --- | --- |
+| `ggml.q8_0_bf16.contract` | Original BF16 inputs and exactly represented I8 codes | F32 FMA after each K32 dot | K32, 40-half pitch |
+| `ggml.q8_0_f16.contract` | Inputs and reconstructed coefficients rounded to F16 | Included in F16 coefficients | K32, 40-half pitch |
+| `ggml.q8_0_f16.contract_k64` | Inputs and reconstructed coefficients rounded to F16 | Included in F16 coefficients | K64, 72-half pitch |
+
+All three use F32 accumulation. Tile dimensions, the wave32 grid, read-ahead
+depth, live input rows, and physical weight layout are caller facts. The motif
+contains no workload threshold, model configuration, epoch-header decoder, or
+global converted-weight allocation. Full panels reuse staged weights across
+rows and staged inputs across columns; returned fragments can feed fused
+operations before publication.
+
+Raw interleaved records and prepared four-channel scale/code planes share the
+same contraction. A byte origin and physical row stride select a submatrix of
+a larger weight bank without copying it. Stream-major weight rows can supply
+multiple feature panels to each wave for fused epilogues. These fragments use
+the RDNA wave32 layout; a CDNA/wave64 contraction is a different implementation,
+not an interchangeable target flag.
+
+The independent [Q8 matrix suite](../../../kernel/ggml/linear/test/) owns tile,
+wave, staging, stream, layout, tail, and numerical coverage. Model suites retain
+only their distinct launch policy, preparation, and fused state/publication
+contracts, reusing its scalar-byte oracle.

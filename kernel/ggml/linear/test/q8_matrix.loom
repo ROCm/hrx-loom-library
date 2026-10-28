@@ -1,0 +1,245 @@
+// Shared Q8 panel qualification: exact BF16 codes with F32 scaling and both
+// F16 reconstruction stages. One scalar-byte oracle covers every tile/wave
+// geometry. Raw records, a strided submatrix, and prepared scale/code planes
+// share the same source values. Inactive inputs are NaNs; output guards and
+// immutable operands cover complete, partial, empty, and multi-stream tiles.
+config.decl @q8_test.tile_rows : %value: index where [range(%value, 16, 128), multiple_of(%value, 16)]
+
+config.decl @q8_test.tile_columns : %value: index where [range(%value, 16, 128), multiple_of(%value, 16)]
+
+config.decl @q8_test.wave_rows : %value: index where [range(%value, 1, 4)]
+
+config.decl @q8_test.wave_columns : %value: index where [range(%value, 1, 4)]
+
+config.decl @q8_test.pipeline_depth : %value: index where [range(%value, 1, 2)]
+
+config.decl @q8_test.stage_k : %value: index where [range(%value, 0, 64), multiple_of(%value, 32)]
+
+config.decl @q8_test.streams : %value: index where [range(%value, 1, 4)]
+
+amdgpu.target<gfx11-generic> @q8_matrix_wave32 {subgroup_size = 32}
+
+template.decl @ggml.q8_0_bf16.contract(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>)
+
+template.decl @ggml.q8_0_f16.contract(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>)
+
+template.decl @ggml.q8_0_f16.contract_k64(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>)
+
+template.decl @tensor.matrix.store_bf16_wave32(%remaining_rows: index, %outputs: index, %fragment_row: index, %result_column: index, %result: vector<8xf32>, %output_view: view<[%remaining_rows]x[%outputs]xbf16>)
+
+func.decl @ggml_q8_0_fixture(%tokens: index, %count: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
+
+func.decl @ggml_q8_0_reference(%half_coefficients: i1, %tokens: index, %count: index, %streams: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.def target(@q8_matrix_wave32) @matrix() {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %wave_size = index.constant 32 : index
+  %wave_rows = config.get @q8_test.wave_rows : index
+  %wave_columns = config.get @q8_test.wave_columns : index
+  %waves = index.mul %wave_rows, %wave_columns : index
+  %threads = index.mul %waves, %wave_size : index
+  kernel.launch.config workgroups(%c2, %c2, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%count_value: index, %outputs_value: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input_arg: buffer, %original: buffer, %weight_arg: buffer, %output_arg: buffer) {
+  %input, %weight, %output = buffer.assume.noalias %input_arg, %weight_arg, %output_arg : buffer, buffer, buffer
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %c16 = index.constant 16 : index
+  %inputs = index.constant 96 : index
+  %tile_rows = config.get @q8_test.tile_rows : index
+  %tile_columns = config.get @q8_test.tile_columns : index
+  %wave_rows = config.get @q8_test.wave_rows : index
+  %wave_columns = config.get @q8_test.wave_columns : index
+  %pipeline_depth = config.get @q8_test.pipeline_depth : index
+  %streams = config.get @q8_test.streams : index
+  %stage = config.get @q8_test.stage_k : index
+  %capacity = index.add %tile_rows, %c3 : index
+  %end = index.assume %count_value [range(%count_value, 0, %capacity)] : index
+  %outputs = index.assume %outputs_value [range(%outputs_value, 4, 132), multiple_of(%outputs_value, 4)] : index
+  %group = kernel.workgroup.id<x> : index
+  %batch = kernel.workgroup.id<y> : index
+  %wave = kernel.subgroup.id : index
+  %first = index.mul %batch, %tile_rows : index
+  %active = index.cmp ult, %first, %end : index
+  scf.if %active {
+    %per_wave_rows = index.div %tile_rows, %wave_rows : index
+    %per_wave_columns = index.div %tile_columns, %wave_columns : index
+    %stream_columns = index.div %per_wave_columns, %streams : index
+    %tile_features = index.div %tile_columns, %streams : index
+    %channel_base = index.mul %group, %tile_features : index
+    %row_fragments = index.div %per_wave_rows, %c16 : index
+    %column_fragments = index.div %per_wave_columns, %c16 : index
+    %fragment_count = index.mul %row_fragments, %column_fragments : index
+    %wave_column = index.rem %wave, %wave_columns : index
+    %wave_row = index.div %wave, %wave_columns : index
+    %wave_token = index.mul %wave_row, %per_wave_rows : index
+    %wave_feature = index.madd %wave_column, %stream_columns, %channel_base : index
+    %scaled_bf16 = index.cmp eq, %stage, %c0 : index
+    %tile = scf.if %scaled_bf16 -> (vector<[%fragment_count]x8xf32>) {
+      %result = template.apply<@ggml.q8_0_bf16.contract>(%capacity, %inputs, %outputs, %streams, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %fragment_count, %first, %end, %channel_base, %split_scales, %row_bytes, %weight_origin, %input, %weight) : (index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%fragment_count]x8xf32>)
+      scf.yield %result : vector<[%fragment_count]x8xf32>
+    } else {
+      %c64 = index.constant 64 : index
+      %paired = index.cmp eq, %stage, %c64 : index
+      %result = scf.if %paired -> (vector<[%fragment_count]x8xf32>) {
+        %result = template.apply<@ggml.q8_0_f16.contract_k64>(%capacity, %inputs, %outputs, %streams, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %fragment_count, %first, %end, %channel_base, %split_scales, %row_bytes, %weight_origin, %input, %weight) : (index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%fragment_count]x8xf32>)
+        scf.yield %result : vector<[%fragment_count]x8xf32>
+      } else {
+        %result = template.apply<@ggml.q8_0_f16.contract>(%capacity, %inputs, %outputs, %streams, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %fragment_count, %first, %end, %channel_base, %split_scales, %row_bytes, %weight_origin, %input, %weight) : (index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%fragment_count]x8xf32>)
+        scf.yield %result : vector<[%fragment_count]x8xf32>
+      }
+      scf.yield %result : vector<[%fragment_count]x8xf32>
+    }
+    %remaining = index.sub %end, %first : index
+    %element_bytes = index.constant 2 : offset
+    %output_row_bytes = index.scale %outputs, %element_bytes : index, offset -> offset
+    %stream_bytes = index.scale %capacity, %output_row_bytes : index, offset -> offset
+    %row_origin = index.scale %first, %output_row_bytes : index, offset -> offset
+    scf.for %ordinal = [%c0 to %fragment_count step %c1] unroll schedule(linear) {
+      %row_fragment = index.div %ordinal, %column_fragments : index
+      %column_fragment = index.rem %ordinal, %column_fragments : index
+      %local_column = index.mul %column_fragment, %c16 : index
+      %stream = index.div %local_column, %stream_columns : index
+      %feature = index.rem %local_column, %stream_columns : index
+      %row = index.madd %row_fragment, %c16, %wave_token : index
+      %column = index.add %wave_feature, %feature : index
+      %stream_origin = index.scale %stream, %stream_bytes : index, offset -> offset
+      %output_origin = index.add %stream_origin, %row_origin : offset
+      %output_view = buffer.view %output[%output_origin] : buffer -> view<[%remaining]x[%outputs]xbf16>
+      %fragment = vector.extract %tile[%ordinal] : vector<[%fragment_count]x8xf32> -> vector<8xf32>
+      template.apply<@tensor.matrix.store_bf16_wave32>(%remaining, %outputs, %row, %column, %fragment, %output_view) : (index, index, index, index, vector<8xf32>, view<[%remaining]x[%outputs]xbf16>)
+    }
+  }
+  kernel.return
+}
+
+func.def @reference(%count: index, %outputs: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %original: buffer, %weight: buffer, %output: buffer) {
+  %c0 = index.constant 0 : index
+  %c3 = index.constant 3 : index
+  %inputs = index.constant 96 : index
+  %tile_rows = config.get @q8_test.tile_rows : index
+  %capacity = index.add %tile_rows, %c3 : index
+  %streams = config.get @q8_test.streams : index
+  %stage = config.get @q8_test.stage_k : index
+  %half_coefficients = index.cmp ne, %stage, %c0 : index
+  func.call @ggml_q8_0_reference(%half_coefficients, %capacity, %count, %streams, %inputs, %outputs, %input, %original, %output) : (i1, index, index, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @geometry(%trial: index) -> (index, index, index, index, index, index, i1, offset, offset) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c16 = index.constant 16 : index
+  %row_storage = index.constant 204 : index
+  %tile_rows = config.get @q8_test.tile_rows : index
+  %tile_columns = config.get @q8_test.tile_columns : index
+  %streams = config.get @q8_test.streams : index
+  %tile_features = index.div %tile_columns, %streams : index
+  %outputs = index.add %tile_features, %c4 : index
+  %capacity = index.add %tile_rows, %c3 : index
+  %channels = index.mul %streams, %outputs : index
+  %payload_bytes = index.mul %channels, %row_storage : index
+  %storage_bytes = index.add %payload_bytes, %c16 : index
+  %ragged = index.add %tile_rows, %c2 : index
+  %empty = index.cmp eq, %trial, %c0 : index
+  %single = index.cmp eq, %trial, %c1 : index
+  %aligned = index.cmp eq, %trial, %c2 : index
+  %full_count = scf.select %aligned, %tile_rows, %ragged : index
+  %nonempty_count = scf.select %single, %c1, %full_count : index
+  %count = scf.select %empty, %c0, %nonempty_count : index
+  %strided = index.cmp eq, %trial, %c4 : index
+  %split_scales = index.cmp eq, %trial, %c5 : index
+  %origin = index.constant 0 : offset
+  %prepared_origin = index.constant 16 : offset
+  %raw_bytes = index.constant 102 : offset
+  %strided_bytes = index.constant 204 : offset
+  %row_bytes = scf.select %strided, %strided_bytes, %raw_bytes : offset
+  %raw_origin = scf.select %strided, %raw_bytes, %origin : offset
+  %weight_origin = scf.select %split_scales, %prepared_origin, %raw_origin : offset
+  func.return %capacity, %count, %streams, %outputs, %channels, %storage_bytes, %split_scales, %row_bytes, %weight_origin : index, index, index, index, index, index, i1, offset, offset
+}
+
+// CPU fixture copies each original scale and signed code to its logical
+// destination. The oracle continues reading the original records, so a bad
+// prepared-layout address cannot be shared by implementation and reference.
+func.def @prepare_fixture(%capacity: index, %count: index, %channels: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %original: buffer, %weight: buffer) {
+  %inputs = index.constant 96 : index
+  func.call @ggml_q8_0_fixture(%capacity, %count, %inputs, %channels, %input, %original) : (index, index, index, index, buffer, buffer)
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %scale_bytes = index.constant 2 : offset
+  %raw = buffer.view %original[%origin] : buffer -> view<[%channels]x3x34xi8>
+  scf.for %channel = [%c0 to %channels step %c1] {
+    scf.for %block = [%c0 to %c3 step %c1] {
+      %record = index.madd %channel, %c3, %block : index
+      %block_bytes = index.constant 34 : offset
+      %source_origin = index.scale %record, %block_bytes : index, offset -> offset
+      %source_scale = buffer.view %original[%source_origin] : buffer -> view<1xf16>
+      %scale = view.load %source_scale[0] : view<1xf16> -> f16
+      %destination_scale, %destination_codes = scf.if %split_scales -> (offset, offset) {
+        %group = index.div %channel, %c4 : index
+        %member = index.rem %channel, %c4 : index
+        %group_bytes = index.constant 408 : offset
+        %plane_bytes = index.constant 24 : offset
+        %code_bytes = index.constant 32 : offset
+        %group_origin = index.scale %group, %group_bytes : index, offset -> offset
+        %within_group = index.madd %block, %c4, %member : index
+        %scale_offset = index.scale %within_group, %scale_bytes : index, offset -> offset
+        %scale_origin = index.add %group_origin, %scale_offset : offset
+        %code_offset = index.scale %within_group, %code_bytes : index, offset -> offset
+        %code_plane = index.add %group_origin, %plane_bytes : offset
+        %code_origin = index.add %code_plane, %code_offset : offset
+        scf.yield %scale_origin, %code_origin : offset, offset
+      } else {
+        %row_origin = index.scale %channel, %row_bytes : index, offset -> offset
+        %block_origin = index.scale %block, %block_bytes : index, offset -> offset
+        %scale_origin = index.add %row_origin, %block_origin : offset
+        %code_origin = index.add %scale_origin, %scale_bytes : offset
+        scf.yield %scale_origin, %code_origin : offset, offset
+      }
+      %scale_position = index.add %weight_origin, %destination_scale : offset
+      %target_scale = buffer.view %weight[%scale_position] : buffer -> view<1xf16>
+      view.store %scale, %target_scale[0] : f16, view<1xf16>
+      %code_position = index.add %weight_origin, %destination_codes : offset
+      %target_codes = buffer.view %weight[%code_position] : buffer -> view<32xi8>
+      scf.for %element = [%c0 to %c32 step %c1] {
+        %c2 = index.constant 2 : index
+        %source_element = index.add %element, %c2 : index
+        %code = view.load %raw[%channel, %block, %source_element] : view<[%channels]x3x34xi8> -> i8
+        view.store %code, %target_codes[%element] : i8, view<32xi8>
+      }
+    }
+  }
+  func.return
+}
+
+check.scenario public @original_q8_matrix {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[6](%trial: index, %entropy: check.entropy) {
+    %capacity, %count, %streams, %outputs, %channels, %storage_bytes, %split_scales, %row_bytes, %weight_origin = check.generate<@geometry>(%trial) : (index) -> (index, index, index, index, index, index, i1, offset, offset)
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<[%capacity]x96xbf16>
+    %original = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<[%channels]x3x34xi8>
+    %weight = check.generate.fill value(85) : tensor<[%storage_bytes]xi8>
+    check.generate<@prepare_fixture>(%capacity, %count, %channels, %split_scales, %row_bytes, %weight_origin, %input, %original, %weight) : (index, index, index, i1, offset, offset, tensor<[%capacity]x96xbf16>, tensor<[%channels]x3x34xi8>, tensor<[%storage_bytes]xi8>) -> ()
+    %output = check.generate.fill value(-17.0) : tensor<[%streams]x[%capacity]x[%outputs]xbf16>
+    check.compare<@matrix, @reference>(%count, %outputs, %split_scales, %row_bytes, %weight_origin, %input, %original, %weight, %output) : (index, index, i1, offset, offset, tensor<[%capacity]x96xbf16>, tensor<[%channels]x3x34xi8>, tensor<[%storage_bytes]xi8>, tensor<[%streams]x[%capacity]x[%outputs]xbf16>) -> () {
+      check.expect.close actual(%output) expected(%output) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<[%streams]x[%capacity]x[%outputs]xbf16>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%capacity]x96xbf16>
+      check.expect.bitwise actual(%original) expected(%original) : tensor<[%channels]x3x34xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<[%storage_bytes]xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@original_q8_matrix> @original_q8_matrix_benchmark

@@ -25,3 +25,19 @@ select gfx9-4 hardware; a run that skips those cases is not qualification.
 
 These tests qualify numerical behavior and specialization. Their one-iteration
 benchmark smoke results do not establish comparative performance.
+
+`q8_matrix.loom` qualifies the BF16-input Q8 panels directly, without any model
+provider or checkpoint. One parameterized suite covers the production tile and
+wave geometries, both read-ahead depths, F32 block scaling, and K32/K64 F16
+reconstruction. Four-stream variants exercise per-wave stream panels. Six
+trials cover empty, single-row, aligned, and ragged cohorts, a strided second
+submatrix, and independently packed four-channel scale/code planes. Three K32
+blocks force the K64 path to handle a missing final block. Inactive inputs
+contain NaNs, and complete output and immutable-input comparisons protect tails.
+
+`q8_reference.loom` decodes original bytes and accumulates in F64, with explicit
+operand-rounding selection. It is a public test-only source provider so fused
+model tests can reuse the oracle while retaining their own protocol adapters.
+The reference never consumes the prepared storage checked by the matrix path.
+Native, access, and race profiles execute the same cases; the benchmark uses
+those cases without inventing a separate fast path.
