@@ -8,6 +8,7 @@
 
 import base64
 import json
+import re
 import struct
 import subprocess
 import sys
@@ -38,7 +39,12 @@ class RequestCheckTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
         vocabulary = {chr(index): index for index in range(128)}
-        special_tokens = (("<bos>", 128), ("<eos>", 129), ("<|image_pad|>", 131))
+        special_tokens = (
+            ("<bos>", 128),
+            ("<eos>", 129),
+            ("<|image_pad|>", 131),
+            ("<|video_pad|>", 132),
+        )
         vocabulary.update({"λ": 130, **dict(special_tokens)})
         tokenizer = {
             "model": {"type": "BPE", "vocab": vocabulary, "merges": []},
@@ -111,12 +117,13 @@ class RequestCheckTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         value = json.loads(result.stdout)
         expected_tokens = []
-        for index, text in enumerate(value["prompt"].split("<|image_pad|>")):
-            if index:
-                expected_tokens.append(131)
-            expected_tokens.extend(
-                130 if character == "λ" else ord(character) for character in text
-            )
+        for text in re.split(r"(<\|(?:image|video)_pad\|>)", value["prompt"]):
+            if text in ("<|image_pad|>", "<|video_pad|>"):
+                expected_tokens.append(131 if text == "<|image_pad|>" else 132)
+            else:
+                expected_tokens.extend(
+                    130 if character == "λ" else ord(character) for character in text
+                )
         self.assertEqual(
             value["tokens"],
             expected_tokens,
@@ -619,7 +626,7 @@ class RequestCheckTest(unittest.TestCase):
             self.assertNotEqual(value["tokens"][offset + count], 131)
         self.assertGreater(spans[1][1], spans[0][1] + 64)
 
-    def test_images_across_turns_and_occurrence_limit(self):
+    def test_images_across_turns_preserve_projection_ordinals(self):
         image = self.image((0, 255, 0))
         request = self.request(
             messages=[
@@ -631,9 +638,78 @@ class RequestCheckTest(unittest.TestCase):
         value = self.success(self.execute(request))
         self.assertEqual([span[0] for span in value["media_spans"]], [0, 1, 2, 3])
         request["messages"][-1]["content"].append(image)
-        result = self.execute(request)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
+        value = self.success(self.execute(request))
+        self.assertEqual([span[0] for span in value["media_spans"]], [0, 1, 2, 3, 4])
+
+    def video(self, timestamps, width=64, height=32):
+        return {
+            "type": "video_frames",
+            "video_frames": {
+                "frames": [
+                    {
+                        "timestamp": timestamp,
+                        "url": self.image((index % 256, 17, 29), width, height)[
+                            "image_url"
+                        ]["url"],
+                    }
+                    for index, timestamp in enumerate(timestamps)
+                ]
+            },
+        }
+
+    def test_video_pairs_timestamps_and_odd_tail_among_images(self):
+        parts = [
+            {"type": "text", "text": "  Compare "},
+            self.image((255, 0, 0), 32, 32),
+            self.video([0.0, 0.75, 2.1, 3.9, 8.2]),
+            {"type": "text", "text": " then "},
+            self.image((0, 0, 255), 32, 32),
+            {"type": "text", "text": " please.  "},
+        ]
+        value = self.success(self.execute(self.request(
+            messages=[{"role": "user", "content": parts}]
+        )))
+        pair = "<|vision_start|>" + "<|video_pad|>" * 2 + "<|vision_end|>"
+        video = "".join(
+            f"<{timestamp} seconds>" + pair for timestamp in ("0.4", "3.0", "8.2")
+        )
+        self.assertIn(video + " then ", value["prompt"])
+        self.assertIn("please.<|im_end|>", value["prompt"])
+        self.assertEqual([span[0] for span in value["media_spans"]], list(range(5)))
+        self.assertEqual([span[2] for span in value["media_spans"]], [64, 2, 2, 2, 64])
+        for projection, offset, count in value["media_spans"]:
+            token = 132 if 1 <= projection <= 3 else 131
+            self.assertEqual(value["tokens"][offset:offset + count], [token] * count)
+
+    def test_video_rounding_and_group_count_through_native_caller(self):
+        # One tiny clip covers both tie directions and more than four groups.
+        times = [0.25, 0.25, 0.75, 0.75, 4.0, 5.0, 7.0, 8.0, 9.25]
+        value = self.success(self.execute(self.request(messages=[{
+            "role": "user", "content": [self.video(times, 1, 1)]
+        }])))
+        pair = "<|vision_start|><|video_pad|><|vision_end|>"
+        expected = ("0.2", "0.8", "4.5", "7.5", "9.2")
+        self.assertIn(
+            "".join(f"<{time} seconds>" + pair for time in expected),
+            value["prompt"],
+        )
+        self.assertEqual([span[2] for span in value["media_spans"]], [1] * 5)
+
+    def test_video_requires_a_pair_and_uniform_display_geometry(self):
+        short = self.video([0.0])
+        mismatched = self.video([0.0, 1.0])
+        mismatched["video_frames"]["frames"][1]["url"] = self.image(
+            (1, 2, 3), 32, 32
+        )["image_url"]["url"]
+        for video in (short, mismatched):
+            with self.subTest(frame_count=len(video["video_frames"]["frames"])):
+                result = self.execute(self.request(
+                    messages=[{"role": "user", "content": [video]}]
+                ))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "at least two frames with identical display dimensions", result.stderr
+                )
 
     def test_general_image_shapes_and_request_budget(self):
         for width, height, budget, expected_rows in (

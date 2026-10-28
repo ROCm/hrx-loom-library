@@ -6,8 +6,8 @@ versioned model card. The bytecode is a declared build output beside the card
 in the test's runfiles. A small BPE
 vocabulary makes every emitted token independently inspectable. Cases cover
 ordinary and thinking history, tool calls and results, request sampling,
-stream fragments, ordered images, resize budgets, and rejection before partial
-output. No checkpoint or network access is needed.
+stream fragments, mixed images and video, temporal pairs, timestamp rounding,
+odd tails, resize budgets, and rejection before partial output. No checkpoint or network access is needed.
 
 VM cases check exact output-span boundaries, integer-grid resize coordinates,
 complete ordinary token planes, live upload descriptors, ordinary versus
@@ -42,21 +42,23 @@ magnified, and degenerate axes. Nonintegral sampling covers independently rounde
 opposite edges. The source root exposes its private helper to this test without
 making it part of the public linking contract.
 
-`vision_control_test.loom` checks one-to-four-image cohorts, square and rectangular
+`vision_control_test.loom` checks one/four/sixteen-group cohorts, one/two-plane
 geometry, both feature widths, stage arguments, and exact output plans. An
-independent upload snapshot checks in-place directory writes and preservation
-of every source byte. Descriptor-only forecasts cover nonzero padded offsets,
+independent upload snapshot checks preservation of the canonical directory
+and every source byte. Descriptor-only forecasts cover nonzero padded offsets,
 mixed geometries, private workspace reuse, retained peers, and quantities above
 32 bits without allocating the represented storage. Only the native stage
 registration sink is substituted; the shared preparation and forecasting code
 runs on the VM.
 
-`vision_resize_test.loom` joins the CPU packet producer with the public GPU filter
-template. Thirty-two trials check complete RGB8 output and input preservation
-across all eight orientations, RGB/RGBA input, identity filtering, and extreme
-scale changes. Analytical coordinate colors expose reflection and transposition
-errors; constant colors isolate filtering and alpha composition. Native AMD GPU
-and access-instrumented profiles run the same cases and benchmark smoke.
+`vision_resize_test.loom` joins the CPU packet producer with the public GPU
+filter template. Sixty-four small trials check complete RGB8 output and input
+preservation across all eight orientations, distinct/repeated planes, RGB/RGBA
+input, identity filtering, and extreme scale changes. Two additional cases
+exercise the maximum video output axis in each orientation. Analytical
+coordinate colors expose reflection and transposition errors; constant colors
+isolate filtering and alpha composition. The native AMD GPU profile runs the
+same cases and a single-iteration benchmark smoke.
 
 These packages run without model dependencies or checkpoints:
 
