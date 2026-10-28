@@ -1,8 +1,9 @@
 // Qwen3.8 antialiased bicubic RGB8 resize from prepared image packets.
 //
 // The launch selects a cohort directory entry and writes that image to
-// a distinct tightly packed RGB8 output buffer. Its packet owns axis starts,
-// coefficient offsets, F32 weights, decoded RGB/RGBA pixels, and orientation
+// a distinct tightly packed RGB8 output buffer. Plane 0 or 1 selects one of
+// the group's temporal inputs; a repeated frame shares its offset. Each plane
+// owns axis starts, coefficient offsets, F32 weights, RGB/RGBA pixels, and orientation
 // bits. Straight alpha composites over white before interpolation. F32 filter
 // results round to nearest-even and clamp to [0,255] on output.
 //
@@ -12,18 +13,25 @@
 //
 // The caller launches 256 threads in wave32 groups, with X/Y covering
 // ceil(width/32) and ceil(height/16). image selects a live directory entry
-// supplied by its cohort; the input and output allocations are disjoint.
+// supplied by its cohort, and plane is in [0,1]. The input and output allocations
+// are disjoint.
 
-template.decl @qwen38.vision.resize(%image: index, %input: buffer, %output: buffer)
+template.decl @qwen38.vision.resize(%image: index, %plane: index, %input: buffer, %output: buffer)
 
-template.def<@qwen38.vision.resize> device @qwen38_vision_resize_body(%image: index, %input: buffer, %output: buffer) {
+template.def<@qwen38.vision.resize> device @qwen38_vision_resize_body(%image: index, %plane: index, %input: buffer, %output: buffer) {
   %origin = index.constant 0 : offset
   %range_stride = index.constant 16 : offset
   %range_offset = index.scale %image, %range_stride : index, offset -> offset
   %range = buffer.view %input[%range_offset] : buffer -> view<2xi64>
   %packet_word = view.load %range[0] : view<2xi64> -> i64
   %packet_bounded = scalar.assume %packet_word [range(%packet_word, 0, 268435456)] : i64
-  %packet_offset = index.cast %packet_bounded : i64 to offset
+  %group_offset = index.cast %packet_bounded : i64 to offset
+  %group = buffer.view %input[%group_offset] : buffer -> view<4xi32>
+  %plane_base = index.constant 2 : index
+  %plane_index = index.add %plane_base, %plane : index
+  %relative_word = view.load %group[%plane_index] : view<4xi32> -> i32
+  %relative = index.cast %relative_word : i32 to offset
+  %packet_offset = index.add %group_offset, %relative : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
