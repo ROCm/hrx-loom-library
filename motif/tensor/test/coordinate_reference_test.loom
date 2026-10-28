@@ -1,0 +1,68 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Coordinate-map tests carry their independent oracle inputs in the first
+// three i32 words of storage: row tiles, column tiles, and row-group size.
+// One padding word and a 16-word prefix guard precede the coordinate pairs;
+// a 16-word suffix guard follows them. Comparing the complete storage also
+// verifies that the GPU leaves the oracle inputs and both guards untouched.
+func.def @coordinate_storage_size(%rows: index, %columns: index) -> (index) {
+  %pair_words = index.constant 2 : index
+  %header_and_guards = index.constant 36 : index
+  %pairs = index.mul %rows, %columns : index
+  %words = index.madd %pairs, %pair_words, %header_and_guards : index
+  func.return %words : index
+}
+
+func.def @initialize_coordinate_grid(%rows: index, %columns: index, %group: index, %storage: buffer) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %storage[%origin] : buffer -> view<3xi32>
+  %row_word = index.cast %rows : index to i32
+  %column_word = index.cast %columns : index to i32
+  %group_word = index.cast %group : index to i32
+  view.store %row_word, %header[0] : i32, view<3xi32>
+  view.store %column_word, %header[1] : i32, view<3xi32>
+  view.store %group_word, %header[2] : i32, view<3xi32>
+  func.return
+}
+
+// Enumerate groups, then columns, then rows. This traversal shares no division
+// or remainder arithmetic with either production coordinate mapping.
+func.def @coordinate_grid_reference(%storage: buffer) {
+  %origin = index.constant 0 : offset
+  %payload = index.constant 80 : offset
+  %header = buffer.view %storage[%origin] : buffer -> view<3xi32>
+  %row_word = view.load %header[0] : view<3xi32> -> i32
+  %column_word = view.load %header[1] : view<3xi32> -> i32
+  %group_word = view.load %header[2] : view<3xi32> -> i32
+  %row_count = index.cast %row_word : i32 to index
+  %column_count = index.cast %column_word : i32 to index
+  %group_size = index.cast %group_word : i32 to index
+  // Every authored configuration has positive dimensions and group size.
+  %rows = index.assume %row_count [gt(%row_count, 0)] : index
+  %columns = index.assume %column_count [gt(%column_count, 0)] : index
+  %group = index.assume %group_size [gt(%group_size, 0)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %count = index.mul %rows, %columns : index
+  %view = buffer.view %storage[%payload] : buffer -> view<[%count]x2xi32>
+  %end = scf.for %first_row = [%c0 to %rows step %group](%group_position = %c0 : index) -> (index) {
+    %limit = index.add %first_row, %group : index
+    %last_row = index.min %limit, %rows : index
+    %next_group = scf.for %column = [%c0 to %columns step %c1](%column_position = %group_position : index) -> (index) {
+      %next_column = scf.for %row = [%first_row to %last_row step %c1](%position = %column_position : index) -> (index) {
+        // Group/column/row enumeration visits every pair exactly once.
+        %ordinal = index.assume %position [ge(%position, 0), lt(%position, %count)] : index
+        %row_value = index.cast %row : index to i32
+        %column_value = index.cast %column : index to i32
+        view.store %row_value, %view[%ordinal, 0] : i32, view<[%count]x2xi32>
+        view.store %column_value, %view[%ordinal, 1] : i32, view<[%count]x2xi32>
+        %next = index.add %position, %c1 : index
+        scf.yield %next : index
+      }
+      scf.yield %next_column : index
+    }
+    scf.yield %next_group : index
+  }
+  func.return
+}

@@ -212,13 +212,21 @@ the real 6144/16384 reduction widths cover panel lifetimes and indexing.
 Dense, column-major, and padded physical results, guards, and immutable
 allocations compare bitwise under native, access, and race instrumentation.
 
-`linear_coordinates_test.loom` checks eighteen grids by enumerating groups, then
-columns, then rows in a VM reference. It does not reuse the production
-division/remainder formulas. Cases include every remainder of an eight-row
-group, singleton and oversized groups, several complete groups, model grids,
-and the maximum 1024×256 grid. Every coordinate pair and both storage guards
-are exact under native and access instrumentation. Both corpora include
-benchmark declarations.
+`linear_coordinates_test.loom` is an authored scenario with eighteen grid
+configurations and one GPU kernel. A command program specializes the grid and
+group size, while `coordinate_reference_test.loom` independently enumerates
+groups, columns, and rows in the VM. The reference does not reuse the production
+division/remainder formulas. Configurations include every remainder of an
+eight-row group, singleton and oversized groups, several complete groups,
+model grids, and the maximum 1024×256 grid. Every coordinate pair, the input
+header, and both storage guards compare bitwise. The benchmark uses the same
+configuration domain. Run the authored scenario directly:
+
+```sh
+python dev.py test --target=//motif/tensor/test:linear_coordinates
+```
+
+The matrix fixture generator owns only `linear_tiled_test.loom`:
 
 ```sh
 python3 -B motif/tensor/test/generate_linear_tiled_oracle.py --check
@@ -234,12 +242,21 @@ distinguish full F32 accumulation from intermediate BF16 rounding. Every
 output, guard, and immutable input compares bitwise under native, access,
 and race instrumentation.
 
-`linear_temporal_coordinates_test.loom` checks twenty-five logical grids, including
-both rounding axes, every remainder of an eight-row group, the model's
-4224/4608-row selections, and the maximum 65536×16384 shape. The shared VM
-reference enumerates groups, columns, and rows without the production rounding
-or division formulas. Complete pairs and guards compare exactly under native
-and access instrumentation. Both corpora declare benchmarks.
+`linear_temporal_coordinates_test.loom` uses the same authored scenario pattern
+and shared VM reference for twenty-five logical grids, including both rounding
+axes, every remainder of an eight-row group, the model's 4224/4608-row selections,
+and the maximum 65536×16384 shape. Explicit expected tile counts keep the
+reference independent of production rounding as well as division/remainder
+mapping. Complete coordinate pairs, the input header, and guards compare
+bitwise. Both coordinate scenarios accept the ordinary optional
+`--config=loom-asan`; their production archives contain neither tests nor
+reference code.
+
+```sh
+python dev.py test --target=//motif/tensor/test:linear_temporal_coordinates
+```
+
+The matrix fixture generator owns only `linear_temporal_test.loom`:
 
 ```sh
 python3 -B motif/tensor/test/generate_linear_temporal_oracle.py --check
