@@ -84,10 +84,12 @@ func.def @vision_cohort_observation(%count: index, %columns: index, %width: i32)
   %first_prepared, %first_units, %first_tag = func.call @qwen38_vision_prepare_request(%request) : (buffer) -> (buffer, i64, i64)
   %packet_bytes = buffer.length %first_prepared
   %packet64 = index.cast %packet_bytes : offset to i64
-  %input_bytes = index.scale %count, %packet_bytes : index, offset -> offset
+  %data_bytes = index.scale %count, %packet_bytes : index, offset -> offset
+  %input_bytes = index.add %range_bytes, %data_bytes : offset
   %packed = buffer.alloca<private> align(16) %input_bytes : buffer
   scf.for %i = [%c0 to %count step %c1] {
-    %offset = index.scale %i, %packet_bytes : index, offset -> offset
+    %relative = index.scale %i, %packet_bytes : index, offset -> offset
+    %offset = index.add %range_bytes, %relative : offset
     %offset64 = index.cast %offset : offset to i64
     view.store %offset64, %range_view[%i, 0] : i64, view<[%count]x2xi64>
     view.store %packet64, %range_view[%i, 1] : i64, view<[%count]x2xi64>
@@ -97,13 +99,11 @@ func.def @vision_cohort_observation(%count: index, %columns: index, %width: i32)
     %prepared, %units, %tag = func.call @qwen38_vision_prepare_request(%request) : (buffer) -> (buffer, i64, i64)
     buffer.copy %prepared[%origin], %packed[%offset], %packet_bytes
   }
-  // Snapshot before the in-place update: comparing payload with packed itself
-  // would accept arbitrary directory or pixel corruption through their alias.
+  buffer.copy %ranges[%origin], %packed[%origin], %range_bytes
+  // Preserve an independent snapshot: an aliased comparison would miss damage
+  // to either the canonical directory or a peer's pixels.
   %expected_payload = buffer.alloca<private> align(16) %input_bytes : buffer
   buffer.copy %packed[%origin], %expected_payload[%origin], %input_bytes
-  %directory = buffer.view %expected_payload[%origin] : buffer -> view<4x2xi64>
-  %prefix = scalar.constant 64 : i64
-  %content_bytes = scalar.subi %packet64, %prefix : i64
   %count64 = index.cast %count : index to i64
   %image_rows = scalar.extui %rows32 : i32 to i64
   %features = index.cast %columns : index to i64
@@ -127,10 +127,6 @@ func.def @vision_cohort_observation(%count: index, %columns: index, %width: i32)
   %requests = buffer.view %expected_plan[%request_base] : buffer -> view<[%count]x3xi64>
   scf.for %i = [%c0 to %count step %c1] {
     %ordinal = index.cast %i : index to i64
-    %offset = scalar.muli %ordinal, %packet64 : i64
-    %header = scalar.addi %offset, %prefix : i64
-    view.store %header, %directory[%i, 0] : i64, view<4x2xi64>
-    view.store %content_bytes, %directory[%i, 1] : i64, view<4x2xi64>
     %first = scalar.muli %ordinal, %image_rows : i64
     view.store %first, %requests[%i, 0] : i64, view<[%count]x3xi64>
     view.store %image_rows, %requests[%i, 1] : i64, view<[%count]x3xi64>

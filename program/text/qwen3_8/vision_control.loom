@@ -3,7 +3,7 @@
 // Request preparation accepts the codec-validated native packet and returns
 // one packet plus a compatibility tag encoding the selected width/height.
 // Batch preparation receives ownership of the native packer's upload for 1-4
-// images of that geometry. It fills the reserved directory in place and returns
+// images of that geometry. Its directory is already device-readable; source returns
 // a feature plan with the model-supplied F32 width per image-token row; every
 // 32x32 output pixel block contributes one row. The stage declaration belongs
 // to preparation, and the runner owns device execution and output storage.
@@ -86,8 +86,8 @@ func.def public @qwen38_vision_prepare_request(%request: buffer) -> (buffer, i64
   func.return %packet, %units, %tag : buffer, i64, i64
 }
 
-// The native packer transfers ownership of its exact upload. Fill the reserved
-// directory in place; the original decoded planes need no further cohort copy.
+// Forward the native packed upload with its canonical request directory.
+// Pixel planes and directory need no source-side cohort copy or offset rewrite.
 func.def public @qwen38_vision_prepare_batch(%feature_columns: index, %ranges: buffer, %packed: buffer) -> (i32, buffer, buffer) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
@@ -100,7 +100,10 @@ func.def public @qwen38_vision_prepare_batch(%feature_columns: index, %ranges: b
   %count = index.cast %count64 : i64 to index
   // Compatibility tags select this cohort before the native packer runs.
   // The first prepared packet carries the selected geometry for this cohort.
-  %resize_header_offset = index.constant 64 : offset
+  %first_range = buffer.view %ranges[%origin] : buffer -> view<1x2xi64>
+  %first_offset = view.load %first_range[0, 0] : view<1x2xi64> -> i64
+  %first_bounded = scalar.assume %first_offset [range(%first_offset, 0, 9223372036854775807)] : i64
+  %resize_header_offset = index.cast %first_bounded : i64 to offset
   %resize_header = buffer.view %packed[%resize_header_offset] : buffer -> view<16xi32>
   %height = view.load %resize_header[2] : view<16xi32> -> i32
   %width = view.load %resize_header[3] : view<16xi32> -> i32
@@ -131,16 +134,7 @@ func.def public @qwen38_vision_prepare_batch(%feature_columns: index, %ranges: b
   view.store %count64, %header[2] : i64, view<4xi64>
   view.store %rows64, %header[3] : i64, view<4xi64>
   %requests = buffer.view %plan[%header_bytes] : buffer -> view<[%count]x3xi64>
-  %ranges_view = buffer.view %ranges[%origin] : buffer -> view<[%count]x2xi64>
-  %directory = buffer.view %packed[%origin] : buffer -> view<4x2xi64>
-  %prefix_bytes = scalar.constant 64 : i64
   scf.for %i = [%c0 to %count step %c1] {
-    %packet_offset = view.load %ranges_view[%i, 0] : view<[%count]x2xi64> -> i64
-    %packet_length = view.load %ranges_view[%i, 1] : view<[%count]x2xi64> -> i64
-    %header_offset = scalar.addi %packet_offset, %prefix_bytes : i64
-    %header_length = scalar.subi %packet_length, %prefix_bytes : i64
-    view.store %header_offset, %directory[%i, 0] : i64, view<4x2xi64>
-    view.store %header_length, %directory[%i, 1] : i64, view<4x2xi64>
     %i64 = index.cast %i : index to i64
     %first = scalar.muli %i64, %image_rows : i64
     view.store %first, %requests[%i, 0] : i64, view<[%count]x3xi64>
