@@ -284,7 +284,7 @@ def main():
     scenarios.add_argument(
         "--vision",
         action="store_true",
-        help="check image answers, retained forks, component eviction, and cold replay",
+        help="check image/video answers, retained forks, component eviction, and cold replay",
     )
     args = parser.parse_args()
     if args.assets is None:

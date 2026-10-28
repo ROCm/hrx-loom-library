@@ -1,6 +1,6 @@
 # Qwen3.8 Flash-Next
 
-This composition runs [Qwen3.8 Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) through Loom's text service using the [Unsloth UD-Q4_K_XL checkpoint](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/766911a6b7369840a91dbcd95f9f997acaab6cd6/UD-Q4_K_XL), with optional image input and Q8 MTP. It includes the model programs, shared Qwen service providers, exact acquisition lock, numerical checks, and learned checkpoint/fork regressions. The device programs target AMD RDNA GPUs through libamdf.
+This composition runs [Qwen3.8 Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) through Loom's text service using the [Unsloth UD-Q4_K_XL checkpoint](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/766911a6b7369840a91dbcd95f9f997acaab6cd6/UD-Q4_K_XL), with optional images, timestamped video frames, and Q8 MTP. It includes the model programs, shared Qwen service providers, exact acquisition lock, numerical checks, and learned checkpoint/fork regressions. The device programs target AMD RDNA GPUs through libamdf.
 
 ## Fetch and serve
 
@@ -26,11 +26,11 @@ The target bank occupies approximately 103.68 GiB before request state, compiler
 | `long-context` | `ud-q4-k-xl` | Eight rows and 262,144-position contexts. |
 | `long-context-mtp` | `ud-q4-k-xl-mtp` | The same native-context capacities with three predictor proposals. |
 | `vision` | `ud-q4-k-xl-vision` | Chat capacities with the original BF16 image projector. |
-| `vision-mtp` | `ud-q4-k-xl-vision-mtp` | Image input with three recursive predictor proposals. |
+| `vision-mtp` | `ud-q4-k-xl-vision-mtp` | Images and video frames with three recursive predictor proposals. |
 
 MTP remains part of the text service. The model card selects the predictor parameter scope and JIT configuration; deployment decides devices, process memory, and request admission. Request-time sampling remains a service option. These capacities are configuration contracts, not throughput or peak-memory estimates.
 
-The image presets acquire `mmproj-BF16.gguf` directly into the separate `vision` scope. They accept up to four images interleaved with text through `image_url` content parts. The projector activates on demand and can release its weights while retained conversations keep their image-conditioned state. Text-only presets retain their original stage catalog and do not acquire or compile the projector. The [overview](OVERVIEW.md#image-conditioned-chat) includes a complete request.
+The vision presets acquire `mmproj-BF16.gguf` directly into the separate `vision` scope. They accept `image_url` and `video_frames` parts interleaved with text, up to 768 supplied images/frames within the request and context budgets. Video uses the trained two-frame temporal projection and preserves client timestamps; an odd tail aliases its final frame. The projector activates on demand and can release its weights while retained conversations keep their image-conditioned state. Text-only presets retain their original stage catalog and do not acquire or compile the projector. The [overview](OVERVIEW.md#image-conditioned-chat) includes a complete request.
 
 ## Build representations and regressions
 
@@ -47,6 +47,6 @@ bazel test --config=asan --config=amdgpu \
 
 Each representation also has `_mtp`, `_mtp_continuation`, `_long_context`, and `_long_context_mtp` targets. For example, `:archive_mtp` builds the compiled provider package selected by the `mtp` preset. Bazel builds program artifacts and records the card and asset lock as regression inputs; checkpoint bytes stay outside its graph. Editing programs or shared providers requires no lock update. An immutable publication can additionally seal its built program bytes with `loom-fetch --update-lock --lock-scope=all`; that generated lock stays with the published artifacts.
 
-Image compositions use `_vision` and `_vision_mtp` targets, such as `:archive_vision_mtp`. They add the shared image service and model-specific projector to the same text provider closure. The service checks exercise both representations, including image recall through a retained partial sparse-attention pool and replay after a server restart.
+Image compositions use `_vision` and `_vision_mtp` targets, such as `:archive_vision_mtp`. They add the shared image service and model-specific projector to the same text provider closure. The service checks exercise both representations, including video recall through a retained partial sparse-attention pool and replay after a server restart.
 
 The manual learned service tests accept a provisioned installation through `LOOM_MODEL_ASSETS` or `--assets`. They compare independent original-model responses, simultaneous checkpoint forks, continuation across a page boundary, fresh-history replay, weight deactivation/reactivation, client disconnect recovery, and joined shutdown. The [test guide](test/README.md) distinguishes those checks from the small numerical fixtures. The [program guide](program/README.md) describes preparation, recurrent ownership, sparse attention, and speculative publication.

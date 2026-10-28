@@ -1,4 +1,4 @@
-# Flash-Next text and image programs
+# Flash-Next text and vision programs
 
 The model composes the shared Qwen text service with its own parameter layout,
 48-layer execution, recurrent state, sparse attention, and multi-token
@@ -101,7 +101,7 @@ same vocabulary rows. Each query retains its original block reduction order
 and BF16 logit publication; inactive queries neither read inputs nor publish
 outputs.
 
-## Original image projector
+## Original image and video projector
 
 Image-enabled variants set `flash_next.image_inputs` and add the image service
 exports. Preparation declares ordinary and mixed-input target, proposal, warm,
@@ -116,14 +116,18 @@ separate `vision` scope. `vision_projector.loom` owns the complete resize,
 specialize shared vision motifs with checkpoint dimensions and BF16 precision.
 The dense Qwen model uses those same algorithms with its own F16 policy.
 
-Each image keeps all heads' keys and values resident through attention. Output
-and feed-forward projections reuse 64-row activation panels, and two F32
-residual banks alternate without copying complete layers. One pure workspace
-layout query serves both command allocation and service memory forecasting.
-The image cohort reuses private workspace sequentially and writes disjoint
-feature ranges into the caller's output. The service owns upload completion,
-feature retention, and release; projector weight residency does not own any
-retained conversation's lifetime.
+Each image or temporal pair keeps all heads' keys and values resident through
+its own attention segment. Compatible groups stack rows across linear and
+feed-forward projections to share weights. Two F32 residual banks alternate
+without copying complete layers. Both temporal planes reuse the activation
+bank during preprocessing; an image or odd video tail aliases one plane.
+
+One pure workspace query serves command allocation and service forecasting.
+Additive patch-row and upload-byte admission bounds each cohort; allocations
+follow live extents, and output ranges are disjoint. A retained request owns
+its compact features plus at most one shared output root. The service owns
+upload completion, feature retention, and release; projector weight residency
+does not own any retained conversation's lifetime.
 
 ## Panel reuse within an epoch
 
