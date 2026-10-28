@@ -9,7 +9,7 @@ workload can be planned, executed, and measured through the ordinary Loom tools.
 | Checks | Independent expectation |
 | --- | --- |
 | Embedding and mixed inputs | Exact signed Q8 values, distinct image features, an immutable source packet larger than the compact accepted batch, rejected holes, ordinary recursive proposals, and complete inactive-output comparisons. |
-| Q8 projection and preparation | Scalar F64 decoding from original GGML bytes, including the selected operand-rounding boundary; batch-independent reductions and in-place preparation preserve output and untouched storage. |
+| Q8 projection and preparation | The shared GGML scalar-byte oracle checks model dispatch and in-place preparation; protocol adapters supply capacity and epoch bounds. |
 | GDN and fused convolution | Scalar channel traversal and per-value recurrence; a closed-form Q8 projection fixture varies inputs and codes across K and tests tile boundaries, shared anchors, advancing writers, and speculative capture in narrow and paired-head schedules. |
 | Hyperconnection and residual fusion | Independent normalization and projection, explicit BF16 publication, and complete inactive-buffer comparisons. |
 | Sparse attention | Independent cache addressing, scalar score and attention references, stable selection, long contexts, causal tails, retained forks, and query-cohort visibility. |
@@ -21,6 +21,10 @@ workload can be planned, executed, and measured through the ordinary Loom tools.
 oracles against ordinary and media input carriers. Media metadata differs from
 IDs, so a mistaken contiguous-I32 read cannot pass. Accepted ID capture remains
 a compact plane, and predictor vocabulary learns only the accepted IDs.
+
+Q8 panel shapes, operand arithmetic, storage layouts, and their benchmarks live
+in [`kernel/ggml/linear/test`](../../../../kernel/ggml/linear/test/), independently
+of this model. This package retains fused epilogues and model policy coverage.
 
 `proposal_launch` exercises the real Q8 projection template at its wave and
 two matrix entry shapes. GPU-published conditions alternate between active

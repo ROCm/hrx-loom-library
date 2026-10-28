@@ -591,3 +591,11 @@ values. The generator requires only Python's standard library:
 ```sh
 python3 -B motif/tensor/test/generate_linear_i8_oracle.py --check
 ```
+
+`matrix_publication.loom` checks native wave32 F32 fragments published to BF16
+without running a matrix contraction. Complete, partial, and wholly inactive
+tiles share one scalar row/column oracle. Six geometries cross both tile edges;
+rounding midpoints exercise both publication paths, and prefix/suffix guards
+and the immutable input compare bitwise. Native GPU execution launches nine
+workgroups per case, with at most 33 rows and 37 columns. The benchmark smoke
+uses one iteration per case without warmup.
