@@ -39,5 +39,7 @@ contain NaNs, and complete output and immutable-input comparisons protect tails.
 operand-rounding selection. It is a public test-only source provider so fused
 model tests can reuse the oracle while retaining their own protocol adapters.
 The reference never consumes the prepared storage checked by the matrix path.
-Native, access, and race profiles execute the same cases; the benchmark uses
-those cases without inventing a separate fast path.
+Native GPU execution checks these bounded cases. Each trial launches four
+workgroups over three K32 blocks, with at most 130 live rows and 144 output
+channels across all streams. The benchmark smoke uses one iteration per case
+without warmup; these timings do not establish throughput.
