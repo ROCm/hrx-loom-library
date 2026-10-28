@@ -131,10 +131,16 @@ jobs:
           path: ${{ runner.temp }}/loom-bazel-cache
           key: loom-library-v1-linux-${{ matrix.id }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: loom-library-v1-linux-${{ matrix.id }}-
-      - name: Identify hardware environment
+      - name: Select the assigned native GPU
         id: hardware_environment
         run: |
           echo "directory=$RUNNER_TEMP" >> "$GITHUB_OUTPUT"
+          python -B build_tools/ci/amd_devices.py \
+            --loom-serve="$RUNNER_TEMP/loom-sdk-venv/bin/loom-serve" \
+            --github-env="$GITHUB_ENV" > "$RUNNER_TEMP/gpu-selection.json"
+          cat "$RUNNER_TEMP/gpu-selection.json"
+      - name: Identify hardware environment
+        run: |
           "$RUNNER_TEMP/loom-sdk-venv/bin/loom-serve" --list_devices=amdgpu > "$RUNNER_TEMP/gpu.txt"
           test -s "$RUNNER_TEMP/gpu.txt"
           if [[ "$HARDWARE_RESOURCES" == *xdna* ]]; then
@@ -144,6 +150,7 @@ jobs:
           {
             echo "$HARDWARE_ID"
             uname -srv
+            cat "$RUNNER_TEMP/gpu-selection.json"
             cat "$RUNNER_TEMP/gpu.txt"
             if [[ -f "$RUNNER_TEMP/npu.txt" ]]; then cat "$RUNNER_TEMP/npu.txt"; fi
             for module in amdgpu amdxdna; do
@@ -172,8 +179,16 @@ jobs:
           read -r -a resources <<< "$HARDWARE_RESOURCES"
           python -B build_tools/ci/test_resources.py "$RUNNER_TEMP/tests.xml" \
             --available "${resources[@]}" > "$RUNNER_TEMP/test-tag-filters.txt"
+          device_environment=()
+          for variable in HAL_VISIBLE_AMDGPU_DEVICES HAL_VISIBLE_RDNA_DEVICES \
+                          HAL_VISIBLE_CDNA_DEVICES HAL_VISIBLE_XDNA_DEVICES; do
+            if [[ -v "$variable" ]]; then
+              device_environment+=("--test_env=$variable=${!variable}")
+            fi
+          done
           bazel test --config=amdgpu --build_tests_only \
             "$(cat "$RUNNER_TEMP/test-tag-filters.txt")" \
+            "${device_environment[@]}" \
             --test_env="LOOM_TEST_PLATFORM=$LOOM_TEST_PLATFORM" \
             --profile="$RUNNER_TEMP/library-hardware.profile.gz" //...
       - name: Save action and test results
@@ -189,6 +204,7 @@ jobs:
           name: library-linux-${{ matrix.id }}-attempt-${{ github.run_attempt }}
           path: |
             ${{ steps.hardware_environment.outputs.directory }}/hardware.txt
+            ${{ steps.hardware_environment.outputs.directory }}/gpu-selection.json
             ${{ steps.hardware_environment.outputs.directory }}/gpu.txt
             ${{ steps.hardware_environment.outputs.directory }}/npu.txt
             ${{ steps.hardware_environment.outputs.directory }}/test-tag-filters.txt
