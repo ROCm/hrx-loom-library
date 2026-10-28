@@ -55,10 +55,12 @@ packing or padding. Callers own storage and synchronization; the provider owns
 the correspondence between logical matrix coordinates and physical LDS rows.
 
 `patch.loom` projects packed RGB8 directly into the trained 2×2 patch order.
-It retains two independent temporal weight contractions in F32, sharing one
-resident input panel between them. Checkpoint storage and operand precision
-are independent specialization facts: original dense F16 is read unchanged,
-while original Flash-Next F32 weights round to BF16 inside the resident tile.
+It retains two independent temporal weight contractions in F32. Two plane
+offsets select real successive frames; equal offsets repeat a still image or
+an odd final frame and share one resident input panel. Checkpoint storage and
+operand precision are independent specialization facts: original dense F16 is
+read unchanged, while original Flash-Next F32 weights round to BF16 inside the
+resident tile.
 No image-sized patch matrix or converted checkpoint is materialized.
 
 `precision.loom` provides rounding, result publication, and native F16/BF16

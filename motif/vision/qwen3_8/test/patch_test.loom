@@ -3,7 +3,8 @@
 // temporal-slice, and output-channel ordering. Each temporal matrix uses two
 // taps, including the last reduction element. Minimum, full-tile, and tail
 // shapes share this oracle. The source has a nonzero byte origin; output has
-// sentinels on both sides. All four storage/compute combinations are checked.
+// sentinels on both sides. Repeated and distinct input planes exercise all
+// four storage/compute combinations without requiring a container decoder.
 
 config.def @vision_patch_test.bf16 = false : i1
 
@@ -22,7 +23,7 @@ func.def @patch_round_reference(%value: f32) -> (f32) {
 
 amdgpu.target<gfx11-generic> @vision_patch_test_wave32 {subgroup_size = 32}
 
-template.decl @qwen38.vision.patch_embedding(%image_height: index, %image_width: index, %bf16: i1, %weights_f32: i1, %source_offset: offset, %source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer)
+template.decl @qwen38.vision.patch_embedding(%image_height: index, %image_width: index, %bf16: i1, %weights_f32: i1, %source_offset: offset, %source1_offset: offset, %source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer)
 
 config.decl @vision_test.image_height : index
 
@@ -55,24 +56,26 @@ kernel.def target(@vision_patch_test_wave32) @patch_embedding() {
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%source_offset: offset, %source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer) {
+} launch(%source_offset: offset, %source1_offset: offset, %source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer) {
   %height = config.get @vision_test.image_height : index
   %width = config.get @vision_test.image_width : index
   %bf16 = config.get @vision_patch_test.bf16 : i1
   %weights_f32 = config.get @vision_patch_test.weights_f32 : i1
-  template.apply<@qwen38.vision.patch_embedding>(%height, %width, %bf16, %weights_f32, %source_offset, %source, %weight0, %weight1, %bias, %output) : (index, index, i1, i1, offset, buffer, buffer, buffer, buffer, buffer)
+  template.apply<@qwen38.vision.patch_embedding>(%height, %width, %bf16, %weights_f32, %source_offset, %source1_offset, %source, %weight0, %weight1, %bias, %output) : (index, index, i1, i1, offset, offset, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }
 
-func.def @patch_pixel(%y: index, %x: index, %channel: index) -> (i8) {
+func.def @patch_pixel(%y: index, %x: index, %channel: index, %frame: index) -> (i8) {
   %c3 = index.constant 3 : index
   %c5 = index.constant 5 : index
   %c11 = index.constant 11 : index
+  %phase = index.constant 67 : index
   %c256 = index.constant 256 : index
   %vertical = index.mul %y, %c5 : index
   %spatial = index.madd %x, %c3, %vertical : index
   %colored = index.madd %channel, %c11, %spatial : index
-  %wrapped = index.rem %colored, %c256 : index
+  %temporal = index.madd %frame, %phase, %colored : index
+  %wrapped = index.rem %temporal, %c256 : index
   %byte = index.cast %wrapped : index to i8
   func.return %byte : i8
 }
@@ -134,7 +137,7 @@ func.def inline @patch_store_weight(%weights: buffer, %row: index, %column: inde
   func.return
 }
 
-func.def @patch_sample_reference(%patch_y: index, %patch_x: index, %column: index) -> (f32) {
+func.def @patch_sample_reference(%patch_y: index, %patch_x: index, %column: index, %frame: index) -> (f32) {
   %c16 = index.constant 16 : index
   %c256 = index.constant 256 : index
   %channel = index.div %column, %c256 : index
@@ -143,7 +146,7 @@ func.def @patch_sample_reference(%patch_y: index, %patch_x: index, %column: inde
   %dx = index.rem %element, %c16 : index
   %y = index.madd %patch_y, %c16, %dy : index
   %x = index.madd %patch_x, %c16, %dx : index
-  %byte = func.call @patch_pixel(%y, %x, %channel) : (index, index, index) -> (i8)
+  %byte = func.call @patch_pixel(%y, %x, %channel, %frame) : (index, index, index, index) -> (i8)
   %wide = scalar.extui %byte : i8 to i32
   %sample = scalar.uitofp %wide : i32 to f32
   %range = scalar.constant 255.0 : f32
@@ -156,7 +159,7 @@ func.def @patch_sample_reference(%patch_y: index, %patch_x: index, %column: inde
   func.return %rounded : f32
 }
 
-func.def @patch_fixture(%source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %expected: buffer) {
+func.def @patch_fixture(%second_frame: index, %source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %expected: buffer) {
   %origin = index.constant 0 : offset
   %source_origin = index.constant 37 : offset
   %c0 = index.constant 0 : index
@@ -170,6 +173,9 @@ func.def @patch_fixture(%source: buffer, %weight0: buffer, %weight1: buffer, %bi
   %c767 = index.constant 767 : index
   %channels = index.constant 1152 : index
   %source_view = buffer.view %source[%source_origin] : buffer -> view<[%source_elements]xi8>
+  %source_bytes = index.cast %source_elements : index to offset
+  %source1_origin = index.add %source_origin, %source_bytes : offset
+  %source1_view = buffer.view %source[%source1_origin] : buffer -> view<[%source_elements]xi8>
   %bias_view = buffer.view %bias[%origin] : buffer -> view<1152xf32>
   %expected_view = buffer.view %expected[%origin] : buffer -> view<[%rows]x1152xf32>
   scf.for %element = [%c0 to %source_elements step %c1] {
@@ -177,8 +183,10 @@ func.def @patch_fixture(%source: buffer, %weight0: buffer, %weight1: buffer, %bi
     %channel = index.rem %element, %c3 : index
     %y = index.div %pixel, %width : index
     %x = index.rem %pixel, %width : index
-    %byte = func.call @patch_pixel(%y, %x, %channel) : (index, index, index) -> (i8)
+    %byte = func.call @patch_pixel(%y, %x, %channel, %c0) : (index, index, index, index) -> (i8)
+    %byte1 = func.call @patch_pixel(%y, %x, %channel, %c1) : (index, index, index, index) -> (i8)
     view.store %byte, %source_view[%element] : i8, view<[%source_elements]xi8>
+    view.store %byte1, %source1_view[%element] : i8, view<[%source_elements]xi8>
   }
   scf.for %channel = [%c0 to %channels step %c1] {
     %column0, %first0, %last0 = func.call @patch_coefficients(%channel, %c0) : (index, index) -> (index, f32, f32)
@@ -207,13 +215,14 @@ func.def @patch_fixture(%source: buffer, %weight0: buffer, %weight1: buffer, %bi
         %block = index.madd %block_y, %blocks_per_row, %block_x : index
         %within = index.madd %within_y, %c2, %within_x : index
         %row = index.madd %block, %c4, %within : index
-        %sample0 = func.call @patch_sample_reference(%y, %x, %column0) : (index, index, index) -> (f32)
-        %sample1 = func.call @patch_sample_reference(%y, %x, %column1) : (index, index, index) -> (f32)
-        %sample_last = func.call @patch_sample_reference(%y, %x, %c767) : (index, index, index) -> (f32)
+        %sample0 = func.call @patch_sample_reference(%y, %x, %column0, %c0) : (index, index, index, index) -> (f32)
+        %sample1 = func.call @patch_sample_reference(%y, %x, %column1, %second_frame) : (index, index, index, index) -> (f32)
+        %sample_last = func.call @patch_sample_reference(%y, %x, %c767, %c0) : (index, index, index, index) -> (f32)
+        %sample_last1 = func.call @patch_sample_reference(%y, %x, %c767, %second_frame) : (index, index, index, index) -> (f32)
         %product00 = scalar.mulf %sample0, %rounded_first0 : f32
         %product01 = scalar.mulf %sample_last, %rounded_last0 : f32
         %product10 = scalar.mulf %sample1, %rounded_first1 : f32
-        %product11 = scalar.mulf %sample_last, %rounded_last1 : f32
+        %product11 = scalar.mulf %sample_last1, %rounded_last1 : f32
         %temporal0 = scalar.addf %product00, %product01 : f32
         %temporal1 = scalar.addf %product10, %product11 : f32
         %combined = scalar.addf %temporal0, %temporal1 : f32
@@ -226,9 +235,13 @@ func.def @patch_fixture(%source: buffer, %weight0: buffer, %weight1: buffer, %bi
 }
 
 // All representation combinations specialize the same public motif.
-command.program.def @patch_complete() launch(%source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer) {
+command.program.def @patch_complete(%second_frame: index) launch(%source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer) {
   %source_offset = index.constant 37 : offset
-  kernel.launch @patch_embedding(%source_offset, %source, %weight0, %weight1, %bias, %output) : (offset, buffer, buffer, buffer, buffer, buffer)
+  %patch_height, %patch_width, %rows, %source_elements = func.call pure @patch_shape() : () -> (index, index, index, index)
+  %source_bytes = index.cast %source_elements : index to offset
+  %plane_offset = index.scale %second_frame, %source_bytes : index, offset -> offset
+  %source1_offset = index.add %source_offset, %plane_offset : offset
+  kernel.launch @patch_embedding(%source_offset, %source1_offset, %source, %weight0, %weight1, %bias, %output) : (offset, offset, buffer, buffer, buffer, buffer, buffer)
   command.return
 }
 
@@ -236,25 +249,26 @@ func.def @patch_expected(%source: buffer, %weight0: buffer, %weight1: buffer, %b
   func.return
 }
 
-check.scenario public @vision_patch_spatial_temporal {
+check.scenario public @vision_patch_spatial_temporal configure[2](%second_frame: index, %configuration_entropy: check.entropy) {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   check.trial[1](%trial: index, %entropy: check.entropy) {
     %patch_height, %patch_width, %rows, %source_elements = check.generate<@patch_shape>() : () -> (index, index, index, index)
-    %source = check.generate.fill value(-91) : tensor<55360xi8>
+    %source = check.generate.fill value(-91) : tensor<110656xi8>
     %weight0 = check.generate.fill value(0) : tensor<3538944xi8>
     %weight1 = check.generate.fill value(0) : tensor<3538944xi8>
     %bias = check.generate.fill value(0.0) : tensor<1152xf32>
-    %expected = check.generate.fill value(0.0) : tensor<[%rows]x1152xf32>
-    check.generate<@patch_fixture>(%source, %weight0, %weight1, %bias, %expected) : (tensor<55360xi8>, tensor<3538944xi8>, tensor<3538944xi8>, tensor<1152xf32>, tensor<[%rows]x1152xf32>) -> ()
+    %expected_storage = check.generate.fill value(99.0) : tensor<82976xf32>
+    %expected = check.tensor.view %expected_storage offset(64) : tensor<82976xf32> -> tensor<[%rows]x1152xf32>
+    check.generate<@patch_fixture>(%second_frame, %source, %weight0, %weight1, %bias, %expected) : (index, tensor<110656xi8>, tensor<3538944xi8>, tensor<3538944xi8>, tensor<1152xf32>, tensor<[%rows]x1152xf32>) -> ()
     %storage = check.generate.fill value(99.0) : tensor<82976xf32>
     %output = check.tensor.view %storage offset(64) : tensor<82976xf32> -> tensor<[%rows]x1152xf32>
     %prefix = check.tensor.view %storage offset(0) : tensor<82976xf32> -> tensor<16xf32>
     %suffix = check.tensor.view %storage offset(331840) : tensor<82976xf32> -> tensor<16xf32>
-    check.compare<@patch_complete, @patch_expected>(%source, %weight0, %weight1, %bias, %output) : (tensor<55360xi8>, tensor<3538944xi8>, tensor<3538944xi8>, tensor<1152xf32>, tensor<[%rows]x1152xf32>) -> () {
-      check.expect.approximate actual(%output) expected(%expected) atol(3.0000000000000001e-06) rtol(1.0000000000000001e-05) nan(different) : tensor<[%rows]x1152xf32>, tensor<[%rows]x1152xf32>
+    check.compare<@patch_complete, @patch_expected>[%second_frame](%source, %weight0, %weight1, %bias, %output) : [index](tensor<110656xi8>, tensor<3538944xi8>, tensor<3538944xi8>, tensor<1152xf32>, tensor<[%rows]x1152xf32>) -> () {
+      check.expect.approximate actual(%storage) expected(%expected_storage) atol(3.0000000000000001e-06) rtol(1.0000000000000001e-05) nan(different) : tensor<82976xf32>, tensor<82976xf32>
       check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<16xf32>
       check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<16xf32>
-      check.expect.bitwise actual(%source) expected(%source) : tensor<55360xi8>
+      check.expect.bitwise actual(%source) expected(%source) : tensor<110656xi8>
       check.expect.bitwise actual(%weight0) expected(%weight0) : tensor<3538944xi8>
       check.expect.bitwise actual(%weight1) expected(%weight1) : tensor<3538944xi8>
       check.expect.bitwise actual(%bias) expected(%bias) : tensor<1152xf32>

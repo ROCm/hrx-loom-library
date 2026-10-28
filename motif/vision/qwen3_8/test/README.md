@@ -8,7 +8,7 @@ New precision, target, and shape coverage belongs here once for all consumers.
 
 | Target | Independent reference and coverage |
 | --- | --- |
-| `patch` | Coordinate-coded RGB8, signed sparse temporal convolutions, last-K taps, and a nonzero source origin. F16/BF16 compute crosses half/F32 weight storage at 4, 64, and 72 patches. |
+| `patch` | Coordinate-coded RGB8 with repeated or distinct frames, signed sparse temporal convolutions, last-K taps, and a nonzero source origin. F16/BF16 compute crosses half/F32 weight storage at 4, 64, and 72 patches. |
 | `normalization` | Analytical spatial planes and population moments cover interpolation, merge order, affine normalization, and zero variance. Minimum, square, landscape, and portrait geometries share one fixture. |
 | `key_value` | Signed sparse products and scalar 2D rotary check every head, concurrent cohort banks, and transposed values at 4, 32, and 36 patches in both half formats. |
 | `attention` | Scalar rotary/dots and complete-row softmax check nonuniform attention. A separate sparse projection oracle isolates output errors. Both formats cover 4, 64, and 72 patches. |
@@ -16,11 +16,12 @@ New precision, target, and shape coverage belongs here once for all consumers.
 | `merger` | Two signed projections and scalar GELU check 1, 64, and 70 merged rows. Both half formats run at both 2560 and 5120 feature columns. |
 | `workspace` | Literal byte counts cover allocation padding, output-backed residual thresholds, both feature widths, maximum geometry, and all resident attention cohort counts. No represented payload is allocated. |
 
-Numerical tests run native and access-instrumented AMD profiles. Minimum, full,
-and partial tiles cover distinct specialization paths. Fixtures retain nonzero
-output origins and allocation guards; access instrumentation checks the active
-view boundaries for every shape. Independent half conversion and GELU helpers
-in `reference.loom` are private test roots, never production dependencies.
+Numerical suites run the native AMD profile; frame fixtures need no video
+container or decoder. Minimum, full, and partial tiles cover distinct
+specialization paths. Fixtures retain nonzero output origins and allocation
+guards. Access instrumentation is available through an explicit manual runner
+invocation and is outside the CI suite. Independent half conversion and GELU
+helpers in `reference.loom` are private test roots, never production dependencies.
 Precision-specific tolerances remain next to their assertions.
 
 ```sh
