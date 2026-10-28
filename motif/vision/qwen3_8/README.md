@@ -24,8 +24,11 @@ program, streaming K/V panels without a global score matrix. Each workgroup
 owns sixteen queries and four heads, with F32 maxima, sums, and accumulation.
 Padded resident rows distribute LDS accesses across banks; query storage
 changes representation only after the preceding reads complete. The caller
-selects a logical cohort and its K/V byte origin independently, permitting
-sequential bank reuse or concurrent heads. A separate shared output projection
+selects a logical head cohort, its K/V byte origin, and the first row in
+stacked residual/statistics/context storage independently. Each segment keeps
+its own rotary coordinates and softmax, while linear operators can consume
+all completed context rows together. This permits sequential bank reuse,
+concurrent heads, and independent frame pairs. A separate shared output projection
 reuses each matrix panel across 64 rows and adds the F32 residual. Original
 F16 and BF16 checkpoints share both algorithms through explicit precision.
 
@@ -81,8 +84,8 @@ and accumulates in F32. Precision is a specialization input, so one schedule
 serves both representations without checkpoint conversion or runtime type
 branches. The source documents exact layouts, rounding boundaries, and launch
 requirements. The [dense model leaf](../../../model/Qwen/Qwen3.8-27B/program/kernel/vision_ffn.loom)
-provides the F16 wave32 launch. Its [independent checks](../../../model/Qwen/Qwen3.8-27B/test/vision_ffn.loom)
-exercise that actual leaf and a test-only BF16 interpretation of the same motif.
+provides the F16 wave32 launch. The [shared independent checks](test/ffn.loom)
+exercise both original F16 and BF16 matrix interpretations.
 
 Shared normalization supplies eight statistics bytes per patch. Up projection
 normalizes while staging and publishes only the 4304-wide half-precision GELU

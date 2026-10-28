@@ -5,7 +5,8 @@
 // terms and weights are dyadic, making the real projection exactly known.
 // The reference uses logical head/channel coordinates, never fragment or LDS
 // layouts. Both half formats run all cohorts concurrently into separate banks.
-// Both outputs have guards, and inputs must remain unchanged. Keys admit one
+// A runtime first-row argument skips a sentinel input row. Both outputs have
+// guards, and inputs must remain unchanged. Keys admit one
 // half ULP plus 1e-7 for native arithmetic
 // and trigonometric approximation. F16 values agree exactly. Native BF16 WMMA
 // can shift the F32 result by one ULP even when the only nonzero product is
@@ -19,19 +20,21 @@ config.decl @vision_test.image_height : index
 
 config.decl @vision_test.image_width : index
 
-func.def pure inline @key_value_shape() -> (index, index, index) {
+func.def pure inline @key_value_shape() -> (index, index, index, index) {
   %height = config.get @vision_test.image_height : index
   %width = config.get @vision_test.image_width : index
   %patch = index.constant 16 : index
   %patch_height = index.div %height, %patch : index
   %patch_width = index.div %width, %patch : index
   %rows = index.mul %patch_height, %patch_width : index
-  func.return %patch_height, %patch_width, %rows : index, index, index
+  %c1 = index.constant 1 : index
+  %storage_rows = index.add %rows, %c1 : index
+  func.return %patch_height, %patch_width, %rows, %storage_rows : index, index, index, index
 }
 
 amdgpu.target<gfx11-generic> @key_value_test_wave32 {subgroup_size = 32}
 
-template.decl @qwen38.vision.key_value(%patch_height: index, %patch_width: index, %bf16: i1, %cohort: index, %output_offset: offset, %residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer)
+template.decl @qwen38.vision.key_value(%patch_height: index, %patch_width: index, %bf16: i1, %first_row: index, %cohort: index, %output_offset: offset, %residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer)
 
 kernel.def target(@key_value_test_wave32) @key_value() {
   %c1 = index.constant 1 : index
@@ -48,14 +51,14 @@ kernel.def target(@key_value_test_wave32) @key_value() {
   %cohorts = index.constant 4 : index
   %threads = index.constant 384 : index
   kernel.launch.config workgroups(%row_tiles, %projections, %cohorts) workgroup_size(%threads, %c1, %c1) : index
-} launch(%bf16: i1, %residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer) {
-  %patch_height, %patch_width, %rows = func.call pure @key_value_shape() : () -> (index, index, index)
+} launch(%bf16: i1, %first_row: index, %residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer) {
+  %patch_height, %patch_width, %rows, %storage_rows = func.call pure @key_value_shape() : () -> (index, index, index, index)
   %cohort = kernel.workgroup.id<z> : index
   %row_bytes = index.constant 576 : index
   %bank_bytes = index.mul %rows, %row_bytes : index
   %byte_index = index.mul %cohort, %bank_bytes : index
   %offset = index.cast %byte_index : index to offset
-  template.apply<@qwen38.vision.key_value>(%patch_height, %patch_width, %bf16, %cohort, %offset, %residual, %statistics, %scale, %shift, %weight, %bias, %key, %value) : (index, index, i1, index, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  template.apply<@qwen38.vision.key_value>(%patch_height, %patch_width, %bf16, %first_row, %cohort, %offset, %residual, %statistics, %scale, %shift, %weight, %bias, %key, %value) : (index, index, i1, index, index, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }
 
@@ -133,13 +136,15 @@ func.def @key_value_fixture(%bf16: i1, %residual: buffer, %statistics: buffer, %
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
-  %patch_height, %patch_width, %rows = func.call pure @key_value_shape() : () -> (index, index, index)
+  %patch_height, %patch_width, %rows, %storage_rows = func.call pure @key_value_shape() : () -> (index, index, index, index)
   %width = index.constant 1152 : index
   %last = index.constant 1151 : index
   %channels = index.constant 3456 : index
   %unit_value = scalar.constant 1.0 : f32
-  %residual_view = buffer.view %residual[%origin] : buffer -> view<[%rows]x1152xf32>
-  %statistics_view = buffer.view %statistics[%origin] : buffer -> view<[%rows]x2xf32>
+  %residual_origin = index.constant 4608 : offset
+  %statistics_origin = index.constant 8 : offset
+  %residual_view = buffer.view %residual[%residual_origin] : buffer -> view<[%rows]x1152xf32>
+  %statistics_view = buffer.view %statistics[%statistics_origin] : buffer -> view<[%rows]x2xf32>
   %scale_view = buffer.view %scale[%origin] : buffer -> view<1152xf32>
   %shift_view = buffer.view %shift[%origin] : buffer -> view<1152xf32>
   %weight_view = buffer.view %weight[%origin] : buffer -> view<3456x1152xi16>
@@ -198,7 +203,7 @@ func.def @key_value_reference(%bf16: i1, %key: buffer, %value: buffer) {
   %c4 = index.constant 4 : index
   %axis_pairs = index.constant 18 : index
   %pairs = index.constant 36 : index
-  %patch_height, %patch_width, %rows = func.call pure @key_value_shape() : () -> (index, index, index)
+  %patch_height, %patch_width, %rows, %storage_rows = func.call pure @key_value_shape() : () -> (index, index, index, index)
   %head_width = index.constant 72 : index
   %heads = index.constant 16 : index
   %width = index.constant 1152 : index
@@ -270,7 +275,8 @@ func.def @key_value_reference(%bf16: i1, %key: buffer, %value: buffer) {
 }
 
 command.program.def @key_value_complete(%bf16: i1) launch(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer) {
-  kernel.launch @key_value(%bf16, %residual, %statistics, %scale, %shift, %weight, %bias, %key, %value) : (i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  %first_row = index.constant 1 : index
+  kernel.launch @key_value(%bf16, %first_row, %residual, %statistics, %scale, %shift, %weight, %bias, %key, %value) : (i1, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   command.return
 }
 
@@ -284,14 +290,14 @@ check.scenario public @vision_key_value_f16 {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   %bf16 = check.literal value(false) : i1
   check.trial[1](%trial: index, %entropy: check.entropy) {
-    %patch_height, %patch_width, %rows = check.generate<@key_value_shape>() : () -> (index, index, index)
-    %residual = check.generate.fill value(0.0) : tensor<[%rows]x1152xf32>
-    %statistics = check.generate.fill value(0.0) : tensor<[%rows]x2xf32>
+    %patch_height, %patch_width, %rows, %storage_rows = check.generate<@key_value_shape>() : () -> (index, index, index, index)
+    %residual = check.generate.fill value(99.0) : tensor<[%storage_rows]x1152xf32>
+    %statistics = check.generate.fill value(99.0) : tensor<[%storage_rows]x2xf32>
     %scale = check.generate.fill value(0.0) : tensor<1152xf32>
     %shift = check.generate.fill value(0.0) : tensor<1152xf32>
     %weight = check.generate.fill value(0.0) : tensor<3456x1152xf16>
     %bias = check.generate.fill value(0.0) : tensor<3456xf32>
-    check.generate<@key_value_fixture>(%bf16, %residual, %statistics, %scale, %shift, %weight, %bias) : (i1, tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xf16>, tensor<3456xf32>) -> ()
+    check.generate<@key_value_fixture>(%bf16, %residual, %statistics, %scale, %shift, %weight, %bias) : (i1, tensor<[%storage_rows]x1152xf32>, tensor<[%storage_rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xf16>, tensor<3456xf32>) -> ()
     %key_storage = check.generate.fill value(99.0) : tensor<41536xf16>
     %value_storage = check.generate.fill value(99.0) : tensor<41536xf16>
     %key = check.tensor.view %key_storage offset(64) : tensor<41536xf16> -> tensor<4x[%rows]x288xf16>
@@ -300,15 +306,15 @@ check.scenario public @vision_key_value_f16 {
     %key_suffix = check.tensor.view %key_storage offset(83008) : tensor<41536xf16> -> tensor<32xf16>
     %value_prefix = check.tensor.view %value_storage offset(0) : tensor<41536xf16> -> tensor<32xf16>
     %value_suffix = check.tensor.view %value_storage offset(83008) : tensor<41536xf16> -> tensor<32xf16>
-    check.compare<@key_value_complete, @key_value_f16_reference>[%bf16](%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value) : [i1](tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xf16>, tensor<3456xf32>, tensor<4x[%rows]x288xf16>, tensor<4x288x[%rows]xf16>) -> () {
+    check.compare<@key_value_complete, @key_value_f16_reference>[%bf16](%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value) : [i1](tensor<[%storage_rows]x1152xf32>, tensor<[%storage_rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xf16>, tensor<3456xf32>, tensor<4x[%rows]x288xf16>, tensor<4x288x[%rows]xf16>) -> () {
       check.expect.approximate actual(%key) expected(%key) atol(9.9999999999999995e-08) rtol(0.001) nan(different) : tensor<4x[%rows]x288xf16>, tensor<4x[%rows]x288xf16>
       check.expect.approximate actual(%value) expected(%value) atol(0.0) rtol(0.0) nan(different) : tensor<4x288x[%rows]xf16>, tensor<4x288x[%rows]xf16>
       check.expect.bitwise actual(%key_prefix) expected(%key_prefix) : tensor<32xf16>
       check.expect.bitwise actual(%key_suffix) expected(%key_suffix) : tensor<32xf16>
       check.expect.bitwise actual(%value_prefix) expected(%value_prefix) : tensor<32xf16>
       check.expect.bitwise actual(%value_suffix) expected(%value_suffix) : tensor<32xf16>
-      check.expect.bitwise actual(%residual) expected(%residual) : tensor<[%rows]x1152xf32>
-      check.expect.bitwise actual(%statistics) expected(%statistics) : tensor<[%rows]x2xf32>
+      check.expect.bitwise actual(%residual) expected(%residual) : tensor<[%storage_rows]x1152xf32>
+      check.expect.bitwise actual(%statistics) expected(%statistics) : tensor<[%storage_rows]x2xf32>
       check.expect.bitwise actual(%scale) expected(%scale) : tensor<1152xf32>
       check.expect.bitwise actual(%shift) expected(%shift) : tensor<1152xf32>
       check.expect.bitwise actual(%weight) expected(%weight) : tensor<3456x1152xf16>
@@ -330,14 +336,14 @@ check.scenario public @vision_key_value_bf16 {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   %bf16 = check.literal value(true) : i1
   check.trial[1](%trial: index, %entropy: check.entropy) {
-    %patch_height, %patch_width, %rows = check.generate<@key_value_shape>() : () -> (index, index, index)
-    %residual = check.generate.fill value(0.0) : tensor<[%rows]x1152xf32>
-    %statistics = check.generate.fill value(0.0) : tensor<[%rows]x2xf32>
+    %patch_height, %patch_width, %rows, %storage_rows = check.generate<@key_value_shape>() : () -> (index, index, index, index)
+    %residual = check.generate.fill value(99.0) : tensor<[%storage_rows]x1152xf32>
+    %statistics = check.generate.fill value(99.0) : tensor<[%storage_rows]x2xf32>
     %scale = check.generate.fill value(0.0) : tensor<1152xf32>
     %shift = check.generate.fill value(0.0) : tensor<1152xf32>
     %weight = check.generate.fill value(0.0) : tensor<3456x1152xbf16>
     %bias = check.generate.fill value(0.0) : tensor<3456xf32>
-    check.generate<@key_value_fixture>(%bf16, %residual, %statistics, %scale, %shift, %weight, %bias) : (i1, tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xbf16>, tensor<3456xf32>) -> ()
+    check.generate<@key_value_fixture>(%bf16, %residual, %statistics, %scale, %shift, %weight, %bias) : (i1, tensor<[%storage_rows]x1152xf32>, tensor<[%storage_rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xbf16>, tensor<3456xf32>) -> ()
     %key_storage = check.generate.fill value(99.0) : tensor<41536xbf16>
     %value_storage = check.generate.fill value(99.0) : tensor<41536xbf16>
     %key = check.tensor.view %key_storage offset(64) : tensor<41536xbf16> -> tensor<4x[%rows]x288xbf16>
@@ -346,15 +352,15 @@ check.scenario public @vision_key_value_bf16 {
     %key_suffix = check.tensor.view %key_storage offset(83008) : tensor<41536xbf16> -> tensor<32xbf16>
     %value_prefix = check.tensor.view %value_storage offset(0) : tensor<41536xbf16> -> tensor<32xbf16>
     %value_suffix = check.tensor.view %value_storage offset(83008) : tensor<41536xbf16> -> tensor<32xbf16>
-    check.compare<@key_value_complete, @key_value_bf16_reference>[%bf16](%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value) : [i1](tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xbf16>, tensor<3456xf32>, tensor<4x[%rows]x288xbf16>, tensor<4x288x[%rows]xbf16>) -> () {
+    check.compare<@key_value_complete, @key_value_bf16_reference>[%bf16](%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value) : [i1](tensor<[%storage_rows]x1152xf32>, tensor<[%storage_rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xbf16>, tensor<3456xf32>, tensor<4x[%rows]x288xbf16>, tensor<4x288x[%rows]xbf16>) -> () {
       check.expect.approximate actual(%key) expected(%key) atol(9.9999999999999995e-08) rtol(0.0080000000000000002) nan(different) : tensor<4x[%rows]x288xbf16>, tensor<4x[%rows]x288xbf16>
       check.expect.approximate actual(%value) expected(%value) atol(9.9999999999999995e-08) rtol(0.0080000000000000002) nan(different) : tensor<4x288x[%rows]xbf16>, tensor<4x288x[%rows]xbf16>
       check.expect.bitwise actual(%key_prefix) expected(%key_prefix) : tensor<32xbf16>
       check.expect.bitwise actual(%key_suffix) expected(%key_suffix) : tensor<32xbf16>
       check.expect.bitwise actual(%value_prefix) expected(%value_prefix) : tensor<32xbf16>
       check.expect.bitwise actual(%value_suffix) expected(%value_suffix) : tensor<32xbf16>
-      check.expect.bitwise actual(%residual) expected(%residual) : tensor<[%rows]x1152xf32>
-      check.expect.bitwise actual(%statistics) expected(%statistics) : tensor<[%rows]x2xf32>
+      check.expect.bitwise actual(%residual) expected(%residual) : tensor<[%storage_rows]x1152xf32>
+      check.expect.bitwise actual(%statistics) expected(%statistics) : tensor<[%storage_rows]x2xf32>
       check.expect.bitwise actual(%scale) expected(%scale) : tensor<1152xf32>
       check.expect.bitwise actual(%shift) expected(%shift) : tensor<1152xf32>
       check.expect.bitwise actual(%weight) expected(%weight) : tensor<3456x1152xbf16>

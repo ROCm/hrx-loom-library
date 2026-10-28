@@ -4,7 +4,9 @@
 // width are even values in 2..256, in the trained 2x2 merge-block order; rows
 // is their product. Cohort 0..3 selects the corresponding QKV weight rows.
 // Input residual is F32 [rows,1152], statistics are F32 [rows,2] (mean and
-// inverse standard deviation), and affine scale/bias are F32 [1152]. Original
+// inverse standard deviation), starting at first_row in their stacked storage.
+// Rotary coordinates remain local to the segment. Affine scale/bias are F32
+// [1152]. Original
 // half weights are [3456,1152], with F32 [3456] bias. The compile-known bf16
 // fact selects F16/BF16 interpretation; normalization, accumulation, bias,
 // and rotary arithmetic remain F32 before rounding to the original half type.
@@ -85,9 +87,9 @@ func.def inline @qwen38_vision_rotate_fragment(%patch_width: index, %row_origin:
   func.return %rotated_left, %rotated_right : vector<8xf32>, vector<8xf32>
 }
 
-template.decl @qwen38.vision.key_value(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %cohort: index, %output_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer)
+template.decl @qwen38.vision.key_value(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %first_row: index, %cohort: index, %output_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer)
 
-template.def<@qwen38.vision.key_value> device @qwen38_vision_key_value_body(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %cohort: index, %output_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer) {
+template.def<@qwen38.vision.key_value> device @qwen38_vision_key_value_body(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %first_row: index, %cohort: index, %output_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -187,8 +189,14 @@ template.def<@qwen38.vision.key_value> device @qwen38_vision_key_value_body(%pat
   %pair_base2 = scf.select %full_output_group, %c16, %c32 : index
 
   %residual_noalias, %statistics_noalias, %layernorm_weight_noalias, %layernorm_bias_noalias, %qkv_weight_noalias, %qkv_bias_noalias, %key_noalias, %value_noalias = buffer.assume.noalias %residual, %statistics, %layernorm_weight, %layernorm_bias, %qkv_weight, %qkv_bias, %key, %value : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer
-  %residual_view = buffer.view %residual_noalias[%origin] : buffer -> view<[%rows]x1152xf32>
-  %statistics_view = buffer.view %statistics_noalias[%origin] : buffer -> view<[%rows]x2xf32>
+  // Select one frame pair's rows inside the stacked linear-operator storage.
+  // Rotary still uses local row coordinates; K/V publication has its own bank.
+  %residual_stride = index.constant 4608 : offset
+  %statistics_stride = index.constant 8 : offset
+  %residual_offset = index.scale %first_row, %residual_stride : index, offset -> offset
+  %statistics_offset = index.scale %first_row, %statistics_stride : index, offset -> offset
+  %residual_view = buffer.view %residual_noalias[%residual_offset] : buffer -> view<[%rows]x1152xf32>
+  %statistics_view = buffer.view %statistics_noalias[%statistics_offset] : buffer -> view<[%rows]x2xf32>
   %layernorm_weight_view = buffer.view %layernorm_weight_noalias[%origin] : buffer -> view<1152xf32>
   %layernorm_bias_view = buffer.view %layernorm_bias_noalias[%origin] : buffer -> view<1152xf32>
   %qkv_weight_view = buffer.view %qkv_weight_noalias[%origin] : buffer -> view<3456x1152xi16>
