@@ -11,6 +11,10 @@ config.decl @qwen38.vision.image_height : %value: index where [range(%value, 32,
 
 config.decl @qwen38.vision.image_width : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
 
+config.decl @qwen38.vision.group_count : %value: index where [range(%value, 1, 16384)]
+
+func.decl pure @qwen38_vision_rows() -> (index)
+
 template.decl @qwen38.vision.attention(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %first_row: index, %cohort: index, %cohort_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer)
 
 template.decl @qwen38.vision.attention_output(%rows_value: index, %bf16: i1, %context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer)
@@ -27,7 +31,8 @@ kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_attention_cohort(%cohort:
   %rows = index.mul %patch_height, %patch_width : index
   %padded_rows = index.add %rows, %c15 : index
   %query_tiles = index.div %padded_rows, %c16 : index
-  kernel.launch.config workgroups(%query_tiles, %c1, %c1) workgroup_size(%c128, %c1, %c1) : index
+  %groups = config.get @qwen38.vision.group_count : index
+  kernel.launch.config workgroups(%query_tiles, %c1, %groups) workgroup_size(%c128, %c1, %c1) : index
 } launch(%cohort: index, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer) where [range(%cohort, 0, 3)] {
   %image_height = config.get @qwen38.vision.image_height : index
   %image_width = config.get @qwen38.vision.image_width : index
@@ -35,22 +40,20 @@ kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_attention_cohort(%cohort:
   %height = index.div %image_height, %patch : index
   %width = index.div %image_width, %patch : index
   %bf16 = scalar.constant false : i1
-  %cohort_offset = index.constant 0 : offset
-  %first_row = index.constant 0 : index
+  %group = kernel.workgroup.id<z> : index
+  %rows = index.mul %height, %width : index
+  %first_row = index.mul %group, %rows : index
+  %cohort_stride = index.constant 576 : offset
+  %cohort_offset = index.scale %first_row, %cohort_stride : index, offset -> offset
   template.apply<@qwen38.vision.attention>(%height, %width, %bf16, %first_row, %cohort, %cohort_offset, %residual, %statistics, %layernorm_weight, %layernorm_bias, %qkv_weight, %qkv_bias, %key, %value, %output) : (index, index, i1, index, index, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }
 
 kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_attention_output() {
   %c1 = index.constant 1 : index
-  %c16 = index.constant 16 : index
   %c63 = index.constant 63 : index
   %c64 = index.constant 64 : index
-  %image_height = config.get @qwen38.vision.image_height : index
-  %image_width = config.get @qwen38.vision.image_width : index
-  %patch_height = index.div %image_height, %c16 : index
-  %patch_width = index.div %image_width, %c16 : index
-  %rows0 = index.mul %patch_height, %patch_width : index
+  %rows0 = func.call pure @qwen38_vision_rows() : () -> (index)
   %rows = index.assume %rows0 [range(%rows0, 4, 65536), multiple_of(%rows0, 4)] : index
   %rounded_rows = index.add %rows, %c63 : index
   %row_tiles = index.div %rounded_rows, %c64 : index
@@ -58,13 +61,8 @@ kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_attention_output() {
   %c256 = index.constant 256 : index
   kernel.launch.config workgroups(%row_tiles, %c9, %c1) workgroup_size(%c256, %c1, %c1) : index
 } launch(%context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) {
-  %image_height = config.get @qwen38.vision.image_height : index
-  %image_width = config.get @qwen38.vision.image_width : index
-  %patch = index.constant 16 : index
-  %height = index.div %image_height, %patch : index
-  %width = index.div %image_width, %patch : index
+  %rows = func.call pure @qwen38_vision_rows() : () -> (index)
   %bf16 = scalar.constant false : i1
-  %rows = index.mul %height, %width : index
   template.apply<@qwen38.vision.attention_output>(%rows, %bf16, %context, %weight, %bias, %residual, %output) : (index, i1, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }
