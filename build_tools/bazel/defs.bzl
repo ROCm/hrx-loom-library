@@ -114,6 +114,9 @@ def _declare_benchmark_admission(name, tags):
 def _validate_execution_profiles(name, execution_profiles):
     if not execution_profiles:
         fail("%s requires at least one execution profile" % name)
+    for profile in execution_profiles:
+        if any([argument.startswith("--sanitizer=") for argument in profile.runner_args]):
+            fail("%s: select sanitizers with the build configuration, not additional execution profiles" % name)
 
 def _validate_kernel_qualification(name, targets):
     if not targets:
@@ -275,6 +278,7 @@ def loom_test(
         variants = variants,
         deps = deps,
         execution_profiles = execution_profiles,
+        benchmark_smoke = False,
         size = size,
         tags = tags,
         visibility = visibility,

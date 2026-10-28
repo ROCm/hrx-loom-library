@@ -597,5 +597,5 @@ without running a matrix contraction. Complete, partial, and wholly inactive
 tiles share one scalar row/column oracle. Six geometries cross both tile edges;
 rounding midpoints exercise both publication paths, and prefix/suffix guards
 and the immutable input compare bitwise. Native GPU execution launches nine
-workgroups per case, with at most 33 rows and 37 columns. The benchmark smoke
-uses one iteration per case without warmup.
+workgroups per case, with at most 33 rows and 37 columns. Its benchmark is
+selected separately through the repository benchmark workflow.

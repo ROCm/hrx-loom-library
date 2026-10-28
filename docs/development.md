@@ -120,6 +120,20 @@ owns the underlying toolchain and linker behavior.
 The [CI maintenance guide](ci.md) describes SDK pins, runner coverage, and
 cache ownership.
 
+Each test has one declaration for its execution environment. Scenarios own
+compile-visible configurations and runtime trials. Select `--config=asan`,
+`--config=tsan`, or `--config=ubsan` to instrument the same test's JIT products;
+these modes also instrument native tools when building from HRX source. An
+installed SDK retains its own native instrumentation. Additional sanitizer
+execution profiles are rejected by the library rules.
+
+Large regressions live in `_stress.loom` sources with `manual` and `stress`
+tags. Select their labels explicitly to run them with or without a sanitizer.
+The `stress` tag allows a scheduled runner to discover this set; Bazel's
+wildcard expansion excludes manual targets even with `--test_tag_filters=stress`.
+Correctness runs execute scenarios once. Their benchmark declarations remain
+available through the separate benchmark workflow below.
+
 ## Check a kernel and inspect its cost
 
 Build a quantization kernel together with its motif dependencies and test module:
