@@ -102,8 +102,11 @@ preserves aspect ratio with 32-pixel processing alignment and a default budget
 of 1,024 image tokens. A request can select 128 through 16,384 tokens per image;
 all media and text tokens share the text context capacity.
 
-The chat endpoint accepts `image_url` and `video_frames` content parts. A video
-part contains a `frames` array of image data URLs and timestamps in seconds.
+The chat endpoint accepts `image_url` and `video_url` content parts. Video uses
+[vLLM-compatible JPEG sequences](https://docs.vllm.ai/en/latest/features/multimodal_inputs/#video-inputs):
+`video_url.url` contains `data:video/jpeg;base64,<JPEG>,<JPEG>,...`, and request-wide
+`media_io_kwargs.video` supplies `fps`, `frames_indices`, and `num_frames: -1`.
+Frame times are index divided by FPS. Frame selection stays on the client.
 It needs at least two frames with equal display dimensions and finite,
 nonnegative, nondecreasing times. The trained temporal projection combines
 successive pairs and emits their mean timestamps; an odd tail aliases its last

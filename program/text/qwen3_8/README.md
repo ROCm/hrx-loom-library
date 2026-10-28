@@ -105,7 +105,9 @@ and token counts. Each video pair emits its mean timestamp to one decimal place
 with nearest-even rounding, followed by its video feature tokens. An odd tail
 aliases its final frame instead of duplicating pixels. Requests may contain up
 to 768 images/frames within the existing compressed-byte and context budgets.
-Explicit frame sampling is preserved; container decoding is not a dependency.
+The HTTP boundary accepts vLLM-compatible `video_url` JPEG sequences and
+`media_io_kwargs.video` timing. Explicit frame sampling is preserved; container
+decoding is not a dependency.
 
 `media.loom` fills eight-word mixed-input records and tracks compressed spatial
 positions. Each projection's extent comes from the prepared source geometry

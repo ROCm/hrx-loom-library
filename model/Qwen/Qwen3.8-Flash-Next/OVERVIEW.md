@@ -91,31 +91,36 @@ through 16384. Image tokens, chat text, and generated output share the selected
 text context capacity. These vision presets start with the same
 16,384-position context as `chat`.
 
-Timestamped frames use the same endpoint and installed projector. For example,
-replace the image part above with a clip assembled from local PNGs:
+Timestamped frames use the same endpoint and installed projector, following
+[vLLM's pre-extracted JPEG sequence convention](https://docs.vllm.ai/en/latest/features/multimodal_inputs/#video-inputs).
+For example, replace the image part above with frames sampled from a video:
 
 ```python
 frames = [
-    {
-        "timestamp": seconds,
-        "url": "data:image/png;base64,"
-        + base64.b64encode(Path(path).read_bytes()).decode("ascii"),
-    }
-    for seconds, path in [
-        (0.0, "frame0.png"), (0.75, "frame1.png"), (2.0, "frame2.png")
-    ]
+    base64.b64encode(Path(path).read_bytes()).decode("ascii")
+    for path in ["frame0.jpg", "frame1.jpg", "frame2.jpg"]
 ]
 body["messages"][0]["content"] = [
-    {"type": "video_frames", "video_frames": {"frames": frames}},
+    {"type": "video_url", "video_url": {
+        "url": "data:video/jpeg;base64," + ",".join(frames)
+    }},
     {"type": "text", "text": "Describe how the scene changes over time."},
 ]
+body["media_io_kwargs"] = {"video": {
+    "fps": 100,
+    "frames_indices": [0, 75, 200],
+    "num_frames": -1,
+    "do_sample_frames": False,
+}}
 ```
 
-Timestamps are finite, nonnegative seconds in nondecreasing order. A clip has
-at least two frames with identical display dimensions; repeated times and odd
-frame counts are supported. Sampling stays under the client's control. Frame
-images use the ordinary codecs, so building and testing this path needs no
-MP4/WebM decoder.
+Each supplied JPEG's timestamp is its frame index divided by `fps`: 0, 0.75,
+and 2 seconds here. Timing metadata applies to all videos in the request.
+A clip has at least two frames with identical display dimensions; repeated
+times and odd frame counts are supported. Sampling stays under the client's
+control. `num_frames: -1` consumes all supplied frames within the model limits;
+omitting it limits a clip to 32 frames. The server accepts this JPEG-sequence
+subset, with no MP4/WebM decoder or remote video fetching.
 
 The processor pairs successive frames using its original temporal weights and
 places each pair at its mean timestamp. An odd final frame supplies both

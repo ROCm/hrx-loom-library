@@ -641,33 +641,37 @@ class RequestCheckTest(unittest.TestCase):
         value = self.success(self.execute(request))
         self.assertEqual([span[0] for span in value["media_spans"]], [0, 1, 2, 3, 4])
 
-    def video(self, timestamps, width=64, height=32):
+    def video(self, count, width=64, height=32):
+        # Small real JPEG inputs exercise the public video/jpeg transport;
+        # numerical pixel and geometry coverage belongs to the shared motifs.
+        image = Path(__file__).with_name(f"video_{width}x{height}.jpg").read_bytes()
+        frame = base64.b64encode(image).decode("ascii")
         return {
-            "type": "video_frames",
-            "video_frames": {
-                "frames": [
-                    {
-                        "timestamp": timestamp,
-                        "url": self.image((index % 256, 17, 29), width, height)[
-                            "image_url"
-                        ]["url"],
-                    }
-                    for index, timestamp in enumerate(timestamps)
-                ]
-            },
+            "type": "video_url",
+            "video_url": {"url": "data:video/jpeg;base64," + ",".join([frame] * count)},
+        }
+
+    def video_options(self, timestamps):
+        return {
+            "video": {
+                "fps": 100,
+                "frames_indices": [round(timestamp * 100) for timestamp in timestamps],
+                "num_frames": -1,
+            }
         }
 
     def test_video_pairs_timestamps_and_odd_tail_among_images(self):
         parts = [
             {"type": "text", "text": "  Compare "},
             self.image((255, 0, 0), 32, 32),
-            self.video([0.0, 0.75, 2.1, 3.9, 8.2]),
+            self.video(5),
             {"type": "text", "text": " then "},
             self.image((0, 0, 255), 32, 32),
             {"type": "text", "text": " please.  "},
         ]
         value = self.success(self.execute(self.request(
-            messages=[{"role": "user", "content": parts}]
+            messages=[{"role": "user", "content": parts}],
+            media_io_kwargs=self.video_options([0.0, 0.75, 2.1, 3.9, 8.2]),
         )))
         pair = "<|vision_start|>" + "<|video_pad|>" * 2 + "<|vision_end|>"
         video = "".join(
@@ -685,8 +689,8 @@ class RequestCheckTest(unittest.TestCase):
         # One tiny clip covers both tie directions and more than four groups.
         times = [0.25, 0.25, 0.75, 0.75, 4.0, 5.0, 7.0, 8.0, 9.25]
         value = self.success(self.execute(self.request(messages=[{
-            "role": "user", "content": [self.video(times, 1, 1)]
-        }])))
+            "role": "user", "content": [self.video(len(times), 1, 1)]
+        }], media_io_kwargs=self.video_options(times))))
         pair = "<|vision_start|><|video_pad|><|vision_end|>"
         expected = ("0.2", "0.8", "4.5", "7.5", "9.2")
         self.assertIn(
@@ -696,13 +700,13 @@ class RequestCheckTest(unittest.TestCase):
         self.assertEqual([span[2] for span in value["media_spans"]], [1] * 5)
 
     def test_video_requires_a_pair_and_uniform_display_geometry(self):
-        short = self.video([0.0])
-        mismatched = self.video([0.0, 1.0])
-        mismatched["video_frames"]["frames"][1]["url"] = self.image(
-            (1, 2, 3), 32, 32
-        )["image_url"]["url"]
+        short = self.video(1)
+        mismatched = self.video(1)
+        mismatched["video_url"]["url"] += "," + self.video(1, 32, 32)[
+            "video_url"
+        ]["url"].split(",", 1)[1]
         for video in (short, mismatched):
-            with self.subTest(frame_count=len(video["video_frames"]["frames"])):
+            with self.subTest(video=video):
                 result = self.execute(self.request(
                     messages=[{"role": "user", "content": [video]}]
                 ))

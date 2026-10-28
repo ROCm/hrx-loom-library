@@ -6,9 +6,10 @@
 
 """Image/video answers, retained partial pools, and parameter lifetimes.
 
-Solid-color PNGs provide independent task expectations without checkpoint-sized
-fixtures. Numerical encoder and speculative-state tests establish the lower
-boundaries; these requests exercise their complete public-service composition.
+Solid-color PNG/JPEG inputs provide independent task expectations without
+checkpoint-sized fixtures. Numerical encoder and speculative-state tests
+establish the lower boundaries; these requests exercise their complete
+public-service composition.
 """
 
 import base64
@@ -17,8 +18,9 @@ import re
 import struct
 import uuid
 import zlib
+from pathlib import Path
 
-from loom_serve_testing.chat import request
+from loom_serve_testing.chat import request_body
 from loom_serve_testing.http_harness import control, wait_status
 
 
@@ -64,11 +66,10 @@ def video_history():
     # Distinct temporal planes, irregular pair times (0.4/3.0/8.2 s), an odd
     # final frame, and a separate still image exercise the full ordered input.
     frames = [
-        (0.0, (255, 0, 0)),
-        (0.75, (192, 0, 0)),
-        (2.1, (0, 0, 255)),
-        (3.9, (0, 0, 192)),
-        (8.2, (0, 255, 0)),
+        base64.b64encode(
+            Path(__file__).with_name(f"video_{name}.jpg").read_bytes()
+        ).decode("ascii")
+        for name in ("red", "dark_red", "blue", "dark_blue", "green")
     ]
     content = [
         {"type": "text", "text": "A still image: "},
@@ -78,13 +79,8 @@ def video_history():
         },
         {"type": "text", "text": "A video clip: "},
         {
-            "type": "video_frames",
-            "video_frames": {
-                "frames": [
-                    {"timestamp": timestamp, "url": image_url(320, 256, color)}
-                    for timestamp, color in frames
-                ]
-            },
+            "type": "video_url",
+            "video_url": {"url": "data:video/jpeg;base64," + ",".join(frames)},
         },
         {"type": "text", "text": VIDEO_SEQUENCE_QUESTION},
     ]
@@ -103,9 +99,34 @@ def cached(answer):
 
 
 def chat(address, model, session, messages, checkpoint=None):
-    result = request(
-        address, session, messages, 24, model=model, checkpoint=checkpoint
-    )
+    body = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "temperature": 0,
+        "enable_thinking": False,
+        "max_tokens": 24,
+    }
+    # Every video in this lifecycle is the same five-frame color sequence.
+    if any(
+        part.get("type") == "video_url"
+        for message in messages
+        if isinstance(message["content"], list)
+        for part in message["content"]
+    ):
+        body["media_io_kwargs"] = {
+            "video": {
+                "fps": 100,
+                "frames_indices": [0, 75, 210, 390, 820],
+                "num_frames": -1,
+                "do_sample_frames": False,
+            }
+        }
+    headers = {"X-Loom-Session": session}
+    if checkpoint is not None:
+        headers["X-Loom-Checkpoint"] = checkpoint
+    result = request_body(address, body, headers)
     print(json.dumps({"case": session, **result}), flush=True)
     assert result["finish_reason"] == "stop", result
     assert not result["reasoning_content"] and not result["tool_calls"], result
