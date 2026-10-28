@@ -72,7 +72,13 @@ class RequestCheckTest(unittest.TestCase):
         self.tokenizer.write_text(json.dumps(tokenizer), encoding="utf-8", newline="\n")
 
     def execute(
-        self, request, response=None, capacity=4096, chunk_size=0, defaults=None
+        self,
+        request,
+        response=None,
+        capacity=4096,
+        chunk_size=0,
+        defaults=None,
+        truncated=False,
     ):
         request_path = self.directory / "request.json"
         request_path.write_text(
@@ -90,6 +96,7 @@ class RequestCheckTest(unittest.TestCase):
             f"--request={request_path}",
             f"--capacity={capacity}",
             f"--response_chunk_size={chunk_size}",
+            f"--response_truncated={'true' if truncated else 'false'}",
             f"--options={defaults_json}",
         ]
         if response is not None:
@@ -689,6 +696,88 @@ class RequestCheckTest(unittest.TestCase):
         self.assertEqual(json.loads(function["arguments"]), {"path": "a.txt"})
         self.assertTrue(value["reusable"])
 
+    def test_token_limit_omits_only_the_unfinished_tool_and_disables_reuse(self):
+        call = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"
+        prefix = "Check λ.\n</think>\n\nReady.\n\n"
+        for stream, chunk_size in ((False, 0), (True, 1), (True, 7)):
+            for complete_prefix in ("", call + "\n"):
+                for tail in (
+                    "<tool_call>",
+                    "<tool_call><function=read><parameter=path>unfinished",
+                    call[:-1],
+                ):
+                    with self.subTest(stream=stream, prefix=complete_prefix, tail=tail):
+                        request = self.request(
+                            stream=stream, enable_thinking=True, tools=TOOLS
+                        )
+                        value = self.success(
+                            self.execute(
+                                request,
+                                prefix + complete_prefix + tail,
+                                chunk_size=chunk_size,
+                                truncated=True,
+                            )
+                        )
+                        self.assertEqual(value["reasoning_content"], "Check λ.\n")
+                        self.assertEqual(value["content"], "Ready.\n\n")
+                        self.assertEqual(
+                            len(value["tool_calls"]), bool(complete_prefix)
+                        )
+                        if complete_prefix:
+                            function = value["tool_calls"][0]["function"]
+                            self.assertEqual(function["name"], "read")
+                            self.assertEqual(
+                                json.loads(function["arguments"]), {"path": "a.txt"}
+                            )
+                        self.assertFalse(value["reusable"])
+                        self.assertEqual(
+                            value["checkpoint"],
+                            value["prompt"]
+                            + "Check λ.\n</think>\n\nReady."
+                            + ("\n\n" + call if complete_prefix else "")
+                            + "<|im_end|>\n",
+                        )
+                        following = self.request(
+                            enable_thinking=True,
+                            tools=TOOLS,
+                            messages=[
+                                *request["messages"],
+                                {
+                                    "role": "assistant",
+                                    "content": value["content"],
+                                    "reasoning_content": value["reasoning_content"],
+                                    "tool_calls": [
+                                        {
+                                            key: entry
+                                            for key, entry in tool.items()
+                                            if key != "index"
+                                        }
+                                        for tool in value["tool_calls"]
+                                    ],
+                                },
+                                {"role": "user", "content": "Continue."},
+                            ],
+                        )
+                        replay = self.success(self.execute(following))
+                        self.assertTrue(
+                            replay["prompt"].startswith(value["checkpoint"])
+                        )
+
+    def test_token_limit_does_not_turn_malformed_tools_into_success(self):
+        for truncated in (False, True):
+            result = self.execute(
+                self.request(tools=TOOLS),
+                "Ready.\n\n<tool_call><funX",
+                truncated=truncated,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("generated tool call expected", result.stderr)
+            self.assertEqual(result.stdout, "")
+        result = self.execute(self.request(tools=TOOLS), "<tool_call><function=read")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unterminated generated tool name", result.stderr)
+        self.assertEqual(result.stdout, "")
+
     def test_tool_catalog_matches_native_admission(self):
         tools = [
             {
@@ -930,7 +1019,7 @@ class RequestCheckTest(unittest.TestCase):
 
     def test_capacity_and_model_identity_rejections_are_atomic(self):
         for request, capacity, diagnostic in (
-            (self.request(), 1, "complete input exceeds token capacity"),
+            (self.request(), 1, "input exceeds the available context size"),
             (self.request(model="another-model"), 4096, "select model"),
         ):
             with self.subTest(capacity=capacity, request=request):

@@ -55,8 +55,10 @@ A card's parameter keys name scopes used by the programs. Multiple checkpoint
 files can populate the same scope in order. Tokenizers and voice recordings
 have explicit roles; they are not inferred from arbitrary filenames. Origins
 name reusable acquisition locations, and each file can specify a different
-remote name and local destination. When remixing a package, update program
-origins to your fork while retaining the intended upstream checkpoint origins.
+remote name and local destination. Shared programs use card-relative origins,
+such as `../../../program/text/qwen3_8/chat.loom`, so a checkout, fork, or
+published snapshot supplies the entire implementation. Checkpoint origins
+retain their independent upstream identities.
 
 Program sets describe linker inputs and libraries. Source and bytecode
 sets can implement the same service; bytecode still supports linking and
@@ -145,9 +147,10 @@ compiler closure. Explicit `files`/`data` mappings remain available for
 compositions whose cards are maintained by hand.
 
 Generated paths are relative to the repository root. A nested checked-in card
-uses a program-set `"origin": "@library/"` to acquire those paths from its
-declared publication root. Fetch places `model.json` at the installation root
-and preserves the selected repository-relative tree beneath it. The authored
+uses a program-set `"origin": "../../../"` to acquire those paths from its
+own checkout or published snapshot, without pinning another library revision.
+Fetch places `model.json` at the installation root and preserves the selected
+repository-relative tree beneath it. The authored
 `directory` follows that layout, such as `model/Qwen/Qwen3.8-27B/program`.
 Runtime paths remain relative to the installed card; serving does not discover
 a Git root. A bytecode publication must provide its generated modules at the
@@ -175,9 +178,9 @@ while `loom-fetch` owns acquisition verification.
 
 Checked-in locks use version 2 with `"scope": "assets"`. Editing a program or
 adding a provider needs no checksum update or `--no-lock`: Git versions the
-source, and Bazel tracks its declared inputs. This also applies to programs
-fetched through `@library`. Cards with that origin can select this checkout
-with `--origin=library=/path/to/your/fork` while retaining asset verification.
+source, and Bazel tracks its declared inputs. Shared providers follow the same
+checkout or publication as the model card, without per-model library pins or
+origin overrides.
 The repository authoring check rejects complete locks alongside model cards.
 
 Fetch copies programs and auxiliary files by default while sharing asset

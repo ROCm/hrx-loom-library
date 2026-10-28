@@ -22,6 +22,17 @@ def main():
         if not separator or not local or published in cards:
             parser.error("--card requires a unique PUBLISHED_PATH=LOCAL_JSON")
         cards[published] = ModelCard.parse(Path(local).read_text(encoding="utf-8"))
+        for choice in cards[published].choices():
+            for file in cards[published].select(**choice).files.values():
+                if "program" in file.roles and (
+                    not isinstance(file.origin, str)
+                    or file.origin.startswith("@")
+                    or "://" in file.origin
+                ):
+                    raise AssertionError(
+                        f"{published}: program {file.path} must use a card-relative "
+                        "source from the same library snapshot"
+                    )
     actual = ModelCatalog.parse(args.catalog.read_text(encoding="utf-8"))
     expected = generate(cards)
     if actual.document != expected.document:
