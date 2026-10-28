@@ -7,14 +7,14 @@ amdgpu.target<gfx11-generic> @resize_test_wave32 {subgroup_size = 32}
 
 // Each group owns 32 columns and sixteen destination rows. Eight horizontal
 // source rows are staged at a time; no image-sized intermediate is allocated.
-template.decl @qwen38.vision.resize(%image: index, %plane: index, %input: buffer, %output: buffer)
+template.decl @qwen38.vision.resize(%image: index, %plane: index, %output_offset: offset, %input: buffer, %output: buffer)
 
 kernel.def target(@resize_test_wave32) @resize_test(%groups_x: index, %groups_y: index) {
   %c1 = index.constant 1 : index
   %threads = index.constant 256 : index
   kernel.launch.config workgroups(%groups_x, %groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%image: index, %plane: index, %input: buffer, %output: buffer) where [range(%image, 0, 3), range(%plane, 0, 1)] {
-  template.apply<@qwen38.vision.resize>(%image, %plane, %input, %output) : (index, index, buffer, buffer)
+} launch(%image: index, %plane: index, %output_offset: offset, %input: buffer, %output: buffer) where [range(%image, 0, 3), range(%plane, 0, 1)] {
+  template.apply<@qwen38.vision.resize>(%image, %plane, %output_offset, %input, %output) : (index, index, offset, buffer, buffer)
   kernel.return
 }
 
@@ -258,19 +258,26 @@ func.def @resize_packet_fixture(%trial_value: index, %packet: buffer, %expected:
 // The fixture supplies analytical expected pixels in a separate observation.
 // Its oracle realization leaves those values unchanged; target output starts
 // with a sentinel and must be overwritten by the production device filter.
-func.def @resize_expected(%image: index, %plane: index, %packet: buffer, %output: buffer) {
+func.def @resize_expected(%image: index, %plane: index, %output_offset: offset, %packet: buffer, %output: buffer) {
   func.return
+}
+
+func.def @resize_output_offset() -> (offset) {
+  %offset = index.constant 16 : offset
+  func.return %offset : offset
 }
 
 check.scenario public @oriented_packets_filter_on_device {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   check.trial[64](%trial: index, %entropy: check.entropy) {
     %packet = check.generate.fill value(-1) : tensor<98304xi8>
-    %expected = check.generate.fill value(-1) : tensor<6144xi8>
+    %expected_storage = check.generate.fill value(-1) : tensor<6176xi8>
+    %expected = check.tensor.view %expected_storage offset(16) : tensor<6176xi8> -> tensor<6144xi8>
     %image, %plane, %groups_x, %groups_y = check.generate<@resize_packet_fixture>(%trial, %packet, %expected) : (index, tensor<98304xi8>, tensor<6144xi8>) -> (index, index, index, index)
-    %output = check.generate.fill value(-1) : tensor<6144xi8>
-    check.compare<@resize_test, @resize_expected>[%groups_x, %groups_y](%image, %plane, %packet, %output) : [index, index](index, index, tensor<98304xi8>, tensor<6144xi8>) -> () {
-      check.expect.bitwise actual(%output) expected(%expected) : tensor<6144xi8>
+    %output = check.generate.fill value(-1) : tensor<6176xi8>
+    %output_offset = check.generate<@resize_output_offset>() : () -> (offset)
+    check.compare<@resize_test, @resize_expected>[%groups_x, %groups_y](%image, %plane, %output_offset, %packet, %output) : [index, index](index, index, offset, tensor<98304xi8>, tensor<6176xi8>) -> () {
+      check.expect.bitwise actual(%output) expected(%expected_storage) : tensor<6176xi8>
       check.expect.bitwise actual(%packet) expected(%packet) : tensor<98304xi8>
     }
   }
