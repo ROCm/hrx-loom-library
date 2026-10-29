@@ -418,7 +418,11 @@ void qwen3_embedding_cohort([[loom::launch]] Bytes projection0_arg, Bytes projec
         auto group_relative = loom::index::scale(loom::index::cast(group), loomt::offset{295936});
         auto group_base = layer_base + group_relative;
         fill_weights(projection0, weight_ingress0.short_group, projection1, weight_ingress1.short_group, projection2, weight_ingress2.short_group, projection3, weight_ingress3.short_group, projection4, weight_ingress4.short_group, projection5, weight_ingress5.short_group, projection6, weight_ingress6.short_group, projection7, weight_ingress7.short_group, group_base, loomt::index{16});
-        wait_for_phase(phase_complete);
+        // The FIFO release protects refills with the same geometry.
+        // Join compute before switching to the overlapping 24-record view.
+        if (group == 5) {
+          wait_for_phase(phase_complete);
+        }
       }
       auto down_base = layer_base + loomt::offset{1775616};
       fill_weights(projection0, weight_ingress0.down_group, projection1, weight_ingress1.down_group, projection2, weight_ingress2.down_group, projection3, weight_ingress3.down_group, projection4, weight_ingress4.down_group, projection5, weight_ingress5.down_group, projection6, weight_ingress6.down_group, projection7, weight_ingress7.down_group, down_base, loomt::index{24});
