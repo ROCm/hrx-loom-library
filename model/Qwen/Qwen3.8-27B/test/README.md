@@ -1,73 +1,19 @@
-# Qwen numerical and input checks
+# Qwen model checks
 
-Small fixtures exercise the production model providers without acquiring
-checkpoints. Each public case or scenario has a benchmark declaration. The
-same workload can therefore be checked, planned, and measured with ordinary
-Loom tools. Correctness runs and benchmark measurements are separate commands.
+Small synthetic workloads check model-specific composition, retained state,
+speculative publication, and preparation without checkpoint acquisition.
+Shared [projection](../../../../kernel/ggml/linear/test/),
+[vision](../../../../motif/vision/qwen3_8/test/), and
+[service-policy](../../../../program/text/qwen3_8/test/) packages own their
+reusable numerical and protocol contracts. Model tests add only the boundaries
+those packages cannot establish independently.
 
-| Checks | Contract and reference |
-| --- | --- |
-| Quantized projections | Independent byte/scalar decoding, exact prepared-layout equivalence, F16 operand rounding, output guards, cohort capacities, signed data, tails, and ordered split reductions. |
-| Attention | Independent cache/page fixtures, rotary coordinates, dense and pooled spans, causal history, partition merges, and alternate matrix targets. |
-| Gated DeltaNet | Serial four-tap convolution and recurrence, retained forks, span ownership, speculative capture, and accepted-state publication. |
-| Selection and inputs | Token/feature gather, lower-ID ties, per-owner sampling streams and permissions, selected-row padding, and MTP carry. Tied-logit sampling uses an analytic maximum-uniform reference rather than the production sampler. |
-| DFlash2 | Context attention, proposal packing, candidate selection, and grouped convolution with independently specified buffers and expected state. |
-
-Vision numerical cases and benchmarks live in the shared
-[vision package](../../../../motif/vision/qwen3_8/test/README.md). It owns
-precision, geometry, numerical references, and device profiles independently
-of model composition and checkpoint acquisition.
-
-The full-width Q5 staging comparison uses weights on a `2^-10` lattice and
-inputs in `{-1, 0, 1}`. Its `2^-12` absolute budget is one quarter of the
-smallest nonzero mathematical result difference; native matrix instructions
-may differ in low bits across reduction orders. A separate packed-byte
-construction checks both schedules against the independent result `2.5`.
-Zero-workload output guards remain bitwise checks.
-
-The ordinary `q6_metadata` target checks code/scale staging, F32/F16 inputs,
-fused residuals, token tails, and inactive outputs. Full-width FFN and attention
-performance workloads live in the manual `q6_metadata_stress` target. They
-remain part of benchmark discovery and can be measured explicitly:
-
-```sh
-python dev.py benchmark \
-  --target=//model/Qwen/Qwen3.8-27B/test:q6_metadata_stress \
-  --config=amdgpu --device=amdgpu://0 \
-  --output-dir=.reports/benchmark/q6-metadata
-```
-
-The selected SDK or source configuration supplies the tools. Performance runs
-use the Release SDK or canonical optimized source configuration and an idle,
-qualified measurement device, as described in the
-[benchmark workflow](../../../../docs/development.md#sweep-repository-benchmarks).
-
-The full-vocabulary `output_projection_stress` target retains the eight-row,
-32-row, and live-prefix comparisons. Its generated weight fixture occupies
-about 1 GiB. Both stress targets use `_stress.loom` sources and carry `manual`
-and `stress` tags, so ordinary CI excludes them. Explicit runs may select the
-same sanitizer configurations as the smaller tests.
-
-Test-only reference kernels remain root-owned. Checks of private convolution
-or coefficient helpers include the unchanged implementation source as a test
-root, preserving the production export boundary. Shared Philox, GGML carrier,
-text-policy, geometry, acceptance, proposal, and continuation contracts remain
-with their shared library owners.
-
-The native AMD profile exercises device behavior; the selected build
-configuration enables access or race instrumentation on that same target. The
-portable normalization, feature capture, and preparation checks also retain
-Vulkan profiles. Target requirements select the appropriate RDNA/CDNA cases;
-a run on one architecture does not qualify another architecture's entries.
-
-## Image input
-
-Packet preparation, cohort plans, admission forecasts, and GPU filtering are
-qualified in the shared [text-program package](../../../../program/text/qwen3_8/test/README.md).
-Encoder numerical tests belong to the shared vision package linked above.
-These packages own independent references, type and shape variants, execution
-profiles, and benchmarks. Model tests retain complete service composition and
-learned outputs.
+Test overviews explain reference independence and numerical acceptance;
+scenarios and BUILD declarations own workload and target coverage. Large
+vocabulary and full-width performance workloads remain explicit stress tests,
+with device allocations approaching a GiB. The
+[development guide](../../../../docs/development.md#build-and-check) owns their
+selection, instrumentation, and benchmark workflow.
 
 ## Learned service checks
 

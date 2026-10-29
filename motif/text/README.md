@@ -25,12 +25,7 @@ Each source has a separate `loom_motif_library`; `utf8` declares its dependency
 on `unicode`. Model-specific sentence splitting and normalization remain in
 the model that owns those policies.
 
-The independent CPython oracle and explicit UTF-8 byte/trim checks run through
-the public Loom runner:
-
-```sh
-bazel test --config=asan //motif/text/...
-```
-
-The [test documentation](test/README.md) describes coverage and regeneration;
-[LICENSE.unicode](LICENSE.unicode) covers the Unicode-derived oracle data.
+The [test package](test/) owns independent CPython observations and UTF-8 byte
+checks; [LICENSE.unicode](LICENSE.unicode) covers Unicode-derived oracle data.
+[Component authoring](../../docs/component-authoring.md) describes the common
+build and test workflow.

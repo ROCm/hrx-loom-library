@@ -14,8 +14,8 @@ the same arithmetic across layers; layer-specific parameter keys and offsets
 belong to the command programs.
 
 Each file has an independently declared relocatable bytecode target. The
-portable card can consume these products, the text sources, or text host
-programs with bytecode device providers. The weight policy is auxiliary input
+portable card selects source or bytecode providers for runtime linking and
+specialization. The weight policy is auxiliary input
 to preparation and returns zero staging bytes, preserving the original tensors.
 
 The numerical port derives from the IREE Moonshine implementation under

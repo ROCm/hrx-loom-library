@@ -70,6 +70,15 @@ provide workload coverage. Related ABIs can share a source file and helpers.
 The target list above chooses compiled artifact checks for this package;
 execution profiles choose where its test module runs.
 
+## Document the owning contract
+
+A directory README explains its purpose, composition boundaries, and rules
+unique to that package, with a short link to the shared workflow. Each test's
+leading comment explains the behavior and independent oracle, including any
+non-obvious numerical or storage contract. A blank line separates that overview
+from the first operation. Scenarios carry the individual shapes and cases;
+comments beside reference helpers and assertions carry detailed error budgets.
+
 ## Connect consumers through dependencies
 
 A model program depends on the kernel provider, such as

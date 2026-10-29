@@ -1,73 +1,18 @@
 # Qwen text-program checks
 
-The native request test links the admitted chat and geometry providers with a
-separate test identity and invokes HRX's production text caller through a
-versioned model card. The bytecode is a declared build output beside the card
-in the test's runfiles. A small BPE
-vocabulary makes every emitted token independently inspectable. Cases cover
-ordinary and thinking history, tool calls and results, request sampling,
-stream fragments, mixed images and video, temporal pairs, timestamp rounding,
-odd tails, resize budgets, and rejection before partial output. No checkpoint or network access is needed.
+These checks exercise shared chat, media, storage, and epoch policy without
+checkpoint acquisition. The native request integration uses the real text
+caller and a small tokenizer whose emitted tokens are independently inspectable.
+VM cases check packet contents, ownership transitions, and exact upload ranges;
+the pixel path joins CPU preparation to device filtering.
 
-VM cases check exact output-span boundaries, integer-grid resize coordinates,
-complete ordinary token planes, live upload descriptors, ordinary versus
-verified continuation progress, and image frontiers across every epoch split.
-Mixed-image checks also run the real continuation algorithm and compare its
-entire compacted active plane, including splits with overlapping source and
-destination records.
-Ownership-event checks compare every resident row, including untouched KV
-origins. The epoch fixture retains sentinel padding so
-writes beyond the submitted prefix are visible. The benchmark declarations
-exercise the same cases through the normal runner; they are correctness smokes
-rather than performance baselines.
+Storage and admission tests create small descriptor tables, including byte
+extents beyond 32 bits, without allocating the represented model storage.
+Complete-buffer comparisons preserve unsubmitted capacity, unrelated resident
+rows, and the original media packet across compaction. Independent expectations
+and any substituted native dependency are documented in each test source.
 
-The storage cases run each model's actual allocation evaluator and resize
-callback. Growth preserves resident payload addresses and request policies.
-Seven packet capacities check exact allocation sizes, alignment, and initial
-zeroing extents, including both sides of 2 GiB and the maximum supported token
-capacity. Only the small descriptor tables are created; represented model
-storage is never materialized. These cases and their VM benchmarks need no
-weights or device.
-
-Image and video resize geometry use authored scenarios with runtime inputs.
-Their 14 image and 10 video trials retain explicit checkpoint expectations for
-alignment, ties, budgets, aspect limits, and odd frame counts. Each family shares
-one compiled subject and benchmark; its expected dimensions are independent
-data, not a second implementation of the production resize arithmetic.
-
-`storage_records_test.loom` checks the shared record writers directly against literal
-I64 tables. Guarded, nonzero-origin subviews cover first/interior/last records,
-all four view roles, partial and full zeroing extents, empty attention views,
-64-bit byte quantities, reordered stores, and replacement of an existing record.
-Separate VM case benchmarks exercise the same writers and exact comparisons.
-The largest allocation is 296 bytes; no represented payload is materialized.
-
-`vision_pixels_test.loom` checks the actual shared axis planner against independent
-bicubic coefficients, clipped support, negative lobes, and identity, reduced,
-magnified, and degenerate axes. Nonintegral sampling covers independently rounded
-opposite edges. The source root exposes its private helper to this test without
-making it part of the public linking contract.
-
-`vision_control_test.loom` checks one/four/sixteen-group cohorts, one/two-plane
-geometry, both feature widths, stage arguments, and exact output plans. An
-independent upload snapshot checks preservation of the canonical directory
-and every source byte. Descriptor-only forecasts cover nonzero padded offsets,
-mixed geometries, private workspace reuse, retained peers, and quantities above
-32 bits without allocating the represented storage. Only the native stage
-registration sink is substituted; the shared preparation and forecasting code
-runs on the VM.
-
-`vision_resize_test.loom` joins the CPU packet producer with the public GPU
-filter template. Sixty-four small trials check complete RGB8 output and input
-preservation across all eight orientations, distinct/repeated planes, RGB/RGBA
-input, identity filtering, and extreme scale changes. Two additional cases
-exercise the maximum video output axis in each orientation. Analytical
-coordinate colors expose reflection and transposition errors; constant colors
-isolate filtering and alpha composition. The native AMD GPU profile runs the
-same cases and a single-iteration benchmark smoke.
-
-These packages run without model dependencies or checkpoints:
-
-```sh
-bazelisk test --config=asan --config=amdgpu //program/text/qwen3_8/test:all
-```
+Numerical encoder checks belong to the [shared vision package](../../../../motif/vision/qwen3_8/test/).
+Model tests own learned outputs and the complete serving lifetime. The
+[development guide](../../../../docs/development.md#build-and-check) explains
+ordinary execution and the source-SDK requirement of the native request test.
