@@ -122,7 +122,7 @@ void qwen3_embedding_query_key_ingress(Bytes sequence_storage, loomt::offset ori
 void qwen3_embedding_query_key_egress_terminal(Bytes sequence_storage, loomt::offset origin, Bytes local_storage, loomt::offset result_offset, Bytes peer_storage, ActivationStream activation_stream, loomt::index zero, loomt::index one, BarrierStream outgoing_arrival, BarrierStream incoming_departure, FeatureStream projection_stream, Bytes output, Bytes state, WeightStream weight_stream, loomt::offset activation_offset, FeatureStream probability_stream, FeatureStream result_stream);
 
 [[loom::symbol("qwen3_embedding.fill_weights"), loom::force_inline]]
-void fill_weights(Bytes input, loomt::offset base, loomt::index count, WeightStream incoming);
+void fill_weights(Bytes input0, WeightStream incoming0, Bytes input1, WeightStream incoming1, Bytes input2, WeightStream incoming2, Bytes input3, WeightStream incoming3, Bytes input4, WeightStream incoming4, Bytes input5, WeightStream incoming5, Bytes input6, WeightStream incoming6, Bytes input7, WeightStream incoming7, loomt::offset base, loomt::index count);
 
 [[loom::symbol("qwen3_embedding.replay_weights16"), loom::force_inline]]
 void replay_weights16(WeightStream source, WeightStream row0, WeightStream row1, WeightStream row2, WeightStream row3, loomt::index panels);
@@ -417,25 +417,11 @@ void qwen3_embedding_cohort([[loom::launch]] Bytes projection0_arg, Bytes projec
       for (int group = 0; group < 6; ++group) {
         auto group_relative = loom::index::scale(loom::index::cast(group), loomt::offset{295936});
         auto group_base = layer_base + group_relative;
-        fill_weights(projection0, group_base, loomt::index{16}, weight_ingress0.short_group);
-        fill_weights(projection1, group_base, loomt::index{16}, weight_ingress1.short_group);
-        fill_weights(projection2, group_base, loomt::index{16}, weight_ingress2.short_group);
-        fill_weights(projection3, group_base, loomt::index{16}, weight_ingress3.short_group);
-        fill_weights(projection4, group_base, loomt::index{16}, weight_ingress4.short_group);
-        fill_weights(projection5, group_base, loomt::index{16}, weight_ingress5.short_group);
-        fill_weights(projection6, group_base, loomt::index{16}, weight_ingress6.short_group);
-        fill_weights(projection7, group_base, loomt::index{16}, weight_ingress7.short_group);
+        fill_weights(projection0, weight_ingress0.short_group, projection1, weight_ingress1.short_group, projection2, weight_ingress2.short_group, projection3, weight_ingress3.short_group, projection4, weight_ingress4.short_group, projection5, weight_ingress5.short_group, projection6, weight_ingress6.short_group, projection7, weight_ingress7.short_group, group_base, loomt::index{16});
         wait_for_phase(phase_complete);
       }
       auto down_base = layer_base + loomt::offset{1775616};
-      fill_weights(projection0, down_base, loomt::index{24}, weight_ingress0.down_group);
-      fill_weights(projection1, down_base, loomt::index{24}, weight_ingress1.down_group);
-      fill_weights(projection2, down_base, loomt::index{24}, weight_ingress2.down_group);
-      fill_weights(projection3, down_base, loomt::index{24}, weight_ingress3.down_group);
-      fill_weights(projection4, down_base, loomt::index{24}, weight_ingress4.down_group);
-      fill_weights(projection5, down_base, loomt::index{24}, weight_ingress5.down_group);
-      fill_weights(projection6, down_base, loomt::index{24}, weight_ingress6.down_group);
-      fill_weights(projection7, down_base, loomt::index{24}, weight_ingress7.down_group);
+      fill_weights(projection0, weight_ingress0.down_group, projection1, weight_ingress1.down_group, projection2, weight_ingress2.down_group, projection3, weight_ingress3.down_group, projection4, weight_ingress4.down_group, projection5, weight_ingress5.down_group, projection6, weight_ingress6.down_group, projection7, weight_ingress7.down_group, down_base, loomt::index{24});
       wait_for_phase(phase_complete);
     }
   }
