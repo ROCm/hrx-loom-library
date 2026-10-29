@@ -1,0 +1,199 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Whole-row RMS references use F64 arithmetic independently of the device's
+// F32 workgroup reduction. The authored dyadic inputs have exact squared sums
+// in F64, including the epsilon-dominated rows. BF16 outputs round the ideal
+// normalized value once; the separate scalar suite checks epilogue boundaries.
+// Metadata records row geometry, epsilon bits, and the weight representation.
+
+func.decl @reference_bf16_round(%value: f32) -> (f32)
+
+func.decl @reference_bf16_value(%word: i16) -> (f32)
+
+func.decl @reference_bf16_bits(%value: f32) -> (i16)
+
+// Patterns select ordinary dyadics, signed zeros, signed units, or tiny dyadics.
+func.def @initialize_rms_rows(%rows_value: index, %width_value: index, %epsilon: f32, %pattern: index, %centered: i1, %parameters: buffer, %input: buffer, %weight: buffer) {
+  %rows = index.assume %rows_value [ge(%rows_value, 1), le(%rows_value, 3)] : index
+  %width = index.assume %width_value [ge(%width_value, 32), le(%width_value, 6144)] : index
+  %origin = index.constant 0 : offset
+  %metadata = buffer.view %parameters[%origin] : buffer -> view<4xi32>
+  %rows_word = index.cast %rows : index to i32
+  %width_word = index.cast %width : index to i32
+  %epsilon_word = scalar.bitcast %epsilon : f32 to i32
+  %centered_word = scalar.extui %centered : i1 to i32
+  view.store %rows_word, %metadata[0] : i32, view<4xi32>
+  view.store %width_word, %metadata[1] : i32, view<4xi32>
+  view.store %epsilon_word, %metadata[2] : i32, view<4xi32>
+  view.store %centered_word, %metadata[3] : i32, view<4xi32>
+  %inputs = buffer.view %input[%origin] : buffer -> view<[%rows]x[%width]xi16>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c13 = index.constant 13 : index
+  %c17 = index.constant 17 : index
+  %c19 = index.constant 19 : index
+  %c31 = index.constant 31 : index
+  %c63 = index.constant 63 : index
+  %c127 = index.constant 127 : index
+  %c257 = index.constant 257 : index
+  %c31_f32 = scalar.constant 31.0 : f32
+  %c63_f32 = scalar.constant 63.0 : f32
+  %c128_f32 = scalar.constant 128.0 : f32
+  %sixteenth = scalar.constant 0.0625 : f32
+  %thirty_second = scalar.constant 0.03125 : f32
+  %sixty_fourth = scalar.constant 0.015625 : f32
+  %weight_offset = scalar.constant 0.001953125 : f32
+  %tiny_scale = scalar.constant 9.5367431640625e-07 : f32
+  %c0_i16 = scalar.constant 0 : i16
+  %sign_bit = scalar.constant -32768 : i16
+  %unit_bits = scalar.constant 16256 : i16
+  %signed_unit_bits = scalar.constant -16512 : i16
+  %zero = index.cmp eq, %pattern, %c1 : index
+  %unit = index.cmp eq, %pattern, %c2 : index
+  %tiny = index.cmp eq, %pattern, %c3 : index
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %column = [%c0 to %width step %c1] {
+      %row_seed = index.mul %row, %c31 : index
+      %ordinal = index.madd %column, %c17, %row_seed : index
+      %cycle = index.rem %ordinal, %c127 : index
+      %word = index.cast %cycle : index to i32
+      %number = scalar.uitofp %word : i32 to f32
+      %delta = scalar.subf %number, %c63_f32 : f32
+      %dyadic = scalar.mulf %delta, %thirty_second : f32
+      %small = scalar.mulf %dyadic, %tiny_scale : f32
+      %value = scf.select %tiny, %small, %dyadic : f32
+      %dyadic_bits = func.call @reference_bf16_bits(%value) : (f32) -> (i16)
+      %parity = index.rem %column, %c2 : index
+      %even = index.cmp eq, %parity, %c0 : index
+      %zero_bits = scf.select %even, %c0_i16, %sign_bit : i16
+      %one_bits = scf.select %even, %unit_bits, %signed_unit_bits : i16
+      %nonzero_bits = scf.select %unit, %one_bits, %dyadic_bits : i16
+      %bits = scf.select %zero, %zero_bits, %nonzero_bits : i16
+      view.store %bits, %inputs[%row, %column] : i16, view<[%rows]x[%width]xi16>
+    }
+  }
+  scf.for %column = [%c0 to %width step %c1] {
+    scf.if %centered {
+      %ordinal = index.mul %column, %c13 : index
+      %cycle = index.rem %ordinal, %c257 : index
+      %word = index.cast %cycle : index to i32
+      %number = scalar.uitofp %word : i32 to f32
+      %delta = scalar.subf %number, %c128_f32 : f32
+      %fraction = scalar.mulf %delta, %sixty_fourth : f32
+      %value = scalar.addf %fraction, %weight_offset : f32
+      %weights = buffer.view %weight[%origin] : buffer -> view<[%width]xf32>
+      view.store %value, %weights[%column] : f32, view<[%width]xf32>
+    } else {
+      %ordinal = index.mul %column, %c19 : index
+      %cycle = index.rem %ordinal, %c63 : index
+      %word = index.cast %cycle : index to i32
+      %number = scalar.uitofp %word : i32 to f32
+      %delta = scalar.subf %number, %c31_f32 : f32
+      %value = scalar.mulf %delta, %sixteenth : f32
+      %bits = func.call @reference_bf16_bits(%value) : (f32) -> (i16)
+      %weights = buffer.view %weight[%origin] : buffer -> view<[%width]xi16>
+      view.store %bits, %weights[%column] : i16, view<[%width]xi16>
+    }
+  }
+  func.return
+}
+
+func.def @rms_row_inverse(%rows_value: index, %width_value: index, %row_value: index, %epsilon: f32, %input: buffer) -> (f64) {
+  %rows = index.assume %rows_value [ge(%rows_value, 1), le(%rows_value, 3)] : index
+  %width = index.assume %width_value [ge(%width_value, 32), le(%width_value, 6144)] : index
+  %row = index.assume %row_value [ge(%row_value, 0), lt(%row_value, %rows)] : index
+  %origin = index.constant 0 : offset
+  %inputs = buffer.view %input[%origin] : buffer -> view<[%rows]x[%width]xi16>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c0_f64 = scalar.constant 0.0 : f64
+  %c1_f64 = scalar.constant 1.0 : f64
+  %sum = scf.for %column = [%c0 to %width step %c1](%sum = %c0_f64 : f64) -> (f64) {
+    %bits = view.load %inputs[%row, %column] : view<[%rows]x[%width]xi16> -> i16
+    %value = func.call @reference_bf16_value(%bits) : (i16) -> (f32)
+    %wide = scalar.extf %value : f32 to f64
+    %square = scalar.mulf %wide, %wide : f64
+    %next = scalar.addf %sum, %square : f64
+    scf.yield %next : f64
+  }
+  %width_word = index.cast %width : index to i32
+  %width_f64 = scalar.uitofp %width_word : i32 to f64
+  %epsilon_f64 = scalar.extf %epsilon : f32 to f64
+  %mean = scalar.divf %sum, %width_f64 : f64
+  %variance = scalar.addf %mean, %epsilon_f64 : f64
+  %root = scalar.sqrtf %variance : f64
+  %inverse = scalar.divf %c1_f64, %root : f64
+  func.return %inverse : f64
+}
+
+func.def @rms_inverse_reference(%parameters: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %metadata = buffer.view %parameters[%origin] : buffer -> view<4xi32>
+  %rows_word = view.load %metadata[0] : view<4xi32> -> i32
+  %width_word = view.load %metadata[1] : view<4xi32> -> i32
+  %epsilon_word = view.load %metadata[2] : view<4xi32> -> i32
+  %rows_value = index.cast %rows_word : i32 to index
+  %width_value = index.cast %width_word : i32 to index
+  %rows = index.assume %rows_value [ge(%rows_value, 1), le(%rows_value, 3)] : index
+  %width = index.assume %width_value [ge(%width_value, 32), le(%width_value, 6144)] : index
+  %epsilon = scalar.bitcast %epsilon_word : i32 to f32
+  %outputs = buffer.view %output[%origin] : buffer -> view<[%rows]xf32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  scf.for %row = [%c0 to %rows step %c1] {
+    %inverse = func.call @rms_row_inverse(%rows, %width, %row, %epsilon, %input) : (index, index, index, f32, buffer) -> (f64)
+    %rounded = scalar.fptrunc %inverse : f64 to f32
+    view.store %rounded, %outputs[%row] : f32, view<[%rows]xf32>
+  }
+  func.return
+}
+
+func.def @rms_rows_reference(%parameters: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %metadata = buffer.view %parameters[%origin] : buffer -> view<4xi32>
+  %rows_word = view.load %metadata[0] : view<4xi32> -> i32
+  %width_word = view.load %metadata[1] : view<4xi32> -> i32
+  %epsilon_word = view.load %metadata[2] : view<4xi32> -> i32
+  %centered_word = view.load %metadata[3] : view<4xi32> -> i32
+  %rows_value = index.cast %rows_word : i32 to index
+  %width_value = index.cast %width_word : i32 to index
+  %rows = index.assume %rows_value [ge(%rows_value, 1), le(%rows_value, 3)] : index
+  %width = index.assume %width_value [ge(%width_value, 32), le(%width_value, 6144)] : index
+  %epsilon = scalar.bitcast %epsilon_word : i32 to f32
+  %centered = scalar.trunci %centered_word : i32 to i1
+  %inputs = buffer.view %input[%origin] : buffer -> view<[%rows]x[%width]xi16>
+  %outputs = buffer.view %output[%origin] : buffer -> view<[%rows]x[%width]xbf16>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c1_f32 = scalar.constant 1.0 : f32
+  scf.for %row = [%c0 to %rows step %c1] {
+    %inverse = func.call @rms_row_inverse(%rows, %width, %row, %epsilon, %input) : (index, index, index, f32, buffer) -> (f64)
+    scf.for %column = [%c0 to %width step %c1] {
+      %bits = view.load %inputs[%row, %column] : view<[%rows]x[%width]xi16> -> i16
+      %value = func.call @reference_bf16_value(%bits) : (i16) -> (f32)
+      %scale = scf.if %centered -> (f32) {
+        %weights = buffer.view %weight[%origin] : buffer -> view<[%width]xf32>
+        %weight_value = view.load %weights[%column] : view<[%width]xf32> -> f32
+        %rounded = func.call @reference_bf16_round(%weight_value) : (f32) -> (f32)
+        %shifted = scalar.addf %rounded, %c1_f32 : f32
+        %scale = func.call @reference_bf16_round(%shifted) : (f32) -> (f32)
+        scf.yield %scale : f32
+      } else {
+        %weights = buffer.view %weight[%origin] : buffer -> view<[%width]xi16>
+        %weight_bits = view.load %weights[%column] : view<[%width]xi16> -> i16
+        %scale = func.call @reference_bf16_value(%weight_bits) : (i16) -> (f32)
+        scf.yield %scale : f32
+      }
+      %value_f64 = scalar.extf %value : f32 to f64
+      %scale_f64 = scalar.extf %scale : f32 to f64
+      %normalized = scalar.mulf %value_f64, %inverse : f64
+      %result = scalar.mulf %normalized, %scale_f64 : f64
+      %rounded = scalar.fptrunc %result : f64 to bf16
+      view.store %rounded, %outputs[%row, %column] : bf16, view<[%rows]x[%width]xbf16>
+    }
+  }
+  func.return
+}
