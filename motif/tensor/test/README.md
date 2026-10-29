@@ -224,18 +224,14 @@ pair-index errors. Every output, storage guard, and immutable buffer compares
 bitwise, including exact input/output aliasing. Native, access-instrumented,
 and race-instrumented modes exercise the row cases.
 
-The normalized cases derive a whole-row inverse from binary64 arithmetic,
-then enclose the RMS corpus's `2^-16` inverse accuracy requirement with
-outward-rounded F32 endpoints. The generator verifies that both endpoints
-produce the same BF16 normalized tensor through the independent epilogue.
+The normalized cases derive a whole-row inverse from binary64 arithmetic.
+Their selected inputs preserve the same BF16 normalized tensor across the
+RMS corpus's `2^-16` inverse accuracy interval, including outward-rounded
+F32 endpoints.
 Monotonic scalar rounding therefore makes the expected tensor unique over
 that interval. Exact rotary arithmetic can then detect cancellation errors
 without a broad output tolerance. Scalar RMS cases independently exercise
 normalization midpoints. No expectation depends on a device's observed output.
-
-```sh
-python3 -B motif/tensor/test/generate_rotary_oracle.py --check
-```
 
 `grouped_convolution_test.loom` uses a scalar F64 oracle that combines the static
 and dynamic coefficients before multiplication and explicitly pads every
@@ -246,25 +242,21 @@ addressing, while bitwise input checks guard the separate-output contract.
 All four shapes have benchmark declarations.
 
 `pointwise_test.loom` checks all four BF16 arithmetic contracts through native
-runtime inputs. SiLU and tanh GELU use binary64 libm formulas at 265 points,
+runtime inputs. SiLU and tanh GELU use independent F64 formulas at 265 points,
 including both curves' negative minima, small signed inputs, and tails through
 ±16. Their error bound is `2e-6 + abs(expected) / 256`: the relative term is
 BF16 round-to-nearest's maximum error, while the absolute term admits F32
 approximation and cancellation near the negative tail. The expected values
 retain the independent formula's F32 precision rather than rounding to BF16.
 
-The 128 residual and 132 Euler cases compare exact bits against rational
-arithmetic with integer ties-to-even rounding. They cover positive and negative
-products, both midpoint parities, cancellation, nonzero residuals, and a time
-delta that must remain F32. Directed Euler inputs also place F32 multiplication
+The 128 residual and 132 Euler cases compare exact bits against F64 products,
+explicit F32 boundaries, and integer ties-to-even rounding. They cover positive
+and negative products, both midpoint parities, cancellation, nonzero residuals,
+and a time delta that must remain F32. Directed Euler inputs also place F32 multiplication
 on either side of BF16 midpoints. The corpus includes explicit differences
 from a fused update and from prematurely rounding the time delta. Each family
 has its own benchmark declaration, and nonmultiple launch tails are bounded
-by the wrapper kernel. Regenerate the authored answers with:
-
-```sh
-python3 -B motif/tensor/test/generate_pointwise_oracle.py
-```
+by the wrapper kernel.
 
 `image_attention_matrix_test.loom` compares complete image-attention heads with
 binary64 dense contractions and a whole softmax. Thirteen scenarios span one
