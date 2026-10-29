@@ -1,0 +1,347 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Directed attention inputs expose mask ownership, common-key cancellation,
+// residual keys, and BF16 probability/gate boundaries. Rounding-margin
+// predicates select dyadic operands in IR without captured numerical tables.
+
+func.decl @reference_bf16_value(%word: i16) -> (f32)
+
+func.decl @reference_bf16_bits(%value: f32) -> (i16)
+
+// The caller supplies a positive, finite, normal probability or sigmoid.
+func.def @attention_bf16_margin(%value: f64) -> (f64) {
+  %rounded = scalar.fptrunc %value : f64 to bf16
+  %word = scalar.bitcast %rounded : bf16 to i16
+  %c1 = scalar.constant 1 : i16
+  %previous_word = scalar.subi %word, %c1 : i16
+  %following_word = scalar.addi %word, %c1 : i16
+  %previous = scalar.bitcast %previous_word : i16 to bf16
+  %following = scalar.bitcast %following_word : i16 to bf16
+  %previous_wide = scalar.extf %previous : bf16 to f64
+  %rounded_wide = scalar.extf %rounded : bf16 to f64
+  %following_wide = scalar.extf %following : bf16 to f64
+  %half = scalar.constant 0.5 : f64
+  %lower_sum = scalar.addf %previous_wide, %rounded_wide : f64
+  %upper_sum = scalar.addf %rounded_wide, %following_wide : f64
+  %lower = scalar.mulf %lower_sum, %half : f64
+  %upper = scalar.mulf %upper_sum, %half : f64
+  %lower_margin = scalar.subf %value, %lower : f64
+  %upper_margin = scalar.subf %upper, %value : f64
+  %margin = scalar.minnumf %lower_margin, %upper_margin : f64
+  func.return %margin : f64
+}
+
+// Keys have dyadic steps of 1/32. Their exponentials remain on the same side
+// of each BF16 midpoint throughout the native score/exp error interval.
+func.def @attention_probability_keys(%choices: buffer) -> (index) {
+  %origin = index.constant 0 : offset
+  %output = buffer.view %choices[%origin] : buffer -> view<128xf64>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %count = index.constant 128 : index
+  %c128 = scalar.constant 128 : i32
+  %spacing = scalar.constant 0.03125 : f64
+  %query = scalar.constant 4.0 : f64
+  %width = scalar.constant 128.0 : f64
+  %root = scalar.sqrtf %width : f64
+  %relative_margin = scalar.constant 6.103515625e-05 : f64
+  %accepted = scf.for %i = [%c0 to %count step %c1](%accepted = %c0 : index) -> (index) {
+    %word = index.cast %i : index to i32
+    %centered = scalar.subi %word, %c128 : i32
+    %number = scalar.sitofp %centered : i32 to f64
+    %key = scalar.mulf %number, %spacing : f64
+    %dot = scalar.mulf %key, %query : f64
+    %score = scalar.divf %dot, %root : f64
+    %probability = scalar.expf %score : f64
+    %margin = func.call @attention_bf16_margin(%probability) : (f64) -> (f64)
+    %required = scalar.mulf %probability, %relative_margin : f64
+    %stable = scalar.cmpf ogt, %margin, %required : f64
+    %next = scf.if %stable -> (index) {
+      %position = index.assume %accepted [ge(%accepted, 0), lt(%accepted, 128)] : index
+      view.store %key, %output[%position] : f64, view<128xf64>
+      %next = index.add %accepted, %c1 : index
+      scf.yield %next : index
+    } else {
+      scf.yield %accepted : index
+    }
+    scf.yield %next : index
+  }
+  func.return %accepted : index
+}
+
+// Gates stay farther than 2^-14 from sigmoid BF16 midpoints. The same choices
+// cover the native shared-store and expanded-store epilogues.
+func.def @initialize_attention_gates(%gate: buffer) {
+  %origin = index.constant 0 : offset
+  %storage_bytes = index.constant 772 : offset
+  %storage = buffer.alloca<private> align(4) %storage_bytes : buffer
+  %choices = buffer.view %storage[%origin] : buffer -> view<193xf32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c7 = index.constant 7 : index
+  %candidate_count = index.constant 193 : index
+  %center = scalar.constant 96 : i32
+  %spacing = scalar.constant 0.0625 : f64
+  %c1_f64 = scalar.constant 1.0 : f64
+  %required = scalar.constant 6.103515625e-05 : f64
+  %accepted = scf.for %i = [%c0 to %candidate_count step %c1](%accepted = %c0 : index) -> (index) {
+    %word = index.cast %i : index to i32
+    %centered = scalar.subi %word, %center : i32
+    %number = scalar.sitofp %centered : i32 to f64
+    %gate_value = scalar.mulf %number, %spacing : f64
+    %negative = scalar.negf %gate_value : f64
+    %exponential = scalar.expf %negative : f64
+    %denominator = scalar.addf %c1_f64, %exponential : f64
+    %sigmoid = scalar.divf %c1_f64, %denominator : f64
+    %margin = func.call @attention_bf16_margin(%sigmoid) : (f64) -> (f64)
+    %stable = scalar.cmpf ogt, %margin, %required : f64
+    %next = scf.if %stable -> (index) {
+      %position = index.assume %accepted [ge(%accepted, 0), lt(%accepted, 193)] : index
+      %narrow = scalar.fptrunc %gate_value : f64 to f32
+      view.store %narrow, %choices[%position] : f32, view<193xf32>
+      %next = index.add %accepted, %c1 : index
+      scf.yield %next : index
+    } else {
+      scf.yield %accepted : index
+    }
+    scf.yield %next : index
+  }
+  %choice_count = index.assume %accepted [ge(%accepted, 1), le(%accepted, 193)] : index
+  %length = buffer.length %gate
+  %bytes = index.cast %length : offset to index
+  %element_bytes = index.constant 2 : index
+  %count_value = index.div %bytes, %element_bytes : index
+  %count = index.assume %count_value [ge(%count_value, 1), le(%count_value, 12288)] : index
+  %gates = buffer.view %gate[%origin] : buffer -> view<[%count]xi16>
+  scf.for %i = [%c0 to %count step %c1] {
+    %ordinal = index.mul %i, %c7 : index
+    %position_value = index.rem %ordinal, %choice_count : index
+    %position = index.assume %position_value [ge(%position_value, 0), lt(%position_value, %choice_count)] : index
+    %value = view.load %choices[%position] : view<193xf32> -> f32
+    %word = func.call @reference_bf16_bits(%value) : (f32) -> (i16)
+    view.store %word, %gates[%i] : i16, view<[%count]xi16>
+  }
+  func.return
+}
+
+// Patterns select ordinary samples, late maxima, probability midpoints,
+// a common-key offset, or a masked residual-key anchor. The mask interval
+// and cycle are independent so the two attention schedules retain their masks.
+func.def @initialize_attention_numerics(%pattern: index, %tile: index, %mask_begin: index, %mask_end: index, %mask_cycle: index, %parameters: buffer, %query: buffer, %key: buffer, %value: buffer, %mask: buffer) {
+  %origin = index.constant 0 : offset
+  %metadata = buffer.view %parameters[%origin] : buffer -> view<5xi32>
+  %row_word = view.load %metadata[0] : view<5xi32> -> i32
+  %column_word = view.load %metadata[1] : view<5xi32> -> i32
+  %row_stride = index.cast %row_word : i32 to index
+  %column_stride = index.cast %column_word : i32 to index
+  %mask_length = buffer.length %mask
+  %tokens = index.cast %mask_length : offset to index
+  %query_length = buffer.length %query
+  %key_length = buffer.length %key
+  %query_bytes = index.cast %query_length : offset to index
+  %key_bytes = index.cast %key_length : offset to index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c7 = index.constant 7 : index
+  %c16 = index.constant 16 : index
+  %c17 = index.constant 17 : index
+  %channels = index.constant 128 : index
+  %last_channel = index.constant 127 : index
+  %last_token = index.sub %tokens, %c1 : index
+  %row_bytes = index.mul %tokens, %c2 : index
+  %query_width = index.div %query_bytes, %row_bytes : index
+  %key_width = index.div %key_bytes, %row_bytes : index
+  %queries = buffer.view %query[%origin] : buffer -> view<[%tokens]x[%query_width]xi16>
+  %keys = buffer.view %key[%origin] : buffer -> view<[%tokens]x[%key_width]xi16>
+  %layout = encoding.layout.strided [%row_stride, %column_stride] : encoding<layout>
+  %values = buffer.view %value[%origin] : buffer -> view<[%tokens]x[%key_width]xi16, %layout>
+  %visibility = buffer.view %mask[%origin] : buffer -> view<[%tokens]xi8>
+  // Padding remains a distinct poison value in both supported physical layouts.
+  %value_length = buffer.length %value
+  %value_bytes = index.cast %value_length : offset to index
+  %value_count = index.div %value_bytes, %c2 : index
+  %value_storage = buffer.view %value[%origin] : buffer -> view<[%value_count]xi16>
+  %padding_value = scalar.constant 123.0 : f32
+  %padding_word = func.call @reference_bf16_bits(%padding_value) : (f32) -> (i16)
+  %transposed = index.cmp eq, %row_stride, %c1 : index
+  scf.if %transposed {
+    scf.for %column = [%c0 to %key_width step %c1] {
+      scf.for %padding = [%tokens to %column_stride step %c1] {
+        %location_value = index.madd %column, %column_stride, %padding : index
+        %location = index.assume %location_value [ge(%location_value, 0), lt(%location_value, %value_count)] : index
+        view.store %padding_word, %value_storage[%location] : i16, view<[%value_count]xi16>
+      }
+    }
+  } else {
+    scf.for %row = [%c0 to %tokens step %c1] {
+      scf.for %padding = [%key_width to %row_stride step %c1] {
+        %location_value = index.madd %row, %row_stride, %padding : index
+        %location = index.assume %location_value [ge(%location_value, 0), lt(%location_value, %value_count)] : index
+        view.store %padding_word, %value_storage[%location] : i16, view<[%value_count]xi16>
+      }
+    }
+  }
+  %probability_case = index.cmp eq, %pattern, %c2 : index
+  %common = index.cmp eq, %pattern, %c3 : index
+  %residual = index.cmp eq, %pattern, %c4 : index
+  %directed = index.cmp ne, %pattern, %c0 : index
+  %probability_storage_bytes = index.constant 1024 : offset
+  %probability_storage = buffer.alloca<private> align(8) %probability_storage_bytes : buffer
+  %probability_keys = buffer.view %probability_storage[%origin] : buffer -> view<128xf64>
+  %probability_count = scf.if %probability_case -> (index) {
+    %count = func.call @attention_probability_keys(%probability_storage) : (buffer) -> (index)
+    scf.yield %count : index
+  } else {
+    scf.yield %c0 : index
+  }
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c1_f32 = scalar.constant 1.0 : f32
+  %cneg1_f32 = scalar.constant -1.0 : f32
+  %c4_f32 = scalar.constant 4.0 : f32
+  %c8_f32 = scalar.constant 8.0 : f32
+  %c256_f32 = scalar.constant 256.0 : f32
+  %common_operand = scalar.constant 1024.0 : f32
+  %common_dot = scalar.constant 1048576.0 : f64
+  %eighth = scalar.constant 0.125 : f32
+  %key_spacing = scalar.constant 0.03125 : f32
+  %c8_i32 = scalar.constant 8 : i32
+  %c4_f64 = scalar.constant 4.0 : f64
+  %c0_f64 = scalar.constant 0.0 : f64
+  %width_f64 = scalar.constant 128.0 : f64
+  %root = scalar.sqrtf %width_f64 : f64
+  %clear = scalar.constant 0 : i8
+  %enabled = scalar.constant 1 : i8
+  %high_bit = scalar.constant -128 : i8
+  %all_bits = scalar.constant -1 : i8
+  %alternate = scalar.constant 2 : i8
+  %shared_cycle = index.cmp eq, %mask_cycle, %c1 : index
+  %cycling = index.cmp ne, %mask_cycle, %c0 : index
+  %small_tile = index.cmp eq, %tile, %c16 : index
+  %flip_position = scf.select %small_tile, %c2, %c5 : index
+  scf.for %row = [%c0 to %tokens step %c1] {
+    %cycle_index = index.rem %row, %c7 : index
+    %cycle_byte = scf.if %shared_cycle -> (i8) {
+      %byte = scf.lookup %cycle_index {
+        0 = (%clear),
+        1 = (%high_bit),
+        2 = (%clear),
+        3 = (%all_bits),
+        4 = (%enabled),
+        5 = (%clear)
+      } default(%alternate) : i8
+      scf.yield %byte : i8
+    } else {
+      %byte = scf.lookup %cycle_index {
+        0 = (%high_bit),
+        1 = (%clear),
+        2 = (%all_bits),
+        3 = (%clear),
+        4 = (%enabled),
+        5 = (%alternate)
+      } default(%clear) : i8
+      scf.yield %byte : i8
+    }
+    %base_byte = scf.select %cycling, %cycle_byte, %enabled : i8
+    %after_begin = index.cmp uge, %row, %mask_begin : index
+    %before_end = index.cmp ult, %row, %mask_end : index
+    %masked = scalar.andi %after_begin, %before_end : i1
+    %mask_byte = scf.select %masked, %clear, %base_byte : i8
+    view.store %mask_byte, %visibility[%row] : i8, view<[%tokens]xi8>
+    scf.if %directed {
+      %last = index.cmp eq, %row, %last_token : index
+      %key_value, %value_sign = scf.if %probability_case -> (f32, f32) {
+        %selected = scf.if %last -> (f64) {
+          scf.yield %c0_f64 : f64
+        } else {
+          %position = index.assume %row [ge(%row, 0), lt(%row, 128), lt(%row, %probability_count)] : index
+          %selected = view.load %probability_keys[%position] : view<128xf64> -> f64
+          scf.yield %selected : f64
+        }
+        %dot = scalar.mulf %selected, %c4_f64 : f64
+        %score = scalar.divf %dot, %root : f64
+        %probability = scalar.expf %score : f64
+        %rounded = scalar.fptrunc %probability : f64 to bf16
+        %wide = scalar.extf %rounded : bf16 to f64
+        %upward = scalar.cmpf oge, %wide, %probability : f64
+        %sign = scf.select %upward, %c1_f32, %cneg1_f32 : f32
+        %negative_sign = scalar.negf %sign : f32
+        %flip = index.cmp eq, %row, %flip_position : index
+        %value_sign = scf.select %flip, %negative_sign, %sign : f32
+        %key_value = scalar.fptrunc %selected : f64 to f32
+        scf.yield %key_value, %value_sign : f32, f32
+      } else {
+        %key_value = scf.if %common -> (f32) {
+          %local = index.rem %row, %c17 : index
+          %word = index.cast %local : index to i32
+          %centered = scalar.subi %word, %c8_i32 : i32
+          %number = scalar.sitofp %centered : i32 to f32
+          %key_value = scalar.mulf %number, %key_spacing : f32
+          scf.yield %key_value : f32
+        } else {
+          %key_value = scf.if %residual -> (f32) {
+            %local = index.rem %row, %c16 : index
+            %word = index.cast %local : index to i32
+            %number = scalar.uitofp %word : i32 to f32
+            %regular = scalar.mulf %number, %key_spacing : f32
+            %key_value = scf.select %last, %c256_f32, %regular : f32
+            scf.yield %key_value : f32
+          } else {
+            %tile_index = index.div %row, %tile : index
+            %local = index.rem %row, %tile : index
+            %tile_word = index.cast %tile_index : index to i32
+            %local_word = index.cast %local : index to i32
+            %tile_number = scalar.uitofp %tile_word : i32 to f32
+            %local_number = scalar.uitofp %local_word : i32 to f32
+            %tile_part = scalar.mulf %tile_number, %c8_f32 : f32
+            %local_part = scalar.mulf %local_number, %eighth : f32
+            %key_value = scalar.addf %tile_part, %local_part : f32
+            scf.yield %key_value : f32
+          }
+          scf.yield %key_value : f32
+        }
+        %wide_key = scalar.extf %key_value : f32 to f64
+        %raw = scalar.addf %common_dot, %wide_key : f64
+        %narrow = scalar.fptrunc %raw : f64 to f32
+        %rounded = scalar.extf %narrow : f32 to f64
+        %difference = scalar.subf %raw, %rounded : f64
+        %positive = scalar.cmpf ogt, %difference, %c0_f64 : f64
+        %negative = scalar.cmpf olt, %difference, %c0_f64 : f64
+        %nonpositive = scf.select %negative, %cneg1_f32, %c0_f32 : f32
+        %value_sign = scf.select %positive, %c1_f32, %nonpositive : f32
+        scf.yield %key_value, %value_sign : f32, f32
+      }
+      scf.for %column = [%c0 to %query_width step %c1] {
+        %channel = index.rem %column, %channels : index
+        %first = index.cmp eq, %channel, %c0 : index
+        %last = index.cmp eq, %channel, %last_channel : index
+        %common_first = scalar.andi %common, %first : i1
+        %first_value = scf.select %common_first, %common_operand, %c0_f32 : f32
+        %last_value = scf.select %common, %c1_f32, %c4_f32 : f32
+        %number = scf.select %last, %last_value, %first_value : f32
+        %word = func.call @reference_bf16_bits(%number) : (f32) -> (i16)
+        view.store %word, %queries[%row, %column] : i16, view<[%tokens]x[%query_width]xi16>
+      }
+      scf.for %column = [%c0 to %key_width step %c1] {
+        %channel = index.rem %column, %channels : index
+        %first = index.cmp eq, %channel, %c0 : index
+        %last = index.cmp eq, %channel, %last_channel : index
+        %common_first = scalar.andi %common, %first : i1
+        %first_value = scf.select %common_first, %common_operand, %c0_f32 : f32
+        %number = scf.select %last, %key_value, %first_value : f32
+        %word = func.call @reference_bf16_bits(%number) : (f32) -> (i16)
+        view.store %word, %keys[%row, %column] : i16, view<[%tokens]x[%key_width]xi16>
+        %directed_value = scalar.ori %probability_case, %common : i1
+        scf.if %directed_value {
+          %value_word = func.call @reference_bf16_bits(%value_sign) : (f32) -> (i16)
+          view.store %value_word, %values[%row, %column] : i16, view<[%tokens]x[%key_width]xi16, %layout>
+        }
+      }
+    }
+  }
+  func.return
+}

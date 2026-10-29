@@ -69,7 +69,7 @@ separate tiles. Its benchmark declarations retain these different input and
 merge shapes rather than reporting one synthetic size.
 
 `attention_expanded_test.loom` compares nineteen causal/noncausal grouped-attention
-cases with whole binary64 QK contractions, a complete masked softmax, and
+cases with authored F64 QK contractions, a complete masked softmax, and
 weighted values. Cases span sixteen-row tails around sixty-four-key panels,
 176-row encoder geometry, the model's 32/8 and 20/20 head ratios, arbitrary
 nonzero masks, empty leading/interior/trailing tiles, single visible keys,
@@ -81,10 +81,9 @@ contraction accuracy, F32 recurrence bounds, and an allowance of `2^-16` per
 approximate exponential/reciprocal. Final BF16 rounding has an explicit
 relative allowance. Single-key, zero, very-negative-score, and dedicated
 probability cases compare bitwise; the latter remain away from output
-rounding boundaries under the fixed arithmetic budget. Mutation checks
-require sensitivity to causal visibility, masks, head grouping, centered-key
-residuals, F32 rounding of an uncentered common logit, and replacing expanded
-probabilities with one BF16 term. The reference never recreates the online
+rounding boundaries under the fixed arithmetic budget. Directed inputs expose
+causal visibility, masks, head grouping, centered-key residuals, F32 rounding of
+an uncentered common logit, and replacing expanded probabilities with one BF16 term. The reference never recreates the online
 GPU recurrence or its shared-memory exchanges.
 
 `attention_expanded_epilogue_test.loom` separately checks every returned row/channel
@@ -92,10 +91,6 @@ coordinate and the BF16 sigmoid/product boundary using independent scalar
 expressions. Values include signed zero, and sigmoid conversions have a margin
 against the approximate-math allowance. Omitting sigmoid rounding changes
 expected bits. Every numerical and epilogue scenario has a benchmark.
-
-```sh
-python3 -B motif/tensor/test/generate_expanded_attention_oracle.py --check
-```
 
 `attention_shared_test.loom` checks both K16 and K32 against whole binary64
 contractions and a dense masked softmax. Twenty-six scenarios cover complete
@@ -110,7 +105,7 @@ Single-tile probability cases instead round the unnormalized probabilities
 explicitly and retain the unrounded denominator. Their probabilities and final
 contexts stay away from BF16 midpoints under the fixed arithmetic budget, so
 the BF16 outputs compare bitwise. Zero, single-key, and identical very-negative
-score cases also compare bitwise. Mutation checks distinguish masking, KV-head
+score cases also compare bitwise. Authored inputs distinguish masking, KV-head
 ownership, all score channels, and probability conversion.
 
 `attention_shared_store_test.loom` checks the gate epilogue separately. Exact
@@ -121,10 +116,6 @@ pass output as the unused gate, matching the production caller. Full immutable
 input storage and output guards compare bitwise with ordinary execution or
 optional Loom address and race checks. Every scenario includes a benchmark
 declaration.
-
-```sh
-python3 -B motif/tensor/test/generate_shared_attention_oracle.py --check
-```
 
 `segmented_attention_test.loom` uses an independent binary64 dense QK contraction,
 whole-segment softmax, and weighted-value contraction. Twelve scenarios cover

@@ -1,0 +1,107 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Single-key and equal-score attention reduce to a masked mean of V. These
+// references cover one 128-channel KV head shared by one or four query heads.
+// Ordinary scalar loops and integer BF16 storage are independent of the native
+// matrix reductions, online softmax, fragment coordinates, and gate epilogues.
+
+func.decl @reference_bf16_value(%word: i16) -> (f32)
+
+func.decl @reference_bf16_bits(%value: f32) -> (i16)
+
+func.decl @reference_bf16_round(%value: f32) -> (f32)
+
+// Integer samples scaled by powers of two retain the dyadic input domain.
+func.def @initialize_attention_samples(%samples: buffer, %scale: f32, %output: buffer) {
+  %bytes = buffer.length %output
+  %length = index.cast %bytes : offset to index
+  %element_bytes = index.constant 2 : index
+  %count = index.div %length, %element_bytes : index
+  %origin = index.constant 0 : offset
+  %start = index.constant 0 : index
+  %step = index.constant 1 : index
+  %input = buffer.view %samples[%origin] : buffer -> view<[%count]xi32>
+  %destination = buffer.view %output[%origin] : buffer -> view<[%count]xi16>
+  scf.for %position = [%start to %count step %step] {
+    %sample = view.load %input[%position] : view<[%count]xi32> -> i32
+    %value = scalar.sitofp %sample : i32 to f32
+    %scaled = scalar.mulf %value, %scale : f32
+    %word = func.call @reference_bf16_bits(%scaled) : (f32) -> (i16)
+    view.store %word, %destination[%position] : i16, view<[%count]xi16>
+  }
+  func.return
+}
+
+// Sum dyadic values exactly in F64 and round only at the model's publication
+// boundaries. A zero sigmoid gate is exactly one half; gated contexts still
+// round to BF16 before multiplication. The result is constant across queries.
+func.def @reference_attention_mean(%transposed: i1, %gated: i1, %value: buffer, %mask: buffer, %output: buffer) {
+  %mask_bytes = buffer.length %mask
+  %tokens = index.cast %mask_bytes : offset to index
+  %output_bytes = buffer.length %output
+  %output_length = index.cast %output_bytes : offset to index
+  %origin = index.constant 0 : offset
+  %start = index.constant 0 : index
+  %step = index.constant 1 : index
+  %channels = index.constant 128 : index
+  %head_bytes = index.constant 256 : index
+  %sequence_bytes = index.mul %tokens, %head_bytes : index
+  %heads = index.div %output_length, %sequence_bytes : index
+  %width = index.mul %heads, %channels : index
+  %values = buffer.view %value[%origin] : buffer -> view<[%tokens]x128xi16>
+  %channel_values = buffer.view %value[%origin] : buffer -> view<128x[%tokens]xi16>
+  %visibility = buffer.view %mask[%origin] : buffer -> view<[%tokens]xi8>
+  %destination = buffer.view %output[%origin] : buffer -> view<[%tokens]x[%width]xi16>
+  %unset = scalar.constant 0 : i8
+  %c0_f64 = scalar.constant 0.0 : f64
+  %half = scalar.constant 0.5 : f32
+  %count = scf.for %position = [%start to %tokens step %step](%current = %start : index) -> (index) {
+    %byte = view.load %visibility[%position] : view<[%tokens]xi8> -> i8
+    %enabled = scalar.cmpi ne, %byte, %unset : i8
+    %increment = scf.select %enabled, %step, %start : index
+    %next = index.add %current, %increment : index
+    scf.yield %next : index
+  }
+  %count_word = index.cast %count : index to i32
+  %divisor = scalar.uitofp %count_word : i32 to f64
+  scf.for %channel = [%start to %channels step %step] {
+    %sum = scf.for %position = [%start to %tokens step %step](%current = %c0_f64 : f64) -> (f64) {
+      %byte = view.load %visibility[%position] : view<[%tokens]xi8> -> i8
+      %enabled = scalar.cmpi ne, %byte, %unset : i8
+      %next = scf.if %enabled -> (f64) {
+        %word = scf.if %transposed -> (i16) {
+          %stored = view.load %channel_values[%channel, %position] : view<128x[%tokens]xi16> -> i16
+          scf.yield %stored : i16
+        } else {
+          %stored = view.load %values[%position, %channel] : view<[%tokens]x128xi16> -> i16
+          scf.yield %stored : i16
+        }
+        %element = func.call @reference_bf16_value(%word) : (i16) -> (f32)
+        %wide = scalar.extf %element : f32 to f64
+        %accumulated = scalar.addf %current, %wide : f64
+        scf.yield %accumulated : f64
+      } else {
+        scf.yield %current : f64
+      }
+      scf.yield %next : f64
+    }
+    %mean = scalar.divf %sum, %divisor : f64
+    %context = scalar.fptrunc %mean : f64 to f32
+    %result = scf.if %gated -> (f32) {
+      %rounded = func.call @reference_bf16_round(%context) : (f32) -> (f32)
+      %product = scalar.mulf %rounded, %half : f32
+      scf.yield %product : f32
+    } else {
+      scf.yield %context : f32
+    }
+    %word = func.call @reference_bf16_bits(%result) : (f32) -> (i16)
+    scf.for %row = [%start to %tokens step %step] {
+      scf.for %head = [%start to %heads step %step] {
+        %column = index.madd %head, %channels, %channel : index
+        view.store %word, %destination[%row, %column] : i16, view<[%tokens]x[%width]xi16>
+      }
+    }
+  }
+  func.return
+}
