@@ -95,19 +95,8 @@ constructions separately require exact F32 results that BF16 cannot represent.
 Input conversion midpoints distinguish rounded weights from their F32 originals.
 All immutable allocations and output guards compare bitwise.
 
-`linear_epilogue_test.loom` supplies twelve independent store, bias, and adapter
-scenarios without performing matrix contraction. Rational scalar arithmetic
-authors each F32 and BF16 boundary, including conversion midpoint parities,
-cancellation, signed zeros, and subnormals. Omission checks prove the corpus
-distinguishes bias conversion, delta rounding, scaled-delta rounding, and the
-zero-strength bypass. Both bias formats, nonzero tile origins, three physical
-layouts, and exact base/output aliasing are exercised. Every observed bit is
-exact, including the F32 result before final publication. Both corpora support
-optional Loom address and race checks and retain benchmark declarations.
-
 ```sh
 python3 -B motif/tensor/test/generate_linear_oracle.py --check
-python3 -B motif/tensor/test/generate_linear_epilogue_oracle.py --check
 ```
 
 `layer_mix_test.loom` independently checks all twelve gathered values, the base
