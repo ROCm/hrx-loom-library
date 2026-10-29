@@ -1,0 +1,185 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// References build an explicitly expanded, zero-padded image before contracting
+// it. This separates the oracle's coordinates from the device motif's per-tap
+// bounds checks and nearest-neighbor division. All payloads start at byte 64;
+// the input prefix contains immutable geometry, residual, and alias metadata.
+func.def @convolution_guard(%length_value: index, %storage: buffer) {
+  %length = index.assume %length_value [ge(%length_value, 0)] : index
+  %base = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %count = index.add %length, %c32 : index
+  %suffix = index.add %length, %c16 : index
+  %sentinel = scalar.constant 123.25 : f32
+  %values = buffer.view %storage[%base] : buffer -> view<[%count]xf32>
+  scf.for %i = [%c0 to %c16 step %c1] {
+    %end = index.add %suffix, %i : index
+    view.store %sentinel, %values[%i] : f32, view<[%count]xf32>
+    view.store %sentinel, %values[%end] : f32, view<[%count]xf32>
+  }
+  func.return
+}
+
+func.def @convolution_header(%height: index, %width: index, %inputs: index, %outputs: index, %extent: index, %planes: index, %upsample: index, %residual: i1, %alias: i1, %input: buffer) {
+  %base = index.constant 0 : offset
+  %header = buffer.view %input[%base] : buffer -> view<9xi32>
+  %height_word = index.cast %height : index to i32
+  %width_word = index.cast %width : index to i32
+  %inputs_word = index.cast %inputs : index to i32
+  %outputs_word = index.cast %outputs : index to i32
+  %extent_word = index.cast %extent : index to i32
+  %planes_word = index.cast %planes : index to i32
+  %upsample_word = index.cast %upsample : index to i32
+  %residual_word = scalar.extui %residual : i1 to i32
+  %alias_word = scalar.extui %alias : i1 to i32
+  view.store %height_word, %header[0] : i32, view<9xi32>
+  view.store %width_word, %header[1] : i32, view<9xi32>
+  view.store %inputs_word, %header[2] : i32, view<9xi32>
+  view.store %outputs_word, %header[3] : i32, view<9xi32>
+  view.store %extent_word, %header[4] : i32, view<9xi32>
+  view.store %planes_word, %header[5] : i32, view<9xi32>
+  view.store %upsample_word, %header[6] : i32, view<9xi32>
+  view.store %residual_word, %header[7] : i32, view<9xi32>
+  view.store %alias_word, %header[8] : i32, view<9xi32>
+  func.return
+}
+
+func.def @convolution_geometry(%input: buffer) -> (index, index, index, index, index, index, index, i1, i1) {
+  %base = index.constant 0 : offset
+  %c0 = scalar.constant 0 : i32
+  %header = buffer.view %input[%base] : buffer -> view<9xi32>
+  %height_word = view.load %header[0] : view<9xi32> -> i32
+  %width_word = view.load %header[1] : view<9xi32> -> i32
+  %inputs_word = view.load %header[2] : view<9xi32> -> i32
+  %outputs_word = view.load %header[3] : view<9xi32> -> i32
+  %extent_word = view.load %header[4] : view<9xi32> -> i32
+  %planes_word = view.load %header[5] : view<9xi32> -> i32
+  %upsample_word = view.load %header[6] : view<9xi32> -> i32
+  %residual_word = view.load %header[7] : view<9xi32> -> i32
+  %alias_word = view.load %header[8] : view<9xi32> -> i32
+  %height_value = index.cast %height_word : i32 to index
+  %width_value = index.cast %width_word : i32 to index
+  %inputs_value = index.cast %inputs_word : i32 to index
+  %outputs_value = index.cast %outputs_word : i32 to index
+  %extent_value = index.cast %extent_word : i32 to index
+  %planes_value = index.cast %planes_word : i32 to index
+  %upsample_value = index.cast %upsample_word : i32 to index
+  %height = index.assume %height_value [ge(%height_value, 1), le(%height_value, 9)] : index
+  %width = index.assume %width_value [ge(%width_value, 1), le(%width_value, 17)] : index
+  %inputs = index.assume %inputs_value [ge(%inputs_value, 1), le(%inputs_value, 384)] : index
+  %outputs = index.assume %outputs_value [ge(%outputs_value, 1), le(%outputs_value, 384)] : index
+  %extent = index.assume %extent_value [ge(%extent_value, 1), le(%extent_value, 5)] : index
+  %planes = index.assume %planes_value [ge(%planes_value, 1), le(%planes_value, 3)] : index
+  %upsample = index.assume %upsample_value [ge(%upsample_value, 1), le(%upsample_value, 3)] : index
+  %residual = scalar.cmpi ne, %residual_word, %c0 : i32
+  %alias = scalar.cmpi ne, %alias_word, %c0 : i32
+  func.return %height, %width, %inputs, %outputs, %extent, %planes, %upsample, %residual, %alias : index, index, index, index, index, index, index, i1, i1
+}
+
+func.def @convolution_pad(%height: index, %width: index, %inputs: index, %extent: index, %upsample: index, %input: buffer, %padded: buffer) {
+  %base = index.constant 0 : offset
+  %origin = index.constant 64 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c0_f32 = scalar.constant 0.0 : f32
+  %border = index.sub %extent, %c1 : index
+  %padding = index.div %extent, %c2 : index
+  %padded_height = index.madd %height, %upsample, %border : index
+  %padded_width = index.madd %width, %upsample, %border : index
+  %source = buffer.view %input[%origin] : buffer -> view<[%inputs]x[%height]x[%width]xf32>
+  %destination = buffer.view %padded[%base] : buffer -> view<[%inputs]x[%padded_height]x[%padded_width]xf32>
+  scf.for %channel = [%c0 to %inputs step %c1] {
+    scf.for %y = [%c0 to %padded_height step %c1] {
+      scf.for %x = [%c0 to %padded_width step %c1] {
+        view.store %c0_f32, %destination[%channel, %y, %x] : f32, view<[%inputs]x[%padded_height]x[%padded_width]xf32>
+      }
+    }
+    // Scatter each physical pixel into its expanded rectangle. The reference
+    // never divides a padded output coordinate to recover a physical input.
+    scf.for %y = [%c0 to %height step %c1] {
+      scf.for %x = [%c0 to %width step %c1] {
+        %value = view.load %source[%channel, %y, %x] : view<[%inputs]x[%height]x[%width]xf32> -> f32
+        %y_origin = index.madd %y, %upsample, %padding : index
+        %x_origin = index.madd %x, %upsample, %padding : index
+        scf.for %dy = [%c0 to %upsample step %c1] {
+          scf.for %dx = [%c0 to %upsample step %c1] {
+            %target_y_value = index.add %y_origin, %dy : index
+            %target_x_value = index.add %x_origin, %dx : index
+            %target_y = index.assume %target_y_value [ge(%target_y_value, 0), lt(%target_y_value, %padded_height)] : index
+            %target_x = index.assume %target_x_value [ge(%target_x_value, 0), lt(%target_x_value, %padded_width)] : index
+            view.store %value, %destination[%channel, %target_y, %target_x] : f32, view<[%inputs]x[%padded_height]x[%padded_width]xf32>
+          }
+        }
+      }
+    }
+  }
+  func.return
+}
+
+// F32 convolution defines ascending input/tap FMAs, then a separately rounded
+// bias addition, followed by the optional residual addition.
+func.def @convolution_scalar_reference(%input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) {
+  %height, %width, %inputs, %outputs, %extent, %planes, %upsample, %add_residual, %alias = func.call @convolution_geometry(%input) : (buffer) -> (index, index, index, index, index, index, index, i1, i1)
+  %base = index.constant 0 : offset
+  %origin = index.constant 64 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %element_bytes = index.constant 4 : offset
+  %c0_f32 = scalar.constant 0.0 : f32
+  %border = index.sub %extent, %c1 : index
+  %output_height = index.mul %height, %upsample : index
+  %output_width = index.mul %width, %upsample : index
+  %padded_height = index.add %output_height, %border : index
+  %padded_width = index.add %output_width, %border : index
+  %padded_pixels = index.mul %padded_height, %padded_width : index
+  %padded_count = index.mul %inputs, %padded_pixels : index
+  %padded_bytes = index.scale %padded_count, %element_bytes : index, offset -> offset
+  %padded = buffer.alloca<private> align(4) %padded_bytes : buffer
+  func.call @convolution_pad(%height, %width, %inputs, %extent, %upsample, %input, %padded) : (index, index, index, index, index, buffer, buffer)
+  %image = buffer.view %padded[%base] : buffer -> view<[%inputs]x[%padded_height]x[%padded_width]xf32>
+  %weights = buffer.view %weight[%origin] : buffer -> view<[%outputs]x[%inputs]x[%planes]x[%extent]x[%extent]xf32>
+  %biases = buffer.view %bias[%origin] : buffer -> view<[%outputs]xf32>
+  %skips = buffer.view %residual[%origin] : buffer -> view<[%outputs]x[%output_height]x[%output_width]xf32>
+  %destination = scf.select %alias, %residual, %output : buffer
+  %results = buffer.view %destination[%origin] : buffer -> view<[%outputs]x[%output_height]x[%output_width]xf32>
+  %plane_value = index.sub %planes, %c1 : index
+  %plane = index.assume %plane_value [ge(%plane_value, 0), lt(%plane_value, %planes)] : index
+  scf.for %output_channel = [%c0 to %outputs step %c1] {
+    scf.for %y = [%c0 to %output_height step %c1] {
+      scf.for %x = [%c0 to %output_width step %c1] {
+        %sum = scf.for %channel = [%c0 to %inputs step %c1](%accumulator = %c0_f32 : f32) -> (f32) {
+          %rows = scf.for %ky = [%c0 to %extent step %c1](%row_sum = %accumulator : f32) -> (f32) {
+            %columns = scf.for %kx = [%c0 to %extent step %c1](%column_sum = %row_sum : f32) -> (f32) {
+              %image_y_value = index.add %y, %ky : index
+              %image_x_value = index.add %x, %kx : index
+              %image_y = index.assume %image_y_value [ge(%image_y_value, 0), lt(%image_y_value, %padded_height)] : index
+              %image_x = index.assume %image_x_value [ge(%image_x_value, 0), lt(%image_x_value, %padded_width)] : index
+              %value = view.load %image[%channel, %image_y, %image_x] : view<[%inputs]x[%padded_height]x[%padded_width]xf32> -> f32
+              %coefficient = view.load %weights[%output_channel, %channel, %plane, %ky, %kx] : view<[%outputs]x[%inputs]x[%planes]x[%extent]x[%extent]xf32> -> f32
+              %next = scalar.fmaf %value, %coefficient, %column_sum : f32
+              scf.yield %next : f32
+            }
+            scf.yield %columns : f32
+          }
+          scf.yield %rows : f32
+        }
+        %bias_value = view.load %biases[%output_channel] : view<[%outputs]xf32> -> f32
+        %biased = scalar.addf %sum, %bias_value : f32
+        %result = scf.if %add_residual -> (f32) {
+          %skip = view.load %skips[%output_channel, %y, %x] : view<[%outputs]x[%output_height]x[%output_width]xf32> -> f32
+          %combined = scalar.addf %biased, %skip : f32
+          scf.yield %combined : f32
+        } else {
+          scf.yield %biased : f32
+        }
+        view.store %result, %results[%output_channel, %y, %x] : f32, view<[%outputs]x[%output_height]x[%output_width]xf32>
+      }
+    }
+  }
+  func.return
+}

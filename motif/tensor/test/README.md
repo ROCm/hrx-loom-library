@@ -351,55 +351,6 @@ executions share these scenarios and their benchmark declarations.
 python3 -B motif/tensor/test/generate_channel_norm_oracle.py --check
 ```
 
-`convolution_test.loom` checks selected-pixel F32 convolution against independently
-expanded and padded logical images. Active coefficients are authored before
-their final temporal-plane placement; earlier planes contain distinct values.
-Exact rational arithmetic rounds every F32 FMA, final bias, and leaf residual
-addition separately. Directed cases distinguish fused products, bias before
-the reduction, and reordered bias/residual addition.
-
-Thirteen cases cover 1×1, 3×3, and 5×5 extents; one and multiple temporal
-planes; nearest-neighbor scales one, two, and three; rectangular images;
-complete, tail, and multiple workgroups; 384 input or output channels; and
-the decoder's final 96-to-3 convolution. Output may alias the residual in
-the wrapper. Every output bit, storage guard, and immutable input is checked
-in both native and access-instrumented execution. Each shape also has a
-benchmark declaration.
-
-```sh
-python3 -B motif/tensor/test/generate_convolution_oracle.py --check
-```
-
-`convolution_matrix_test.loom` checks the cooperative BF16/F32 3×3 implementation
-against independently expanded, padded logical images and exact rational
-BF16 quantization. Nine cases cover partial and complete 32-pixel tiles,
-multiple channel tiles, unequal input/output channels, reductions through
-384 inputs, nearest scales one/two/three, one/two/three temporal planes,
-residual aliasing, and positive/negative BF16 midpoints with both parities.
-All 128 threads enter the implementation even for a single live pixel.
-
-Native matrix arithmetic may differ from exact F32 sums even when every
-mathematical partial sum is representable. The accuracy requirement is twenty
-significant binary bits relative to the input contribution scale, twelve bits
-beyond the BF16 operands. For each scenario, the generator computes the largest
-sum of absolute quantized products plus absolute bias/residual contributions;
-the absolute error budget is that scale divided by `2^20`, with zero relative
-tolerance and no accepted NaNs. This bounds error through cancellation without
-substituting hardware-derived expected values. Every budget is less than half
-the smallest ordinary nonzero product, so losing one such product fails.
-
-Two directed cases remain bitwise: an accumulated result that F16 cannot
-represent and a cancellation that distinguishes residual addition before or
-after rounded bias. Every storage guard and immutable input is also exact.
-Normal, access-instrumented, and race-instrumented execution share the cases;
-each shape has a benchmark declaration. Scalar and matrix tests share only
-guarded fixture storage and comparison authoring, with separate arithmetic
-references and launch bodies.
-
-```sh
-python3 -B motif/tensor/test/generate_convolution_matrix_oracle.py --check
-```
-
 `time_test.loom` compares sinusoidal features with binary64 exponential and
 trigonometric evaluation after explicit F32 frequency and phase boundaries.
 The independent reference constructs whole frequency rows, then concatenates
