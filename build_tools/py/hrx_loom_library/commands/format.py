@@ -152,10 +152,8 @@ def check_repository(context: RepositoryContext) -> None:
     """Checks every Loom source admitted to the repository workspace."""
     sources = _loom_sources(context.repository_root, [])
     if not sources:
-        print("No Loom source files to format", flush=True)
         return
     _run_loom_format(context, "--check", sources)
-    print(f"Checked {len(sources)} Loom source files", flush=True)
 
 
 def _run(args: argparse.Namespace, context: RepositoryContext) -> None:
@@ -170,8 +168,6 @@ def _run(args: argparse.Namespace, context: RepositoryContext) -> None:
         else _loom_sources(context.repository_root, args.sources)
     )
     if not sources:
-        selection = "staged " if args.staged else ""
-        print(f"No {selection}Loom source files to format", flush=True)
         return
     if args.staged and args.mode == "fix":
         unstaged_sources = _unstaged_loom_sources(context, sources)
@@ -184,14 +180,12 @@ def _run(args: argparse.Namespace, context: RepositoryContext) -> None:
 
     if args.mode == "check":
         _run_loom_format(context, "--check", sources)
-        print(f"Checked {len(sources)} Loom source files", flush=True)
         return
 
     _run_loom_format(context, "--in-place", sources)
     if args.staged:
         _stage_loom_sources(context, sources)
     _run_loom_format(context, "--check", sources)
-    print(f"Formatted and checked {len(sources)} Loom source files", flush=True)
 
 
 def register(subparsers: Any) -> None:

@@ -32,6 +32,8 @@ class CommandDiscoveryTest(unittest.TestCase):
 
         self.assertEqual(parser.parse_args(["lint"]).command, "lint")
         self.assertEqual(parser.parse_args(["format", "--check"]).mode, "check")
+        self.assertFalse(parser.parse_args(["test"]).verbose)
+        self.assertTrue(parser.parse_args(["--verbose", "test"]).verbose)
 
 
 if __name__ == "__main__":

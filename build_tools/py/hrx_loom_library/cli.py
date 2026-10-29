@@ -40,6 +40,12 @@ def _command_modules() -> list[ModuleType]:
 def create_parser() -> argparse.ArgumentParser:
     """Builds the CLI from command-owned parser registrations."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Echo authoring subprocess commands, including successful queries.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for module in _command_modules():
         module.register(subparsers)
@@ -55,7 +61,7 @@ def main(
     args = parser.parse_args(argv)
     if repository_root is None:
         repository_root = Path(__file__).resolve().parents[3]
-    context = RepositoryContext(repository_root.resolve())
+    context = RepositoryContext(repository_root.resolve(), verbose=args.verbose)
     try:
         args.handler(args, context)
     except UserError as error:

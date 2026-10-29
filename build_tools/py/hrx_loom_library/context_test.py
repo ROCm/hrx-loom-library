@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import io
 import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -71,6 +73,47 @@ class CommandFormattingTest(unittest.TestCase):
             rendered = context.format_command(command)
 
         self.assertEqual(rendered, shlex.join(command))
+
+
+class ProcessDiagnosticsTest(unittest.TestCase):
+    def test_success_preserves_captured_output_without_echoing_by_default(self):
+        command = [sys.executable, "-c", "print('query result')"]
+        with tempfile.TemporaryDirectory() as directory:
+            for verbose in (False, True):
+                with self.subTest(verbose=verbose):
+                    repository = context.RepositoryContext(Path(directory), verbose)
+                    output, diagnostics = io.StringIO(), io.StringIO()
+                    with redirect_stdout(output), redirect_stderr(diagnostics):
+                        result = repository.run(command, capture_output=True)
+                    self.assertEqual(result, "query result\n")
+                    self.assertEqual(output.getvalue(), "")
+                    expected = "+ " + context.format_command(command) + "\n"
+                    self.assertEqual(
+                        diagnostics.getvalue(), expected if verbose else ""
+                    )
+
+    def test_failure_reports_command_and_both_streams_once(self):
+        command = [
+            sys.executable,
+            "-c",
+            "import sys; print('partial result'); "
+            "print('failure detail', file=sys.stderr); sys.exit(7)",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            for verbose in (False, True):
+                with self.subTest(verbose=verbose):
+                    repository = context.RepositoryContext(Path(directory), verbose)
+                    output, diagnostics = io.StringIO(), io.StringIO()
+                    with redirect_stdout(output), redirect_stderr(diagnostics):
+                        with self.assertRaises(subprocess.CalledProcessError) as error:
+                            repository.run(command, capture_output=True)
+                    self.assertEqual(error.exception.returncode, 7)
+                    self.assertEqual(error.exception.cmd, command)
+                    self.assertEqual(output.getvalue(), "partial result\n")
+                    self.assertEqual(
+                        diagnostics.getvalue(),
+                        "+ " + context.format_command(command) + "\nfailure detail\n",
+                    )
 
 
 if __name__ == "__main__":
