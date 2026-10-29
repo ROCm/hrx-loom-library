@@ -36,10 +36,12 @@ normalization responsibility as a constant from the placed strand.
 
 Projection arithmetic uses N8/K8 BFP16EBS8 panels, compensated BF16 operands,
 and F32 accumulators. BF16 normalization, rotary transforms, sequence-masked
-softmax, and the SiLU lookup table keep their defined rounding
-boundaries. Generic native packing and requested-prefix L2 normalization come
-from the format and tensor motifs. Model-specific panel shapes and the
-offsets within each logical parameter remain in these providers.
+softmax, and the SiLU lookup table keep their defined rounding boundaries.
+`tile_math.cxx` expresses these structured view and vector operations in C++
+and retains the two contract-bound AIE2P assembly leaves inline. Generic native
+packing and requested-prefix L2 normalization come from the format and tensor
+motifs. Model-specific panel shapes and the offsets within each logical
+parameter remain in these providers.
 
 The declaration graph in `BUILD.bazel` mirrors these ownership boundaries.
 Each provider builds to relocatable bytecode independently; runtime linking
