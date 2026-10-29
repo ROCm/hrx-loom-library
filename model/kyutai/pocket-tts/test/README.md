@@ -1,40 +1,15 @@
-# Pocket numerical and state checks
+# Pocket model checks
 
-These workloads use synthetic tensors and the public Loom case/benchmark
-runner. They need no checkpoint, reference recordings, or network access.
-Each test leaf declares its exact geometry and direct provider dependencies.
+Synthetic tensors exercise causal histories, voice conditioning, streaming
+state, sampling identity, and model-specific numerical composition without
+checkpoints or reference recordings. Reordered cohorts compare with isolated
+rows while complete storage observations retain inactive residents and guards.
+Shared text and tensor motifs own their reusable arithmetic and Unicode checks.
 
-Projection, convolution, and normalization checks use independent numerical
-expressions. Streaming-state checks cover causal histories, overlap tails,
-latent recurrence, and the waveform startup fade. Batched checks compare
-reordered cohorts with isolated rows while observing complete output and state
-banks, including nonzero origins, padding, inactive residents, and guards.
-Conditioning checks use independent rectangular prefix copies to verify
-retained voices, one writer per voice, and reused request rows.
-
-Sampling checks cover the full request seed, distinct generation counters,
-replay, and row-membership changes. Their expected normal samples follow
-Random123 Philox4x32-10 and F32 Box–Muller arithmetic; shared motif tests also
-check canonical Philox vectors and an independent double-precision normal
-oracle. The maximum context layout check exercises byte extents beyond signed
-32-bit storage without allocating that maximum-size model.
-
-The text normalization corpus records the upstream Pocket English policy for
-357 inputs, including Unicode uppercase expansion, whitespace, punctuation,
-closers, and tail selection. Its generated data is separate from the Loom
-implementation. Numerical tests run through the native AMD GPU profile; pure
-text checks use the VM reference profile.
-
-```sh
-bazel test --config=asan --config=amdgpu \
-  //model/kyutai/pocket-tts/program/... \
-  //model/kyutai/pocket-tts/test/...
-```
-
-Numerical kernel cases include benchmark declarations for the same bounded
-workload. Normal test execution also runs one benchmark iteration. These checks
-establish correctness and executable workload coverage; performance measurements
-use the optimized profile and a qualified measurement host.
+The owning test overview records independent reference provenance and numerical
+acceptance; scenarios own geometry and directed cases. The
+[development guide](../../../../docs/development.md#build-and-check) covers
+ordinary tests, optional instrumentation, and separate benchmark execution.
 
 ## Full learned speech
 

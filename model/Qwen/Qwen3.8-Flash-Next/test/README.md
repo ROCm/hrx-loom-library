@@ -1,61 +1,23 @@
-# Flash-Next numerical checks
+# Flash-Next model checks
 
-Small synthetic inputs exercise the production providers without downloading
-the full checkpoint. The original numerical configurations cover individual
-operations, packed epochs, retained state, and speculative publication. Every
-public case or scenario has a corresponding benchmark declaration so the same
-workload can be planned, executed, and measured through the ordinary Loom tools.
+Synthetic inputs check model dispatch, retained state, speculative publication,
+and fused epilogues without downloading the checkpoint. Shared
+[Q8 projection](../../../../kernel/ggml/linear/test/),
+[vision](../../../../motif/vision/qwen3_8/test/), and
+[media-policy](../../../../program/text/qwen3_8/test/) packages own their reusable
+contracts. Model scenarios preserve the distinction between resident identity,
+packed rows, original media offsets, and accepted history.
 
-| Checks | Independent expectation |
-| --- | --- |
-| Embedding and mixed inputs | Exact signed Q8 values, distinct image features, an immutable source packet larger than the compact accepted batch, rejected holes, ordinary recursive proposals, and complete inactive-output comparisons. |
-| Q8 projection and preparation | The shared GGML scalar-byte oracle checks model dispatch and in-place preparation; protocol adapters supply capacity and epoch bounds. |
-| GDN and fused convolution | Scalar channel traversal and per-value recurrence; a closed-form Q8 projection fixture varies inputs and codes across K and tests tile boundaries, shared anchors, advancing writers, and speculative capture in narrow and paired-head schedules. |
-| Hyperconnection and residual fusion | Independent normalization and projection, explicit BF16 publication, and complete inactive-buffer comparisons. |
-| Sparse attention | Independent cache addressing, scalar score and attention references, stable selection, long contexts, causal tails, retained forks, and query-cohort visibility. |
-| Copied-history proposals | Closed-form repeated-token fixtures cross page and subgroup boundaries, choose the newest equal-length match, reject short or incomplete continuations, and compare complete compacted buffers. Empty, copied, neural, mixed, and sampled cohorts retain distinct resident, input, output, and policy identities. |
-| Experts and mixed quantization | Scalar decoding of each admitted block format, independent matrix references, route grouping, padded tasks, and routed/shared output composition. |
-| MTP, output, and vocabulary | Independent projection references and explicit expected state for accepted history, compact vocabularies, fallback selection, proposal rejection, and retained carry. |
+The owning test source explains its oracle and numerical bounds. Whole-storage
+comparisons preserve inactive outputs and immutable inputs. Full-vocabulary
+stress workloads allocate more than 600 MiB of synthetic weights and remain
+explicit manual selections. The
+[development guide](../../../../docs/development.md#build-and-check) owns normal
+execution, independent Loom instrumentation, and benchmark commands.
 
-`retained`, `mtp_state`, and `speculation` run the same independent ordinary-ID
-oracles against ordinary and media input carriers. Media metadata differs from
-IDs, so a mistaken contiguous-I32 read cannot pass. Accepted ID capture remains
-a compact plane, and predictor vocabulary learns only the accepted IDs.
-
-Q8 panel shapes, operand arithmetic, storage layouts, and their benchmarks live
-in [`kernel/ggml/linear/test`](../../../../kernel/ggml/linear/test/), independently
-of this model. This package retains fused epilogues and model policy coverage.
-
-`proposal_launch` exercises the real Q8 projection template at its wave and
-two matrix entry shapes. GPU-published conditions alternate between active
-and skipped rounds, including an observed false value followed by an overwrite.
-Complete output comparisons distinguish preserved sentinels from the exact
-unit-input contraction. The ordinary constant-true call uses the same source.
-
-Run the package through the repository's normal build environment:
-
-```sh
-bazel test --config=asan --config=amdgpu \
-  //model/Qwen/Qwen3.8-Flash-Next/test/...
-```
-
-The hardware execution profile exercises the native AMD HAL. The build
-configuration selects instrumentation on the same test targets: `asan` enables
-access checks, and `tsan` enables race checks. Omitting those configurations runs
-without instrumentation. Correctness tests retain complete output comparisons
-and their declared numerical tolerances. Benchmarks run separately through
-`dev.py benchmark`.
-
-`vocabulary_stress` and `draft_head_stress` exercise the complete vocabulary,
-including compact-vocabulary fallback and canonical sampling. Each generates
-more than 600 MiB of Q8 weights. Their `_stress.loom` sources and `manual, stress`
-tags keep these regressions available for explicit runs without including them
-in ordinary CI.
-
-Learned service qualification is a separate boundary: it uses the full
-provisioned checkpoint and a built model representation. Numerical fixtures
-cannot establish chat formatting, retained-request ownership, parameter
-activation, or joined server shutdown.
+Learned service checks below establish formatting, activation, retained-request
+ownership, and shutdown through the complete model; numerical fixtures alone
+cannot establish those contracts.
 
 ## Installed service checks
 

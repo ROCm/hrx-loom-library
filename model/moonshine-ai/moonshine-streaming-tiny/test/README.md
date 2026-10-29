@@ -13,7 +13,9 @@ assets through `LOOM_MODEL_ASSETS`; full checkpoints never enter action inputs,
 runfiles, or retained test outputs. The three `transcription_*_test` targets use
 normal Bazel caching. They are explicit `manual` targets because their runner
 needs provisioned assets and an AMDGPU device.
-The [developer workflow](../README.md) shows build, fetch, and invocation.
+The [developer workflow](../README.md) shows asset provisioning and full-service
+invocation; the [shared development guide](../../../../docs/development.md#build-and-check)
+owns ordinary component tests and benchmarks.
 
 Source and archive cases use the same exact reference. The checker
 verifies the input PCM digest, uploads the audio with deliberately odd HTTP

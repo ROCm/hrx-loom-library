@@ -53,50 +53,22 @@ values must agree after effort alias resolution; member order never overrides
 an explicit preference. Unknown keys, duplicate members within one object, and
 wrongly typed values reject.
 
-`epoch.loom` consumes consecutive first and continuation cohorts. Each record
-carries length, causal and source positions, resident row, known-input range,
-flags, output credit, and continuation owner.
-Encoding builds the source's packed descriptors and selected-row mapping.
-It returns fourteen explicit upload ranges; unused capacity remains untouched
-and is not uploaded. The retained control allocation contains a 10-word stage
-header, one 24-byte sampling record per resident identity, a 64-byte layout
-recipe, and fourteen 40-byte transfer records. The composition's preparation
-provider owns this allocation.
-Encoding gathers the current cohort's sampling records; output identities name
-their first-cohort policy ordinal, not their resident state ID. Reordered
-continuations preserve that policy ordinal through their first-result tags.
+Queued execution separates packed cohort position, resident row, source
+position, and first-cohort policy identity. Preparation owns the retained
+control allocation; packet encoding returns only live upload ranges. Resident
+growth preserves stage handles and existing sampling policies without deriving
+packet capacity from the resident count.
 
-`storage.loom` owns the shared control recipe, descriptor writers, and capacity
-policy. Packet capacity covers isolated prefill and the largest prepared token
-bucket, rounded upward to an even value. Resident growth preserves that capacity,
-stage handles, and existing sampling policies; new residents start with empty
-policies. The packet-capacity checks use literal small catalogs, and each
-model's storage checks exercise its real allocation evaluator through growth.
-Both paths have VM benchmarks without model parameters or device execution.
-
-The allocation writer publishes eleven records of byte size, 256-byte alignment,
-and initial zero extent. The row-view writer publishes offset/length pairs in
-control, attention, input, and progress order. Both update caller-owned tables;
-model preparation computes the extents and the native materializer owns the
-actual allocations. Exact record checks include guards, untouched slots,
-replacement writes, and quantities above 32-bit byte addressing.
+Shared storage writers describe allocations and row views in caller-owned
+tables. Model preparation computes extents, and the native materializer owns
+the actual allocations. Each source documents its record layout and update
+contract; descriptor-only tests cover large extents without creating payloads.
 
 Runner imports enqueue target, proposal, verification, catch-up, and feedback
-work. Proposal variants cover power-of-two cohort capacities, and the live span
-count selects the smallest sufficient variant. Ordinary and mixed-input
-catalogs retain explicit proposal and catch-up origins. Every variant uses the
-same parameter domain and fixed packet layout; growing resident storage
-preserves the stage handles. The returned completion edge covers mutable work;
-feedback has its own transfer edge, which the owner joins before publishing progress.
-Publication consumes completed immutable feedback and reports consumed inputs,
-known inputs, output IDs, verification counts, and the next source position.
-Continuation flags are indexed by first-cohort ordinal, independently of the
-resident identity. Every plan record names its first-cohort owner explicitly,
-including records in the first cohort itself.
-State ownership and feedback publication use the supplied buffer extents and
-live cohort size. Device packet encoding still uses the composition's fixed
-sampling and descriptor layout described above.
-No transform waits for a device or recovers ownership from buffer contents.
+work. Completion edges determine when mutable work has retired and when
+immutable feedback may be published. Continuations preserve their first-cohort
+owner while compacting live rows. Neither policy transforms nor packet writers
+wait for a device or infer ownership from buffer contents.
 
 `chat_media.loom` plans and renders ordered images and timestamped video frames.
 Native inspection supplies decoded dimensions, source ranges, and finite,

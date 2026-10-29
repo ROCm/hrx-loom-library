@@ -18,11 +18,15 @@ programs. Benchmarks select the low, middle, and high Unicode property ranges,
 ASCII and four-byte encoding, and mixed whitespace trimming. They define
 repeatable workloads without asserting a performance threshold.
 
+Reproduce the pinned upstream observations with:
+
 ```sh
-bazel test --config=asan //motif/text/test:all
 python3.12 -B motif/text/test/generate_unicode_oracle.py
 ```
 
 Regeneration requires Unicode 15.0.0 and fails on a different Python UCD
 version. Changes to the runtime's Unicode properties are checked against this
 pinned behavior before updating the oracle's version.
+
+The [development guide](../../../docs/development.md#build-and-check) owns
+normal test and benchmark commands.

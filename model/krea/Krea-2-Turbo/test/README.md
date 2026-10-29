@@ -1,31 +1,15 @@
-# Krea correctness checks
+# Krea model checks
 
-The ordinary test suite requires no learned checkpoint. `geometry_test.loom`
-exercises the production request geometry and workspace policy through the VM,
-including negative and oversized inputs, alignment, the exact combined-token
-limit, and the tile-policy threshold. These are the functions used by both
-cold preparation and request-specific stage declarations.
+Small authored workloads check request geometry, workspace admission, adapter
+binding, and spatial tile ownership without learned parameters. Independent
+integer and storage references exercise the same planners and copy commands
+used by preparation and execution. Test overviews explain their oracles;
+scenarios own shapes, boundary cases, and numerical acceptance.
 
-`vae_tile_axis_test.loom` runs 76 extent/tile pairs through the production planner
-templates and an independent integer reference in Loom's VM. The reference walks
-pixel centers to establish ownership, including ties, without using the
-production midpoint formula. Complete-buffer comparisons cover the stride,
-interval count, last-tile anchoring, full axis partition, unused capacity, and
-sentinel guards.
-An authored receptive-field check establishes the decoder's 15-pixel radius.
-The family needs no generated source or binary fixture.
-
-`vae_tiles_test.loom` checks actual extraction and stitching with
-full-image pitches, independent input/output storage, and untouched sentinel
-regions. Its seven configurations cover untiled, minimum-overlap, landscape,
-portrait, 1024-image, one-axis, and long-axis partitions. Native, access-sanitized,
-and race-sanitized executions use the same expected buffers.
-
-The reusable tensor tests own their numerical contracts. In particular,
-`motif/tensor/test/linear_i8_test.loom` uses an independent integer-dot and F32/BF16
-reference for signed extremes, scales, rounding boundaries, row/column tails,
-K64/K128 panels, and the model's 6144/16384 reduction lengths. This establishes
-arithmetic correctness separately from the final image regression.
+Reusable numerical checks belong to [tensor motifs](../../../../motif/tensor/test/).
+This package owns model composition and the learned regressions below. The
+[development guide](../../../../docs/development.md#build-and-check) covers
+ordinary execution, optional instrumentation, and benchmarks.
 
 ## Full model regression
 
