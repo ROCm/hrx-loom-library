@@ -21,13 +21,6 @@ Each scenario also declares a benchmark over its initialized inputs. Benchmarks
 run separately through the [benchmark workflow](../../../docs/development.md#sweep-repository-benchmarks).
 Correctness runs do not establish model throughput.
 
-```sh
-bazel test --config=asan --config=amdgpu \
-  //motif/tensor/test:adapter //motif/tensor/test:adapter_exact \
-  //motif/tensor/test:adapter_layer_mix //motif/tensor/test:adapter_cohort \
-  //motif/tensor/test:adapter_reference_test
-```
-
 `random_test.loom` executes the three published
 [Random123 known-answer vectors](https://github.com/DEShawResearch/random123/blob/d8a0c25e49992685c0b9d91b553c1d04f81b6b4b/tests/kat_vectors)
 for Philox4x32-10 through the VM reference provider: zero words, all-one words,

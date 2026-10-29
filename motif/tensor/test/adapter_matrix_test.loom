@@ -1,0 +1,118 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// One launch per adapter ABI, specialized by the scenario's geometry. Runtime
+// count, bank offsets, and strengths stay in the caller-owned selection record.
+// Rank scratch is observable independently of the final output. Both normal
+// and stress scenarios use these same launch and composition definitions.
+amdgpu.target<gfx11-generic> @tensor_adapter_rdna3
+
+amdgpu.target<gfx11-generic> @adapter_matrix_wave32 {subgroup_size = 32}
+
+template.decl @projection.adapter_down_bf16(%rows: index, %inputs: index, %count: index, %offset_layout: encoding<layout>, %strength_layout: encoding<layout>, %offsets: view<[%count]xi64, %offset_layout>, %strengths: view<[%count]xf32, %strength_layout>, %input: buffer, %factors: buffer, %low: buffer)
+
+template.decl @projection.adapter_up_bf16(%rows: index, %outputs: index, %count: index, %output_layout: encoding<layout>, %offset_layout: encoding<layout>, %offsets: view<[%count]xi64, %offset_layout>, %low: buffer, %factors: buffer, %base: buffer, %output: buffer)
+
+template.decl @adapter_case(%group: index, %configuration: index) -> (index, index)
+
+template.decl @adapter_shape(%geometry: index) -> (index, index, index, index, index, index, index, i1)
+
+func.decl pure @adapter_selection_count(%selection: index, %banks: index) -> (index)
+
+kernel.def target(@adapter_matrix_wave32) @adapter_down(%rows: index, %inputs: index) {
+  %tile = index.constant 16 : index
+  %unit = index.constant 1 : index
+  %threads = index.constant 128 : index
+  %groups = index.div %rows, %tile : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%rows: index, %inputs: index, %input: buffer, %factors: buffer, %selections: buffer, %low: buffer) {
+  %origin = index.constant 0 : offset
+  %offset_origin = index.constant 16 : offset
+  %strength_origin = index.constant 24 : offset
+  %offset_layout = encoding.layout.strided [2] : encoding<layout>
+  %strength_layout = encoding.layout.strided [4] : encoding<layout>
+  %header = buffer.view %selections[%origin] : buffer -> view<1xi32>
+  %count_word = view.load %header[0] : view<1xi32> -> i32
+  %nonnegative = scalar.assume %count_word [range(%count_word, 0, 2147483647)] : i32
+  %count = index.cast %nonnegative : i32 to index
+  %offsets = buffer.view %selections[%offset_origin] : buffer -> view<[%count]xi64, %offset_layout>
+  %strengths = buffer.view %selections[%strength_origin] : buffer -> view<[%count]xf32, %strength_layout>
+  template.apply<@projection.adapter_down_bf16>(%rows, %inputs, %count, %offset_layout, %strength_layout, %offsets, %strengths, %input, %factors, %low) : (index, index, index, encoding<layout>, encoding<layout>, view<[%count]xi64, %offset_layout>, view<[%count]xf32, %strength_layout>, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@adapter_matrix_wave32) @adapter_up(%rows: index, %outputs: index) {
+  %unit = index.constant 1 : index
+  %row_tile = index.constant 64 : index
+  %column_tile = index.constant 128 : index
+  %row_padding = index.constant 63 : index
+  %column_padding = index.constant 127 : index
+  %padded_rows = index.add %rows, %row_padding : index
+  %padded_columns = index.add %outputs, %column_padding : index
+  %row_groups = index.div %padded_rows, %row_tile : index
+  %column_groups = index.div %padded_columns, %column_tile : index
+  kernel.launch.config workgroups(%column_groups, %row_groups, %unit) workgroup_size(%column_tile, %unit, %unit) : index
+} launch(%rows: index, %outputs: index, %row_stride: index, %column_stride: index, %low: buffer, %factors: buffer, %selections: buffer, %base: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %offset_origin = index.constant 16 : offset
+  %offset_layout = encoding.layout.strided [2] : encoding<layout>
+  %output_layout = encoding.layout.strided [%row_stride, %column_stride] : encoding<layout>
+  %header = buffer.view %selections[%origin] : buffer -> view<1xi32>
+  %count_word = view.load %header[0] : view<1xi32> -> i32
+  %nonnegative = scalar.assume %count_word [range(%count_word, 0, 2147483647)] : i32
+  %count = index.cast %nonnegative : i32 to index
+  %offsets = buffer.view %selections[%offset_origin] : buffer -> view<[%count]xi64, %offset_layout>
+  template.apply<@projection.adapter_up_bf16>(%rows, %outputs, %count, %output_layout, %offset_layout, %offsets, %low, %factors, %base, %output) : (index, index, index, encoding<layout>, encoding<layout>, view<[%count]xi64, %offset_layout>, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@adapter_matrix_wave32) @adapter_copy_base(%elements: index) {
+  %unit = index.constant 1 : index
+  %threads = index.constant 128 : index
+  %padding = index.constant 127 : index
+  %padded = index.add %elements, %padding : index
+  %groups = index.div %padded, %threads : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%elements: index, %base: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %threads = index.constant 128 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %position = index.madd %group, %threads, %lane : index
+  %valid = index.cmp ult, %position, %elements : index
+  scf.if %valid {
+    %source = buffer.view %base[%origin] : buffer -> view<[%elements]xi16>
+    %destination = buffer.view %output[%origin] : buffer -> view<[%elements]xi16>
+    %word = view.load %source[%position] : view<[%elements]xi16> -> i16
+    view.store %word, %destination[%position] : i16, view<[%elements]xi16>
+  }
+  kernel.return
+}
+
+command.program.def @adapter_matrix_program(%group: index, %configuration: index) launch(%input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer, %low: buffer, %output: buffer) {
+  %geometry, %selection = template.apply<@adapter_case>(%group, %configuration) : (index, index) -> (index, index)
+  %rows, %inputs, %outputs, %banks, %stride, %row_stride, %column_stride, %exact = template.apply<@adapter_shape>(%geometry) : (index) -> (index, index, index, index, index, index, index, i1)
+  %c0 = index.constant 0 : index
+  %rank = index.constant 32 : index
+  %payload = index.constant 16 : offset
+  %input_origin = index.constant 32 : offset
+  %count = func.call pure inline @adapter_selection_count(%selection, %banks) : (index, index) -> (index)
+  %factor_bytes = index.mul %banks, %stride : index
+  %output_elements = index.mul %rows, %outputs : index
+  %low_rows = index.mul %count, %rows : index
+  %low_elements = index.mul %low_rows, %rank : index
+  %activation = buffer.view %input[%input_origin] : buffer -> view<[%rows]x[%inputs]xbf16>
+  %down_factors = buffer.view %down[%payload] : buffer -> view<[%factor_bytes]xi8>
+  %up_factors = buffer.view %up[%payload] : buffer -> view<[%factor_bytes]xi8>
+  %bases = buffer.view %base[%payload] : buffer -> view<[%output_elements]xbf16>
+  %lows = buffer.view %low[%payload] : buffer -> view<[%low_elements]xbf16>
+  %results = buffer.view %output[%payload] : buffer -> view<[%output_elements]xbf16>
+  %active = index.cmp ugt, %count, %c0 : index
+  scf.if %active {
+    kernel.launch @adapter_down[%rows, %inputs](%rows, %inputs, %activation, %down_factors, %selections, %lows) : [index, index](index, index, view<[%rows]x[%inputs]xbf16>, view<[%factor_bytes]xi8>, buffer, view<[%low_elements]xbf16>)
+    kernel.launch @adapter_up[%rows, %outputs](%rows, %outputs, %row_stride, %column_stride, %lows, %up_factors, %selections, %bases, %results) : [index, index](index, index, index, index, view<[%low_elements]xbf16>, view<[%factor_bytes]xi8>, buffer, view<[%output_elements]xbf16>, view<[%output_elements]xbf16>)
+  } else {
+    kernel.launch @adapter_copy_base[%output_elements](%output_elements, %bases, %results) : [index](index, view<[%output_elements]xbf16>, view<[%output_elements]xbf16>)
+  }
+  command.return
+}
