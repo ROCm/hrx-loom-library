@@ -12,15 +12,42 @@
 //
 amdgpu.target<gfx11-generic> @qwen38_resize_wave32 {subgroup_size = 32}
 
-// Each group owns 32 columns and sixteen destination rows. Eight horizontal
-// source rows are staged at a time; no image-sized intermediate is allocated.
-template.decl @qwen38.vision.resize(%image: index, %input: buffer, %output: buffer)
+config.decl @qwen38.vision.group_count : %value: index where [range(%value, 1, 16384)]
 
-kernel.def target(@qwen38_resize_wave32) @qwen38_vision_resize(%groups_x: index, %groups_y: index) {
+config.decl @qwen38.vision.plane_count : %value: index where [range(%value, 1, 2)]
+
+config.decl @qwen38.vision.image_height : %value: index where [range(%value, 32, 6400), multiple_of(%value, 32)]
+
+config.decl @qwen38.vision.image_width : %value: index where [range(%value, 32, 6400), multiple_of(%value, 32)]
+
+template.decl @qwen38.vision.resize(%image: index, %plane: index, %output_offset: offset, %input: buffer, %output: buffer)
+
+// Each workgroup owns 32 columns and sixteen destination rows. Eight horizontal
+// source rows are staged at a time; Z selects a distinct image/frame plane.
+kernel.def target(@qwen38_resize_wave32) @qwen38_vision_resize() {
   %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%groups_x, %groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%image: index, %input: buffer, %output: buffer) where [range(%image, 0, 3)] {
-  template.apply<@qwen38.vision.resize>(%image, %input, %output) : (index, buffer, buffer)
+  %height = config.get @qwen38.vision.image_height : index
+  %width = config.get @qwen38.vision.image_width : index
+  %groups = config.get @qwen38.vision.group_count : index
+  %planes = config.get @qwen38.vision.plane_count : index
+  %groups_x = index.div %width, %c32 : index
+  %groups_y = index.div %height, %c16 : index
+  %groups_z = index.mul %groups, %planes : index
+  kernel.launch.config workgroups(%groups_x, %groups_y, %groups_z) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %output: buffer) {
+  %height = config.get @qwen38.vision.image_height : index
+  %width = config.get @qwen38.vision.image_width : index
+  %planes = config.get @qwen38.vision.plane_count : index
+  %plane_index = kernel.workgroup.id<z> : index
+  %image = index.div %plane_index, %planes : index
+  %plane = index.rem %plane_index, %planes : index
+  %area = index.mul %height, %width : index
+  %channels = index.constant 3 : offset
+  %plane_bytes = index.scale %area, %channels : index, offset -> offset
+  %output_offset = index.scale %plane_index, %plane_bytes : index, offset -> offset
+  template.apply<@qwen38.vision.resize>(%image, %plane, %output_offset, %input, %output) : (index, index, offset, buffer, buffer)
   kernel.return
 }

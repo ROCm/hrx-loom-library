@@ -1,6 +1,6 @@
 // F32 learned positions and normalization for the 1152-wide Qwen3.8 encoder.
 //
-// Image height/width are compile-known multiples of 32 in [32,4096]. Their
+// Image height/width are compile-known multiples of 32 in [32,6400]. Their
 // 16x16 patches occupy row-major 2x2 merge blocks, horizontal displacement
 // first within each block. position_statistics interpolates the original
 // [48,48,1152] learned table with aligned corners, adds into the caller's
@@ -9,6 +9,8 @@
 // statistics computes the same moments for subsequent transformer residuals.
 // layernorm_apply applies [1152] F32 scale/bias into a distinct F32 output;
 // transformer projections instead consume the moments during matrix staging.
+// Both row-only operations accept a flat extent across independent image or
+// video segments. Only position_statistics needs spatial dimensions.
 //
 // Each call requires rows 256-thread workgroups, with all other group/item
 // extents one. Geometry is supplied by the composition leaf, and all buffers
@@ -57,9 +59,11 @@ template.def<@qwen38.vision.statistics> device @qwen38_vision_statistics_body(%r
   template.return
 }
 
-template.decl @qwen38.vision.position_statistics(%image_height: index, %image_width: index, %position_table: buffer, %residual: buffer, %statistics: buffer)
+// Positions remain local to this image/pair; residuals and statistics begin at
+// first_row in their respective stacked buffers.
+template.decl @qwen38.vision.position_statistics(%image_height: index, %image_width: index, %first_row: index, %position_table: buffer, %residual: buffer, %statistics: buffer)
 
-template.def<@qwen38.vision.position_statistics> device @qwen38_vision_position_statistics_body(%image_height: index, %image_width: index, %position_table: buffer, %residual: buffer, %statistics: buffer) {
+template.def<@qwen38.vision.position_statistics> device @qwen38_vision_position_statistics_body(%image_height: index, %image_width: index, %first_row: index, %position_table: buffer, %residual: buffer, %statistics: buffer) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -78,12 +82,12 @@ template.def<@qwen38.vision.position_statistics> device @qwen38_vision_position_
 
   %patch_height0 = index.div %image_height, %c16 : index
   %patch_width0 = index.div %image_width, %c16 : index
-  %patch_height = index.assume %patch_height0 [range(%patch_height0, 2, 256), multiple_of(%patch_height0, 2)] : index
-  %patch_width = index.assume %patch_width0 [range(%patch_width0, 2, 256), multiple_of(%patch_width0, 2)] : index
+  %patch_height = index.assume %patch_height0 [range(%patch_height0, 2, 400), multiple_of(%patch_height0, 2)] : index
+  %patch_width = index.assume %patch_width0 [range(%patch_width0, 2, 400), multiple_of(%patch_width0, 2)] : index
   %rows0 = index.mul %patch_height, %patch_width : index
   %rows = index.assume %rows0 [range(%rows0, 4, 65536), multiple_of(%rows0, 4)] : index
   %block_width0 = index.div %patch_width, %c2 : index
-  %block_width = index.assume %block_width0 [range(%block_width0, 1, 128)] : index
+  %block_width = index.assume %block_width0 [range(%block_width0, 1, 200)] : index
 
   %row0 = kernel.workgroup.id<x> : index
   %row = index.assume %row0 [lt(%row0, %rows)] : index
@@ -138,8 +142,12 @@ template.def<@qwen38.vision.position_statistics> device @qwen38_vision_position_
 
   %position_noalias, %residual_noalias, %statistics_noalias = buffer.assume.noalias %position_table, %residual, %statistics : buffer, buffer, buffer
   %position_view = buffer.view %position_noalias[%origin] : buffer -> view<2304x1152xf32>
-  %residual_view = buffer.view %residual_noalias[%origin] : buffer -> view<[%rows]x1152xf32>
-  %statistics_view = buffer.view %statistics_noalias[%origin] : buffer -> view<[%rows]x2xf32>
+  %residual_stride = index.constant 4608 : offset
+  %statistics_stride = index.constant 8 : offset
+  %residual_offset = index.scale %first_row, %residual_stride : index, offset -> offset
+  %statistics_offset = index.scale %first_row, %statistics_stride : index, offset -> offset
+  %residual_view = buffer.view %residual_noalias[%residual_offset] : buffer -> view<[%rows]x1152xf32>
+  %statistics_view = buffer.view %statistics_noalias[%statistics_offset] : buffer -> view<[%rows]x2xf32>
 
   %partial_sum, %partial_square_sum = scf.for %column = [%lane to %c1152 step %c256](%sum = %c0_f32 : f32, %square_sum = %c0_f32 : f32) -> (f32, f32) {
     %a = view.load %position_view[%bounded_source_index00, %column] : view<2304x1152xf32> -> f32
@@ -181,19 +189,15 @@ template.def<@qwen38.vision.position_statistics> device @qwen38_vision_position_
   template.return
 }
 
-template.decl @qwen38.vision.layernorm_apply(%image_height: index, %image_width: index, %residual: buffer, %statistics: buffer, %weight: buffer, %bias: buffer, %output: buffer)
+template.decl @qwen38.vision.layernorm_apply(%rows_value: index, %residual: buffer, %statistics: buffer, %weight: buffer, %bias: buffer, %output: buffer)
 
-template.def<@qwen38.vision.layernorm_apply> device @qwen38_vision_layernorm_apply_body(%image_height: index, %image_width: index, %residual: buffer, %statistics: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+template.def<@qwen38.vision.layernorm_apply> device @qwen38_vision_layernorm_apply_body(%rows_value: index, %residual: buffer, %statistics: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
-  %c16 = index.constant 16 : index
   %c256 = index.constant 256 : index
   %c1152 = index.constant 1152 : index
-  %patch_height = index.div %image_height, %c16 : index
-  %patch_width = index.div %image_width, %c16 : index
-  %rows0 = index.mul %patch_height, %patch_width : index
-  %rows = index.assume %rows0 [range(%rows0, 4, 65536), multiple_of(%rows0, 4)] : index
+  %rows = index.assume %rows_value [range(%rows_value, 4, 65536), multiple_of(%rows_value, 4)] : index
   %row0 = kernel.workgroup.id<x> : index
   %row = index.assume %row0 [lt(%row0, %rows)] : index
   %lane = kernel.workitem.id<x> : index

@@ -1,9 +1,10 @@
-// Qwen3.8 text image service v1 request and cohort policy.
+// Qwen3.8 image/frame-pair request and row-bounded cohort policy.
 //
 // Request preparation accepts the codec-validated native packet and returns
-// one packet plus a compatibility tag encoding the selected width/height.
-// Batch preparation receives ownership of the native packer's upload for 1-4
-// images of that geometry. It fills the reserved directory in place and returns
+// one packet plus a compatibility tag for geometry and temporal plane count.
+// Additive units bound both patch rows and upload bytes. Batch preparation
+// receives ownership of the native packer's upload for compatible groups.
+// Its directory is already device-readable; source returns
 // a feature plan with the model-supplied F32 width per image-token row; every
 // 32x32 output pixel block contributes one row. The stage declaration belongs
 // to preparation, and the runner owns device execution and output storage.
@@ -14,12 +15,13 @@ func.decl pure @qwen38_vision_workspace(%rows: index, %feature_columns: index) -
 
 func.decl @qwen38_vision_pixel_packet(%request: buffer) -> (buffer)
 
-func.decl @qwen38_vision_stage(%height: i64, %width: i64, %count: i64) -> (i32)
+func.decl @qwen38_vision_stage(%height: i64, %width: i64, %count: i64, %planes: i64) -> (i32)
 
 // Forecast the complete request before decoding pixels or activating weights.
 // Descriptors contain native image headers and chat metadata, not pixel planes.
-// Equal selected geometry permits sharing a cohort with up to three peers, so
-// retained storage includes their rows even when this request owns one image.
+// Native text composition shares at most one cohort per logical request.
+// Its other roots contain only this request's projections; peer retention is
+// therefore one maximal output root, independent of the projection count.
 func.def public @qwen38_vision_forecast(%feature_columns: index, %parameter_capacity: i64, %ranges: buffer, %descriptors: buffer) -> (i64, i64, i64) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
@@ -29,65 +31,86 @@ func.def public @qwen38_vision_forecast(%feature_columns: index, %parameter_capa
   %range_bytes = buffer.length %ranges
   %range_length = index.cast %range_bytes : offset to i64
   %count_value = scalar.divui %range_length, %range_stride : i64
-  %count64 = scalar.assume %count_value [range(%count_value, 1, 4)] : i64
+  %count64 = scalar.assume %count_value [range(%count_value, 1, 2147483647)] : i64
   %count = index.cast %count64 : i64 to index
   %records = buffer.view %ranges[%origin] : buffer -> view<[%count]x2xi64>
-  %total_rows, %largest_rows = scf.for %i = [%c0 to %count step %c1](%total = %zero64 : i64, %largest = %zero64 : i64) -> (i64, i64) {
+  %total_rows = scf.for %i = [%c0 to %count step %c1](%total = %zero64 : i64) -> (i64) {
     %offset_value = view.load %records[%i, 0] : view<[%count]x2xi64> -> i64
     %bounded_offset = scalar.assume %offset_value [range(%offset_value, 0, 9223372036854775807)] : i64
     %offset = index.cast %bounded_offset : i64 to offset
-    %header = buffer.view %descriptors[%offset] : buffer -> view<16xi32>
-    %rows32 = view.load %header[7] : view<16xi32> -> i32
+    %header = buffer.view %descriptors[%offset] : buffer -> view<8xi32>
+    %rows32 = view.load %header[2] : view<8xi32> -> i32
     %rows = scalar.extui %rows32 : i32 to i64
     %next_total = scalar.addi %total, %rows : i64
-    %larger = scalar.cmpi ugt, %rows, %largest : i64
-    %next_largest = scf.select %larger, %rows, %largest : i64
-    scf.yield %next_total, %next_largest : i64, i64
+    scf.yield %next_total : i64
   }
-  // Four patch rows form one feature. The command and admission share the
-  // same allocation lengths and residual-bank lifetimes.
-  %patches_per_feature = scalar.constant 4 : i64
-  %patch_rows64 = scalar.muli %largest_rows, %patches_per_feature : i64
-  %patch_rows = index.cast %patch_rows64 : i64 to index
+  // The source admission budget bounds every active cohort to 65,536 patch
+  // rows. Actual allocations use its populated extent; forecasting includes
+  // the largest cohort this request could share with independent peers.
+  %patch_rows = index.constant 65536 : index
   %residual_bytes, %secondary_bytes, %statistics_bytes, %activation_bytes, %workspace_bytes = func.call pure @qwen38_vision_workspace(%patch_rows, %feature_columns) : (index, index) -> (offset, offset, offset, offset, offset)
   %workspace = index.cast %workspace_bytes : offset to i64
   // Direct-import projector weights need no preparation staging. Peer images
   // may have larger original pixel planes, so use the full prepared upload cap.
-  %upload_capacity = scalar.constant 269746752 : i64
+  %upload_capacity = scalar.constant 268435456 : i64
   %fixed = scalar.addi %parameter_capacity, %upload_capacity : i64
   %private_peak = scalar.addi %fixed, %workspace : i64
   %columns64 = index.cast %feature_columns : index to i64
   %element_bytes = scalar.constant 4 : i64
   %feature_bytes = scalar.muli %columns64, %element_bytes : i64
-  %cohort_capacity = scalar.constant 4 : i64
+  %maximum_rows = scalar.constant 16384 : i64
   // F32 feature rows are already multiples of the 16-byte gather alignment.
   %expanded = scalar.muli %total_rows, %feature_bytes : i64
-  %retained = scalar.muli %expanded, %cohort_capacity : i64
+  %shared_root = scalar.muli %maximum_rows, %feature_bytes : i64
+  %retained = scalar.addi %expanded, %shared_root : i64
   func.return %private_peak, %retained, %expanded : i64, i64, i64
 }
 
+// Each unit pays for one patch row and 4096 upload bytes. The same 65,536-unit
+// ceiling bounds workspace and the complete 256 MiB upload, including its
+// 16-byte-per-projection directory. Rounding occurs per request, before packing.
+func.def public pure @qwen38_vision_cohort_units(%patch_rows: i64, %packet_bytes: i64) -> (i64) {
+  %bias = scalar.constant 4111 : i64
+  %unit_bytes = scalar.constant 4096 : i64
+  %rounded = scalar.addi %packet_bytes, %bias : i64
+  %upload_units = scalar.divui %rounded, %unit_bytes : i64
+  %rows_larger = scalar.cmpi ugt, %patch_rows, %upload_units : i64
+  %units = scf.select %rows_larger, %patch_rows, %upload_units : i64
+  func.return %units : i64
+}
+
 // Chat policy owns the selected geometry. Native admission owns codec bounds;
-// only images with the same selected shape share a projection cohort.
+// only groups with the same selected shape and plane count share a cohort.
 func.def public @qwen38_vision_prepare_request(%request: buffer) -> (buffer, i64, i64) {
   %origin = index.constant 0 : offset
-  %header = buffer.view %request[%origin] : buffer -> view<16xi32>
-  %metadata_word = view.load %header[8] : view<16xi32> -> i32
+  %header = buffer.view %request[%origin] : buffer -> view<8xi32>
+  %metadata_word = view.load %header[3] : view<8xi32> -> i32
   %metadata_offset = index.cast %metadata_word : i32 to offset
   %metadata = buffer.view %request[%metadata_offset] : buffer -> view<2xi32>
   %width = view.load %metadata[0] : view<2xi32> -> i32
   %height = view.load %metadata[1] : view<2xi32> -> i32
   %width64 = scalar.extui %width : i32 to i64
   %height64 = scalar.extui %height : i32 to i64
+  %planes32 = view.load %header[1] : view<8xi32> -> i32
+  %planes = scalar.extui %planes32 : i32 to i64
+  %plane_shift = scalar.constant 16 : i64
+  %plane_bits = scalar.shli %planes, %plane_shift : i64
+  %low_bits = scalar.ori %height64, %plane_bits : i64
   %shift = scalar.constant 32 : i64
   %width_bits = scalar.shli %width64, %shift : i64
-  %tag = scalar.ori %width_bits, %height64 : i64
+  %tag = scalar.ori %width_bits, %low_bits : i64
   %packet = func.call @qwen38_vision_pixel_packet(%request) : (buffer) -> (buffer)
-  %units = scalar.constant 1 : i64
+  %pixels = scalar.muli %width64, %height64 : i64
+  %patch_area = scalar.constant 256 : i64
+  %rows = scalar.divui %pixels, %patch_area : i64
+  %length = buffer.length %packet
+  %bytes = index.cast %length : offset to i64
+  %units = func.call pure @qwen38_vision_cohort_units(%rows, %bytes) : (i64, i64) -> (i64)
   func.return %packet, %units, %tag : buffer, i64, i64
 }
 
-// The native packer transfers ownership of its exact upload. Fill the reserved
-// directory in place; the original decoded planes need no further cohort copy.
+// Forward the native packed upload with its canonical request directory.
+// Pixel planes and directory need no source-side cohort copy or offset rewrite.
 func.def public @qwen38_vision_prepare_batch(%feature_columns: index, %ranges: buffer, %packed: buffer) -> (i32, buffer, buffer) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
@@ -96,14 +119,23 @@ func.def public @qwen38_vision_prepare_batch(%feature_columns: index, %ranges: b
   %range_bytes64 = index.cast %range_bytes : offset to i64
   %range_record_bytes = scalar.constant 16 : i64
   %count_value = scalar.divui %range_bytes64, %range_record_bytes : i64
-  %count64 = scalar.assume %count_value [range(%count_value, 1, 4)] : i64
+  %count64 = scalar.assume %count_value [range(%count_value, 1, 16384)] : i64
   %count = index.cast %count64 : i64 to index
   // Compatibility tags select this cohort before the native packer runs.
   // The first prepared packet carries the selected geometry for this cohort.
-  %resize_header_offset = index.constant 64 : offset
-  %resize_header = buffer.view %packed[%resize_header_offset] : buffer -> view<16xi32>
-  %height = view.load %resize_header[2] : view<16xi32> -> i32
-  %width = view.load %resize_header[3] : view<16xi32> -> i32
+  %first_range = buffer.view %ranges[%origin] : buffer -> view<1x2xi64>
+  %first_offset = view.load %first_range[0, 0] : view<1x2xi64> -> i64
+  %first_bounded = scalar.assume %first_offset [range(%first_offset, 0, 9223372036854775807)] : i64
+  %group_offset = index.cast %first_bounded : i64 to offset
+  %group = buffer.view %packed[%group_offset] : buffer -> view<4xi32>
+  %first_plane = view.load %group[2] : view<4xi32> -> i32
+  %second_plane = view.load %group[3] : view<4xi32> -> i32
+  %distinct = scalar.cmpi ne, %first_plane, %second_plane : i32
+  %single_plane = scalar.constant 1 : i64
+  %paired_planes = scalar.constant 2 : i64
+  %planes = scf.select %distinct, %paired_planes, %single_plane : i64
+  %width = view.load %group[0] : view<4xi32> -> i32
+  %height = view.load %group[1] : view<4xi32> -> i32
   %width64 = scalar.extui %width : i32 to i64
   %height64 = scalar.extui %height : i32 to i64
   %pixels = scalar.muli %width64, %height64 : i64
@@ -131,16 +163,7 @@ func.def public @qwen38_vision_prepare_batch(%feature_columns: index, %ranges: b
   view.store %count64, %header[2] : i64, view<4xi64>
   view.store %rows64, %header[3] : i64, view<4xi64>
   %requests = buffer.view %plan[%header_bytes] : buffer -> view<[%count]x3xi64>
-  %ranges_view = buffer.view %ranges[%origin] : buffer -> view<[%count]x2xi64>
-  %directory = buffer.view %packed[%origin] : buffer -> view<4x2xi64>
-  %prefix_bytes = scalar.constant 64 : i64
   scf.for %i = [%c0 to %count step %c1] {
-    %packet_offset = view.load %ranges_view[%i, 0] : view<[%count]x2xi64> -> i64
-    %packet_length = view.load %ranges_view[%i, 1] : view<[%count]x2xi64> -> i64
-    %header_offset = scalar.addi %packet_offset, %prefix_bytes : i64
-    %header_length = scalar.subi %packet_length, %prefix_bytes : i64
-    view.store %header_offset, %directory[%i, 0] : i64, view<4x2xi64>
-    view.store %header_length, %directory[%i, 1] : i64, view<4x2xi64>
     %i64 = index.cast %i : index to i64
     %first = scalar.muli %i64, %image_rows : i64
     view.store %first, %requests[%i, 0] : i64, view<[%count]x3xi64>
@@ -155,7 +178,7 @@ func.def public @qwen38_vision_prepare_batch(%feature_columns: index, %ranges: b
     view.store %offset, %records[%i, 0] : i64, view<[%row_count]x2xi64>
     view.store %elements, %records[%i, 1] : i64, view<[%row_count]x2xi64>
   }
-  %stage = func.call @qwen38_vision_stage(%height64, %width64, %count64) : (i64, i64, i64) -> (i32)
+  %stage = func.call @qwen38_vision_stage(%height64, %width64, %count64, %planes) : (i64, i64, i64, i64) -> (i32)
   func.return %stage, %packed, %plan : i32, buffer, buffer
 }
 

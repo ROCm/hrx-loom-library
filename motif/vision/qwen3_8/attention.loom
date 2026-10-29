@@ -6,7 +6,9 @@
 // merge-block order. Cohort 0..3 selects four 72-channel heads. K [rows,288]
 // and transposed V [288,rows] begin at cohort_offset bytes in their buffers;
 // the caller supplies their completed publication. Output is the cohort's
-// disjoint 288-column slice of a complete half context [rows,1152].
+// disjoint 288-column slice of a complete half context [rows,1152]. first_row
+// selects the segment origin in stacked residual, statistics, and context
+// storage. Rotary coordinates and softmax remain local to that segment.
 //
 // One 128-thread wave32 group owns sixteen queries and four heads. Query
 // projection uses 32-column resident panels; online softmax streams sixteen
@@ -149,11 +151,11 @@ func.def inline @qwen38_vision_rotate_query_pair(%bf16: i1, %query: buffer, %pat
   func.return %rotated_left, %rotated_right : i16, i16
 }
 
-template.decl @qwen38.vision.attention(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %cohort: index, %cohort_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer)
+template.decl @qwen38.vision.attention(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %first_row: index, %cohort: index, %cohort_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer)
 
 template.decl @qwen38.vision.attention_output(%rows_value: index, %bf16: i1, %context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer)
 
-template.def<@qwen38.vision.attention> device @qwen38_vision_attention_body(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %cohort: index, %cohort_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer) {
+template.def<@qwen38.vision.attention> device @qwen38_vision_attention_body(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %first_row: index, %cohort: index, %cohort_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -184,8 +186,8 @@ template.def<@qwen38.vision.attention> device @qwen38_vision_attention_body(%pat
   %negative_vector = vector.splat %negative_large : vector<8xf32>
   %scale_vector = vector.splat %attention_scale : vector<8xf32>
 
-  %patch_height = index.assume %patch_height_value [range(%patch_height_value, 2, 256), multiple_of(%patch_height_value, 2)] : index
-  %patch_width = index.assume %patch_width_value [range(%patch_width_value, 2, 256), multiple_of(%patch_width_value, 2)] : index
+  %patch_height = index.assume %patch_height_value [range(%patch_height_value, 2, 400), multiple_of(%patch_height_value, 2)] : index
+  %patch_width = index.assume %patch_width_value [range(%patch_width_value, 2, 400), multiple_of(%patch_width_value, 2)] : index
   %rows0 = index.mul %patch_height, %patch_width : index
   %rows = index.assume %rows0 [range(%rows0, 4, 65536), multiple_of(%rows0, 4)] : index
 
@@ -210,14 +212,22 @@ template.def<@qwen38.vision.attention> device @qwen38_vision_attention_body(%pat
   %qkv_bias_global = buffer.assume.memory_space<global> %qkv_bias_noalias : buffer
   %key_global = buffer.assume.memory_space<global> %key_noalias : buffer
   %output_global = buffer.assume.memory_space<global> %output_noalias : buffer
-  %residual_view = buffer.view %residual_global[%origin] : buffer -> view<[%rows]x1152xf32>
-  %statistics_view = buffer.view %statistics_global[%origin] : buffer -> view<[%rows]x2xf32>
+  // The softmax covers only this pair. Linear operators consume the flat
+  // storage across pairs after every segment has published its context rows.
+  %residual_stride = index.constant 4608 : offset
+  %statistics_stride = index.constant 8 : offset
+  %context_stride = index.constant 2304 : offset
+  %residual_offset = index.scale %first_row, %residual_stride : index, offset -> offset
+  %statistics_offset = index.scale %first_row, %statistics_stride : index, offset -> offset
+  %context_offset = index.scale %first_row, %context_stride : index, offset -> offset
+  %residual_view = buffer.view %residual_global[%residual_offset] : buffer -> view<[%rows]x1152xf32>
+  %statistics_view = buffer.view %statistics_global[%statistics_offset] : buffer -> view<[%rows]x2xf32>
   %layernorm_weight_view = buffer.view %layernorm_weight_global[%origin] : buffer -> view<1152xf32>
   %layernorm_bias_view = buffer.view %layernorm_bias_global[%origin] : buffer -> view<1152xf32>
   %qkv_weight_view = buffer.view %qkv_weight_global[%origin] : buffer -> view<3456x1152xi16>
   %qkv_bias_view = buffer.view %qkv_bias_global[%origin] : buffer -> view<3456xf32>
   %key_view = buffer.view %key_global[%cohort_offset] : buffer -> view<[%rows]x288xi16>
-  %context_view = buffer.view %output_global[%origin] : buffer -> view<[%rows]x1152xi16>
+  %context_view = buffer.view %output_global[%context_offset] : buffer -> view<[%rows]x1152xi16>
 
   %input_stage_bytes = index.constant 2304 : offset
   %weight_stage_bytes = index.constant 18432 : offset

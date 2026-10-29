@@ -4,11 +4,15 @@
 
 amdgpu.target<gfx11-generic> @qwen38_vision_gfx11 {subgroup_size = 32}
 
-config.decl @qwen38.vision.image_height : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
+config.decl @qwen38.vision.image_height : %value: index where [range(%value, 32, 6400), multiple_of(%value, 32)]
 
-config.decl @qwen38.vision.image_width : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
+config.decl @qwen38.vision.image_width : %value: index where [range(%value, 32, 6400), multiple_of(%value, 32)]
 
-template.decl @qwen38.vision.patch_embedding(%image_height: index, %image_width: index, %bf16: i1, %weights_f32: i1, %source_offset: offset, %source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer)
+config.decl @qwen38.vision.group_count : %value: index where [range(%value, 1, 16384)]
+
+config.decl @qwen38.vision.plane_count : %value: index where [range(%value, 1, 2)]
+
+template.decl @qwen38.vision.patch_embedding(%image_height: index, %image_width: index, %bf16: i1, %weights_f32: i1, %first_row: index, %source_offset: offset, %source1_offset: offset, %source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer)
 
 kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_patch_embedding() {
   %c1 = index.constant 1 : index
@@ -24,12 +28,27 @@ kernel.def target(@qwen38_vision_gfx11) @qwen38_vision_patch_embedding() {
   %c63 = index.constant 63 : index
   %rounded_rows = index.add %rows, %c63 : index
   %row_groups = index.div %rounded_rows, %c64 : index
-  kernel.launch.config workgroups(%row_groups, %c18, %c1) workgroup_size(%c256, %c1, %c1) : index
-} launch(%source_offset: offset, %source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer) {
+  %groups = config.get @qwen38.vision.group_count : index
+  kernel.launch.config workgroups(%row_groups, %c18, %groups) workgroup_size(%c256, %c1, %c1) : index
+} launch(%source: buffer, %weight0: buffer, %weight1: buffer, %bias: buffer, %output: buffer) {
   %image_height = config.get @qwen38.vision.image_height : index
   %image_width = config.get @qwen38.vision.image_width : index
   %bf16 = scalar.constant false : i1
   %weights_f32 = scalar.constant false : i1
-  template.apply<@qwen38.vision.patch_embedding>(%image_height, %image_width, %bf16, %weights_f32, %source_offset, %source, %weight0, %weight1, %bias, %output) : (index, index, i1, i1, offset, buffer, buffer, buffer, buffer, buffer)
+  %group = kernel.workgroup.id<z> : index
+  %planes = config.get @qwen38.vision.plane_count : index
+  %area = index.mul %image_height, %image_width : index
+  %patch_area = index.constant 256 : index
+  %pair_rows = index.div %area, %patch_area : index
+  %first_row = index.mul %group, %pair_rows : index
+  %c1 = index.constant 1 : index
+  %second_plane = index.sub %planes, %c1 : index
+  %channels = index.constant 3 : offset
+  %plane_bytes = index.scale %area, %channels : index, offset -> offset
+  %plane_index = index.mul %group, %planes : index
+  %source_offset = index.scale %plane_index, %plane_bytes : index, offset -> offset
+  %second_delta = index.scale %second_plane, %plane_bytes : index, offset -> offset
+  %source1_offset = index.add %source_offset, %second_delta : offset
+  template.apply<@qwen38.vision.patch_embedding>(%image_height, %image_width, %bf16, %weights_f32, %first_row, %source_offset, %source1_offset, %source, %weight0, %weight1, %bias, %output) : (index, index, i1, i1, index, offset, offset, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }

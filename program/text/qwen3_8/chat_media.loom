@@ -1,0 +1,265 @@
+// Qwen ordered text, image, and timestamped-video framing. Native inspection
+// owns byte decoding, source ranges, dimensions, and finite ordered timestamps.
+// This source owns temporal pairing, common clip geometry, and projected token
+// placement. Plan records name input ranges; metadata is the selected pixel
+// width/height. A single-plane odd tail aliases its partner in pixel preparation.
+
+func.decl import("input") @require(%condition: i32, %diagnostic: buffer)
+
+func.decl import("json") @format_f64(%value: f64, %fractional_digits: i32) -> (buffer)
+
+func.decl @qwen38_vision_geometry(%width: i32, %height: i32, %maximum_tokens: i32) -> (i32, i32)
+
+func.decl @qwen38_video_geometry(%width: i32, %height: i32, %frames: i32) -> (i32, i32)
+
+global.rodata.def @media_role_error = bytes("5177656e20696d6167657320616e6420766964656f206672616d657320726571756972652061207573657220726f6c65")
+
+global.rodata.def @media_geometry_error = bytes("5177656e206d6564696120726571756972657320646973706c61792061737065637420726174696f206174206d6f737420323030")
+
+global.rodata.def @media_video_error = bytes("5177656e20766964656f207265717569726573206174206c656173742074776f206672616d65732077697468206964656e746963616c20646973706c61792064696d656e73696f6e73")
+
+global.rodata.def @media_vision_start = bytes("3c7c766973696f6e5f73746172747c3e")
+
+global.rodata.def @media_image_pad = bytes("3c7c696d6167655f7061647c3e")
+
+global.rodata.def @media_video_pad = bytes("3c7c766964656f5f7061647c3e")
+
+global.rodata.def @media_vision_end = bytes("3c7c766973696f6e5f656e647c3e")
+
+global.rodata.def @media_time_open = bytes("3c")
+
+global.rodata.def @media_time_close = bytes("207365636f6e64733e")
+
+// One source content part supplies one image or a uniformly shaped clip.
+// Inspect all frame geometry before publishing any projection of that clip.
+func.def @media_geometry(%frames: buffer, %first: index, %count: index, %video: i1, %maximum_tokens: i32) -> (i32, i32) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %stride = index.constant 16 : offset
+  %first_offset = index.scale %first, %stride : index, offset -> offset
+  %geometry = buffer.view %frames[%first_offset] : buffer -> view<2xi32>
+  %width = view.load %geometry[0] : view<2xi32> -> i32
+  %height = view.load %geometry[1] : view<2xi32> -> i32
+  %short_axis = scalar.minui %width, %height : i32
+  %long_axis = scalar.maxui %width, %height : i32
+  %ratio = scalar.constant 200 : i32
+  %long_limit = scalar.muli %short_axis, %ratio : i32
+  %aspect_valid = scalar.cmpi ule, %long_axis, %long_limit : i32
+  %aspect32 = scalar.extui %aspect_valid : i1 to i32
+  %geometry_error = global.load @media_geometry_error : buffer
+  func.call @require(%aspect32, %geometry_error) : (i32, buffer)
+  %selected_width, %selected_height = scf.if %video -> (i32, i32) {
+    %pair_size = index.constant 2 : index
+    %has_pair = index.cmp uge, %count, %pair_size : index
+    %valid = scf.for %i = [%c0 to %count step %c1](%same = %has_pair : i1) -> (i1) {
+      %frame = index.add %first, %i : index
+      %offset = index.scale %frame, %stride : index, offset -> offset
+      %shape = buffer.view %frames[%offset] : buffer -> view<2xi32>
+      %frame_width = view.load %shape[0] : view<2xi32> -> i32
+      %frame_height = view.load %shape[1] : view<2xi32> -> i32
+      %same_width = scalar.cmpi eq, %frame_width, %width : i32
+      %same_height = scalar.cmpi eq, %frame_height, %height : i32
+      %same_shape = scalar.andi %same_width, %same_height : i1
+      %next = scalar.andi %same, %same_shape : i1
+      scf.yield %next : i1
+    }
+    %valid32 = scalar.extui %valid : i1 to i32
+    %error = global.load @media_video_error : buffer
+    func.call @require(%valid32, %error) : (i32, buffer)
+    %count32 = index.cast %count : index to i32
+    %result_width, %result_height = func.call @qwen38_video_geometry(%width, %height, %count32) : (i32, i32, i32) -> (i32, i32)
+    scf.yield %result_width, %result_height : i32, i32
+  } else {
+    %result_width, %result_height = func.call @qwen38_vision_geometry(%width, %height, %maximum_tokens) : (i32, i32, i32) -> (i32, i32)
+    scf.yield %result_width, %result_height : i32, i32
+  }
+  func.return %selected_width, %selected_height : i32, i32
+}
+
+func.def @media_timestamp(%frames: buffer, %first: index, %count: index) -> (buffer) {
+  %c1 = index.constant 1 : index
+  %stride = index.constant 16 : offset
+  %time_offset = index.constant 8 : offset
+  %first_offset = index.scale %first, %stride : index, offset -> offset
+  %first_time = index.add %first_offset, %time_offset : offset
+  %tail = index.sub %count, %c1 : index
+  %last = index.add %first, %tail : index
+  %last_offset = index.scale %last, %stride : index, offset -> offset
+  %last_time = index.add %last_offset, %time_offset : offset
+  %begin = buffer.view %frames[%first_time] : buffer -> view<1xf64>
+  %end = buffer.view %frames[%last_time] : buffer -> view<1xf64>
+  %first_timestamp = view.load %begin[0] : view<1xf64> -> f64
+  %last_timestamp = view.load %end[0] : view<1xf64> -> f64
+  // Halve before adding so every finite admitted timestamp stays finite.
+  %half = scalar.constant 0.5 : f64
+  %first_half = scalar.mulf %first_timestamp, %half : f64
+  %last_half = scalar.mulf %last_timestamp, %half : f64
+  %average = scalar.addf %first_half, %last_half : f64
+  %digits = scalar.constant 1 : i32
+  %text = func.call @format_f64(%average, %digits) : (f64, i32) -> (buffer)
+  func.return %text : buffer
+}
+
+// The returned text buffer has spare timestamp capacity; only the returned
+// byte length is live. The chat caller trims that span and shifts its markers.
+// A plan reserves at most one 28-byte record and eight metadata bytes per
+// inspected input. Paired clips populate fewer records without another copy.
+func.def public @qwen38_chat_media_content(%content: buffer, %parts: buffer, %frames: buffer, %part_count: i64, %media_allowed: i1, %maximum_tokens: i32) -> (buffer, offset, buffer, i64) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %text_kind = scalar.constant 0 : i32
+  %video_kind = scalar.constant 2 : i32
+  %frame_bytes = buffer.length %frames
+  %frame_length = index.cast %frame_bytes : offset to index
+  %stride_index = index.constant 16 : index
+  %input_count = index.div %frame_length, %stride_index : index
+  %capacity = index.assume %input_count [range(%input_count, 0, 768)] : index
+  %record_stride = index.constant 28 : offset
+  %shape_stride = index.constant 8 : offset
+  %metadata_begin = index.scale %capacity, %record_stride : index, offset -> offset
+  %metadata_bytes = index.scale %capacity, %shape_stride : index, offset -> offset
+  %plan_bytes = index.add %metadata_begin, %metadata_bytes : offset
+  %plan = buffer.alloca<private> align(4) %plan_bytes : buffer
+  %markers = buffer.view %plan[%origin] : buffer -> view<[%capacity]x7xi32>
+  %bounded_part_count = scalar.assume %part_count [range(%part_count, 1, 4096)] : i64
+  %part_extent = index.cast %bounded_part_count : i64 to index
+  %records = buffer.view %parts[%origin] : buffer -> view<[%part_extent]x6xi32>
+  %token_pixels = scalar.constant 1024 : i32
+  %metadata_length = scalar.constant 8 : i32
+  %projection_count, %total_rows, %video_count = scf.for %i = [%c0 to %part_extent step %c1](%projection = %c0 : index, %rows = %c0 : index, %videos = %c0 : index) -> (index, index, index) {
+    %kind = view.load %records[%i, 0] : view<[%part_extent]x6xi32> -> i32
+    %is_text = scalar.cmpi eq, %kind, %text_kind : i32
+    %next, %next_rows, %next_videos = scf.if %is_text -> (index, index, index) {
+      scf.yield %projection, %rows, %videos : index, index, index
+    } else {
+      %allowed32 = scalar.extui %media_allowed : i1 to i32
+      %error = global.load @media_role_error : buffer
+      func.call @require(%allowed32, %error) : (i32, buffer)
+      %video = scalar.cmpi eq, %kind, %video_kind : i32
+      %first32 = view.load %records[%i, 3] : view<[%part_extent]x6xi32> -> i32
+      %count32 = view.load %records[%i, 4] : view<[%part_extent]x6xi32> -> i32
+      %first = index.cast %first32 : i32 to index
+      %count = index.cast %count32 : i32 to index
+      %end = index.add %first, %count : index
+      %width, %height = func.call @media_geometry(%frames, %first, %count, %video, %maximum_tokens) : (buffer, index, index, i1, i32) -> (i32, i32)
+      %pixels = scalar.muli %width, %height : i32
+      %features = scalar.divui %pixels, %token_pixels : i32
+      %feature_extent = index.cast %features : i32 to index
+      %step = scf.select %video, %c2, %c1 : index
+      %after = scf.for %frame = [%first to %end step %step](%position = %projection : index) -> (index) {
+        %record = index.assume %position [ge(%position, 0), lt(%position, %capacity)] : index
+        %remaining = index.sub %end, %frame : index
+        %group_count = index.min %remaining, %step : index
+        %frame32 = index.cast %frame : index to i32
+        %group_count32 = index.cast %group_count : index to i32
+        %shape_delta = index.scale %record, %shape_stride : index, offset -> offset
+        %shape_offset = index.add %metadata_begin, %shape_delta : offset
+        %shape_offset32 = index.cast %shape_offset : offset to i32
+        %shape = buffer.view %plan[%shape_offset] : buffer -> view<2xi32>
+        view.store %width, %shape[0] : i32, view<2xi32>
+        view.store %height, %shape[1] : i32, view<2xi32>
+        view.store %frame32, %markers[%record, 0] : i32, view<[%capacity]x7xi32>
+        view.store %group_count32, %markers[%record, 1] : i32, view<[%capacity]x7xi32>
+        view.store %features, %markers[%record, 4] : i32, view<[%capacity]x7xi32>
+        view.store %shape_offset32, %markers[%record, 5] : i32, view<[%capacity]x7xi32>
+        view.store %metadata_length, %markers[%record, 6] : i32, view<[%capacity]x7xi32>
+        %next = index.add %position, %c1 : index
+        scf.yield %next : index
+      }
+      %groups = index.sub %after, %projection : index
+      %added_rows = index.mul %groups, %feature_extent : index
+      %new_rows = index.add %rows, %added_rows : index
+      %added_videos = scf.select %video, %groups, %c0 : index
+      %new_videos = index.add %videos, %added_videos : index
+      scf.yield %after, %new_rows, %new_videos : index, index, index
+    }
+    scf.yield %next, %next_rows, %next_videos : index, index, index
+  }
+  %vision_start = global.load @media_vision_start : buffer
+  %vision_end = global.load @media_vision_end : buffer
+  %image_pad = global.load @media_image_pad : buffer
+  %video_pad = global.load @media_video_pad : buffer
+  %time_open = global.load @media_time_open : buffer
+  %time_close = global.load @media_time_close : buffer
+  %start_length = buffer.length %vision_start
+  %end_length = buffer.length %vision_end
+  // Both special pad spellings occupy thirteen bytes.
+  %pad_length = buffer.length %image_pad
+  %padding_bytes = index.scale %total_rows, %pad_length : index, offset -> offset
+  %delimiter_length = index.add %start_length, %end_length : offset
+  %delimiter_bytes = index.scale %projection_count, %delimiter_length : index, offset -> offset
+  // Finite nonnegative F64: at most 309 integral digits, '.0', and delimiters.
+  %timestamp_capacity = index.constant 321 : offset
+  %timestamp_bytes = index.scale %video_count, %timestamp_capacity : index, offset -> offset
+  %content_bytes = buffer.length %content
+  %media_bytes = index.add %padding_bytes, %delimiter_bytes : offset
+  %with_text = index.add %content_bytes, %media_bytes : offset
+  %output_capacity = index.add %with_text, %timestamp_bytes : offset
+  %scratch = buffer.alloca<private> align(1) %output_capacity : buffer
+  %open_length = buffer.length %time_open
+  %close_length = buffer.length %time_close
+  %used, %final_projection = scf.for %i = [%c0 to %part_extent step %c1](%cursor = %origin : offset, %projection = %c0 : index) -> (offset, index) {
+    %kind = view.load %records[%i, 0] : view<[%part_extent]x6xi32> -> i32
+    %is_text = scalar.cmpi eq, %kind, %text_kind : i32
+    %next_cursor, %next_projection = scf.if %is_text -> (offset, index) {
+      %source32 = view.load %records[%i, 1] : view<[%part_extent]x6xi32> -> i32
+      %length32 = view.load %records[%i, 2] : view<[%part_extent]x6xi32> -> i32
+      %source = index.cast %source32 : i32 to offset
+      %length = index.cast %length32 : i32 to offset
+      buffer.copy %content[%source], %scratch[%cursor], %length
+      %after_text = index.add %cursor, %length : offset
+      scf.yield %after_text, %projection : offset, index
+    } else {
+      %video = scalar.cmpi eq, %kind, %video_kind : i32
+      %first32 = view.load %records[%i, 3] : view<[%part_extent]x6xi32> -> i32
+      %count32 = view.load %records[%i, 4] : view<[%part_extent]x6xi32> -> i32
+      %first = index.cast %first32 : i32 to index
+      %count = index.cast %count32 : i32 to index
+      %end = index.add %first, %count : index
+      %step = scf.select %video, %c2, %c1 : index
+      %pad = scf.select %video, %video_pad, %image_pad : buffer
+      %after, %next = scf.for %frame = [%first to %end step %step](%position = %cursor : offset, %ordinal = %projection : index) -> (offset, index) {
+        %record = index.assume %ordinal [ge(%ordinal, 0), lt(%ordinal, %capacity)] : index
+        %features32 = view.load %markers[%record, 4] : view<[%capacity]x7xi32> -> i32
+        %features = index.cast %features32 : i32 to index
+        %before_vision = scf.if %video -> (offset) {
+          %group_count32 = view.load %markers[%record, 1] : view<[%capacity]x7xi32> -> i32
+          %group_count = index.cast %group_count32 : i32 to index
+          %timestamp = func.call @media_timestamp(%frames, %frame, %group_count) : (buffer, index, index) -> (buffer)
+          %length = buffer.length %timestamp
+          buffer.copy %time_open[%origin], %scratch[%position], %open_length
+          %number_begin = index.add %position, %open_length : offset
+          buffer.copy %timestamp[%origin], %scratch[%number_begin], %length
+          %suffix_begin = index.add %number_begin, %length : offset
+          buffer.copy %time_close[%origin], %scratch[%suffix_begin], %close_length
+          %after_time = index.add %suffix_begin, %close_length : offset
+          scf.yield %after_time : offset
+        } else {
+          scf.yield %position : offset
+        }
+        buffer.copy %vision_start[%origin], %scratch[%before_vision], %start_length
+        %marker_begin = index.add %before_vision, %start_length : offset
+        %after_pads = scf.for %j = [%c0 to %features step %c1](%pad_cursor = %marker_begin : offset) -> (offset) {
+          buffer.copy %pad[%origin], %scratch[%pad_cursor], %pad_length
+          %next = index.add %pad_cursor, %pad_length : offset
+          scf.yield %next : offset
+        }
+        buffer.copy %vision_end[%origin], %scratch[%after_pads], %end_length
+        %after_vision = index.add %after_pads, %end_length : offset
+        %marker_length = index.sub %after_pads, %marker_begin : offset
+        %marker_begin32 = index.cast %marker_begin : offset to i32
+        %marker_length32 = index.cast %marker_length : offset to i32
+        view.store %marker_begin32, %markers[%record, 2] : i32, view<[%capacity]x7xi32>
+        view.store %marker_length32, %markers[%record, 3] : i32, view<[%capacity]x7xi32>
+        %next = index.add %ordinal, %c1 : index
+        scf.yield %after_vision, %next : offset, index
+      }
+      scf.yield %after, %next : offset, index
+    }
+    scf.yield %next_cursor, %next_projection : offset, index
+  }
+  %count64 = index.cast %projection_count : index to i64
+  func.return %scratch, %used, %plan, %count64 : buffer, offset, buffer, i64
+}

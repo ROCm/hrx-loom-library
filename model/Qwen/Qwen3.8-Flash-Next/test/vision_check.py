@@ -4,11 +4,12 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""Image answers, retained partial pools, and independent parameter lifetimes.
+"""Image/video answers, retained partial pools, and parameter lifetimes.
 
-Solid-color PNGs provide independent task expectations without checkpoint-sized
-fixtures. Numerical encoder and speculative-state tests establish the lower
-boundaries; these requests exercise their complete public-service composition.
+Solid-color PNG/JPEG inputs provide independent task expectations without
+checkpoint-sized fixtures. Numerical encoder and speculative-state tests
+establish the lower boundaries; these requests exercise their complete
+public-service composition.
 """
 
 import base64
@@ -17,14 +18,19 @@ import re
 import struct
 import uuid
 import zlib
+from pathlib import Path
 
-from loom_serve_testing.chat import request
+from loom_serve_testing.chat import request_body
 from loom_serve_testing.http_harness import control, wait_status
 
 
 COLOR_QUESTION = "Hi! What color fills this image? Reply with only the color name."
-COUNT_QUESTION = "Count the solid colors in the image. Reply with only one digit."
-RECALL_QUESTION = "Which color was in the image? Answer with one word."
+VIDEO_SEQUENCE_QUESTION = (
+    "Name the video colors in temporal order. Reply with only the color names."
+)
+VIDEO_RECALL_QUESTION = (
+    "What color fills the final video frame? Reply with only the color name."
+)
 RED = (320, 256, (255, 0, 0))
 
 
@@ -56,6 +62,31 @@ def history(images, question):
     return [{"role": "user", "content": content}]
 
 
+def video_history():
+    # Distinct temporal planes, irregular pair times (0.4/3.0/8.2 s), an odd
+    # final frame, and a separate still image exercise the full ordered input.
+    frames = [
+        base64.b64encode(
+            Path(__file__).with_name(f"video_{name}.jpg").read_bytes()
+        ).decode("ascii")
+        for name in ("red", "dark_red", "blue", "dark_blue", "green")
+    ]
+    content = [
+        {"type": "text", "text": "A still image: "},
+        {
+            "type": "image_url",
+            "image_url": {"url": image_url(320, 256, (255, 255, 0))},
+        },
+        {"type": "text", "text": "A video clip: "},
+        {
+            "type": "video_url",
+            "video_url": {"url": "data:video/jpeg;base64," + ",".join(frames)},
+        },
+        {"type": "text", "text": VIDEO_SEQUENCE_QUESTION},
+    ]
+    return [{"role": "user", "content": content}]
+
+
 def append(messages, answer, question):
     return messages + [
         {"role": "assistant", "content": answer["text"]},
@@ -68,9 +99,34 @@ def cached(answer):
 
 
 def chat(address, model, session, messages, checkpoint=None):
-    result = request(
-        address, session, messages, 24, model=model, checkpoint=checkpoint
-    )
+    body = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "temperature": 0,
+        "enable_thinking": False,
+        "max_tokens": 24,
+    }
+    # Every video in this lifecycle is the same five-frame color sequence.
+    if any(
+        part.get("type") == "video_url"
+        for message in messages
+        if isinstance(message["content"], list)
+        for part in message["content"]
+    ):
+        body["media_io_kwargs"] = {
+            "video": {
+                "fps": 100,
+                "frames_indices": [0, 75, 210, 390, 820],
+                "num_frames": -1,
+                "do_sample_frames": False,
+            }
+        }
+    headers = {"X-Loom-Session": session}
+    if checkpoint is not None:
+        headers["X-Loom-Checkpoint"] = checkpoint
+    result = request_body(address, body, headers)
     print(json.dumps({"case": session, **result}), flush=True)
     assert result["finish_reason"] == "stop", result
     assert not result["reasoning_content"] and not result["tool_calls"], result
@@ -82,7 +138,7 @@ def color(answer, expected):
 
 
 def run(address, model):
-    """Check image ownership through speculative or target-only execution."""
+    """Check mixed media ownership through speculative or target-only execution."""
     prefix = "vision-check-" + uuid.uuid4().hex
     headers = {"Content-Type": "application/json", "X-Loom-Model": model}
     record = {}
@@ -137,11 +193,15 @@ def run(address, model):
             headers=headers,
         )
 
-    retained_history = history([RED], COUNT_QUESTION)
+    retained_history = video_history()
     retained = request("retained-root", retained_history)
-    assert retained["text"] == "1", retained
+    assert re.findall(r"[a-z]+", retained["text"].lower()) == [
+        "red",
+        "blue",
+        "green",
+    ], retained
     wait_status(address, model=model, phase="idle", queued_requests=0, active_requests=0)
-    checkpoint = prefix + "-image"
+    checkpoint = prefix + "-video"
     checkpoint_path = "/v1/checkpoints/" + checkpoint
     receipt = control(
         address,
@@ -155,7 +215,7 @@ def run(address, model):
     try:
         assert receipt["host_snapshot_bytes"] == 0, receipt
         # A later fork completes this QSA group with coordinates carried from
-        # the retained image endpoint, rather than current-packet coordinates.
+        # the retained video endpoint, rather than current-packet coordinates.
         assert receipt["position"] % 4 != 0, receipt
         blue = request("blue", history([(1024, 1024, (0, 0, 255))], COLOR_QUESTION))
         color(blue, "blue")
@@ -190,20 +250,27 @@ def run(address, model):
             operation("undrain")
 
         branches = []
-        for ordinal, prompt in enumerate(
-            [RECALL_QUESTION, "Was the image red or blue? Reply with one word."]
+        for ordinal, (prompt, expected) in enumerate(
+            [
+                (VIDEO_RECALL_QUESTION, "green"),
+                (
+                    "What color fills the video at 3 seconds? "
+                    "Reply with only the color name.",
+                    "blue",
+                ),
+            ]
         ):
             messages = append(retained_history, retained, prompt)
             answer = request("fork-" + str(ordinal), messages, checkpoint)
-            color(answer, "red")
+            color(answer, expected)
             assert cached(answer) == receipt["position"], (answer, receipt)
-            branches.append(messages)
+            branches.append((messages, expected))
         assert not settled()["parameters"]["image"]["active"], (
             "fork reactivated projector"
         )
 
-        for ordinal, messages in enumerate(branches):
-            color(request("replay-" + str(ordinal), messages), "red")
+        for ordinal, (messages, expected) in enumerate(branches):
+            color(request("replay-" + str(ordinal), messages), expected)
         purple = request(
             "fresh-purple", history([(512, 320, (128, 0, 128))], COLOR_QUESTION)
         )
@@ -226,8 +293,8 @@ def run(address, model):
             assert warm["compilation"] == before["compilation"], (before, warm)
         finally:
             operation("undrain")
-        restored = request("restored", branches[0], checkpoint)
-        color(restored, "red")
+        restored = request("restored", branches[0][0], checkpoint)
+        color(restored, branches[0][1])
         assert cached(restored) == receipt["position"], (restored, receipt)
     finally:
         control(address, "DELETE", checkpoint_path, 200, headers=headers)
@@ -235,11 +302,11 @@ def run(address, model):
 
 
 def replay(address, model, record):
-    """Replay the image-bearing history after the prior server has joined."""
+    """Replay mixed media after the prior server and device have joined."""
     messages = append(
-        history([RED], COUNT_QUESTION), record["retained-root"], RECALL_QUESTION
+        video_history(), record["retained-root"], VIDEO_RECALL_QUESTION
     )
     answer = chat(address, model, "vision-cold-" + uuid.uuid4().hex, messages)
-    color(answer, "red")
+    color(answer, "green")
     assert cached(answer) == 0, answer
     return answer

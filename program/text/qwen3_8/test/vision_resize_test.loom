@@ -7,14 +7,14 @@ amdgpu.target<gfx11-generic> @resize_test_wave32 {subgroup_size = 32}
 
 // Each group owns 32 columns and sixteen destination rows. Eight horizontal
 // source rows are staged at a time; no image-sized intermediate is allocated.
-template.decl @qwen38.vision.resize(%image: index, %input: buffer, %output: buffer)
+template.decl @qwen38.vision.resize(%image: index, %plane: index, %output_offset: offset, %input: buffer, %output: buffer)
 
 kernel.def target(@resize_test_wave32) @resize_test(%groups_x: index, %groups_y: index) {
   %c1 = index.constant 1 : index
   %threads = index.constant 256 : index
   kernel.launch.config workgroups(%groups_x, %groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%image: index, %input: buffer, %output: buffer) where [range(%image, 0, 3)] {
-  template.apply<@qwen38.vision.resize>(%image, %input, %output) : (index, buffer, buffer)
+} launch(%image: index, %plane: index, %output_offset: offset, %input: buffer, %output: buffer) where [range(%image, 0, 3), range(%plane, 0, 1)] {
+  template.apply<@qwen38.vision.resize>(%image, %plane, %output_offset, %input, %output) : (index, index, offset, buffer, buffer)
   kernel.return
 }
 
@@ -64,17 +64,18 @@ func.def @resize_sample(%x: i32, %y: i32, %channel: i32, %constant: i1) -> (i32)
   func.return %result : i32
 }
 
-func.def @resize_packet_fixture(%trial_value: index, %packet: buffer, %expected: buffer) -> (index, index, index) {
-  %variant = index.assume %trial_value [range(%trial_value, 0, 31)] : index
+func.def @resize_packet_fixture_impl(%trial_value: index, %long_axis: i1, %packet: buffer, %expected: buffer) -> (index, index, index, index) {
+  %bounded_trial = index.assume %trial_value [range(%trial_value, 0, 63)] : index
   %c16 = index.constant 16 : index
   %c32 = index.constant 32 : index
+  %variant = index.rem %bounded_trial, %c32 : index
+  %temporal = index.div %bounded_trial, %c32 : index
   %trial = index.rem %variant, %c16 : index
   %portrait = index.div %variant, %c16 : index
   %origin = index.constant 0 : offset
-  %pixel_offset = index.constant 80 : offset
-  %metadata_offset = index.constant 64 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
   %c3 = index.constant 3 : index
   %c4 = index.constant 4 : index
   %mode_index = index.div %trial, %c4 : index
@@ -98,7 +99,6 @@ func.def @resize_packet_fixture(%trial_value: index, %packet: buffer, %expected:
   %up = scalar.cmpi eq, %mode, %c3_i32 : i32
   %constant = scalar.cmpi uge, %mode, %c2_i32 : i32
   %alpha_bit = scalar.andi %mode, %c1_i32 : i32
-  %has_alpha = scalar.cmpi ne, %alpha_bit, %c0_i32 : i32
   %channels = scalar.addi %c3_i32, %alpha_bit : i32
   %wide_width = scf.select %down, %c128_i32, %c64_i32 : i32
   %wide_height = scf.select %down, %c64_i32, %c32_i32 : i32
@@ -108,57 +108,102 @@ func.def @resize_packet_fixture(%trial_value: index, %packet: buffer, %expected:
   %transposed = scalar.cmpi uge, %orientation, %c5_i32 : i32
   %display_width = scf.select %transposed, %physical_height, %physical_width : i32
   %display_height = scf.select %transposed, %physical_width, %physical_height : i32
-  %target_width = scf.select %transposed, %c32_i32, %c64_i32 : i32
-  %target_height = scf.select %transposed, %c64_i32, %c32_i32 : i32
+  %maximum_axis = scalar.constant 6400 : i32
+  %target_long = scf.select %long_axis, %maximum_axis, %c64_i32 : i32
+  %target_width = scf.select %transposed, %c32_i32, %target_long : i32
+  %target_height = scf.select %transposed, %target_long, %c32_i32 : i32
   %source_pixels = scalar.muli %physical_width, %physical_height : i32
   %source_bytes = scalar.muli %source_pixels, %channels : i32
-  %c80_i32 = scalar.constant 80 : i32
-  %request_length = scalar.addi %c80_i32, %source_bytes : i32
-  %request_bytes = index.cast %request_length : i32 to offset
+  %paired = index.cmp ne, %temporal, %c0 : index
+  %plane_count = index.add %temporal, %c1 : index
+  %selected_plane = index.rem %variant, %c2 : index
+  %select_second = index.cmp ne, %selected_plane, %c0 : index
+  %invert = scalar.andi %paired, %select_second : i1
+  %second_channels = scalar.subi %c7_i32, %channels : i32
+  %selected_channels = scf.select %invert, %second_channels, %channels : i32
+  %has_alpha = scalar.cmpi eq, %selected_channels, %c4_i32 : i32
+  %second_source_bytes = scalar.muli %source_pixels, %second_channels : i32
+  %first_bytes = index.cast %source_bytes : i32 to offset
+  %second_bytes_value = index.cast %second_source_bytes : i32 to offset
+  %second_bytes = scf.select %paired, %second_bytes_value, %origin : offset
+  %native_header_bytes = index.constant 32 : offset
+  %descriptor_stride = index.constant 48 : offset
+  %metadata_bytes = index.constant 8 : offset
+  %descriptor_bytes = index.scale %plane_count, %descriptor_stride : index, offset -> offset
+  %metadata_offset = index.add %native_header_bytes, %descriptor_bytes : offset
+  %prefix_bytes = index.add %metadata_offset, %metadata_bytes : offset
+  %request_bytes, %prefix_offset, %first_pixels, %second_pixels = buffer.pack [align(16) %prefix_bytes, align(16) %first_bytes, align(16) %second_bytes] : offset
   %request = buffer.alloca<private> align(16) %request_bytes : buffer
-  buffer.fill %c0_i32, %request[%origin], %pixel_offset : i32
-  %header = buffer.view %request[%origin] : buffer -> view<16xi32>
-  view.store %c1_i32, %header[0] : i32, view<16xi32>
-  view.store %physical_width, %header[2] : i32, view<16xi32>
-  view.store %physical_height, %header[3] : i32, view<16xi32>
-  view.store %display_width, %header[4] : i32, view<16xi32>
-  view.store %display_height, %header[5] : i32, view<16xi32>
-  view.store %orientation, %header[6] : i32, view<16xi32>
-  view.store %c2_i32, %header[7] : i32, view<16xi32>
-  view.store %c64_i32, %header[8] : i32, view<16xi32>
-  view.store %c8_i32, %header[9] : i32, view<16xi32>
-  view.store %c80_i32, %header[10] : i32, view<16xi32>
-  view.store %source_bytes, %header[11] : i32, view<16xi32>
-  view.store %channels, %header[12] : i32, view<16xi32>
+  buffer.fill %c0_i32, %request[%origin], %request_bytes : i32
+  %request_length = index.cast %request_bytes : offset to i32
+  %plane_count_word = index.cast %plane_count : index to i32
+  %metadata_word = index.cast %metadata_offset : offset to i32
+  %pixel_word = index.cast %first_pixels : offset to i32
+  %header = buffer.view %request[%origin] : buffer -> view<8xi32>
+  view.store %c2_i32, %header[0] : i32, view<8xi32>
+  view.store %plane_count_word, %header[1] : i32, view<8xi32>
+  %target_pixels = scalar.muli %target_width, %target_height : i32
+  %token_pixels = scalar.constant 1024 : i32
+  %feature_count = scalar.divui %target_pixels, %token_pixels : i32
+  view.store %feature_count, %header[2] : i32, view<8xi32>
+  view.store %metadata_word, %header[3] : i32, view<8xi32>
+  view.store %c8_i32, %header[4] : i32, view<8xi32>
+  view.store %c32_i32, %header[5] : i32, view<8xi32>
+  view.store %pixel_word, %header[6] : i32, view<8xi32>
+  view.store %request_length, %header[7] : i32, view<8xi32>
   %geometry = buffer.view %request[%metadata_offset] : buffer -> view<2xi32>
   view.store %target_width, %geometry[0] : i32, view<2xi32>
   view.store %target_height, %geometry[1] : i32, view<2xi32>
   %width = index.cast %physical_width : i32 to index
   %height = index.cast %physical_height : i32 to index
-  %channel_count = index.cast %channels : i32 to index
-  %pixels = buffer.view %request[%pixel_offset] : buffer -> view<[%height]x[%width]x[%channel_count]xi8>
-  scf.for %y = [%c0 to %height step %c1] {
-    scf.for %x = [%c0 to %width step %c1] {
-      scf.for %channel = [%c0 to %channel_count step %c1] {
-        %x_word = index.cast %x : index to i32
-        %y_word = index.cast %y : index to i32
-        %channel_word = index.cast %channel : index to i32
-        %sample = func.call @resize_sample(%x_word, %y_word, %channel_word, %constant) : (i32, i32, i32, i1) -> (i32)
-        %byte = scalar.trunci %sample : i32 to i8
-        view.store %byte, %pixels[%y, %x, %channel] : i8, view<[%height]x[%width]x[%channel_count]xi8>
+  scf.for %frame = [%c0 to %plane_count step %c1] {
+    %second = index.cmp ne, %frame, %c0 : index
+    %frame_channels = scf.select %second, %second_channels, %channels : i32
+    %frame_bytes = scf.select %second, %second_source_bytes, %source_bytes : i32
+    %frame_pixels = scf.select %second, %second_pixels, %first_pixels : offset
+    %frame_word = index.cast %frame_pixels : offset to i32
+    %relative = index.scale %frame, %descriptor_stride : index, offset -> offset
+    %plane_offset = index.add %native_header_bytes, %relative : offset
+    %plane = buffer.view %request[%plane_offset] : buffer -> view<12xi32>
+    view.store %c1_i32, %plane[0] : i32, view<12xi32>
+    view.store %physical_width, %plane[1] : i32, view<12xi32>
+    view.store %physical_height, %plane[2] : i32, view<12xi32>
+    view.store %display_width, %plane[3] : i32, view<12xi32>
+    view.store %display_height, %plane[4] : i32, view<12xi32>
+    view.store %orientation, %plane[5] : i32, view<12xi32>
+    view.store %frame_word, %plane[6] : i32, view<12xi32>
+    view.store %frame_bytes, %plane[7] : i32, view<12xi32>
+    view.store %frame_channels, %plane[8] : i32, view<12xi32>
+    %channel_count = index.cast %frame_channels : i32 to index
+    %pixels = buffer.view %request[%frame_pixels] : buffer -> view<[%height]x[%width]x[%channel_count]xi8>
+    scf.for %y = [%c0 to %height step %c1] {
+      scf.for %x = [%c0 to %width step %c1] {
+        scf.for %channel = [%c0 to %channel_count step %c1] {
+          %x_word = index.cast %x : index to i32
+          %y_word = index.cast %y : index to i32
+          %channel_word = index.cast %channel : index to i32
+          %sample = func.call @resize_sample(%x_word, %y_word, %channel_word, %constant) : (i32, i32, i32, i1) -> (i32)
+          %rgb = index.cmp ult, %channel, %c3 : index
+          %inverted = scalar.andi %second, %rgb : i1
+          %maximum = scalar.constant 255 : i32
+          %complement = scalar.subi %maximum, %sample : i32
+          %value = scf.select %inverted, %complement, %sample : i32
+          %byte = scalar.trunci %value : i32 to i8
+          view.store %byte, %pixels[%y, %x, %channel] : i8, view<[%height]x[%width]x[%channel_count]xi8>
+        }
       }
     }
   }
   %prepared = func.call @qwen38_vision_pixel_packet(%request) : (buffer) -> (buffer)
   %prepared_bytes = buffer.length %prepared
-  buffer.copy %prepared[%origin], %packet[%origin], %prepared_bytes
+  %directory_bytes = index.constant 64 : offset
+  buffer.copy %prepared[%origin], %packet[%directory_bytes], %prepared_bytes
   %image = index.rem %trial, %c4 : index
   %directory = buffer.view %packet[%origin] : buffer -> view<4x2xi64>
   %header_position = scalar.constant 64 : i64
   %length = index.cast %prepared_bytes : offset to i64
-  %header_length = scalar.subi %length, %header_position : i64
   view.store %header_position, %directory[%image, 0] : i64, view<4x2xi64>
-  view.store %header_length, %directory[%image, 1] : i64, view<4x2xi64>
+  view.store %length, %directory[%image, 1] : i64, view<4x2xi64>
   %target_x = index.cast %target_width : i32 to index
   %target_y = index.cast %target_height : i32 to index
   %result = buffer.view %expected[%origin] : buffer -> view<[%target_y]x[%target_x]x3xi8>
@@ -188,7 +233,10 @@ func.def @resize_packet_fixture(%trial_value: index, %packet: buffer, %expected:
       %source_y = scf.select %reverse_row, %inverted_row, %row : i32
       scf.for %channel = [%c0 to %c3 step %c1] {
         %channel_word = index.cast %channel : index to i32
-        %sample = func.call @resize_sample(%source_x, %source_y, %channel_word, %constant) : (i32, i32, i32, i1) -> (i32)
+        %original = func.call @resize_sample(%source_x, %source_y, %channel_word, %constant) : (i32, i32, i32, i1) -> (i32)
+        %white = scalar.constant 255 : i32
+        %inverse = scalar.subi %white, %original : i32
+        %sample = scf.select %invert, %inverse, %original : i32
         %value = scf.if %has_alpha -> (i32) {
           %alpha = func.call @resize_sample(%source_x, %source_y, %c3_i32, %constant) : (i32, i32, i32, i1) -> (i32)
           %maximum = scalar.constant 255 : i32
@@ -209,29 +257,72 @@ func.def @resize_packet_fixture(%trial_value: index, %packet: buffer, %expected:
   }
   %groups_x = index.div %target_x, %c32 : index
   %groups_y = index.div %target_y, %c16 : index
-  func.return %image, %groups_x, %groups_y : index, index, index
+  func.return %image, %selected_plane, %groups_x, %groups_y : index, index, index, index
+}
+
+func.def @resize_packet_fixture(%trial: index, %packet: buffer, %expected: buffer) -> (index, index, index, index) {
+  %long_axis = scalar.constant false : i1
+  %image, %plane, %groups_x, %groups_y = func.call @resize_packet_fixture_impl(%trial, %long_axis, %packet, %expected) : (index, i1, buffer, buffer) -> (index, index, index, index)
+  func.return %image, %plane, %groups_x, %groups_y : index, index, index, index
+}
+
+// A one-pixel constant expands along each maximum output axis. Only these two
+// cases need the larger fixture; ordinary orientation/plane cases stay small.
+func.def @resize_long_axis_fixture(%trial: index, %packet: buffer, %expected: buffer) -> (index, index, index, index) {
+  %orientation_stride = index.constant 16 : index
+  %upsample = index.constant 12 : index
+  %variant = index.madd %trial, %orientation_stride, %upsample : index
+  %long_axis = scalar.constant true : i1
+  %image, %plane, %groups_x, %groups_y = func.call @resize_packet_fixture_impl(%variant, %long_axis, %packet, %expected) : (index, i1, buffer, buffer) -> (index, index, index, index)
+  func.return %image, %plane, %groups_x, %groups_y : index, index, index, index
 }
 
 // The fixture supplies analytical expected pixels in a separate observation.
 // Its oracle realization leaves those values unchanged; target output starts
 // with a sentinel and must be overwritten by the production device filter.
-func.def @resize_expected(%image: index, %packet: buffer, %output: buffer) {
+func.def @resize_expected(%image: index, %plane: index, %output_offset: offset, %packet: buffer, %output: buffer) {
   func.return
+}
+
+func.def @resize_output_offset() -> (offset) {
+  %offset = index.constant 16 : offset
+  func.return %offset : offset
 }
 
 check.scenario public @oriented_packets_filter_on_device {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
-  check.trial[32](%trial: index, %entropy: check.entropy) {
-    %packet = check.generate.fill value(-1) : tensor<65536xi8>
-    %expected = check.generate.fill value(-1) : tensor<6144xi8>
-    %image, %groups_x, %groups_y = check.generate<@resize_packet_fixture>(%trial, %packet, %expected) : (index, tensor<65536xi8>, tensor<6144xi8>) -> (index, index, index)
-    %output = check.generate.fill value(-1) : tensor<6144xi8>
-    check.compare<@resize_test, @resize_expected>[%groups_x, %groups_y](%image, %packet, %output) : [index, index](index, tensor<65536xi8>, tensor<6144xi8>) -> () {
-      check.expect.bitwise actual(%output) expected(%expected) : tensor<6144xi8>
-      check.expect.bitwise actual(%packet) expected(%packet) : tensor<65536xi8>
+  check.trial[64](%trial: index, %entropy: check.entropy) {
+    %packet = check.generate.fill value(-1) : tensor<98304xi8>
+    %expected_storage = check.generate.fill value(-1) : tensor<6176xi8>
+    %expected = check.tensor.view %expected_storage offset(16) : tensor<6176xi8> -> tensor<6144xi8>
+    %image, %plane, %groups_x, %groups_y = check.generate<@resize_packet_fixture>(%trial, %packet, %expected) : (index, tensor<98304xi8>, tensor<6144xi8>) -> (index, index, index, index)
+    %output = check.generate.fill value(-1) : tensor<6176xi8>
+    %output_offset = check.generate<@resize_output_offset>() : () -> (offset)
+    check.compare<@resize_test, @resize_expected>[%groups_x, %groups_y](%image, %plane, %output_offset, %packet, %output) : [index, index](index, index, offset, tensor<98304xi8>, tensor<6176xi8>) -> () {
+      check.expect.bitwise actual(%output) expected(%expected_storage) : tensor<6176xi8>
+      check.expect.bitwise actual(%packet) expected(%packet) : tensor<98304xi8>
     }
   }
   check.return
 }
 
 check.benchmark<@oriented_packets_filter_on_device> @oriented_rgb_and_rgba_resize
+
+check.scenario public @video_maximum_axes_filter_on_device {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %packet = check.generate.fill value(-1) : tensor<524288xi8>
+    %expected_storage = check.generate.fill value(-1) : tensor<614432xi8>
+    %expected = check.tensor.view %expected_storage offset(16) : tensor<614432xi8> -> tensor<614400xi8>
+    %image, %plane, %groups_x, %groups_y = check.generate<@resize_long_axis_fixture>(%trial, %packet, %expected) : (index, tensor<524288xi8>, tensor<614400xi8>) -> (index, index, index, index)
+    %output = check.generate.fill value(-1) : tensor<614432xi8>
+    %output_offset = check.generate<@resize_output_offset>() : () -> (offset)
+    check.compare<@resize_test, @resize_expected>[%groups_x, %groups_y](%image, %plane, %output_offset, %packet, %output) : [index, index](index, index, offset, tensor<524288xi8>, tensor<614432xi8>) -> () {
+      check.expect.bitwise actual(%output) expected(%expected_storage) : tensor<614432xi8>
+      check.expect.bitwise actual(%packet) expected(%packet) : tensor<524288xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@video_maximum_axes_filter_on_device> @video_maximum_axis_resize

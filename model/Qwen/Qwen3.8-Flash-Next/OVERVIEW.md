@@ -48,9 +48,9 @@ The quantized repository retains that model license.
 
 The `vision` and `vision-mtp` presets add the matching original
 [`mmproj-BF16.gguf`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6/mmproj-BF16.gguf)
-in a separate `vision` parameter scope. The same source, bytecode, and mixed
-representations support target-only and speculative image input. No offline
-weight conversion is required.
+in a separate `vision` parameter scope. Both source and bytecode
+representations support target-only and speculative image and video input.
+No offline weight conversion is required.
 
 ```sh
 loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/Qwen/Qwen3.8-Flash-Next/model.json \
@@ -83,20 +83,63 @@ request = Request("http://127.0.0.1:8080/v1/chat/completions",
 print(json.load(urlopen(request)))
 ```
 
-Up to four images may appear in a conversation. Each compressed image is
-bounded to 64 MiB and 4096 pixels per dimension. Processing aligns dimensions
-to 32 pixels and defaults to at most 1024 image tokens; `max_image_tokens`
-can select 128 through 16384. Image tokens, chat text, and generated output
-share the selected text context capacity. These image presets start with
-the same 16,384-position context as `chat`.
+Up to 768 supplied images and frames may appear in a conversation, subject to
+request and context budgets. Each compressed image is bounded to 64 MiB and
+4096 pixels per dimension. Image processing aligns dimensions to 32 pixels
+and defaults to at most 1024 image tokens; `max_image_tokens` can select 128
+through 16384. Image tokens, chat text, and generated output share the selected
+text context capacity. These vision presets start with the same
+16,384-position context as `chat`.
+
+Timestamped frames use the same endpoint and installed projector, following
+[vLLM's pre-extracted JPEG sequence convention](https://docs.vllm.ai/en/latest/features/multimodal_inputs/#video-inputs).
+For example, replace the image part above with frames sampled from a video:
+
+```python
+frames = [
+    base64.b64encode(Path(path).read_bytes()).decode("ascii")
+    for path in ["frame0.jpg", "frame1.jpg", "frame2.jpg"]
+]
+body["messages"][0]["content"] = [
+    {"type": "video_url", "video_url": {
+        "url": "data:video/jpeg;base64," + ",".join(frames)
+    }},
+    {"type": "text", "text": "Describe how the scene changes over time."},
+]
+body["media_io_kwargs"] = {"video": {
+    "fps": 100,
+    "frames_indices": [0, 75, 200],
+    "num_frames": -1,
+    "do_sample_frames": False,
+}}
+```
+
+Each supplied JPEG's timestamp is its frame index divided by `fps`: 0, 0.75,
+and 2 seconds here. Timing metadata applies to all videos in the request.
+A clip has at least two frames with identical display dimensions; repeated
+times and odd frame counts are supported. Sampling stays under the client's
+control. `num_frames: -1` consumes all supplied frames within the model limits;
+omitting it limits a clip to 32 frames. The server accepts this JPEG-sequence
+subset, with no MP4/WebM decoder or remote video fetching.
+
+The processor pairs successive frames using its original temporal weights and
+places each pair at its mean timestamp. An odd final frame supplies both
+planes without a second pixel allocation. Video resize uses the checkpoint's
+whole-clip pixel budget, independently of `max_image_tokens`. Image/video
+features, timestamp text, and generated output share the context budget.
+When a prompt mixes media, explicit text labels such as "A still image:" and
+"A video clip:" help the model associate questions with the intended input.
 
 The projector uses 27 transformer blocks and produces 2560-wide F32 language
 features from original BF16 matrix and F32 affine parameters. Its parameter
-bank occupies 907,530,240 bytes. It activates on the first image request and
-can release that storage independently of retained image-conditioned
+bank occupies 907,530,240 bytes. It activates on the first image or video
+request and can release that storage independently of retained media-conditioned
 conversations. Encoder workspace, uploaded pixels, and retained features
-are separate from the parameter bank. The text-only presets do not acquire
-the projector or prepare image-specific stages.
+are separate from the parameter bank. Compatible frame pairs share linear and
+feed-forward weight reads; attention remains local to each pair. Upload and
+workspace capacity limit cohorts without forcing all frames into one
+allocation. The text-only presets do not acquire the projector or prepare
+image-specific stages.
 
 ## Optional multi-token prediction
 

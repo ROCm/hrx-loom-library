@@ -19,6 +19,15 @@ func.def pure inline @attention_rows() -> (index) {
   func.return %rows : index
 }
 
+// Extra sentinel row makes a nonzero segment origin observable without adding
+// another matrix fixture or another scenario variant.
+func.def pure inline @attention_storage_shape() -> (index, index) {
+  %rows = func.call pure @attention_rows() : () -> (index)
+  %c1 = index.constant 1 : index
+  %storage_rows = index.add %rows, %c1 : index
+  func.return %rows, %storage_rows : index, index
+}
+
 func.def @attention_sample(%row: index, %column: index) -> (f32) {
   %c3 = index.constant 3 : index
   %c7 = index.constant 7 : index
@@ -50,8 +59,10 @@ func.def @attention_fixture(%bf16: i1, %residual: buffer, %statistics: buffer, %
   %bias_midpoint = scalar.constant 2.0 : f32
   %step = scalar.constant 0.0625 : f32
   %quarter = scalar.constant 0.25 : f32
-  %residual_view = buffer.view %residual[%origin] : buffer -> view<[%rows]x1152xf32>
-  %statistics_view = buffer.view %statistics[%origin] : buffer -> view<[%rows]x2xf32>
+  %residual_origin = index.constant 4608 : offset
+  %statistics_origin = index.constant 8 : offset
+  %residual_view = buffer.view %residual[%residual_origin] : buffer -> view<[%rows]x1152xf32>
+  %statistics_view = buffer.view %statistics[%statistics_origin] : buffer -> view<[%rows]x2xf32>
   %weight_view = buffer.view %weight[%origin] : buffer -> view<3456x1152xi16>
   %bias_view = buffer.view %bias[%origin] : buffer -> view<3456xf32>
   %key_view = buffer.view %key[%origin] : buffer -> view<4x[%rows]x288xi16>
@@ -115,11 +126,13 @@ func.def @attention_reference(%bf16: i1, %residual: buffer, %statistics: buffer,
   %scratch = buffer.alloca<private> align(16) %scratch_bytes : buffer
   %query_view = buffer.view %scratch[%origin] : buffer -> view<72xf32>
   %score_view = buffer.view %scratch[%score_origin] : buffer -> view<[%rows]xf32>
-  %residual_view = buffer.view %residual[%origin] : buffer -> view<[%rows]x1152xf32>
+  %residual_origin = index.constant 4608 : offset
+  %context_origin = index.constant 2304 : offset
+  %residual_view = buffer.view %residual[%residual_origin] : buffer -> view<[%rows]x1152xf32>
   %bias_view = buffer.view %bias[%origin] : buffer -> view<3456xf32>
   %key_view = buffer.view %key[%origin] : buffer -> view<4x[%rows]x288xi16>
   %value_view = buffer.view %value[%origin] : buffer -> view<4x288x[%rows]xi16>
-  %context_view = buffer.view %context[%origin] : buffer -> view<[%rows]x1152xi16>
+  %context_view = buffer.view %context[%context_origin] : buffer -> view<[%rows]x1152xi16>
   scf.for %row = [%c0 to %rows step %c1] {
     %block = index.div %row, %c4 : index
     %within = index.rem %row, %c4 : index
@@ -217,7 +230,8 @@ func.def @attention_reference(%bf16: i1, %residual: buffer, %statistics: buffer,
 }
 
 command.program.def @attention_run(%bf16: i1) launch(%residual: buffer, %statistics: buffer, %scale: buffer, %shift: buffer, %weight: buffer, %bias: buffer, %key: buffer, %value: buffer, %context: buffer) {
-  kernel.launch @vision_attention_all_heads(%bf16, %residual, %statistics, %scale, %shift, %weight, %bias, %key, %value, %context) : (i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  %first_row = index.constant 1 : index
+  kernel.launch @vision_attention_all_heads(%bf16, %first_row, %residual, %statistics, %scale, %shift, %weight, %bias, %key, %value, %context) : (i1, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   command.return
 }
 
@@ -310,7 +324,7 @@ config.decl @vision_test.image_height : %value: index where [range(%value, 32, 4
 
 config.decl @vision_test.image_width : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
 
-template.decl @qwen38.vision.attention(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %cohort: index, %cohort_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer)
+template.decl @qwen38.vision.attention(%patch_height_value: index, %patch_width_value: index, %bf16: i1, %first_row: index, %cohort: index, %cohort_offset: offset, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer)
 
 template.decl @qwen38.vision.attention_output(%rows_value: index, %bf16: i1, %context: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer)
 
@@ -328,7 +342,7 @@ kernel.def target(@attention_test_wave32) @vision_attention_all_heads() {
   %query_tiles = index.div %padded_rows, %c16 : index
   %cohort_count = index.constant 4 : index
   kernel.launch.config workgroups(%query_tiles, %c1, %cohort_count) workgroup_size(%c128, %c1, %c1) : index
-} launch(%bf16: i1, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer) {
+} launch(%bf16: i1, %first_row: index, %residual: buffer, %statistics: buffer, %layernorm_weight: buffer, %layernorm_bias: buffer, %qkv_weight: buffer, %qkv_bias: buffer, %key: buffer, %value: buffer, %output: buffer) {
   %image_height = config.get @vision_test.image_height : index
   %image_width = config.get @vision_test.image_width : index
   %patch = index.constant 16 : index
@@ -341,7 +355,7 @@ kernel.def target(@attention_test_wave32) @vision_attention_all_heads() {
   %cohort_rows = index.mul %cohort, %rows : index
   %byte_index = index.mul %cohort_rows, %row_bytes : index
   %cohort_offset = index.cast %byte_index : index to offset
-  template.apply<@qwen38.vision.attention>(%height, %width, %bf16, %cohort, %cohort_offset, %residual, %statistics, %layernorm_weight, %layernorm_bias, %qkv_weight, %qkv_bias, %key, %value, %output) : (index, index, i1, index, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  template.apply<@qwen38.vision.attention>(%height, %width, %bf16, %first_row, %cohort, %cohort_offset, %residual, %statistics, %layernorm_weight, %layernorm_bias, %qkv_weight, %qkv_bias, %key, %value, %output) : (index, index, i1, index, index, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }
 
@@ -382,26 +396,26 @@ check.scenario public @vision_attention_f16_nonuniform {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   %bf16 = check.literal value(false) : i1
   check.trial[1](%trial: index, %entropy: check.entropy) {
-    %rows = check.generate<@attention_rows>() : () -> (index)
-    %residual = check.generate.fill value(0.0) : tensor<[%rows]x1152xf32>
-    %statistics = check.generate.fill value(0.0) : tensor<[%rows]x2xf32>
+    %rows, %storage_rows = check.generate<@attention_storage_shape>() : () -> (index, index)
+    %residual = check.generate.fill value(99.0) : tensor<[%storage_rows]x1152xf32>
+    %statistics = check.generate.fill value(99.0) : tensor<[%storage_rows]x2xf32>
     %scale = check.generate.fill value(0.5) : tensor<1152xf32>
     %shift = check.generate.fill value(0.0) : tensor<1152xf32>
     %weight = check.generate.fill value(0.0) : tensor<3456x1152xf16>
     %bias = check.generate.fill value(0.0) : tensor<3456xf32>
     %key = check.generate.fill value(0.0) : tensor<4x[%rows]x288xf16>
     %value = check.generate.fill value(0.0) : tensor<4x288x[%rows]xf16>
-    check.generate<@attention_fixture>(%bf16, %residual, %statistics, %weight, %bias, %key, %value) : (i1, tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<3456x1152xf16>, tensor<3456xf32>, tensor<4x[%rows]x288xf16>, tensor<4x288x[%rows]xf16>) -> ()
-    %storage = check.generate.fill value(99.0) : tensor<83008xf16>
-    %context = check.tensor.view %storage offset(64) : tensor<83008xf16> -> tensor<[%rows]x1152xf16>
-    %prefix = check.tensor.view %storage offset(0) : tensor<83008xf16> -> tensor<32xf16>
-    %suffix = check.tensor.view %storage offset(165952) : tensor<83008xf16> -> tensor<32xf16>
-    check.compare<@attention_run, @attention_f16_reference>[%bf16](%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value, %context) : [i1](tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xf16>, tensor<3456xf32>, tensor<4x[%rows]x288xf16>, tensor<4x288x[%rows]xf16>, tensor<[%rows]x1152xf16>) -> () {
-      check.expect.approximate actual(%context) expected(%context) atol(9.9999999999999995e-08) rtol(0.002) nan(different) : tensor<[%rows]x1152xf16>, tensor<[%rows]x1152xf16>
+    check.generate<@attention_fixture>(%bf16, %residual, %statistics, %weight, %bias, %key, %value) : (i1, tensor<[%storage_rows]x1152xf32>, tensor<[%storage_rows]x2xf32>, tensor<3456x1152xf16>, tensor<3456xf32>, tensor<4x[%rows]x288xf16>, tensor<4x288x[%rows]xf16>) -> ()
+    %storage = check.generate.fill value(99.0) : tensor<84160xf16>
+    %context = check.tensor.view %storage offset(64) : tensor<84160xf16> -> tensor<[%storage_rows]x1152xf16>
+    %prefix = check.tensor.view %storage offset(0) : tensor<84160xf16> -> tensor<32xf16>
+    %suffix = check.tensor.view %storage offset(168256) : tensor<84160xf16> -> tensor<32xf16>
+    check.compare<@attention_run, @attention_f16_reference>[%bf16](%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value, %context) : [i1](tensor<[%storage_rows]x1152xf32>, tensor<[%storage_rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xf16>, tensor<3456xf32>, tensor<4x[%rows]x288xf16>, tensor<4x288x[%rows]xf16>, tensor<[%storage_rows]x1152xf16>) -> () {
+      check.expect.approximate actual(%context) expected(%context) atol(9.9999999999999995e-08) rtol(0.002) nan(different) : tensor<[%storage_rows]x1152xf16>, tensor<[%storage_rows]x1152xf16>
       check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<32xf16>
       check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<32xf16>
-      check.expect.bitwise actual(%residual) expected(%residual) : tensor<[%rows]x1152xf32>
-      check.expect.bitwise actual(%statistics) expected(%statistics) : tensor<[%rows]x2xf32>
+      check.expect.bitwise actual(%residual) expected(%residual) : tensor<[%storage_rows]x1152xf32>
+      check.expect.bitwise actual(%statistics) expected(%statistics) : tensor<[%storage_rows]x2xf32>
       check.expect.bitwise actual(%scale) expected(%scale) : tensor<1152xf32>
       check.expect.bitwise actual(%shift) expected(%shift) : tensor<1152xf32>
       check.expect.bitwise actual(%weight) expected(%weight) : tensor<3456x1152xf16>
@@ -460,26 +474,26 @@ check.scenario public @vision_attention_bf16_nonuniform {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   %bf16 = check.literal value(true) : i1
   check.trial[1](%trial: index, %entropy: check.entropy) {
-    %rows = check.generate<@attention_rows>() : () -> (index)
-    %residual = check.generate.fill value(0.0) : tensor<[%rows]x1152xf32>
-    %statistics = check.generate.fill value(0.0) : tensor<[%rows]x2xf32>
+    %rows, %storage_rows = check.generate<@attention_storage_shape>() : () -> (index, index)
+    %residual = check.generate.fill value(99.0) : tensor<[%storage_rows]x1152xf32>
+    %statistics = check.generate.fill value(99.0) : tensor<[%storage_rows]x2xf32>
     %scale = check.generate.fill value(0.5) : tensor<1152xf32>
     %shift = check.generate.fill value(0.0) : tensor<1152xf32>
     %weight = check.generate.fill value(0.0) : tensor<3456x1152xbf16>
     %bias = check.generate.fill value(0.0) : tensor<3456xf32>
     %key = check.generate.fill value(0.0) : tensor<4x[%rows]x288xbf16>
     %value = check.generate.fill value(0.0) : tensor<4x288x[%rows]xbf16>
-    check.generate<@attention_fixture>(%bf16, %residual, %statistics, %weight, %bias, %key, %value) : (i1, tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<3456x1152xbf16>, tensor<3456xf32>, tensor<4x[%rows]x288xbf16>, tensor<4x288x[%rows]xbf16>) -> ()
-    %storage = check.generate.fill value(99.0) : tensor<83008xbf16>
-    %context = check.tensor.view %storage offset(64) : tensor<83008xbf16> -> tensor<[%rows]x1152xbf16>
-    %prefix = check.tensor.view %storage offset(0) : tensor<83008xbf16> -> tensor<32xbf16>
-    %suffix = check.tensor.view %storage offset(165952) : tensor<83008xbf16> -> tensor<32xbf16>
-    check.compare<@attention_run, @attention_bf16_reference>[%bf16](%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value, %context) : [i1](tensor<[%rows]x1152xf32>, tensor<[%rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xbf16>, tensor<3456xf32>, tensor<4x[%rows]x288xbf16>, tensor<4x288x[%rows]xbf16>, tensor<[%rows]x1152xbf16>) -> () {
-      check.expect.approximate actual(%context) expected(%context) atol(9.9999999999999995e-08) rtol(0.016) nan(different) : tensor<[%rows]x1152xbf16>, tensor<[%rows]x1152xbf16>
+    check.generate<@attention_fixture>(%bf16, %residual, %statistics, %weight, %bias, %key, %value) : (i1, tensor<[%storage_rows]x1152xf32>, tensor<[%storage_rows]x2xf32>, tensor<3456x1152xbf16>, tensor<3456xf32>, tensor<4x[%rows]x288xbf16>, tensor<4x288x[%rows]xbf16>) -> ()
+    %storage = check.generate.fill value(99.0) : tensor<84160xbf16>
+    %context = check.tensor.view %storage offset(64) : tensor<84160xbf16> -> tensor<[%storage_rows]x1152xbf16>
+    %prefix = check.tensor.view %storage offset(0) : tensor<84160xbf16> -> tensor<32xbf16>
+    %suffix = check.tensor.view %storage offset(168256) : tensor<84160xbf16> -> tensor<32xbf16>
+    check.compare<@attention_run, @attention_bf16_reference>[%bf16](%residual, %statistics, %scale, %shift, %weight, %bias, %key, %value, %context) : [i1](tensor<[%storage_rows]x1152xf32>, tensor<[%storage_rows]x2xf32>, tensor<1152xf32>, tensor<1152xf32>, tensor<3456x1152xbf16>, tensor<3456xf32>, tensor<4x[%rows]x288xbf16>, tensor<4x288x[%rows]xbf16>, tensor<[%storage_rows]x1152xbf16>) -> () {
+      check.expect.approximate actual(%context) expected(%context) atol(9.9999999999999995e-08) rtol(0.016) nan(different) : tensor<[%storage_rows]x1152xbf16>, tensor<[%storage_rows]x1152xbf16>
       check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<32xbf16>
       check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<32xbf16>
-      check.expect.bitwise actual(%residual) expected(%residual) : tensor<[%rows]x1152xf32>
-      check.expect.bitwise actual(%statistics) expected(%statistics) : tensor<[%rows]x2xf32>
+      check.expect.bitwise actual(%residual) expected(%residual) : tensor<[%storage_rows]x1152xf32>
+      check.expect.bitwise actual(%statistics) expected(%statistics) : tensor<[%storage_rows]x2xf32>
       check.expect.bitwise actual(%scale) expected(%scale) : tensor<1152xf32>
       check.expect.bitwise actual(%shift) expected(%shift) : tensor<1152xf32>
       check.expect.bitwise actual(%weight) expected(%weight) : tensor<3456x1152xbf16>

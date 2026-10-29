@@ -8,7 +8,7 @@ contains no checkpoint paths.
 
 `chat.loom` consumes the native service's validated request records and its
 JSON, tokenizer, input-validation, and tool host imports. It owns the ChatML
-framing, optional reasoning block, XML tool syntax, image markers, and sampling
+framing, optional reasoning block, XML tool syntax, media markers, and sampling
 packet. Generated text becomes reusable retained history only when canonical
 history preserves the exact emitted bytes. Partial reasoning and tool markers
 remain withheld during streaming and are resolved at completion. Returned
@@ -98,32 +98,45 @@ live cohort size. Device packet encoding still uses the composition's fixed
 sampling and descriptor layout described above.
 No transform waits for a device or recovers ownership from buffer contents.
 
-`media.loom` fills eight-word mixed-input records and tracks compressed image
-positions. Each input plane's extent comes from the prepared source geometry
+`chat_media.loom` plans and renders ordered images and timestamped video frames.
+Native inspection supplies decoded dimensions, source ranges, and finite,
+nondecreasing timestamps; source selects temporal pairs, geometry, marker ranges,
+and token counts. Each video pair emits its mean timestamp to one decimal place
+with nearest-even rounding, followed by its video feature tokens. An odd tail
+aliases its final frame instead of duplicating pixels. Requests may contain up
+to 768 images/frames within the existing compressed-byte and context budgets.
+The HTTP boundary accepts vLLM-compatible `video_url` JPEG sequences and
+`media_io_kwargs.video` timing. Explicit frame sampling is preserved; container
+decoding is not a dependency.
+
+`media.loom` fills eight-word mixed-input records and tracks compressed spatial
+positions. Each projection's extent comes from the prepared source geometry
 and native invocation packet, independently of resident session capacity.
 Compaction preserves feature offsets into the original immutable packet.
-`vision_geometry.loom` evaluates the processor's smart-resize policy on the
-integer grid of 32-pixel merged patches, including ties-to-even alignment and
-minimum/maximum image area. Image availability remains a model-component
-choice; linking chat policy does not supply a vision encoder.
+`vision_geometry.loom` evaluates smart resize on the integer grid of 32-pixel
+merged patches. Images use the requested token budget; videos use the checkpoint's
+whole-clip pixel budget, raw frame count for scaling, and nearest-even temporal
+alignment for the area threshold. Short-axis expansion can produce a 6,400-pixel
+output axis without increasing the 4,096-pixel source decode limit. Linking chat
+policy alone does not supply an encoder.
 
-The image-service providers share the native packet and completion protocol.
-`vision_pixels.loom` constructs the antialiased bicubic axis plans and preserves
-the decoded RGB/RGBA plane and orientation. `vision_stages.loom` binds selected
-height, width, and cohort size to the composing model's
+The image-service providers share the native multi-plane packet and completion
+protocol. `vision_pixels.loom` constructs antialiased bicubic axis plans for each
+distinct RGB/RGBA plane and preserves its orientation. `vision_stages.loom` binds
+height, width, plane count, and cohort size to the composing model's
 `qwen38_vision_projector` command. The prepare host owns stage compilation and
 reuse. `vision_prepare.loom` binds the `vision` parameter scope through the
 model's `weights.loom` placement policy and returns exact service ceilings.
 The model supplies its name and feature width.
 
-`vision_control.loom` receives codec-validated descriptors or native packed
-uploads. It tags compatible requests, fills the existing cohort directory,
-describes disjoint F32 feature ranges, and hands execution to the runner.
-Forecasting uses the supplied projector capacity and the same workspace query
-as the device command, including a second residual bank when the feature width
-cannot hold one. Native serving retains projected allocation roots until their
-consumers finish. The composing model exposes the versioned service callbacks;
-these providers add no extra upload copy or completion wait.
+`vision_control.loom` tags compatible projections, consumes the native packer's
+canonical directory, describes disjoint F32 feature ranges, and hands execution
+to the runner. Cohort admission accounts for both patch rows and prepared upload
+bytes. Compatible projections share linear and feed-forward weight reads while
+attention stays within each image or frame pair. Forecasting uses the same
+workspace query as the device command and includes retained features plus one
+shared output root. Native serving keeps those roots alive until their consumers
+finish. These providers add no extra upload copy or completion wait.
 
 The [tests](test/) use the real native chat caller, small tokenizers, and VM
 checks for source-defined packet and streaming contracts. Learned service
