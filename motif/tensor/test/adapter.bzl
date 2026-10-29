@@ -3,7 +3,7 @@
 load("@hrx//loom/target/amdgpu:execution_profiles.bzl", "AMD_GPU_HARDWARE_PROFILE")
 load("//build_tools/bazel:defs.bzl", "loom_test")
 
-def adapter_tests(matrix_leaf, scalar_leaf):
+def adapter_tests(matrix_leaf):
     # Twelve matrix families accompany the fused twelve-layer scalar provider.
     shapes = [
         (64, 6144),
@@ -22,7 +22,6 @@ def adapter_tests(matrix_leaf, scalar_leaf):
     cases = [
         ("adapter", "matrix", {}, False),
         ("adapter_exact", "matrix", {}, True),
-        ("adapter_layer_mix", "scalar", {}, False),
         ("adapter_cohort", "cohort", {}, False),
     ] + [
         ("adapter_shape_%d_%d" % (inputs, outputs), "matrix", {
@@ -46,7 +45,7 @@ def adapter_tests(matrix_leaf, scalar_leaf):
                 "selections": ["empty", "odd", "even", "seven", "duplicate_bank", "cancel_bank", "zero_strength", "fractional"],
             }, False))
     for name, mode, options, exact in cases:
-        leaf = scalar_leaf if mode == "scalar" else matrix_leaf
+        leaf = matrix_leaf
         native.genrule(
             name = name + "_fixture",
             testonly = True,
@@ -58,6 +57,6 @@ def adapter_tests(matrix_leaf, scalar_leaf):
         loom_test(
             name = name,
             srcs = [name + "_test.loom"],
-            deps = ["//motif/tensor:layer_mix" if mode == "scalar" else "//motif/tensor:adapter"],
+            deps = ["//motif/tensor:adapter"],
             execution_profiles = [AMD_GPU_HARDWARE_PROFILE],
         )

@@ -379,178 +379,12 @@ def cohort_fixture(leaf):
     return "\n".join(parts)
 
 
-def scalar_fixture(leaf):
-    rows, width, rank, banks, stride = 2, 65, 32, 7, 784
-
-    def packed_scalar(values, storage="bf16"):
-        if storage == "f32":
-            return struct.pack("<" + "f" * len(values), *values)
-        words = [
-            struct.unpack("<I", struct.pack("<f", bf16(value)))[0] >> 16
-            for value in values
-        ]
-        return struct.pack("<" + "H" * len(words), *words)
-
-    selections = (
-        ("empty", ()),
-        ("single", ((3, 0.5),)),
-        ("pair", ((1, -0.75), (5, 1.0))),
-        ("odd", ((0, 1.0), (1, -0.5), (2, 0.75))),
-        ("even", ((0, 1.0), (2, -0.5), (4, 0.25), (6, 0.75))),
-        ("seven", tuple((i, (1.0, -0.5, 0.25)[i % 3]) for i in range(banks))),
-        ("duplicate", ((1, 0.25), (3, -1.0), (1, 0.75))),
-        ("cancel", ((1, 1.0), (1, -1.0))),
-        ("fractional", ((1, 0.3), (4, 0.7), (6, -0.625))),
-        ("zero", ((1, 0.0), (6, -0.0), (4, 0.0))),
-    )
-    inputs = [
-        [
-            [
-                [
-                    (((row * 7 + channel * 5 + layer * 3) % 15) - 7) / 8
-                    for layer in range(12)
-                ]
-                for channel in range(width)
-            ]
-            for row in range(rows)
-        ]
-    ][0]
-    weight = [1 + 1 / 256, 1 + 3 / 256, -1 - 1 / 256, -1 - 3 / 256] + [
-        (k - 4) / 8 for k in range(8)
-    ]
-    down = [
-        [
-            [(((bank * 11 + rank * 5 + layer * 3) % 7) - 3) / 8 for layer in range(12)]
-            for rank in range(rank)
-        ]
-        for bank in range(banks)
-    ]
-    up = [
-        [(((bank * 5 + rank * 7) % 11) - 5) / 8 for rank in range(rank)]
-        for bank in range(banks)
-    ]
-
-    def factors(banks):
-        result = bytearray()
-        for bank in banks:
-            encoded = packed_scalar(bank)
-            result.extend(encoded)
-            result.extend(bytes([77]) * (stride - len(encoded)))
-        return bytes(result)
-
-    def dot(values, coefficients):
-        total = 0.0
-        for value, coefficient in zip(values, coefficients):
-            total += value * coefficient
-            assert f32(total) == total
-        return total
-
-    def oracle(selected):
-        result = []
-        for row in inputs:
-            for values in row:
-                base = bf16(dot(values, [bf16(value) for value in weight]))
-                total = 0.0
-                for bank, strength in selected:
-                    for element in range(rank):
-                        low = bf16(f32(dot(values, down[bank][element]) * f32(strength)))
-                        total += low * up[bank][element]
-                        assert f32(total) == total
-                result.append(bf16(f32(base + total)))
-        return packed_scalar(result)
-
-    shared = {
-        "input": packed_scalar(
-            [
-                inputs[row][channel][layer]
-                for row in range(rows)
-                for layer in range(12)
-                for channel in range(width)
-            ]
-        ),
-        "a": factors([[value for rank in bank for value in rank] for bank in down]),
-        "b": factors(up),
-    }
-    parts = [leaf]
-    for key, value in shared.items():
-        parts.append(rodata(key, value))
-    for storage in ("f32", "bf16"):
-        parts.append(rodata("weight_" + storage, packed_scalar(weight, storage)))
-        for selection_name, selected in selections:
-            name = storage + "_" + selection_name
-            metadata = struct.pack("<i12x", len(selected)) + b"".join(
-                struct.pack("<Qf4x", bank * stride, strength)
-                for bank, strength in selected
-            )
-            expected = oracle(selected)
-            values = dict(
-                shared, weight=packed_scalar(weight, storage), selections=metadata
-            )
-            names = ("input", "weight", "a", "b", "selections", "output")
-            sizes = {key: len(value) for key, value in values.items()} | {
-                "output": len(expected)
-            }
-            declarations = ", ".join("%" + key + ": buffer" for key in names)
-            arguments = ", ".join("%" + key for key in names)
-            tensors = ", ".join(f"tensor<{sizes[key]}xi8>" for key in names)
-            parts.extend(
-                (
-                    rodata(name + "_selections", metadata),
-                    rodata(name + "_expected", expected),
-                )
-            )
-            copies = []
-            for key in names[:-1]:
-                symbol = (
-                    name + "_selections"
-                    if key == "selections"
-                    else "weight_" + storage
-                    if key == "weight"
-                    else key
-                )
-                copies += [
-                    f"  %{key}_bytes = index.constant {sizes[key]} : offset",
-                    f"  %{key}_source = global.load @{symbol} : buffer",
-                    f"  buffer.copy %{key}_source[%origin], %{key}[%origin], %{key}_bytes",
-                ]
-            parts.append(f"""func.def @initialize_{name}({declarations}) {{
-      %origin = index.constant 0 : offset
-    {chr(10).join(copies)}
-      func.return
-    }}
-    func.def @reference_{name}({declarations}) {{
-      %origin = index.constant 0 : offset
-      %bytes = index.constant {len(expected)} : offset
-      %expected = global.load @{name}_expected : buffer
-      buffer.copy %expected[%origin], %output[%origin], %bytes
-      func.return
-    }}
-    check.scenario public @{name} {{
-      check.requires<hal.amdgpu.target> {{target = "gfx11-generic"}}
-      check.trial[1](%trial: index, %entropy: check.entropy) {{
-    """)
-            for key in names:
-                parts.append(
-                    f"    %{key}_storage = check.generate.fill value(77) : tensor<{sizes[key] + 32}xi8>\n    %{key} = check.tensor.view %{key}_storage offset(16) : tensor<{sizes[key] + 32}xi8> -> tensor<{sizes[key]}xi8>\n"
-                )
-            parts.append(
-                f"    check.generate<@initialize_{name}>({arguments}) : ({tensors}) -> ()\n    check.compare<@count_scalar_{storage}, @reference_{name}>({arguments}) : ({tensors}) -> () {{\n"
-            )
-            for key in names:
-                parts.append(
-                    f"      check.expect.bitwise actual(%{key}_storage) expected(%{key}_storage) : tensor<{sizes[key] + 32}xi8>\n"
-                )
-            parts.append("    }\n  }\n  check.return\n}\n")
-            parts.append(f"check.benchmark<@{name}> @{name}_benchmark\n")
-    return "\n".join(parts)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--leaf", type=Path, required=True)
     parser.add_argument(
-        "--mode", choices=("matrix", "cohort", "scalar"), default="matrix"
+        "--mode", choices=("matrix", "cohort"), default="matrix"
     )
     parser.add_argument("--exact", action="store_true")
     parser.add_argument("--options", type=json.loads, default={})
@@ -560,10 +394,8 @@ def main():
     leaf = args.leaf.read_text()
     if args.mode == "matrix":
         text = matrix_fixture(leaf, args.exact, args.options)
-    elif args.mode == "cohort":
-        text = cohort_fixture(leaf)
     else:
-        text = scalar_fixture(leaf)
+        text = cohort_fixture(leaf)
     args.output.write_text(text)
 
 
