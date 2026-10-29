@@ -1,0 +1,319 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Fused twelve-layer adapters retain one gathered activation across runtime
+// selections. The scalar oracle reads actual operands, contracts dyadic values
+// exactly in F64, and rounds each strength-scaled rank term independently to
+// BF16 before the up contraction. Base weights exercise both storage formats
+// and both parities/signs of BF16 ties. Empty, repeated, canceling, fractional,
+// and signed-zero selections preserve ordering, bank padding, immutable inputs,
+// and output guards. The second metadata header word describes weight storage
+// to the reference; production providers consume only count, offsets, and scales.
+amdgpu.target<gfx11-generic> @adapter_scalar_wave32 {subgroup_size = 32}
+
+template.decl @projection.adapter_layer_mix_12_bf16(%rows: index, %width: index, %rank: index, %row: index, %channel: index, %weight_is_bf16: i1, %input: buffer, %weight: buffer, %a: buffer, %b: buffer, %count: index, %offset_layout: encoding<layout>, %strength_layout: encoding<layout>, %offsets: view<[%count]xi64, %offset_layout>, %strengths: view<[%count]xf32, %strength_layout>) -> (bf16)
+
+func.decl @reference_bf16_value(%word: i16) -> (f32)
+
+func.decl @reference_bf16_bits(%value: f32) -> (i16)
+
+func.decl @reference_bf16_round(%value: f32) -> (f32)
+
+func.decl pure @adapter_selection_count(%selection: index, %banks: index) -> (index)
+
+func.decl @initialize_adapter_selection(%selection: index, %banks: index, %stride: index, %exact: i1, %selections: buffer)
+
+func.def @adapter_mix_configuration(%configuration: index) -> (index, i1, index, index, index, index) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %c9 = index.constant 9 : index
+  %c10 = index.constant 10 : index
+  %c11 = index.constant 11 : index
+  %c16 = index.constant 16 : index
+  %c24 = index.constant 24 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  %ordinal = index.rem %configuration, %c10 : index
+  %weight_bf16 = index.cmp uge, %configuration, %c10 : index
+  %selection = scf.lookup %ordinal {
+    0 = (%c0),
+    1 = (%c1),
+    2 = (%c2),
+    3 = (%c3),
+    4 = (%c5),
+    5 = (%c6),
+    6 = (%c9),
+    7 = (%c10),
+    8 = (%c11)
+  } default(%c8) : index
+  %count = func.call pure @adapter_selection_count(%selection, %c7) : (index, index) -> (index)
+  %selection_bytes = index.madd %count, %c16, %c16 : index
+  %selection_storage = index.add %selection_bytes, %c32 : index
+  %weight_bytes = scf.select %weight_bf16, %c24, %c48 : index
+  %weight_storage = index.add %weight_bytes, %c32 : index
+  func.return %selection, %weight_bf16, %selection_bytes, %selection_storage, %weight_bytes, %weight_storage : index, i1, index, index, index, index
+}
+
+func.def @initialize_adapter_mix(%configuration: index, %input: buffer, %weight: buffer, %down: buffer, %up: buffer, %selections: buffer) {
+  %selection, %weight_bf16, %selection_bytes, %selection_storage, %weight_bytes, %weight_storage = func.call @adapter_mix_configuration(%configuration) : (index) -> (index, i1, index, index, index, index)
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c7 = index.constant 7 : index
+  %c11 = index.constant 11 : index
+  %layers = index.constant 12 : index
+  %period = index.constant 15 : index
+  %rank = index.constant 32 : index
+  %width = index.constant 65 : index
+  %stride = index.constant 784 : index
+  %bank_bytes = index.constant 784 : offset
+  %false = scalar.constant false : i1
+  %center = scalar.constant 7 : i32
+  %down_center = scalar.constant 3 : i32
+  %up_center = scalar.constant 5 : i32
+  %weight_center = scalar.constant 8 : i32
+  %eighth = scalar.constant 0.125 : f32
+  %positive_even = scalar.constant 1.00390625 : f32
+  %positive_odd = scalar.constant 1.01171875 : f32
+  %negative_even = scalar.constant -1.00390625 : f32
+  %negative_odd = scalar.constant -1.01171875 : f32
+  func.call @initialize_adapter_selection(%selection, %c7, %stride, %false, %selections) : (index, index, index, i1, buffer)
+  %header = buffer.view %selections[%origin] : buffer -> view<4xi32>
+  %weight_tag = scalar.extui %weight_bf16 : i1 to i32
+  view.store %weight_tag, %header[1] : i32, view<4xi32>
+  %inputs = buffer.view %input[%origin] : buffer -> view<2x12x65xi16>
+  scf.for %row = [%c0 to %c2 step %c1] {
+    scf.for %layer = [%c0 to %layers step %c1] {
+      scf.for %channel = [%c0 to %width step %c1] {
+        %row_part = index.mul %row, %c7 : index
+        %layer_part = index.madd %layer, %c3, %row_part : index
+        %affine = index.madd %channel, %c5, %layer_part : index
+        %reduced = index.rem %affine, %period : index
+        %integer = index.cast %reduced : index to i32
+        %signed = scalar.subi %integer, %center : i32
+        %value = scalar.sitofp %signed : i32 to f32
+        %scaled = scalar.mulf %value, %eighth : f32
+        %word = func.call @reference_bf16_bits(%scaled) : (f32) -> (i16)
+        view.store %word, %inputs[%row, %layer, %channel] : i16, view<2x12x65xi16>
+      }
+    }
+  }
+  scf.for %layer = [%c0 to %layers step %c1] {
+    %integer = index.cast %layer : index to i32
+    %signed = scalar.subi %integer, %weight_center : i32
+    %value = scalar.sitofp %signed : i32 to f32
+    %scaled = scalar.mulf %value, %eighth : f32
+    %coefficient = scf.lookup %layer {
+      0 = (%positive_even),
+      1 = (%positive_odd),
+      2 = (%negative_even),
+      3 = (%negative_odd)
+    } default(%scaled) : f32
+    scf.if %weight_bf16 {
+      %weights = buffer.view %weight[%origin] : buffer -> view<12xi16>
+      %word = func.call @reference_bf16_bits(%coefficient) : (f32) -> (i16)
+      view.store %word, %weights[%layer] : i16, view<12xi16>
+    } else {
+      %weights = buffer.view %weight[%origin] : buffer -> view<12xf32>
+      view.store %coefficient, %weights[%layer] : f32, view<12xf32>
+    }
+  }
+  scf.for %bank = [%c0 to %c7 step %c1] {
+    %bank_origin = index.scale %bank, %bank_bytes : index, offset -> offset
+    %down_weights = buffer.view %down[%bank_origin] : buffer -> view<32x12xi16>
+    %up_weights = buffer.view %up[%bank_origin] : buffer -> view<32xi16>
+    scf.for %element = [%c0 to %rank step %c1] {
+      scf.for %layer = [%c0 to %layers step %c1] {
+        %bank_part = index.mul %bank, %c11 : index
+        %rank_part = index.madd %element, %c5, %bank_part : index
+        %affine = index.madd %layer, %c3, %rank_part : index
+        %reduced = index.rem %affine, %c7 : index
+        %integer = index.cast %reduced : index to i32
+        %signed = scalar.subi %integer, %down_center : i32
+        %value = scalar.sitofp %signed : i32 to f32
+        %scaled = scalar.mulf %value, %eighth : f32
+        %word = func.call @reference_bf16_bits(%scaled) : (f32) -> (i16)
+        view.store %word, %down_weights[%element, %layer] : i16, view<32x12xi16>
+      }
+      %bank_part = index.mul %bank, %c5 : index
+      %affine = index.madd %element, %c7, %bank_part : index
+      %reduced = index.rem %affine, %c11 : index
+      %integer = index.cast %reduced : index to i32
+      %signed = scalar.subi %integer, %up_center : i32
+      %value = scalar.sitofp %signed : i32 to f32
+      %scaled = scalar.mulf %value, %eighth : f32
+      %word = func.call @reference_bf16_bits(%scaled) : (f32) -> (i16)
+      view.store %word, %up_weights[%element] : i16, view<32xi16>
+    }
+  }
+  func.return
+}
+
+kernel.def target(@adapter_scalar_wave32) @apply_adapter_mix(%weight_bf16: i1) {
+  %rows = index.constant 2 : index
+  %unit = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%weight_bf16: i1, %input: buffer, %weight: buffer, %down: buffer, %up: buffer, %selections: buffer, %output: buffer) {
+  %rows = index.constant 2 : index
+  %width = index.constant 65 : index
+  %rank = index.constant 32 : index
+  %row_id = kernel.workgroup.id<x> : index
+  %row = index.assume %row_id [ge(%row_id, 0), lt(%row_id, %rows)] : index
+  %channel = kernel.workitem.id<x> : index
+  %valid = index.cmp ult, %channel, %width : index
+  scf.if %valid {
+    %origin = index.constant 0 : offset
+    %offset_origin = index.constant 16 : offset
+    %strength_origin = index.constant 24 : offset
+    %offset_layout = encoding.layout.strided [2] : encoding<layout>
+    %strength_layout = encoding.layout.strided [4] : encoding<layout>
+    %header = buffer.view %selections[%origin] : buffer -> view<1xi32>
+    %count_word = view.load %header[0] : view<1xi32> -> i32
+    %nonnegative = scalar.assume %count_word [range(%count_word, 0, 2147483647)] : i32
+    %count = index.cast %nonnegative : i32 to index
+    %offsets = buffer.view %selections[%offset_origin] : buffer -> view<[%count]xi64, %offset_layout>
+    %strengths = buffer.view %selections[%strength_origin] : buffer -> view<[%count]xf32, %strength_layout>
+    %value = template.apply<@projection.adapter_layer_mix_12_bf16>(%rows, %width, %rank, %row, %channel, %weight_bf16, %input, %weight, %down, %up, %count, %offset_layout, %strength_layout, %offsets, %strengths) : (index, index, index, index, index, i1, buffer, buffer, buffer, buffer, index, encoding<layout>, encoding<layout>, view<[%count]xi64, %offset_layout>, view<[%count]xf32, %strength_layout>) -> (bf16)
+    %outputs = buffer.view %output[%origin] : buffer -> view<2x65xbf16>
+    view.store %value, %outputs[%row, %channel] : bf16, view<2x65xbf16>
+  }
+  kernel.return
+}
+
+command.program.def @adapter_mix_program(%configuration: index) launch(%input: buffer, %weight: buffer, %down: buffer, %up: buffer, %selections: buffer, %output: buffer) {
+  %boundary = index.constant 10 : index
+  %weight_bf16 = index.cmp uge, %configuration, %boundary : index
+  kernel.launch @apply_adapter_mix[%weight_bf16](%weight_bf16, %input, %weight, %down, %up, %selections, %output) : [i1](i1, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+func.def @adapter_mix_reference(%input: buffer, %weight: buffer, %down: buffer, %up: buffer, %selections: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %offset_origin = index.constant 16 : offset
+  %strength_origin = index.constant 24 : offset
+  %offset_layout = encoding.layout.strided [2] : encoding<layout>
+  %strength_layout = encoding.layout.strided [4] : encoding<layout>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %layers = index.constant 12 : index
+  %rank = index.constant 32 : index
+  %width = index.constant 65 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %c0_f64 = scalar.constant 0.0 : f64
+  %header = buffer.view %selections[%origin] : buffer -> view<4xi32>
+  %count_word = view.load %header[0] : view<4xi32> -> i32
+  %weight_word = view.load %header[1] : view<4xi32> -> i32
+  %count = index.cast %count_word : i32 to index
+  %weight_bf16 = scalar.cmpi ne, %weight_word, %c0_i32 : i32
+  %offsets = buffer.view %selections[%offset_origin] : buffer -> view<[%count]xi64, %offset_layout>
+  %strengths = buffer.view %selections[%strength_origin] : buffer -> view<[%count]xf32, %strength_layout>
+  %inputs = buffer.view %input[%origin] : buffer -> view<2x12x65xi16>
+  %outputs = buffer.view %output[%origin] : buffer -> view<2x65xi16>
+  scf.for %row = [%c0 to %c2 step %c1] {
+    scf.for %channel = [%c0 to %width step %c1] {
+      %base_sum = scf.for %layer = [%c0 to %layers step %c1](%sum = %c0_f64 : f64) -> (f64) {
+        %input_word = view.load %inputs[%row, %layer, %channel] : view<2x12x65xi16> -> i16
+        %input_value = func.call @reference_bf16_value(%input_word) : (i16) -> (f32)
+        %coefficient = scf.if %weight_bf16 -> (f32) {
+          %weights = buffer.view %weight[%origin] : buffer -> view<12xi16>
+          %word = view.load %weights[%layer] : view<12xi16> -> i16
+          %value = func.call @reference_bf16_value(%word) : (i16) -> (f32)
+          scf.yield %value : f32
+        } else {
+          %weights = buffer.view %weight[%origin] : buffer -> view<12xf32>
+          %stored = view.load %weights[%layer] : view<12xf32> -> f32
+          %value = func.call @reference_bf16_round(%stored) : (f32) -> (f32)
+          scf.yield %value : f32
+        }
+        %left = scalar.extf %input_value : f32 to f64
+        %right = scalar.extf %coefficient : f32 to f64
+        %product = scalar.mulf %left, %right : f64
+        %next = scalar.addf %sum, %product : f64
+        scf.yield %next : f64
+      }
+      %base_narrow = scalar.fptrunc %base_sum : f64 to f32
+      %base = func.call @reference_bf16_round(%base_narrow) : (f32) -> (f32)
+      %delta = scf.for %ordinal = [%c0 to %count step %c1](%sum = %c0_f64 : f64) -> (f64) {
+        %address = view.load %offsets[%ordinal] : view<[%count]xi64, %offset_layout> -> i64
+        %nonnegative = scalar.assume %address [range(%address, 0, 9223372036854775807)] : i64
+        %bank_offset = index.cast %nonnegative : i64 to offset
+        %scale = view.load %strengths[%ordinal] : view<[%count]xf32, %strength_layout> -> f32
+        %down_weights = buffer.view %down[%bank_offset] : buffer -> view<32x12xi16>
+        %up_weights = buffer.view %up[%bank_offset] : buffer -> view<32xi16>
+        %bank_sum = scf.for %element = [%c0 to %rank step %c1](%partial = %sum : f64) -> (f64) {
+          %dot = scf.for %layer = [%c0 to %layers step %c1](%accumulator = %c0_f64 : f64) -> (f64) {
+            %input_word = view.load %inputs[%row, %layer, %channel] : view<2x12x65xi16> -> i16
+            %weight_word = view.load %down_weights[%element, %layer] : view<32x12xi16> -> i16
+            %input_value = func.call @reference_bf16_value(%input_word) : (i16) -> (f32)
+            %weight_value = func.call @reference_bf16_value(%weight_word) : (i16) -> (f32)
+            %left = scalar.extf %input_value : f32 to f64
+            %right = scalar.extf %weight_value : f32 to f64
+            %product = scalar.mulf %left, %right : f64
+            %next = scalar.addf %accumulator, %product : f64
+            scf.yield %next : f64
+          }
+          %dot_narrow = scalar.fptrunc %dot : f64 to f32
+          %scaled = scalar.mulf %dot_narrow, %scale : f32
+          %low = func.call @reference_bf16_round(%scaled) : (f32) -> (f32)
+          %up_word = view.load %up_weights[%element] : view<32xi16> -> i16
+          %up_value = func.call @reference_bf16_value(%up_word) : (i16) -> (f32)
+          %left = scalar.extf %low : f32 to f64
+          %right = scalar.extf %up_value : f32 to f64
+          %product = scalar.mulf %left, %right : f64
+          %next = scalar.addf %partial, %product : f64
+          scf.yield %next : f64
+        }
+        scf.yield %bank_sum : f64
+      }
+      %base_wide = scalar.extf %base : f32 to f64
+      %combined = scalar.addf %base_wide, %delta : f64
+      %narrow = scalar.fptrunc %combined : f64 to f32
+      %word = func.call @reference_bf16_bits(%narrow) : (f32) -> (i16)
+      view.store %word, %outputs[%row, %channel] : i16, view<2x65xi16>
+    }
+  }
+  func.return
+}
+
+check.scenario public @adapter_layer_mix configure[20](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %selection, %weight_bf16, %selection_bytes, %selection_storage_bytes, %weight_bytes, %weight_storage_bytes = check.generate<@adapter_mix_configuration>(%configuration) : (index) -> (index, i1, index, index, index, index)
+    %input_storage = check.generate.fill value(77) : tensor<3152xi8>
+    %input = check.tensor.view %input_storage offset(16) : tensor<3152xi8> -> tensor<3120xi8>
+    %weight_storage = check.generate.fill value(77) : tensor<[%weight_storage_bytes]xi8>
+    %weight = check.tensor.view %weight_storage offset(16) : tensor<[%weight_storage_bytes]xi8> -> tensor<[%weight_bytes]xi8>
+    %down_storage = check.generate.fill value(77) : tensor<5520xi8>
+    %down = check.tensor.view %down_storage offset(16) : tensor<5520xi8> -> tensor<5488xi8>
+    %up_storage = check.generate.fill value(77) : tensor<5520xi8>
+    %up = check.tensor.view %up_storage offset(16) : tensor<5520xi8> -> tensor<5488xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %output_storage = check.generate.fill value(77) : tensor<292xi8>
+    %output = check.tensor.view %output_storage offset(16) : tensor<292xi8> -> tensor<260xi8>
+    check.generate<@initialize_adapter_mix>(%configuration, %input, %weight, %down, %up, %selections) : (index, tensor<3120xi8>, tensor<[%weight_bytes]xi8>, tensor<5488xi8>, tensor<5488xi8>, tensor<[%selection_bytes]xi8>) -> ()
+    check.compare<@adapter_mix_program, @adapter_mix_reference>[%configuration](%input, %weight, %down, %up, %selections, %output) : [index](tensor<3120xi8>, tensor<[%weight_bytes]xi8>, tensor<5488xi8>, tensor<5488xi8>, tensor<[%selection_bytes]xi8>, tensor<260xi8>) -> () {
+      check.expect.bitwise actual(%input_storage) expected(%input_storage) : tensor<3152xi8>
+      check.expect.bitwise actual(%weight_storage) expected(%weight_storage) : tensor<[%weight_storage_bytes]xi8>
+      check.expect.bitwise actual(%down_storage) expected(%down_storage) : tensor<5520xi8>
+      check.expect.bitwise actual(%up_storage) expected(%up_storage) : tensor<5520xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.bitwise actual(%output_storage) expected(%output_storage) : tensor<292xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@adapter_layer_mix> @adapter_layer_mix_benchmark

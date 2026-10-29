@@ -1,0 +1,98 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Two callers share immutable factor banks and one maximum-sized rank buffer.
+// Reversing their execution order checks that publication and scratch reuse do
+// not leak between requests with different selections. The final scratch image
+// includes the untouched tail left by the shorter request. Both calls compose
+// the same matrix program used by ordinary and stress scenarios.
+command.program.decl @adapter_matrix_program(%group: index, %configuration: index) launch(%input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer, %low: buffer, %output: buffer)
+
+func.decl @initialize_adapter_matrix(%group: index, %configuration: index, %input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer)
+
+func.decl @adapter_matrix_reference(%input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer, %low: buffer, %output: buffer)
+
+func.def @initialize_adapter_cohort(%order: index, %input0: buffer, %input1: buffer, %down: buffer, %up: buffer, %selection0: buffer, %selection1: buffer, %base0: buffer, %base1: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  func.call @initialize_adapter_matrix(%c3, %c0, %input0, %down, %up, %selection0, %base0) : (index, index, buffer, buffer, buffer, buffer, buffer)
+  func.call @initialize_adapter_matrix(%c2, %c1, %input1, %down, %up, %selection1, %base1) : (index, index, buffer, buffer, buffer, buffer, buffer)
+  %order_origin = index.constant 4 : offset
+  %header = buffer.view %input0[%order_origin] : buffer -> view<1xi32>
+  %order_word = index.cast %order : index to i32
+  view.store %order_word, %header[0] : i32, view<1xi32>
+  func.return
+}
+
+command.program.def @adapter_cohort(%order: index) launch(%input0: buffer, %input1: buffer, %down: buffer, %up: buffer, %selection0: buffer, %selection1: buffer, %base0: buffer, %base1: buffer, %low: buffer, %output0: buffer, %output1: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %forward = index.cmp eq, %order, %c0 : index
+  scf.if %forward {
+    command.program.launch @adapter_matrix_program[%c3, %c0](%input0, %down, %up, %selection0, %base0, %low, %output0) : [index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    command.program.launch @adapter_matrix_program[%c2, %c1](%input1, %down, %up, %selection1, %base1, %low, %output1) : [index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  } else {
+    command.program.launch @adapter_matrix_program[%c2, %c1](%input1, %down, %up, %selection1, %base1, %low, %output1) : [index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    command.program.launch @adapter_matrix_program[%c3, %c0](%input0, %down, %up, %selection0, %base0, %low, %output0) : [index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  command.return
+}
+
+func.def @adapter_cohort_reference(%input0: buffer, %input1: buffer, %down: buffer, %up: buffer, %selection0: buffer, %selection1: buffer, %base0: buffer, %base1: buffer, %low: buffer, %output0: buffer, %output1: buffer) {
+  %order_origin = index.constant 4 : offset
+  %header = buffer.view %input0[%order_origin] : buffer -> view<1xi32>
+  %order = view.load %header[0] : view<1xi32> -> i32
+  %c0 = scalar.constant 0 : i32
+  %forward = scalar.cmpi eq, %order, %c0 : i32
+  scf.if %forward {
+    func.call @adapter_matrix_reference(%input0, %down, %up, %selection0, %base0, %low, %output0) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    func.call @adapter_matrix_reference(%input1, %down, %up, %selection1, %base1, %low, %output1) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  } else {
+    func.call @adapter_matrix_reference(%input1, %down, %up, %selection1, %base1, %low, %output1) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    func.call @adapter_matrix_reference(%input0, %down, %up, %selection0, %base0, %low, %output0) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  func.return
+}
+
+check.scenario public @shared_scratch configure[2](%order: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input0 = check.generate.fill value(77) : tensor<10304xi8>
+    %input1 = check.generate.fill value(77) : tensor<10304xi8>
+    %down = check.generate.fill value(77) : tensor<28704xi8>
+    %up = check.generate.fill value(77) : tensor<28704xi8>
+    %selection_storage0 = check.generate.fill value(77) : tensor<96xi8>
+    %selection_storage1 = check.generate.fill value(77) : tensor<80xi8>
+    %selection0 = check.tensor.view %selection_storage0 offset(16) : tensor<96xi8> -> tensor<64xi8>
+    %selection1 = check.tensor.view %selection_storage1 offset(16) : tensor<80xi8> -> tensor<48xi8>
+    %base0 = check.generate.fill value(19789) : tensor<5136xi16>
+    %base1 = check.generate.fill value(19789) : tensor<5136xi16>
+    %low = check.generate.fill value(19789) : tensor<7696xi16>
+    %output0 = check.generate.fill value(19789) : tensor<5136xi16>
+    %output1 = check.generate.fill value(19789) : tensor<5136xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<7696xi16> -> tensor<7696xbf16>
+    %values0 = check.tensor.view %output0 offset(0) : tensor<5136xi16> -> tensor<5136xbf16>
+    %values1 = check.tensor.view %output1 offset(0) : tensor<5136xi16> -> tensor<5136xbf16>
+    check.generate<@initialize_adapter_cohort>(%order, %input0, %input1, %down, %up, %selection0, %selection1, %base0, %base1) : (index, tensor<10304xi8>, tensor<10304xi8>, tensor<28704xi8>, tensor<28704xi8>, tensor<64xi8>, tensor<48xi8>, tensor<5136xi16>, tensor<5136xi16>) -> ()
+    check.compare<@adapter_cohort, @adapter_cohort_reference>[%order](%input0, %input1, %down, %up, %selection0, %selection1, %base0, %base1, %low, %output0, %output1) : [index](tensor<10304xi8>, tensor<10304xi8>, tensor<28704xi8>, tensor<28704xi8>, tensor<64xi8>, tensor<48xi8>, tensor<5136xi16>, tensor<5136xi16>, tensor<7696xi16>, tensor<5136xi16>, tensor<5136xi16>) -> () {
+      check.expect.bitwise actual(%input0) expected(%input0) : tensor<10304xi8>
+      check.expect.bitwise actual(%input1) expected(%input1) : tensor<10304xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<28704xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<28704xi8>
+      check.expect.bitwise actual(%selection_storage0) expected(%selection_storage0) : tensor<96xi8>
+      check.expect.bitwise actual(%selection_storage1) expected(%selection_storage1) : tensor<80xi8>
+      check.expect.bitwise actual(%base0) expected(%base0) : tensor<5136xi16>
+      check.expect.bitwise actual(%base1) expected(%base1) : tensor<5136xi16>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(6.2882900238037109e-06) rtol(0.0) nan(different) : tensor<7696xbf16>, tensor<7696xbf16>
+      check.expect.approximate actual(%values0) expected(%values0) atol(0.015625) rtol(0.0) nan(different) : tensor<5136xbf16>, tensor<5136xbf16>
+      check.expect.approximate actual(%values1) expected(%values1) atol(0.0078125) rtol(0.0) nan(different) : tensor<5136xbf16>, tensor<5136xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@shared_scratch> @shared_scratch_benchmark

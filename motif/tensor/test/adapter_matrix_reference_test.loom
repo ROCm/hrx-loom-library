@@ -1,0 +1,446 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Logical adapter inputs and scalar references. The mixed activation and down
+// factors have periods five and seven along K, so a thirty-five-term product
+// period determines the exact contraction and its absolute contribution sum.
+// This identity bounds reference work while the device reads every full matrix.
+// Rank scratch rounds after F32 strength multiplication; the up contraction
+// adds the base once before BF16 publication. Reference arithmetic and integer
+// BF16 rounding are independent of matrix fragments and native reduction order.
+// Geometry lives in the protected activation prefix. Other buffers retain
+// sixteen-byte guards and any padding between physical factor banks.
+func.decl @reference_bf16_value(%word: i16) -> (f32)
+
+func.decl @reference_bf16_bits(%value: f32) -> (i16)
+
+func.decl @reference_bf16_round(%value: f32) -> (f32)
+
+func.decl pure @adapter_selection_count(%selection: index, %banks: index) -> (index)
+
+func.decl @initialize_adapter_selection(%selection: index, %banks: index, %stride: index, %exact: i1, %selections: buffer)
+
+template.decl @adapter_shape(%geometry: index) -> (index, index, index, index, index, index, index, i1)
+
+template.def<@adapter_shape> @adapter_shape_values(%geometry: index) -> (index, index, index, index, index, index, index, i1) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  %c16 = index.constant 16 : index
+  %c64 = index.constant 64 : index
+  %c80 = index.constant 80 : index
+  %c128 = index.constant 128 : index
+  %c192 = index.constant 192 : index
+  %c256 = index.constant 256 : index
+  %c1536 = index.constant 1536 : index
+  %c2560 = index.constant 2560 : index
+  %c6144 = index.constant 6144 : index
+  %c6912 = index.constant 6912 : index
+  %c16384 = index.constant 16384 : index
+  %c36864 = index.constant 36864 : index
+  %rows, %inputs, %outputs = scf.lookup %geometry {
+    0 = (%c80, %c64, %c64),
+    1 = (%c80, %c64, %c64),
+    2 = (%c80, %c128, %c192),
+    3 = (%c80, %c128, %c192),
+    4 = (%c80, %c128, %c192),
+    5 = (%c80, %c128, %c192),
+    6 = (%c16, %c64, %c6144),
+    7 = (%c16, %c256, %c6144),
+    8 = (%c16, %c2560, %c2560),
+    9 = (%c16, %c2560, %c6144),
+    10 = (%c16, %c2560, %c6912),
+    11 = (%c16, %c6144, %c64),
+    12 = (%c16, %c6144, %c1536),
+    13 = (%c16, %c6144, %c6144),
+    14 = (%c16, %c6144, %c16384),
+    15 = (%c16, %c6144, %c36864),
+    16 = (%c16, %c6912, %c2560)
+  } default(%c16, %c16384, %c6144) : index, index, index
+  %exact = index.cmp eq, %geometry, %c1 : index
+  %stress = index.cmp uge, %geometry, %c6 : index
+  %banks = scf.select %stress, %c3, %c7 : index
+  %padded = index.cmp uge, %geometry, %c2 : index
+  %padding = scf.select %padded, %c16, %c0 : index
+  %maximum = index.max %inputs, %outputs : index
+  %stride = index.madd %maximum, %c64, %padding : index
+  %column_begin = index.cmp uge, %geometry, %c4 : index
+  %layout = index.cmp ult, %geometry, %c6 : index
+  %column_major = scalar.andi %column_begin, %layout : i1
+  %row_stride = scf.select %column_major, %c1, %outputs : index
+  %column_stride = scf.select %column_major, %rows, %c1 : index
+  template.return %rows, %inputs, %outputs, %banks, %stride, %row_stride, %column_stride, %exact : index, index, index, index, index, index, index, i1
+}
+
+// Scenario groups share one numerical envelope. Their configurations retain
+// the original selections and both physical layouts; aliasing is a trial-level
+// storage relationship rather than a different production kernel.
+template.decl @adapter_case(%group: index, %configuration: index) -> (index, index)
+
+template.def<@adapter_case> @adapter_case_values(%group: index, %configuration: index) -> (index, index) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %c9 = index.constant 9 : index
+  %c10 = index.constant 10 : index
+  %c11 = index.constant 11 : index
+  %c17 = index.constant 17 : index
+  %geometry, %selection = scf.switch %group -> (index, index) {
+    case 0 {
+      %selection = index.mul %configuration, %c8 : index
+      scf.yield %c0, %selection : index, index
+    }
+    case 1 {
+      scf.yield %c0, %c1 : index, index
+    }
+    case 2 {
+      %selection = index.madd %configuration, %c2, %c2 : index
+      scf.yield %c0, %selection : index, index
+    }
+    case 3 {
+      %selection = scf.lookup %configuration {
+        0 = (%c3),
+        1 = (%c5),
+        2 = (%c6)
+      } default(%c7) : index
+      scf.yield %c0, %selection : index, index
+    }
+    case 4 {
+      scf.yield %c1, %configuration : index, index
+    }
+    case 5 {
+      %layout = index.div %configuration, %c2 : index
+      %ordinal = index.rem %configuration, %c2 : index
+      %geometry = index.madd %layout, %c2, %c2 : index
+      %selection = index.mul %ordinal, %c8 : index
+      scf.yield %geometry, %selection : index, index
+    }
+    case 6 {
+      %layout = index.div %configuration, %c4 : index
+      %ordinal = index.rem %configuration, %c4 : index
+      %geometry = index.madd %layout, %c2, %c2 : index
+      %selection = scf.lookup %ordinal {
+        0 = (%c3),
+        1 = (%c5),
+        2 = (%c6)
+      } default(%c9) : index
+      scf.yield %geometry, %selection : index, index
+    }
+    case 7 {
+      %geometry = index.madd %configuration, %c2, %c2 : index
+      scf.yield %geometry, %c10 : index, index
+    }
+    case 8 {
+      %geometry = index.madd %configuration, %c2, %c2 : index
+      scf.yield %geometry, %c11 : index, index
+    }
+    case 9 {
+      scf.yield %c6, %c3 : index, index
+    }
+    case 10 {
+      scf.yield %c7, %c3 : index, index
+    }
+    case 11 {
+      %geometry = index.add %configuration, %c8 : index
+      scf.yield %geometry, %c3 : index, index
+    }
+    case 12 {
+      %geometry = index.add %configuration, %c11 : index
+      scf.yield %geometry, %c3 : index, index
+    }
+    default {
+      scf.yield %c17, %c3 : index, index
+    }
+  }
+  template.return %geometry, %selection : index, index
+}
+
+func.def @adapter_storage(%group: index, %configuration: index) -> (index, index, index, index, index, index, index, index, index, index) {
+  %geometry, %selection = template.apply<@adapter_case>(%group, %configuration) : (index, index) -> (index, index)
+  %rows, %inputs, %outputs, %banks, %stride, %row_stride, %column_stride, %exact = template.apply<@adapter_shape>(%geometry) : (index) -> (index, index, index, index, index, index, index, i1)
+  %c2 = index.constant 2 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %count = func.call pure @adapter_selection_count(%selection, %banks) : (index, index) -> (index)
+  %input_elements = index.mul %rows, %inputs : index
+  %input_bytes = index.madd %input_elements, %c2, %c64 : index
+  %factor_bytes = index.madd %banks, %stride, %c32 : index
+  %selection_bytes = index.madd %count, %c16, %c16 : index
+  %selection_storage = index.add %selection_bytes, %c32 : index
+  %output_elements = index.mul %rows, %outputs : index
+  %output_storage = index.add %output_elements, %c16 : index
+  %low_rows = index.mul %count, %rows : index
+  %low_elements = index.mul %low_rows, %c32 : index
+  %low_storage = index.add %low_elements, %c16 : index
+  func.return %input_bytes, %factor_bytes, %selection_bytes, %selection_storage, %output_elements, %output_storage, %low_elements, %low_storage, %geometry, %selection : index, index, index, index, index, index, index, index, index, index
+}
+
+func.def @initialize_adapter_matrix(%group: index, %configuration: index, %input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer) {
+  %geometry, %selection = template.apply<@adapter_case>(%group, %configuration) : (index, index) -> (index, index)
+  %rows, %inputs, %outputs, %banks, %stride, %row_stride, %column_stride, %exact = template.apply<@adapter_shape>(%geometry) : (index) -> (index, index, index, index, index, index, index, i1)
+  %origin = index.constant 0 : offset
+  %payload = index.constant 16 : offset
+  %input_origin = index.constant 32 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c5 = index.constant 5 : index
+  %c7 = index.constant 7 : index
+  %c11 = index.constant 11 : index
+  %c15 = index.constant 15 : index
+  %rank = index.constant 32 : index
+  %input_center = scalar.constant 7 : i32
+  %down_center = scalar.constant 3 : i32
+  %up_center = scalar.constant 5 : i32
+  %c0_f32 = scalar.constant 0.0 : f32
+  %eighth = scalar.constant 0.125 : f32
+  %quarter = scalar.constant 0.25 : f32
+  %header = buffer.view %input[%origin] : buffer -> view<1xi32>
+  %geometry_word = index.cast %geometry : index to i32
+  view.store %geometry_word, %header[0] : i32, view<1xi32>
+  %zero_selection = index.constant 8 : index
+  %disabled = index.cmp eq, %selection, %zero_selection : index
+  %positive_strengths = scalar.ori %exact, %disabled : i1
+  func.call @initialize_adapter_selection(%selection, %banks, %stride, %positive_strengths, %selections) : (index, index, index, i1, buffer)
+  %activation = buffer.view %input[%input_origin] : buffer -> view<[%rows]x[%inputs]xi16>
+  scf.for %row = [%c0 to %rows step %c1] {
+    %parity = index.rem %row, %c2 : index
+    %amplitude = index.add %parity, %c1 : index
+    %amplitude_word = index.cast %amplitude : index to i32
+    %exact_value = scalar.uitofp %amplitude_word : i32 to f32
+    scf.for %column = [%c0 to %inputs step %c1] {
+      %row_part = index.mul %row, %c7 : index
+      %affine = index.madd %column, %c3, %row_part : index
+      %reduced = index.rem %affine, %c15 : index
+      %integer = index.cast %reduced : index to i32
+      %signed = scalar.subi %integer, %input_center : i32
+      %integer_value = scalar.sitofp %signed : i32 to f32
+      %mixed = scalar.mulf %integer_value, %eighth : f32
+      %value = scf.select %exact, %exact_value, %mixed : f32
+      %word = func.call @reference_bf16_bits(%value) : (f32) -> (i16)
+      view.store %word, %activation[%row, %column] : i16, view<[%rows]x[%inputs]xi16>
+    }
+  }
+  %stride_bytes = index.cast %stride : index to offset
+  scf.for %bank = [%c0 to %banks step %c1] {
+    %bank_relative = index.scale %bank, %stride_bytes : index, offset -> offset
+    %bank_origin = index.add %bank_relative, %payload : offset
+    %down_weights = buffer.view %down[%bank_origin] : buffer -> view<32x[%inputs]xi16>
+    %up_weights = buffer.view %up[%bank_origin] : buffer -> view<[%outputs]x32xi16>
+    %bank_amplitude = index.add %bank, %c1 : index
+    %bank_word = index.cast %bank_amplitude : index to i32
+    %bank_value = scalar.uitofp %bank_word : i32 to f32
+    %bank_scale = scalar.mulf %bank_value, %eighth : f32
+    scf.for %element = [%c0 to %rank step %c1] {
+      scf.for %column = [%c0 to %inputs step %c1] {
+        %bank_part = index.mul %bank, %c11 : index
+        %rank_part = index.madd %element, %c5, %bank_part : index
+        %affine = index.madd %column, %c3, %rank_part : index
+        %reduced = index.rem %affine, %c7 : index
+        %integer = index.cast %reduced : index to i32
+        %signed = scalar.subi %integer, %down_center : i32
+        %integer_value = scalar.sitofp %signed : i32 to f32
+        %mixed = scalar.mulf %integer_value, %eighth : f32
+        %diagonal = index.cmp eq, %column, %element : index
+        %sparse = scf.select %diagonal, %bank_scale, %c0_f32 : f32
+        %value = scf.select %exact, %sparse, %mixed : f32
+        %word = func.call @reference_bf16_bits(%value) : (f32) -> (i16)
+        view.store %word, %down_weights[%element, %column] : i16, view<32x[%inputs]xi16>
+      }
+    }
+    scf.for %channel = [%c0 to %outputs step %c1] {
+      scf.for %element = [%c0 to %rank step %c1] {
+        %bank_part = index.mul %bank, %c5 : index
+        %channel_part = index.madd %channel, %c3, %bank_part : index
+        %affine = index.madd %element, %c7, %channel_part : index
+        %reduced = index.rem %affine, %c11 : index
+        %integer = index.cast %reduced : index to i32
+        %signed = scalar.subi %integer, %up_center : i32
+        %integer_value = scalar.sitofp %signed : i32 to f32
+        %mixed = scalar.mulf %integer_value, %eighth : f32
+        %active_element = index.rem %channel, %rank : index
+        %diagonal = index.cmp eq, %element, %active_element : index
+        %sparse = scf.select %diagonal, %eighth, %c0_f32 : f32
+        %value = scf.select %exact, %sparse, %mixed : f32
+        %word = func.call @reference_bf16_bits(%value) : (f32) -> (i16)
+        view.store %word, %up_weights[%channel, %element] : i16, view<[%outputs]x32xi16>
+      }
+    }
+  }
+  %count = index.mul %rows, %outputs : index
+  %bases = buffer.view %base[%payload] : buffer -> view<[%count]xi16>
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %channel = [%c0 to %outputs step %c1] {
+      %row_part = index.mul %row, %c3 : index
+      %affine = index.madd %channel, %c5, %row_part : index
+      %reduced = index.rem %affine, %c11 : index
+      %integer = index.cast %reduced : index to i32
+      %signed = scalar.subi %integer, %up_center : i32
+      %integer_value = scalar.sitofp %signed : i32 to f32
+      %mixed = scalar.mulf %integer_value, %quarter : f32
+      %parity = index.rem %channel, %c2 : index
+      %amplitude = index.add %parity, %c1 : index
+      %amplitude_word = index.cast %amplitude : index to i32
+      %amplitude_value = scalar.uitofp %amplitude_word : i32 to f32
+      %sparse = scalar.mulf %amplitude_value, %eighth : f32
+      %value = scf.select %exact, %sparse, %mixed : f32
+      %word = func.call @reference_bf16_bits(%value) : (f32) -> (i16)
+      %row_offset = index.mul %row, %row_stride : index
+      %position = index.madd %channel, %column_stride, %row_offset : index
+      view.store %word, %bases[%position] : i16, view<[%count]xi16>
+    }
+  }
+  func.return
+}
+
+// One complete period, including the partial tail, is evaluated from actual
+// storage. Sparse exact cases instead read their one nonzero coefficient.
+func.def @adapter_down_product(%rows: index, %inputs: index, %row: index, %element: index, %exact: i1, %bank_origin: offset, %input: buffer, %down: buffer) -> (f64, f64) {
+  %input_origin = index.constant 32 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %period = index.constant 35 : index
+  %rank = index.constant 32 : index
+  %c0_f64 = scalar.constant 0.0 : f64
+  %row_index = index.assume %row [ge(%row, 0), lt(%row, %rows)] : index
+  %element_index = index.assume %element [ge(%element, 0), lt(%element, %rank)] : index
+  %activation = buffer.view %input[%input_origin] : buffer -> view<[%rows]x[%inputs]xi16>
+  %weights = buffer.view %down[%bank_origin] : buffer -> view<32x[%inputs]xi16>
+  %terms = index.min %inputs, %period : index
+  %end = scf.select %exact, %c1, %terms : index
+  %repeat_count = index.div %inputs, %terms : index
+  %repetitions = scf.select %exact, %c1, %repeat_count : index
+  %tail = index.rem %inputs, %terms : index
+  %repeat_word = index.cast %repetitions : index to i32
+  %repeat_value = scalar.uitofp %repeat_word : i32 to f64
+  %sum, %norm = scf.for %ordinal = [%c0 to %end step %c1](%sum = %c0_f64 : f64, %norm = %c0_f64 : f64) -> (f64, f64) {
+    %column_value = scf.select %exact, %element, %ordinal : index
+    %column = index.assume %column_value [ge(%column_value, 0), lt(%column_value, %inputs)] : index
+    %input_word = view.load %activation[%row_index, %column] : view<[%rows]x[%inputs]xi16> -> i16
+    %weight_word = view.load %weights[%element_index, %column] : view<32x[%inputs]xi16> -> i16
+    %input_value = func.call @reference_bf16_value(%input_word) : (i16) -> (f32)
+    %weight_value = func.call @reference_bf16_value(%weight_word) : (i16) -> (f32)
+    %left = scalar.extf %input_value : f32 to f64
+    %right = scalar.extf %weight_value : f32 to f64
+    %product = scalar.mulf %left, %right : f64
+    %included = index.cmp ult, %ordinal, %tail : index
+    %mixed_tail = scf.select %included, %product, %c0_f64 : f64
+    %tail_product = scf.select %exact, %c0_f64, %mixed_tail : f64
+    %repeated = scalar.mulf %product, %repeat_value : f64
+    %contribution = scalar.addf %repeated, %tail_product : f64
+    %magnitude = scalar.absf %contribution : f64
+    %next_sum = scalar.addf %sum, %contribution : f64
+    %next_norm = scalar.addf %norm, %magnitude : f64
+    scf.yield %next_sum, %next_norm : f64, f64
+  }
+  func.return %sum, %norm : f64, f64
+}
+
+func.def @adapter_matrix_reference(%input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer, %low: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %payload = index.constant 16 : offset
+  %strength_origin = index.constant 24 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c11 = index.constant 11 : index
+  %c15 = index.constant 15 : index
+  %rank = index.constant 32 : index
+  %word_bytes = index.constant 2 : offset
+  %c0_f64 = scalar.constant 0.0 : f64
+  %header = buffer.view %input[%origin] : buffer -> view<1xi32>
+  %geometry_word = view.load %header[0] : view<1xi32> -> i32
+  %geometry = index.cast %geometry_word : i32 to index
+  %rows, %inputs, %outputs, %banks, %stride, %row_stride, %column_stride, %exact = template.apply<@adapter_shape>(%geometry) : (index) -> (index, index, index, index, index, index, index, i1)
+  %selection_header = buffer.view %selections[%origin] : buffer -> view<1xi32>
+  %count_word = view.load %selection_header[0] : view<1xi32> -> i32
+  %count = index.cast %count_word : i32 to index
+  %offset_layout = encoding.layout.strided [2] : encoding<layout>
+  %strength_layout = encoding.layout.strided [4] : encoding<layout>
+  %offsets = buffer.view %selections[%payload] : buffer -> view<[%count]xi64, %offset_layout>
+  %strengths = buffer.view %selections[%strength_origin] : buffer -> view<[%count]xf32, %strength_layout>
+  %lows = buffer.view %low[%payload] : buffer -> view<[%count]x[%rows]x32xi16>
+  %row_period = scf.select %exact, %c2, %c15 : index
+  %reference_rows = index.min %rows, %row_period : index
+  %column_period = scf.select %exact, %rank, %c11 : index
+  %reference_columns = index.min %outputs, %column_period : index
+  scf.for %ordinal = [%c0 to %count step %c1] {
+    %address = view.load %offsets[%ordinal] : view<[%count]xi64, %offset_layout> -> i64
+    %nonnegative = scalar.assume %address [range(%address, 0, 9223372036854775807)] : i64
+    %relative = index.cast %nonnegative : i64 to offset
+    %bank_origin = index.add %relative, %payload : offset
+    %scale = view.load %strengths[%ordinal] : view<[%count]xf32, %strength_layout> -> f32
+    scf.for %row = [%c0 to %reference_rows step %c1] {
+      scf.for %element = [%c0 to %rank step %c1] {
+        %sum, %norm = func.call @adapter_down_product(%rows, %inputs, %row, %element, %exact, %bank_origin, %input, %down) : (index, index, index, index, i1, offset, buffer, buffer) -> (f64, f64)
+        %narrow = scalar.fptrunc %sum : f64 to f32
+        %scaled = scalar.mulf %narrow, %scale : f32
+        %word = func.call @reference_bf16_bits(%scaled) : (f32) -> (i16)
+        scf.for %copy_row = [%row to %rows step %row_period] {
+          view.store %word, %lows[%ordinal, %copy_row, %element] : i16, view<[%count]x[%rows]x32xi16>
+        }
+      }
+    }
+  }
+  %scratch_count = index.mul %reference_rows, %reference_columns : index
+  %wide_bytes = index.constant 8 : offset
+  %scratch_bytes = index.scale %scratch_count, %wide_bytes : index, offset -> offset
+  %scratch = buffer.alloca<private> align(8) %scratch_bytes : buffer
+  %deltas = buffer.view %scratch[%origin] : buffer -> view<[%reference_rows]x[%reference_columns]xf64>
+  scf.for %row = [%c0 to %reference_rows step %c1] {
+    scf.for %channel = [%c0 to %reference_columns step %c1] {
+      %sum = scf.for %ordinal = [%c0 to %count step %c1](%sum = %c0_f64 : f64) -> (f64) {
+        %address = view.load %offsets[%ordinal] : view<[%count]xi64, %offset_layout> -> i64
+        %nonnegative = scalar.assume %address [range(%address, 0, 9223372036854775807)] : i64
+        %relative = index.cast %nonnegative : i64 to offset
+        %bank_origin = index.add %relative, %payload : offset
+        %weights = buffer.view %up[%bank_origin] : buffer -> view<[%outputs]x32xi16>
+        %bank_sum = scf.for %element = [%c0 to %rank step %c1](%partial = %sum : f64) -> (f64) {
+          %low_word = view.load %lows[%ordinal, %row, %element] : view<[%count]x[%rows]x32xi16> -> i16
+          %weight_word = view.load %weights[%channel, %element] : view<[%outputs]x32xi16> -> i16
+          %low_value = func.call @reference_bf16_value(%low_word) : (i16) -> (f32)
+          %weight_value = func.call @reference_bf16_value(%weight_word) : (i16) -> (f32)
+          %left = scalar.extf %low_value : f32 to f64
+          %right = scalar.extf %weight_value : f32 to f64
+          %product = scalar.mulf %left, %right : f64
+          %next = scalar.addf %partial, %product : f64
+          scf.yield %next : f64
+        }
+        scf.yield %bank_sum : f64
+      }
+      view.store %sum, %deltas[%row, %channel] : f64, view<[%reference_rows]x[%reference_columns]xf64>
+    }
+  }
+  %element_count = index.mul %rows, %outputs : index
+  %bases = buffer.view %base[%payload] : buffer -> view<[%element_count]xi16>
+  %results = buffer.view %output[%payload] : buffer -> view<[%element_count]xi16>
+  scf.for %row = [%c0 to %rows step %c1] {
+    %reference_row = index.rem %row, %row_period : index
+    scf.for %channel = [%c0 to %outputs step %c1] {
+      %reference_column = index.rem %channel, %column_period : index
+      %delta = view.load %deltas[%reference_row, %reference_column] : view<[%reference_rows]x[%reference_columns]xf64> -> f64
+      %row_offset = index.mul %row, %row_stride : index
+      %position = index.madd %channel, %column_stride, %row_offset : index
+      %base_word = view.load %bases[%position] : view<[%element_count]xi16> -> i16
+      %base_value = func.call @reference_bf16_value(%base_word) : (i16) -> (f32)
+      %base_wide = scalar.extf %base_value : f32 to f64
+      %combined = scalar.addf %delta, %base_wide : f64
+      %narrow = scalar.fptrunc %combined : f64 to f32
+      %word = func.call @reference_bf16_bits(%narrow) : (f32) -> (i16)
+      view.store %word, %results[%position] : i16, view<[%element_count]xi16>
+    }
+  }
+  func.return
+}

@@ -1,13 +1,9 @@
 # Tensor correctness and benchmark workloads
 
-The adapter corpus uses the twelve original matrix shape families and the
-fused twelve-layer scalar contraction. Separate leaves supply metadata views
-to the reusable providers. Python standard-library generators create synthetic
-operands and independent scalar results in Bazel output; they use no model
-checkpoints. The same GPU scenarios support optional Loom address and race
-checks through `--config=loom-asan` and `--config=loom-tsan`. Native tool
-instrumentation is independent; `--config=asan` alone does not select Loom
-checks. See [development](../../../docs/development.md) for configuration.
+Adapter tests supply typed runtime selections to reusable matrix and scalar
+providers. Synthetic operands and independent references require no model
+checkpoints. Optional Loom instrumentation is independent of native tool
+instrumentation; see [development](../../../docs/development.md) for configuration.
 
 Selections cover empty, single, odd/even, seven-bank, reordered, duplicate,
 canceling, zero, and fractional strengths. Dense and column-major layouts
@@ -24,13 +20,6 @@ exceed the accepted bounds; device observations never determine a tolerance.
 Each scenario also declares a benchmark over its initialized inputs. Benchmarks
 run separately through the [benchmark workflow](../../../docs/development.md#sweep-repository-benchmarks).
 Correctness runs do not establish model throughput.
-
-```sh
-bazel test --config=asan --config=amdgpu \
-  //motif/tensor/test:adapter //motif/tensor/test:adapter_exact \
-  //motif/tensor/test:adapter_layer_mix //motif/tensor/test:adapter_cohort \
-  //motif/tensor/test:adapter_reference_test
-```
 
 `random_test.loom` executes the three published
 [Random123 known-answer vectors](https://github.com/DEShawResearch/random123/blob/d8a0c25e49992685c0b9d91b553c1d04f81b6b4b/tests/kat_vectors)

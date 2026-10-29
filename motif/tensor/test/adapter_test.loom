@@ -1,0 +1,419 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Runtime matrix selection, intermediate rank publication, and final base
+// accumulation. The independent scalar reference preserves F32 strength and
+// BF16 storage boundaries. Numerical groups retain the original input-derived
+// sum(abs(products))*2^-20 envelope through both projection stages. Exact
+// inputs and disabled final outputs compare every bit; mixed rank scratch
+// preserves numerical signed-zero equivalence. Layout scenarios include
+// column-major storage and exact base/output aliasing. Whole immutable buffers
+// compare bitwise. The BF16 guard word 0x4d4d is finite and its least-bit change
+// exceeds every absolute tolerance, so whole-storage approximate comparisons
+// also require the guard bits to remain unchanged, including the dynamic suffix.
+command.program.decl @adapter_matrix_program(%group: index, %configuration: index) launch(%input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer, %low: buffer, %output: buffer)
+
+func.decl @adapter_storage(%group: index, %configuration: index) -> (index, index, index, index, index, index, index, index, index, index)
+
+func.decl @initialize_adapter_matrix(%group: index, %configuration: index, %input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer)
+
+func.decl @adapter_matrix_reference(%input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer, %low: buffer, %output: buffer)
+
+check.scenario public @matrix_disabled configure[2](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(0) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.bitwise actual(%base) expected(%base) : tensor<[%output_words]xi16>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(0.0) rtol(0.0) nan(different) : tensor<[%low_words]xbf16>, tensor<[%low_words]xbf16>
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%output_words]xi16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@matrix_disabled> @matrix_disabled_benchmark
+
+check.scenario public @matrix_single configure[1](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(1) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.bitwise actual(%base) expected(%base) : tensor<[%output_words]xi16>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(3.1441450119018555e-06) rtol(0.0) nan(different) : tensor<[%low_words]xbf16>, tensor<[%low_words]xbf16>
+      check.expect.approximate actual(%output_values) expected(%output_values) atol(0.0078125) rtol(0.0) nan(different) : tensor<[%output_words]xbf16>, tensor<[%output_words]xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@matrix_single> @matrix_single_benchmark
+
+check.scenario public @matrix_pair configure[2](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(2) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.bitwise actual(%base) expected(%base) : tensor<[%output_words]xi16>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(6.2882900238037109e-06) rtol(0.0) nan(different) : tensor<[%low_words]xbf16>, tensor<[%low_words]xbf16>
+      check.expect.approximate actual(%output_values) expected(%output_values) atol(0.0078125) rtol(0.0) nan(different) : tensor<[%output_words]xbf16>, tensor<[%output_words]xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@matrix_pair> @matrix_pair_benchmark
+
+check.scenario public @matrix_multiple configure[4](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(3) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.bitwise actual(%base) expected(%base) : tensor<[%output_words]xi16>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(6.2882900238037109e-06) rtol(0.0) nan(different) : tensor<[%low_words]xbf16>, tensor<[%low_words]xbf16>
+      check.expect.approximate actual(%output_values) expected(%output_values) atol(0.015625) rtol(0.0) nan(different) : tensor<[%output_words]xbf16>, tensor<[%output_words]xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@matrix_multiple> @matrix_multiple_benchmark
+
+check.scenario public @matrix_exact configure[9](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(4) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.bitwise actual(%base) expected(%base) : tensor<[%output_words]xi16>
+      check.expect.bitwise actual(%low) expected(%low) : tensor<[%low_words]xi16>
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%output_words]xi16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@matrix_exact> @matrix_exact_benchmark
+
+check.scenario public @layout_disabled configure[4](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(5) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.bitwise actual(%base) expected(%base) : tensor<[%output_words]xi16>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(0.0) rtol(0.0) nan(different) : tensor<[%low_words]xbf16>, tensor<[%low_words]xbf16>
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%output_words]xi16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@layout_disabled> @layout_disabled_benchmark
+
+check.scenario public @layout_multiple configure[8](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(6) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.bitwise actual(%base) expected(%base) : tensor<[%output_words]xi16>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(1.1920928955078125e-05) rtol(0.0) nan(different) : tensor<[%low_words]xbf16>, tensor<[%low_words]xbf16>
+      check.expect.approximate actual(%output_values) expected(%output_values) atol(0.015625) rtol(0.0) nan(different) : tensor<[%output_words]xbf16>, tensor<[%output_words]xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@layout_multiple> @layout_multiple_benchmark
+
+check.scenario public @layout_cancel configure[2](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(7) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.bitwise actual(%base) expected(%base) : tensor<[%output_words]xi16>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(1.1920928955078125e-05) rtol(0.0) nan(different) : tensor<[%low_words]xbf16>, tensor<[%low_words]xbf16>
+      check.expect.approximate actual(%output_values) expected(%output_values) atol(5.14984130859375e-05) rtol(0.0) nan(different) : tensor<[%output_words]xbf16>, tensor<[%output_words]xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@layout_cancel> @layout_cancel_benchmark
+
+check.scenario public @layout_fractional configure[2](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(8) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.bitwise actual(%base) expected(%base) : tensor<[%output_words]xi16>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(0.00390625) rtol(0.0) nan(different) : tensor<[%low_words]xbf16>, tensor<[%low_words]xbf16>
+      check.expect.approximate actual(%output_values) expected(%output_values) atol(0.0078125) rtol(0.0) nan(different) : tensor<[%output_words]xbf16>, tensor<[%output_words]xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@layout_fractional> @layout_fractional_benchmark
+
+check.scenario public @alias_disabled configure[4](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(5) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.tensor.view %base offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(0.0) rtol(0.0) nan(different) : tensor<[%low_words]xbf16>, tensor<[%low_words]xbf16>
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%output_words]xi16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@alias_disabled> @alias_disabled_benchmark
+
+check.scenario public @alias_multiple configure[8](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(6) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.tensor.view %base offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(1.1920928955078125e-05) rtol(0.0) nan(different) : tensor<[%low_words]xbf16>, tensor<[%low_words]xbf16>
+      check.expect.approximate actual(%output_values) expected(%output_values) atol(0.015625) rtol(0.0) nan(different) : tensor<[%output_words]xbf16>, tensor<[%output_words]xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@alias_multiple> @alias_multiple_benchmark
+
+check.scenario public @alias_cancel configure[2](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(7) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.tensor.view %base offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(1.1920928955078125e-05) rtol(0.0) nan(different) : tensor<[%low_words]xbf16>, tensor<[%low_words]xbf16>
+      check.expect.approximate actual(%output_values) expected(%output_values) atol(5.14984130859375e-05) rtol(0.0) nan(different) : tensor<[%output_words]xbf16>, tensor<[%output_words]xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@alias_cancel> @alias_cancel_benchmark
+
+check.scenario public @alias_fractional configure[2](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %group = check.literal value(8) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_bytes, %factor_bytes, %selection_bytes, %selection_storage_bytes, %output_elements, %output_words, %low_elements, %low_words, %geometry, %selection = check.generate<@adapter_storage>(%group, %configuration) : (index, index) -> (index, index, index, index, index, index, index, index, index, index)
+    %input = check.generate.fill value(77) : tensor<[%input_bytes]xi8>
+    %down = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %up = check.generate.fill value(77) : tensor<[%factor_bytes]xi8>
+    %selections_storage = check.generate.fill value(77) : tensor<[%selection_storage_bytes]xi8>
+    %selections = check.tensor.view %selections_storage offset(16) : tensor<[%selection_storage_bytes]xi8> -> tensor<[%selection_bytes]xi8>
+    %base = check.generate.fill value(19789) : tensor<[%output_words]xi16>
+    %low = check.generate.fill value(19789) : tensor<[%low_words]xi16>
+    %output = check.tensor.view %base offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xi16>
+    %low_values = check.tensor.view %low offset(0) : tensor<[%low_words]xi16> -> tensor<[%low_words]xbf16>
+    %output_values = check.tensor.view %output offset(0) : tensor<[%output_words]xi16> -> tensor<[%output_words]xbf16>
+    check.generate<@initialize_adapter_matrix>(%group, %configuration, %input, %down, %up, %selections, %base) : (index, index, tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>) -> ()
+    check.compare<@adapter_matrix_program, @adapter_matrix_reference>[%group, %configuration](%input, %down, %up, %selections, %base, %low, %output) : [index, index](tensor<[%input_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%factor_bytes]xi8>, tensor<[%selection_bytes]xi8>, tensor<[%output_words]xi16>, tensor<[%low_words]xi16>, tensor<[%output_words]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
+      check.expect.bitwise actual(%down) expected(%down) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<[%factor_bytes]xi8>
+      check.expect.bitwise actual(%selections_storage) expected(%selections_storage) : tensor<[%selection_storage_bytes]xi8>
+      check.expect.approximate actual(%low_values) expected(%low_values) atol(0.00390625) rtol(0.0) nan(different) : tensor<[%low_words]xbf16>, tensor<[%low_words]xbf16>
+      check.expect.approximate actual(%output_values) expected(%output_values) atol(0.0078125) rtol(0.0) nan(different) : tensor<[%output_words]xbf16>, tensor<[%output_words]xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@alias_fractional> @alias_fractional_benchmark
