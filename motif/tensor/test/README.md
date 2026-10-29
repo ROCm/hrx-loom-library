@@ -79,26 +79,6 @@ two-dispatch case expects the sixteen lowest IDs among equal winners from
 separate tiles. Its benchmark declarations retain these different input and
 merge shapes rather than reporting one synthetic size.
 
-`linear_test.loom` checks eleven BF16 projection shapes against independently
-authored whole-matrix products. Both checkpoint storage formats, short and
-partial 256-input blocks, multiple blocks, and the 2560/6144-column model
-reductions are covered. Reversed grid traversal checks that logical tile
-origins reach contraction and publication unchanged. BF16 output in dense,
-column-major, and padded layouts compares bitwise, including untouched holes.
-
-Native F32 matrix results have an input-scaled accuracy requirement:
-`atol = max(sum(abs(BF16 products))) / 2^20`, with zero relative tolerance.
-The generator verifies this budget is below half the smallest nonzero product
-in each case. This measures contraction accuracy without assuming native matrix
-instructions reproduce ordered scalar accumulation bits. Two positive-term
-constructions separately require exact F32 results that BF16 cannot represent.
-Input conversion midpoints distinguish rounded weights from their F32 originals.
-All immutable allocations and output guards compare bitwise.
-
-```sh
-python3 -B motif/tensor/test/generate_linear_oracle.py --check
-```
-
 `attention_expanded_test.loom` compares nineteen causal/noncausal grouped-attention
 cases with whole binary64 QK contractions, a complete masked softmax, and
 weighted values. Cases span sixteen-row tails around sixty-four-key panels,
@@ -178,14 +158,6 @@ instrumentation; every scenario also has a benchmark declaration.
 python3 -B motif/tensor/test/generate_segmented_attention_oracle.py --check
 ```
 
-`linear_tiled_test.loom` compares ten cooperative projection shapes with the same
-independent whole-matrix oracle. The 16-, 32-, and 48-row tails exercise
-workgroup-wide staging and retirement when some waves own no output. Multiple
-K256 blocks, complete and incomplete traversal groups, oversized groups, and
-the real 6144/16384 reduction widths cover panel lifetimes and indexing.
-Dense, column-major, and padded physical results, guards, and immutable
-allocations compare bitwise under native, access, and race instrumentation.
-
 `linear_coordinates_test.loom` is an authored scenario with eighteen grid
 configurations and one GPU kernel. A command program specializes the grid and
 group size, while `coordinate_reference_test.loom` independently enumerates
@@ -200,22 +172,6 @@ configuration domain. Run the authored scenario directly:
 python dev.py test --target=//motif/tensor/test:linear_coordinates
 ```
 
-The matrix fixture generator owns only `linear_tiled_test.loom`:
-
-```sh
-python3 -B motif/tensor/test/generate_linear_tiled_oracle.py --check
-```
-
-`linear_temporal_test.loom` compares seventeen full-reduction contractions with
-independent dyadic whole-matrix products. All seven row-tail sizes and five
-column-tail sizes, simultaneous interior/tail tiles, complete and incomplete
-groups, and oversized groups exercise bank ownership and guarded publication.
-Both LDS acquisition schedules run with multiple K64 transitions and the final
-no-refill drain. Model reduction widths 6144/16384 and small positive terms
-distinguish full F32 accumulation from intermediate BF16 rounding. Every
-output, guard, and immutable input compares bitwise under native, access,
-and race instrumentation.
-
 `linear_temporal_coordinates_test.loom` uses the same authored scenario pattern
 and shared VM reference for twenty-five logical grids, including both rounding
 axes, every remainder of an eight-row group, the model's 4224/4608-row selections,
@@ -228,12 +184,6 @@ reference code.
 
 ```sh
 python dev.py test --target=//motif/tensor/test:linear_temporal_coordinates
-```
-
-The matrix fixture generator owns only `linear_temporal_test.loom`:
-
-```sh
-python3 -B motif/tensor/test/generate_linear_temporal_oracle.py --check
 ```
 
 `rmsnorm_test.loom` compares retained-row normalization with a sequential F64
@@ -450,25 +400,6 @@ references and launch bodies.
 python3 -B motif/tensor/test/generate_convolution_matrix_oracle.py --check
 ```
 
-`embedding_test.loom` compares selected BF16 elements with complete row copies.
-The independent reference computes byte ranges from the requested IDs and
-copies each row without floating-point evaluation or the production lookup
-template. Integer-generated storage exercises all 65,536 BF16 bit patterns,
-including NaN payloads, signed zeros, subnormals, and infinities.
-
-Five cases cover a single element, odd widths and launch tails, repeated and
-reversed IDs, the 151,936-row vocabulary boundary, and the encoder's
-2,560-channel width. The vocabulary-boundary table uses a non-power-of-two
-word period so narrowing a row ID to sixteen bits selects different data.
-Input and output views have nonzero origins. Output
-words, prefix/suffix guards, the entire ID allocation, and the entire immutable
-table are checked bitwise. Native and access-instrumented execution share
-these cases and their benchmark declarations.
-
-```sh
-python3 -B motif/tensor/test/generate_embedding_cases.py --check
-```
-
 `time_test.loom` compares sinusoidal features with binary64 exponential and
 trigonometric evaluation after explicit F32 frequency and phase boundaries.
 The independent reference constructs whole frequency rows, then concatenates
@@ -529,21 +460,6 @@ A sixty-four-term case first produces 64, then adds three sixteen-term tiles
 of 1/1024. F16 accumulation retains 64, while F32 accumulation publishes
 64.0625 in F16. This precision distinction remains exact. Every shape has a
 benchmark workload; correctness timings do not establish a throughput claim.
-
-The signed I8 projection corpus in `linear_i8_test.loom` uses complete integer dot
-products and independently rounded F32 scale products, I32-to-F32 conversions,
-and BF16 results. Fourteen scenarios cover every 16-row tail in a 128-row tile,
-K64 and K128 panels, partial output tiles, grouped traversal, and the model's
-6144- and 16384-element reductions. Dense, column-major, and padded outputs
-retain complete guard regions. All four input arrays also compare bitwise.
-Signed extremes, positive and negative scales, zero scales, large integer
-sums, and positive/negative BF16 midpoints exercise the arithmetic boundaries.
-Ordinary execution and optional Loom address/race checks use the same expected
-values. The generator requires only Python's standard library:
-
-```sh
-python3 -B motif/tensor/test/generate_linear_i8_oracle.py --check
-```
 
 `matrix_publication_test.loom` checks native wave32 F32 fragments published to BF16
 without running a matrix contraction. Complete, partial, and wholly inactive

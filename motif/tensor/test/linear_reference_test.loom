@@ -1,0 +1,162 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Dyadic matrix inputs and an independent scalar dot product for BF16
+// projections. Mixed rows repeat every fifteen terms. Products are multiples
+// of 1/64 and their absolute sum fits F32 exactly for these workloads, so the
+// reference is independent of native matrix reduction order. Precision inputs
+// instead use a unit term followed by 2^-13 terms to distinguish accumulation
+// from final BF16 publication. The VM reads actual operands, sums in F64, and
+// uses integer BF16 rounding. Shapes and layout occupy a protected input prefix;
+// payload origins, remaining guards, output padding, and inputs stay observable.
+func.decl @reference_bf16_value(%word: i16) -> (f32)
+
+func.decl @reference_bf16_bits(%value: f32) -> (i16)
+
+func.def @linear_fixture_value(%row: index, %column: index, %weight: i1, %precision: i1) -> (f32) {
+  %c0 = index.constant 0 : index
+  %c3 = index.constant 3 : index
+  %c5 = index.constant 5 : index
+  %c7 = index.constant 7 : index
+  %c11 = index.constant 11 : index
+  %period = index.constant 15 : index
+  %center = scalar.constant 7 : i32
+  %eighth = scalar.constant 0.125 : f32
+  %unit = scalar.constant 1.0 : f32
+  %small = scalar.constant 0.0001220703125 : f32
+  %row_factor = scf.select %weight, %c5, %c3 : index
+  %column_factor = scf.select %weight, %c7, %c11 : index
+  %row_part = index.mul %row, %row_factor : index
+  %affine = index.madd %column, %column_factor, %row_part : index
+  %reduced = index.rem %affine, %period : index
+  %word = index.cast %reduced : index to i32
+  %signed = scalar.subi %word, %center : i32
+  %integer = scalar.sitofp %signed : i32 to f32
+  %mixed = scalar.mulf %integer, %eighth : f32
+  %first = index.cmp eq, %column, %c0 : index
+  %activation = scf.select %weight, %small, %unit : f32
+  %directed = scf.select %first, %unit, %activation : f32
+  %value = scf.select %precision, %directed, %mixed : f32
+  func.return %value : f32
+}
+
+func.def @linear_fixture_initialize(%rows: index, %inputs: index, %outputs: index, %row_stride: index, %column_stride: index, %precision: i1, %input: buffer, %weight: buffer) {
+  %base = index.constant 0 : offset
+  %origin = index.constant 32 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %false = scalar.constant false : i1
+  %true = scalar.constant true : i1
+  %header = buffer.view %input[%base] : buffer -> view<6xi32>
+  %row_word = index.cast %rows : index to i32
+  %input_word = index.cast %inputs : index to i32
+  %output_word = index.cast %outputs : index to i32
+  %row_stride_word = index.cast %row_stride : index to i32
+  %column_stride_word = index.cast %column_stride : index to i32
+  %precision_word = scalar.extui %precision : i1 to i32
+  view.store %row_word, %header[0] : i32, view<6xi32>
+  view.store %input_word, %header[1] : i32, view<6xi32>
+  view.store %output_word, %header[2] : i32, view<6xi32>
+  view.store %row_stride_word, %header[3] : i32, view<6xi32>
+  view.store %column_stride_word, %header[4] : i32, view<6xi32>
+  view.store %precision_word, %header[5] : i32, view<6xi32>
+  %activation = buffer.view %input[%origin] : buffer -> view<[%rows]x[%inputs]xi16>
+  %weights = buffer.view %weight[%origin] : buffer -> view<[%outputs]x[%inputs]xi16>
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %column = [%c0 to %inputs step %c1] {
+      %value = func.call @linear_fixture_value(%row, %column, %false, %precision) : (index, index, i1, i1) -> (f32)
+      %word = func.call @reference_bf16_bits(%value) : (f32) -> (i16)
+      view.store %word, %activation[%row, %column] : i16, view<[%rows]x[%inputs]xi16>
+    }
+  }
+  scf.for %channel = [%c0 to %outputs step %c1] {
+    scf.for %column = [%c0 to %inputs step %c1] {
+      %value = func.call @linear_fixture_value(%channel, %column, %true, %precision) : (index, index, i1, i1) -> (f32)
+      %word = func.call @reference_bf16_bits(%value) : (f32) -> (i16)
+      view.store %word, %weights[%channel, %column] : i16, view<[%outputs]x[%inputs]xi16>
+    }
+  }
+  func.return
+}
+
+func.def @linear_fixture_product(%rows: index, %inputs: index, %outputs: index, %row: index, %channel: index, %column: index, %input: buffer, %weight: buffer) -> (f64) {
+  %origin = index.constant 32 : offset
+  %activation = buffer.view %input[%origin] : buffer -> view<[%rows]x[%inputs]xi16>
+  %weights = buffer.view %weight[%origin] : buffer -> view<[%outputs]x[%inputs]xi16>
+  %row_index = index.assume %row [ge(%row, 0), lt(%row, %rows)] : index
+  %channel_index = index.assume %channel [ge(%channel, 0), lt(%channel, %outputs)] : index
+  %column_index = index.assume %column [ge(%column, 0), lt(%column, %inputs)] : index
+  %left_word = view.load %activation[%row_index, %column_index] : view<[%rows]x[%inputs]xi16> -> i16
+  %right_word = view.load %weights[%channel_index, %column_index] : view<[%outputs]x[%inputs]xi16> -> i16
+  %left = func.call @reference_bf16_value(%left_word) : (i16) -> (f32)
+  %right = func.call @reference_bf16_value(%right_word) : (i16) -> (f32)
+  %left_wide = scalar.extf %left : f32 to f64
+  %right_wide = scalar.extf %right : f32 to f64
+  %product = scalar.mulf %left_wide, %right_wide : f64
+  func.return %product : f64
+}
+
+func.def @linear_fixture_reference(%input: buffer, %weight: buffer, %output: buffer) {
+  %base = index.constant 0 : offset
+  %origin = index.constant 32 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %period = index.constant 15 : index
+  %c0_f64 = scalar.constant 0.0 : f64
+  %c0_i32 = scalar.constant 0 : i32
+  %header = buffer.view %input[%base] : buffer -> view<6xi32>
+  %row_word = view.load %header[0] : view<6xi32> -> i32
+  %input_word = view.load %header[1] : view<6xi32> -> i32
+  %output_word = view.load %header[2] : view<6xi32> -> i32
+  %row_stride_word = view.load %header[3] : view<6xi32> -> i32
+  %column_stride_word = view.load %header[4] : view<6xi32> -> i32
+  %precision_word = view.load %header[5] : view<6xi32> -> i32
+  %rows = index.cast %row_word : i32 to index
+  %inputs = index.cast %input_word : i32 to index
+  %outputs = index.cast %output_word : i32 to index
+  %row_stride = index.cast %row_stride_word : i32 to index
+  %column_stride = index.cast %column_stride_word : i32 to index
+  %precision = scalar.cmpi ne, %precision_word, %c0_i32 : i32
+  %row_major = index.cmp eq, %column_stride, %c1 : index
+  %pitch = scf.select %row_major, %row_stride, %outputs : index
+  %count = index.mul %rows, %pitch : index
+  %results = buffer.view %output[%origin] : buffer -> view<[%count]xi16>
+  %terms = index.min %inputs, %period : index
+  %repetitions = index.div %inputs, %terms : index
+  %remainder = index.rem %inputs, %terms : index
+  %repeat_word = index.cast %repetitions : index to i32
+  %repeat_wide = scalar.uitofp %repeat_word : i32 to f64
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %channel = [%c0 to %outputs step %c1] {
+      %total = scf.if %precision -> (f64) {
+        %head = func.call @linear_fixture_product(%rows, %inputs, %outputs, %row, %channel, %c0, %input, %weight) : (index, index, index, index, index, index, buffer, buffer) -> (f64)
+        %tail = func.call @linear_fixture_product(%rows, %inputs, %outputs, %row, %channel, %c1, %input, %weight) : (index, index, index, index, index, index, buffer, buffer) -> (f64)
+        %remaining = index.sub %inputs, %c1 : index
+        %remaining_word = index.cast %remaining : index to i32
+        %remaining_wide = scalar.uitofp %remaining_word : i32 to f64
+        %tail_sum = scalar.mulf %tail, %remaining_wide : f64
+        %total = scalar.addf %head, %tail_sum : f64
+        scf.yield %total : f64
+      } else {
+        %period_sum, %tail_sum = scf.for %column = [%c0 to %terms step %c1](%sum = %c0_f64 : f64, %tail = %c0_f64 : f64) -> (f64, f64) {
+          %product = func.call @linear_fixture_product(%rows, %inputs, %outputs, %row, %channel, %column, %input, %weight) : (index, index, index, index, index, index, buffer, buffer) -> (f64)
+          %included = index.cmp ult, %column, %remainder : index
+          %tail_product = scf.select %included, %product, %c0_f64 : f64
+          %next_sum = scalar.addf %sum, %product : f64
+          %next_tail = scalar.addf %tail, %tail_product : f64
+          scf.yield %next_sum, %next_tail : f64, f64
+        }
+        %repeated = scalar.mulf %period_sum, %repeat_wide : f64
+        %total = scalar.addf %repeated, %tail_sum : f64
+        scf.yield %total : f64
+      }
+      %value = scalar.fptrunc %total : f64 to f32
+      %word = func.call @reference_bf16_bits(%value) : (f32) -> (i16)
+      %row_offset = index.mul %row, %row_stride : index
+      %position_value = index.madd %channel, %column_stride, %row_offset : index
+      %position = index.assume %position_value [ge(%position_value, 0), lt(%position_value, %count)] : index
+      view.store %word, %results[%position] : i16, view<[%count]xi16>
+    }
+  }
+  func.return
+}
