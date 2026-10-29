@@ -208,10 +208,6 @@ and race-instrumented execution cover reduction and whole-row ownership;
 ordinary execution and optional address checks cover scalar arithmetic. Each
 scenario has a benchmark declaration.
 
-```sh
-python3 -B motif/tensor/test/generate_rmsnorm_bf16_row_oracle.py --check
-```
-
 The rotary corpus distinguishes adjacent pairs with F32 tables from half-split
 pairs with BF16 products. `rotary_scalar_test.loom` checks 304 exact pair outputs,
 including cancellation, signed zeros, subnormals, and wide exponents. Omitting
