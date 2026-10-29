@@ -79,26 +79,6 @@ two-dispatch case expects the sixteen lowest IDs among equal winners from
 separate tiles. Its benchmark declarations retain these different input and
 merge shapes rather than reporting one synthetic size.
 
-`linear_test.loom` checks eleven BF16 projection shapes against independently
-authored whole-matrix products. Both checkpoint storage formats, short and
-partial 256-input blocks, multiple blocks, and the 2560/6144-column model
-reductions are covered. Reversed grid traversal checks that logical tile
-origins reach contraction and publication unchanged. BF16 output in dense,
-column-major, and padded layouts compares bitwise, including untouched holes.
-
-Native F32 matrix results have an input-scaled accuracy requirement:
-`atol = max(sum(abs(BF16 products))) / 2^20`, with zero relative tolerance.
-The generator verifies this budget is below half the smallest nonzero product
-in each case. This measures contraction accuracy without assuming native matrix
-instructions reproduce ordered scalar accumulation bits. Two positive-term
-constructions separately require exact F32 results that BF16 cannot represent.
-Input conversion midpoints distinguish rounded weights from their F32 originals.
-All immutable allocations and output guards compare bitwise.
-
-```sh
-python3 -B motif/tensor/test/generate_linear_oracle.py --check
-```
-
 `attention_expanded_test.loom` compares nineteen causal/noncausal grouped-attention
 cases with whole binary64 QK contractions, a complete masked softmax, and
 weighted values. Cases span sixteen-row tails around sixty-four-key panels,
