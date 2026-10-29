@@ -273,10 +273,7 @@ F32 results use a `1e-6` absolute and relative bound. F16 comparisons use
 across the final rounding boundary. Zero outputs are checked exactly.
 
 The BF16 RMS corpus separates scalar rounding, reduction accuracy, and row
-storage. `rmsnorm_bf16_scalar_test.loom` compares 186 pairs of epilogue results
-bitwise against exact rational arithmetic, covering weight/scale midpoints,
-the normalized-value boundary, signed zeros, and subnormals. The generator
-checks that omitting each of those intermediate roundings changes the corpus.
+storage.
 
 `rmsnorm_bf16_inverse_test.loom` compares seven whole-row inverse norms with a
 binary64 sum and reciprocal square root. Its relative accuracy requirement
@@ -299,7 +296,6 @@ ordinary execution and optional address checks cover scalar arithmetic. Each
 scenario has a benchmark declaration.
 
 ```sh
-python3 -B motif/tensor/test/generate_rmsnorm_bf16_scalar_oracle.py --check
 python3 -B motif/tensor/test/generate_rmsnorm_bf16_row_oracle.py --check
 ```
 
