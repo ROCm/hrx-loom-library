@@ -1,0 +1,166 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// A regular H4 matrix has +1 everywhere except its -1 anti-diagonal. Scalar
+// contractions over each axis of a 4x4x4x4 tensor evaluate its fourth Kronecker
+// power independently of subgroup shuffles and vector/lane placement. Dyadic
+// fixtures are exact through every sum; F64 scratch exposes the mathematical
+// transform before each explicitly rounded quantization boundary.
+func.decl @reference_bf16_round(%value: f32) -> (f32)
+
+func.decl @reference_bf16_value(%word: i16) -> (f32)
+
+func.def @convrot_coefficient(%row: index, %column: index) -> (f64) {
+  %c3 = index.constant 3 : index
+  %c1_f64 = scalar.constant 1.0 : f64
+  %cneg1_f64 = scalar.constant -1.0 : f64
+  %diagonal = index.add %row, %column : index
+  %negative = index.cmp eq, %diagonal, %c3 : index
+  %coefficient = scf.select %negative, %cneg1_f64, %c1_f64 : f64
+  func.return %coefficient : f64
+}
+
+func.def @convrot_digit_reference(%input: buffer, %output: buffer) {
+  %base = index.constant 0 : offset
+  %origin = index.constant 64 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c32 = index.constant 32 : index
+  %c0_f64 = scalar.constant 0.0 : f64
+  %header = buffer.view %input[%base] : buffer -> view<1xi32>
+  %distance_word = view.load %header[0] : view<1xi32> -> i32
+  %distance_value = index.cast %distance_word : i32 to index
+  %distance = index.assume %distance_value [ge(%distance_value, 1), le(%distance_value, 4)] : index
+  %values = buffer.view %input[%origin] : buffer -> view<32x8xf32>
+  %results = buffer.view %output[%origin] : buffer -> view<32x8xf32>
+  scf.for %lane = [%c0 to %c32 step %c1] {
+    %group = index.div %lane, %distance : index
+    %digit = index.rem %group, %c4 : index
+    %offset = index.mul %digit, %distance : index
+    %first_lane = index.sub %lane, %offset : index
+    scf.for %component = [%c0 to %c8 step %c1] {
+      %sum = scf.for %column = [%c0 to %c4 step %c1](%total = %c0_f64 : f64) -> (f64) {
+        %source_value = index.madd %column, %distance, %first_lane : index
+        %source = index.assume %source_value [ge(%source_value, 0), lt(%source_value, 32)] : index
+        %value = view.load %values[%source, %component] : view<32x8xf32> -> f32
+        %wide = scalar.extf %value : f32 to f64
+        %coefficient = func.call @convrot_coefficient(%digit, %column) : (index, index) -> (f64)
+        %product = scalar.mulf %wide, %coefficient : f64
+        %next = scalar.addf %total, %product : f64
+        scf.yield %next : f64
+      }
+      %result = scalar.fptrunc %sum : f64 to f32
+      view.store %result, %results[%lane, %component] : f32, view<32x8xf32>
+    }
+  }
+  func.return
+}
+
+func.def @convrot_row_reference(%input: buffer, %output: buffer, %scales: buffer) {
+  %base = index.constant 0 : offset
+  %input_origin = index.constant 32 : offset
+  %output_origin = index.constant 16 : offset
+  %scale_origin = index.constant 64 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c16 = index.constant 16 : index
+  %c64 = index.constant 64 : index
+  %c256 = index.constant 256 : index
+  %element_bytes = index.constant 4 : offset
+  %scratch_bytes = index.constant 4096 : offset
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c0_f64 = scalar.constant 0.0 : f64
+  %normalization = scalar.constant 0.0625 : f64
+  %limit = scalar.constant 127.0 : f32
+  %minimum_scale = scalar.constant 1.0000000000000001e-30 : f32
+  %lower = scalar.constant -128.0 : f32
+  %header = buffer.view %input[%base] : buffer -> view<2xi32>
+  %rows_word = view.load %header[0] : view<2xi32> -> i32
+  %columns_word = view.load %header[1] : view<2xi32> -> i32
+  %rows_value = index.cast %rows_word : i32 to index
+  %columns_value = index.cast %columns_word : i32 to index
+  %rows = index.assume %rows_value [ge(%rows_value, 1), le(%rows_value, 256)] : index
+  %columns = index.assume %columns_value [ge(%columns_value, 256), le(%columns_value, 16384), multiple_of(%columns_value, 256)] : index
+  %blocks = index.div %columns, %c256 : index
+  %row_bytes = index.scale %columns, %element_bytes : index, offset -> offset
+  %row_storage = buffer.alloca<private> align(4) %row_bytes : buffer
+  %work = buffer.alloca<private> align(8) %scratch_bytes : buffer
+  %values = buffer.view %input[%input_origin] : buffer -> view<[%rows]x[%columns]xi16>
+  %results = buffer.view %output[%output_origin] : buffer -> view<[%rows]x[%columns]xi8>
+  %row_scales = buffer.view %scales[%scale_origin] : buffer -> view<[%rows]xf32>
+  %rotated = buffer.view %row_storage[%base] : buffer -> view<[%columns]xf32>
+  %scratch = buffer.view %work[%base] : buffer -> view<2x256xf64>
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %block = [%c0 to %blocks step %c1] {
+      %block_origin = index.mul %block, %c256 : index
+      scf.for %i = [%c0 to %c256 step %c1] {
+        %column = index.add %block_origin, %i : index
+        %word = view.load %values[%row, %column] : view<[%rows]x[%columns]xi16> -> i16
+        %value = func.call @reference_bf16_value(%word) : (i16) -> (f32)
+        %wide = scalar.extf %value : f32 to f64
+        view.store %wide, %scratch[0, %i] : f64, view<2x256xf64>
+      }
+      // Contract a dense H4 matrix along each tensor axis. Two fixed-size
+      // scratch blocks keep the oracle linear in the row size.
+      scf.for %axis = [%c0 to %c4 step %c1] {
+        %source = index.rem %axis, %c2 : index
+        %destination = index.sub %c1, %source : index
+        %stride = scf.lookup %axis {
+          0 = (%c1),
+          1 = (%c4),
+          2 = (%c16)
+        } default(%c64) : index
+        scf.for %i = [%c0 to %c256 step %c1] {
+          %group = index.div %i, %stride : index
+          %digit = index.rem %group, %c4 : index
+          %axis_offset = index.mul %digit, %stride : index
+          %first = index.sub %i, %axis_offset : index
+          %sum = scf.for %column = [%c0 to %c4 step %c1](%total = %c0_f64 : f64) -> (f64) {
+            %position_value = index.madd %column, %stride, %first : index
+            %position = index.assume %position_value [ge(%position_value, 0), lt(%position_value, 256)] : index
+            %value = view.load %scratch[%source, %position] : view<2x256xf64> -> f64
+            %coefficient = func.call @convrot_coefficient(%digit, %column) : (index, index) -> (f64)
+            %product = scalar.mulf %value, %coefficient : f64
+            %accumulated = scalar.addf %total, %product : f64
+            scf.yield %accumulated : f64
+          }
+          view.store %sum, %scratch[%destination, %i] : f64, view<2x256xf64>
+        }
+      }
+      scf.for %i = [%c0 to %c256 step %c1] {
+        %column = index.add %block_origin, %i : index
+        %sum = view.load %scratch[0, %i] : view<2x256xf64> -> f64
+        %normalized = scalar.mulf %sum, %normalization : f64
+        %value = scalar.fptrunc %normalized : f64 to f32
+        %rounded = func.call @reference_bf16_round(%value) : (f32) -> (f32)
+        view.store %rounded, %rotated[%column] : f32, view<[%columns]xf32>
+      }
+    }
+    %maximum = scf.for %column = [%c0 to %columns step %c1](%maximum = %c0_f32 : f32) -> (f32) {
+      %value = view.load %rotated[%column] : view<[%columns]xf32> -> f32
+      %magnitude = scalar.absf %value : f32
+      %updated = scalar.maxnumf %maximum, %magnitude : f32
+      scf.yield %updated : f32
+    }
+    %divided = scalar.divf %maximum, %limit : f32
+    %scale = scalar.maxnumf %divided, %minimum_scale : f32
+    %divisor = func.call @reference_bf16_round(%scale) : (f32) -> (f32)
+    view.store %scale, %row_scales[%row] : f32, view<[%rows]xf32>
+    scf.for %column = [%c0 to %columns step %c1] {
+      %value = view.load %rotated[%column] : view<[%columns]xf32> -> f32
+      %quotient = scalar.divf %value, %divisor : f32
+      %rounded = func.call @reference_bf16_round(%quotient) : (f32) -> (f32)
+      %nearest = scalar.roundevenf %rounded : f32
+      %bounded_low = scalar.maxnumf %nearest, %lower : f32
+      %bounded = scalar.minnumf %bounded_low, %limit : f32
+      %integer = scalar.fptosi %bounded : f32 to i32
+      %byte = scalar.trunci %integer : i32 to i8
+      view.store %byte, %results[%row, %column] : i8, view<[%rows]x[%columns]xi8>
+    }
+  }
+  func.return
+}

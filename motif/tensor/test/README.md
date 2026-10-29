@@ -248,29 +248,6 @@ normalization midpoints. No expectation depends on a device's observed output.
 python3 -B motif/tensor/test/generate_rotary_oracle.py --check
 ```
 
-The ConvRot reference constructs the dense fourth Kronecker power of an
-explicit regular H4 matrix, independently of the production shuffle network.
-Its dyadic input sums are exactly representable in F32. Rational rounding
-then supplies the BF16 rotated values, F32 row scales, BF16 divisors and
-quotients, nearest-even integers, and saturation.
-
-`convrot_rows_test.loom` checks every one of the 256 basis vectors, uneven block
-distribution across four subgroups, the real 6144/16384-column shapes, and
-multiple rows. Zero, tiny, and large values exercise the scale floor and
-range. Both signs and parities of integer midpoints occur, including a
-negative quotient rounding to -128 and a positive one saturating to 127.
-The generator verifies that omitting any intermediate BF16 boundary changes
-the corpus. Signed-I8 outputs, F32 scales, all guards, and immutable input
-compare bitwise under native, access, and race instrumentation.
-
-`convrot_digits_test.loom` checks both supported digit distances directly against
-dense H4 rows. It includes native and access-instrumented execution with exact
-full-buffer observations. Every scenario has a benchmark declaration.
-
-```sh
-python3 -B motif/tensor/test/generate_convrot_oracle.py --check
-```
-
 `grouped_convolution_test.loom` uses a scalar F64 oracle that combines the static
 and dynamic coefficients before multiplication and explicitly pads every
 tap. It checks three independent eight-position, 5120-channel blocks,
