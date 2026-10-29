@@ -30,15 +30,10 @@ and mixed counter/key words. Every output word is checked exactly.
 native GPU results exactly under the `gfx11-generic` execution contract. Its
 second kernel checks 64 normal pairs crossing
 radial endpoints, F32 conversion boundaries, and angular octants. The expected
-values come from double-precision libm after the declared F32 uniform
+values come from a strict F64 VM reference after the declared F32 uniform
 conversion, independently of Loom's approximate target instructions. The
 accepted error is `2e-9 + 5e-7 * abs(expected)`, including the near-zero angular
 results and the smallest positive radial sample.
-
-```sh
-bazel test --config=asan --config=amdgpu //motif/tensor/test:all
-python3 -B motif/tensor/test/generate_normal_oracle.py
-```
 
 The benchmarks select complete counter blocks and a 64-pair normal workload.
 They exercise runtime buffer inputs so native arithmetic remains in the
