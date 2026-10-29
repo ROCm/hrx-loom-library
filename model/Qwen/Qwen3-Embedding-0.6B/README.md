@@ -34,10 +34,10 @@ bazel build \
 ```
 
 The selected outputs live below
-`bazel-bin/model/Qwen/Qwen3-Embedding-0.6B/`. `source` retains Loom text;
-`archive` uses bytecode. Both retain `policy.loom` as an explicit auxiliary
-compiler input. They remain inputs to runtime linking
-and JIT specialization.
+`bazel-bin/model/Qwen/Qwen3-Embedding-0.6B/`. `source` retains the authored
+Loom and C++ text; `archive` uses bytecode. Both retain `policy.loom` as an
+explicit auxiliary compiler input. They remain inputs to runtime linking and
+JIT specialization.
 
 Each package contains a selected `model.json`, deployment `serve.json`, and
 its provider closure. Full parameters and the tokenizer retain their acquisition
