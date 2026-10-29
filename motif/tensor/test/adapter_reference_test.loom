@@ -1,0 +1,187 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Check the oracle's acceptance contract independently of device output. Each
+// nonzero selection is dropped, negated, and redirected to the next physical
+// bank; each zero strength is replaced by one. Every mutation must exceed twice
+// the original numerical envelope. Both mixed and exactly representable inputs
+// participate, and the input-derived bounds must match their authored values.
+func.decl @initialize_adapter_matrix(%group: index, %configuration: index, %input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer)
+
+func.decl @adapter_matrix_reference(%input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer, %low: buffer, %output: buffer)
+
+func.decl @adapter_matrix_bounds(%geometry: index, %input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer) -> (f64, f64)
+
+func.decl @reference_bf16_value(%word: i16) -> (f32)
+
+func.def @adapter_selection_check(%configuration: index) -> (i32, i1) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c7 = index.constant 7 : index
+  %c9 = index.constant 9 : index
+  %stride = index.constant 4096 : index
+  %elements = index.constant 5120 : index
+  %origin = index.constant 0 : offset
+  %payload = index.constant 16 : offset
+  %strength_origin = index.constant 24 : offset
+  %record_bytes = index.constant 16 : offset
+  %input_bytes = index.constant 10304 : offset
+  %factor_bytes = index.constant 28704 : offset
+  %selection_bytes = index.constant 128 : offset
+  %output_bytes = index.constant 10272 : offset
+  %low_bytes = index.constant 35872 : offset
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %c0_f64 = scalar.constant 0.0 : f64
+  %unit_strength = scalar.constant 1.0 : f32
+  %margin_factor = scalar.constant 2.0 : f64
+  %small_output_bound = scalar.constant 0.0078125 : f64
+  %large_output_bound = scalar.constant 0.015625 : f64
+  %single_low_bound = scalar.constant 3.1441450119018555e-06 : f64
+  %multiple_low_bound = scalar.constant 6.2882900238037109e-06 : f64
+  %input = buffer.alloca<private> align(16) %input_bytes : buffer
+  %down = buffer.alloca<private> align(16) %factor_bytes : buffer
+  %up = buffer.alloca<private> align(16) %factor_bytes : buffer
+  %base = buffer.alloca<private> align(16) %output_bytes : buffer
+  %selections = buffer.alloca<private> align(16) %selection_bytes : buffer
+  %altered = buffer.alloca<private> align(16) %selection_bytes : buffer
+  %low = buffer.alloca<private> align(16) %low_bytes : buffer
+  %expected = buffer.alloca<private> align(16) %output_bytes : buffer
+  %actual = buffer.alloca<private> align(16) %output_bytes : buffer
+  %selection = index.rem %configuration, %c9 : index
+  %exact = index.cmp uge, %configuration, %c9 : index
+  %mixed_group, %mixed_configuration = scf.lookup %selection {
+    0 = (%c0, %c0),
+    1 = (%c1, %c0),
+    2 = (%c2, %c0),
+    3 = (%c3, %c0),
+    4 = (%c2, %c1),
+    5 = (%c3, %c1),
+    6 = (%c3, %c2),
+    7 = (%c3, %c3)
+  } default(%c0, %c1) : index, index
+  %group = scf.select %exact, %c4, %mixed_group : index
+  %member = scf.select %exact, %selection, %mixed_configuration : index
+  %geometry = scf.select %exact, %c1, %c0 : index
+  func.call @initialize_adapter_matrix(%group, %member, %input, %down, %up, %selections, %base) : (index, index, buffer, buffer, buffer, buffer, buffer)
+  %output_bound, %low_bound = func.call @adapter_matrix_bounds(%geometry, %input, %down, %up, %selections, %base) : (index, buffer, buffer, buffer, buffer, buffer) -> (f64, f64)
+  %mixed_output_bound, %mixed_low_bound = scf.lookup %selection {
+    0 = (%c0_f64, %c0_f64),
+    1 = (%small_output_bound, %single_low_bound),
+    2 = (%small_output_bound, %multiple_low_bound),
+    4 = (%small_output_bound, %multiple_low_bound),
+    8 = (%c0_f64, %c0_f64)
+  } default(%large_output_bound, %multiple_low_bound) : f64, f64
+  %expected_output_bound = scf.select %exact, %c0_f64, %mixed_output_bound : f64
+  %expected_low_bound = scf.select %exact, %c0_f64, %mixed_low_bound : f64
+  %output_bound_matches = scalar.cmpf oeq, %output_bound, %expected_output_bound : f64
+  %low_bound_matches = scalar.cmpf oeq, %low_bound, %expected_low_bound : f64
+  %bounds_match = scalar.andi %output_bound_matches, %low_bound_matches : i1
+  %margin = scalar.mulf %output_bound, %margin_factor : f64
+  func.call @adapter_matrix_reference(%input, %down, %up, %selections, %base, %low, %expected) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  %header = buffer.view %selections[%origin] : buffer -> view<1xi32>
+  %count_word = view.load %header[0] : view<1xi32> -> i32
+  %bounded_count = scalar.assume %count_word [range(%count_word, 0, 7)] : i32
+  %count = index.cast %bounded_count : i32 to index
+  %offset_layout = encoding.layout.strided [2] : encoding<layout>
+  %strength_layout = encoding.layout.strided [4] : encoding<layout>
+  %offsets = buffer.view %selections[%payload] : buffer -> view<[%count]xi64, %offset_layout>
+  %strengths = buffer.view %selections[%strength_origin] : buffer -> view<[%count]xf32, %strength_layout>
+  %altered_header = buffer.view %altered[%origin] : buffer -> view<1xi32>
+  %altered_offsets = buffer.view %altered[%payload] : buffer -> view<[%count]xi64, %offset_layout>
+  %altered_strengths = buffer.view %altered[%strength_origin] : buffer -> view<[%count]xf32, %strength_layout>
+  %expected_values = buffer.view %expected[%payload] : buffer -> view<5120xi16>
+  %actual_values = buffer.view %actual[%payload] : buffer -> view<5120xi16>
+  %metadata_records = index.add %count, %c1 : index
+  %metadata_bytes = index.scale %metadata_records, %record_bytes : index, offset -> offset
+  %passed = scf.for %ordinal = [%c0 to %count step %c1](%passed = %c0_i32 : i32) -> (i32) {
+    %strength = view.load %strengths[%ordinal] : view<[%count]xf32, %strength_layout> -> f32
+    %strength_wide = scalar.extf %strength : f32 to f64
+    %disabled = scalar.cmpf oeq, %strength_wide, %c0_f64 : f64
+    %mutations = scf.select %disabled, %c1, %c3 : index
+    %record_passed = scf.for %mutation = [%c0 to %mutations step %c1](%record_passed = %passed : i32) -> (i32) {
+      buffer.copy %selections[%origin], %altered[%origin], %metadata_bytes
+      scf.if %disabled {
+        view.store %unit_strength, %altered_strengths[%ordinal] : f32, view<[%count]xf32, %strength_layout>
+      } else {
+        scf.switch %mutation {
+          case 0 {
+            %remaining = index.sub %count, %c1 : index
+            %remaining_word = index.cast %remaining : index to i32
+            view.store %remaining_word, %altered_header[0] : i32, view<1xi32>
+            scf.for %destination = [%ordinal to %remaining step %c1] {
+              %source_record = index.add %destination, %c1 : index
+              %source_relative = index.scale %source_record, %record_bytes : index, offset -> offset
+              %destination_relative = index.scale %destination, %record_bytes : index, offset -> offset
+              %source_origin = index.add %source_relative, %payload : offset
+              %destination_origin = index.add %destination_relative, %payload : offset
+              buffer.copy %selections[%source_origin], %altered[%destination_origin], %record_bytes
+            }
+          }
+          case 1 {
+            %opposite = scalar.negf %strength : f32
+            view.store %opposite, %altered_strengths[%ordinal] : f32, view<[%count]xf32, %strength_layout>
+          }
+          default {
+            %address = view.load %offsets[%ordinal] : view<[%count]xi64, %offset_layout> -> i64
+            %position = index.cast %address : i64 to index
+            %bank = index.div %position, %stride : index
+            %next = index.add %bank, %c1 : index
+            %replacement = index.rem %next, %c7 : index
+            %replacement_position = index.mul %replacement, %stride : index
+            %replacement_address = index.cast %replacement_position : index to i64
+            view.store %replacement_address, %altered_offsets[%ordinal] : i64, view<[%count]xi64, %offset_layout>
+          }
+        }
+      }
+      func.call @adapter_matrix_reference(%input, %down, %up, %altered, %base, %low, %actual) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+      %maximum_error = scf.for %position = [%c0 to %elements step %c1](%maximum = %c0_f64 : f64) -> (f64) {
+        %actual_word = view.load %actual_values[%position] : view<5120xi16> -> i16
+        %expected_word = view.load %expected_values[%position] : view<5120xi16> -> i16
+        %actual_value = func.call @reference_bf16_value(%actual_word) : (i16) -> (f32)
+        %expected_value = func.call @reference_bf16_value(%expected_word) : (i16) -> (f32)
+        %actual_wide = scalar.extf %actual_value : f32 to f64
+        %expected_wide = scalar.extf %expected_value : f32 to f64
+        %difference = scalar.subf %actual_wide, %expected_wide : f64
+        %error = scalar.absf %difference : f64
+        %larger = scalar.cmpf ogt, %error, %maximum : f64
+        %next_maximum = scf.select %larger, %error, %maximum : f64
+        scf.yield %next_maximum : f64
+      }
+      %distinguished = scalar.cmpf ogt, %maximum_error, %margin : f64
+      %increment = scf.select %distinguished, %c1_i32, %c0_i32 : i32
+      %next_passed = scalar.addi %record_passed, %increment : i32
+      scf.yield %next_passed : i32
+    }
+    scf.yield %record_passed : i32
+  }
+  func.return %passed, %bounds_match : i32, i1
+}
+
+func.def @adapter_all_selections() -> (i32, i32) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %configurations = index.constant 18 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %mutations, %bounds = scf.for %configuration = [%c0 to %configurations step %c1](%mutations = %c0_i32 : i32, %bounds = %c0_i32 : i32) -> (i32, i32) {
+    %passed, %bounds_match = func.call @adapter_selection_check(%configuration) : (index) -> (i32, i1)
+    %increment = scf.select %bounds_match, %c1_i32, %c0_i32 : i32
+    %next_mutations = scalar.addi %mutations, %passed : i32
+    %next_bounds = scalar.addi %bounds, %increment : i32
+    scf.yield %next_mutations, %next_bounds : i32, i32
+  }
+  func.return %mutations, %bounds : i32, i32
+}
+
+check.case public @selection_sensitivity {
+  %mutations, %bounds = func.call @adapter_all_selections() : () -> (i32, i32)
+  %expected_mutations = check.literal value(138) : i32
+  %expected_bounds = check.literal value(18) : i32
+  check.expect.equal actual(%mutations) expected(%expected_mutations) : i32
+  check.expect.equal actual(%bounds) expected(%expected_bounds) : i32
+  check.return
+}

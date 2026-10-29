@@ -1,0 +1,161 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Propagate a twenty-bit contraction budget through actual input magnitudes,
+// runtime strengths, BF16 rank publication, and the final base addition. The
+// interval calculation supplies an independent check on the scenarios' literal
+// tolerances; device observations are never inputs to the numerical contract.
+func.decl @reference_bf16_value(%word: i16) -> (f32)
+
+func.decl @reference_bf16_round(%value: f32) -> (f32)
+
+template.decl @adapter_shape(%geometry: index) -> (index, index, index, index, index, index, index, i1)
+
+func.decl @adapter_down_product(%rows: index, %inputs: index, %row: index, %element: index, %exact: i1, %bank_origin: offset, %input: buffer, %down: buffer) -> (f64, f64)
+
+func.def @adapter_round_bound(%value: f64) -> (f64) {
+  %narrow = scalar.fptrunc %value : f64 to f32
+  %rounded = func.call @reference_bf16_round(%narrow) : (f32) -> (f32)
+  %wide = scalar.extf %rounded : f32 to f64
+  func.return %wide : f64
+}
+
+func.def @adapter_output_bound(%value: f64, %base: f32) -> (f64) {
+  %narrow = scalar.fptrunc %value : f64 to f32
+  %combined = scalar.addf %narrow, %base : f32
+  %rounded = func.call @reference_bf16_round(%combined) : (f32) -> (f32)
+  %wide = scalar.extf %rounded : f32 to f64
+  func.return %wide : f64
+}
+
+func.def @adapter_matrix_bounds(%geometry: index, %input: buffer, %down: buffer, %up: buffer, %selections: buffer, %base: buffer) -> (f64, f64) {
+  %origin = index.constant 0 : offset
+  %payload = index.constant 16 : offset
+  %strength_origin = index.constant 24 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c11 = index.constant 11 : index
+  %c15 = index.constant 15 : index
+  %rank = index.constant 32 : index
+  %wide_bytes = index.constant 8 : offset
+  %c0_f64 = scalar.constant 0.0 : f64
+  %contraction_error = scalar.constant 9.5367431640625e-07 : f64
+  %rows, %inputs, %outputs, %banks, %stride, %row_stride, %column_stride, %exact = template.apply<@adapter_shape>(%geometry) : (index) -> (index, index, index, index, index, index, index, i1)
+  %header = buffer.view %selections[%origin] : buffer -> view<1xi32>
+  %count_word = view.load %header[0] : view<1xi32> -> i32
+  %count = index.cast %count_word : i32 to index
+  %offset_layout = encoding.layout.strided [2] : encoding<layout>
+  %strength_layout = encoding.layout.strided [4] : encoding<layout>
+  %offsets = buffer.view %selections[%payload] : buffer -> view<[%count]xi64, %offset_layout>
+  %strengths = buffer.view %selections[%strength_origin] : buffer -> view<[%count]xf32, %strength_layout>
+  %row_period = scf.select %exact, %c2, %c15 : index
+  %reference_rows = index.min %rows, %row_period : index
+  %column_period = scf.select %exact, %rank, %c11 : index
+  %reference_columns = index.min %outputs, %column_period : index
+  %rank_rows = index.mul %count, %reference_rows : index
+  %rank_elements = index.mul %rank_rows, %rank : index
+  %interval_elements = index.mul %rank_elements, %c3 : index
+  %interval_bytes = index.scale %interval_elements, %wide_bytes : index, offset -> offset
+  %storage = buffer.alloca<private> align(8) %interval_bytes : buffer
+  %intervals = buffer.view %storage[%origin] : buffer -> view<[%count]x[%reference_rows]x32x3xf64>
+  %low_bound = scf.for %ordinal = [%c0 to %count step %c1](%bank_bound = %c0_f64 : f64) -> (f64) {
+    %address = view.load %offsets[%ordinal] : view<[%count]xi64, %offset_layout> -> i64
+    %nonnegative = scalar.assume %address [range(%address, 0, 9223372036854775807)] : i64
+    %relative = index.cast %nonnegative : i64 to offset
+    %bank_origin = index.add %relative, %payload : offset
+    %strength = view.load %strengths[%ordinal] : view<[%count]xf32, %strength_layout> -> f32
+    %scale = scalar.extf %strength : f32 to f64
+    %row_bound = scf.for %row = [%c0 to %reference_rows step %c1](%row_bound = %bank_bound : f64) -> (f64) {
+      %rank_bound = scf.for %element = [%c0 to %rank step %c1](%rank_bound = %row_bound : f64) -> (f64) {
+        %sum, %norm = func.call @adapter_down_product(%rows, %inputs, %row, %element, %exact, %bank_origin, %input, %down) : (index, index, index, index, i1, offset, buffer, buffer) -> (f64, f64)
+        %error = scalar.mulf %norm, %contraction_error : f64
+        %lower_sum = scalar.subf %sum, %error : f64
+        %upper_sum = scalar.addf %sum, %error : f64
+        %nominal_product = scalar.mulf %sum, %scale : f64
+        %lower_product = scalar.mulf %lower_sum, %scale : f64
+        %upper_product = scalar.mulf %upper_sum, %scale : f64
+        %nominal = func.call @adapter_round_bound(%nominal_product) : (f64) -> (f64)
+        %left = func.call @adapter_round_bound(%lower_product) : (f64) -> (f64)
+        %right = func.call @adapter_round_bound(%upper_product) : (f64) -> (f64)
+        %ordered = scalar.cmpf ole, %left, %right : f64
+        %lower = scf.select %ordered, %left, %right : f64
+        %upper = scf.select %ordered, %right, %left : f64
+        view.store %nominal, %intervals[%ordinal, %row, %element, 0] : f64, view<[%count]x[%reference_rows]x32x3xf64>
+        view.store %lower, %intervals[%ordinal, %row, %element, 1] : f64, view<[%count]x[%reference_rows]x32x3xf64>
+        view.store %upper, %intervals[%ordinal, %row, %element, 2] : f64, view<[%count]x[%reference_rows]x32x3xf64>
+        %left_difference = scalar.subf %nominal, %lower : f64
+        %right_difference = scalar.subf %upper, %nominal : f64
+        %left_error = scalar.absf %left_difference : f64
+        %right_error = scalar.absf %right_difference : f64
+        %left_larger = scalar.cmpf ogt, %left_error, %rank_bound : f64
+        %with_left = scf.select %left_larger, %left_error, %rank_bound : f64
+        %right_larger = scalar.cmpf ogt, %right_error, %with_left : f64
+        %with_right = scf.select %right_larger, %right_error, %with_left : f64
+        scf.yield %with_right : f64
+      }
+      scf.yield %rank_bound : f64
+    }
+    scf.yield %row_bound : f64
+  }
+  %output_elements = index.mul %rows, %outputs : index
+  %bases = buffer.view %base[%payload] : buffer -> view<[%output_elements]xi16>
+  %output_bound = scf.for %row = [%c0 to %rows step %c1](%row_bound = %c0_f64 : f64) -> (f64) {
+    %reference_row = index.rem %row, %row_period : index
+    %channel_bound = scf.for %channel = [%c0 to %reference_columns step %c1](%channel_bound = %row_bound : f64) -> (f64) {
+      %nominal, %lower, %upper, %norm = scf.for %ordinal = [%c0 to %count step %c1](%nominal = %c0_f64 : f64, %lower = %c0_f64 : f64, %upper = %c0_f64 : f64, %norm = %c0_f64 : f64) -> (f64, f64, f64, f64) {
+        %address = view.load %offsets[%ordinal] : view<[%count]xi64, %offset_layout> -> i64
+        %nonnegative = scalar.assume %address [range(%address, 0, 9223372036854775807)] : i64
+        %relative = index.cast %nonnegative : i64 to offset
+        %bank_origin = index.add %relative, %payload : offset
+        %weights = buffer.view %up[%bank_origin] : buffer -> view<[%outputs]x32xi16>
+        %next_nominal, %next_lower, %next_upper, %next_norm = scf.for %element = [%c0 to %rank step %c1](%center_sum = %nominal : f64, %lower_sum = %lower : f64, %upper_sum = %upper : f64, %norm_sum = %norm : f64) -> (f64, f64, f64, f64) {
+          %center = view.load %intervals[%ordinal, %reference_row, %element, 0] : view<[%count]x[%reference_rows]x32x3xf64> -> f64
+          %low = view.load %intervals[%ordinal, %reference_row, %element, 1] : view<[%count]x[%reference_rows]x32x3xf64> -> f64
+          %high = view.load %intervals[%ordinal, %reference_row, %element, 2] : view<[%count]x[%reference_rows]x32x3xf64> -> f64
+          %weight_word = view.load %weights[%channel, %element] : view<[%outputs]x32xi16> -> i16
+          %weight_value = func.call @reference_bf16_value(%weight_word) : (i16) -> (f32)
+          %weight = scalar.extf %weight_value : f32 to f64
+          %nominal_product = scalar.mulf %center, %weight : f64
+          %left = scalar.mulf %low, %weight : f64
+          %right = scalar.mulf %high, %weight : f64
+          %ordered = scalar.cmpf ole, %left, %right : f64
+          %lower_product = scf.select %ordered, %left, %right : f64
+          %upper_product = scf.select %ordered, %right, %left : f64
+          %left_magnitude = scalar.absf %left : f64
+          %right_magnitude = scalar.absf %right : f64
+          %left_larger = scalar.cmpf ogt, %left_magnitude, %right_magnitude : f64
+          %magnitude = scf.select %left_larger, %left_magnitude, %right_magnitude : f64
+          %center_result = scalar.addf %center_sum, %nominal_product : f64
+          %lower_result = scalar.addf %lower_sum, %lower_product : f64
+          %upper_result = scalar.addf %upper_sum, %upper_product : f64
+          %norm_result = scalar.addf %norm_sum, %magnitude : f64
+          scf.yield %center_result, %lower_result, %upper_result, %norm_result : f64, f64, f64, f64
+        }
+        scf.yield %next_nominal, %next_lower, %next_upper, %next_norm : f64, f64, f64, f64
+      }
+      %row_offset = index.mul %row, %row_stride : index
+      %position = index.madd %channel, %column_stride, %row_offset : index
+      %base_word = view.load %bases[%position] : view<[%output_elements]xi16> -> i16
+      %base_value = func.call @reference_bf16_value(%base_word) : (i16) -> (f32)
+      %error = scalar.mulf %norm, %contraction_error : f64
+      %lower_sum = scalar.subf %lower, %error : f64
+      %upper_sum = scalar.addf %upper, %error : f64
+      %center = func.call @adapter_output_bound(%nominal, %base_value) : (f64, f32) -> (f64)
+      %left = func.call @adapter_output_bound(%lower_sum, %base_value) : (f64, f32) -> (f64)
+      %right = func.call @adapter_output_bound(%upper_sum, %base_value) : (f64, f32) -> (f64)
+      %left_difference = scalar.subf %center, %left : f64
+      %right_difference = scalar.subf %right, %center : f64
+      %left_error = scalar.absf %left_difference : f64
+      %right_error = scalar.absf %right_difference : f64
+      %left_larger = scalar.cmpf ogt, %left_error, %channel_bound : f64
+      %with_left = scf.select %left_larger, %left_error, %channel_bound : f64
+      %right_larger = scalar.cmpf ogt, %right_error, %with_left : f64
+      %with_right = scf.select %right_larger, %right_error, %with_left : f64
+      scf.yield %with_right : f64
+    }
+    scf.yield %channel_bound : f64
+  }
+  func.return %output_bound, %low_bound : f64, f64
+}
