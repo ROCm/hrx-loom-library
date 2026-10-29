@@ -31,6 +31,8 @@ class RepositoryContext:
 
     # Root of the library worktree used for filesystem and process operations.
     repository_root: Path
+    # Echo subprocess commands even when they complete successfully.
+    verbose: bool = False
 
     def bazel_executable(self) -> str:
         selected = os.environ.get("BAZEL")
@@ -45,7 +47,8 @@ class RepositoryContext:
         return executable
 
     def run(self, command: list[str], *, capture_output: bool = False) -> str:
-        print("+ " + format_command(command), flush=True)
+        if self.verbose:
+            print("+ " + format_command(command), file=sys.stderr, flush=True)
         result = subprocess.run(
             command,
             capture_output=capture_output,
@@ -54,6 +57,8 @@ class RepositoryContext:
             text=True,
         )
         if result.returncode != 0:
+            if not self.verbose:
+                print("+ " + format_command(command), file=sys.stderr, flush=True)
             if capture_output:
                 sys.stdout.write(result.stdout or "")
                 sys.stderr.write(result.stderr or "")

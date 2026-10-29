@@ -19,7 +19,7 @@ enable Loom checks. Ordinary CI leaves Loom instrumentation disabled.
 
 | Job suffix | Work |
 | --- | --- |
-| `Host` | Source policy, formatting, linking, model-card checks, generated oracles, and CPU/VM tests. |
+| `Host` | Source policy, formatting, linking, model-card checks, and CPU/VM tests. |
 | `AMD gfx942`, `AMD gfx110x`, `AMD gfx1151`, `AMD gfx120x` | Native AMD GPU correctness scenarios. |
 | `AMD gfx1150 GPU + NPU4` | The GPU checks plus native XDNA tests, with both device classes exposed. |
 
@@ -94,6 +94,13 @@ revision. A Linux cross-build input archive does not establish native Windows
 qualification. Neither lane is represented by a source-built substitute.
 
 ## Cache and diagnostic evidence
+
+CI uses Bazel's terse test summary: failures and aggregate counts remain visible
+without a row for every cached success. Tool diagnostics and failed-test logs
+remain enabled. Authoring commands omit successful subprocess echoes; use
+`python dev.py --verbose test` to include their complete command lines. Failed
+commands are printed regardless of verbosity, with their original output and
+exit status. Formatting reports come from `loom-format` itself.
 
 Each lane restores a persistent Bazel disk cache and saves its new action and
 test results, including successful actions from failed runs. Snapshot keys use
