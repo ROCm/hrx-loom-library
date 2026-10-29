@@ -1,0 +1,115 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Construct time inputs and evaluate complete cosine/sine rows independently
+// of device lanes. Frequencies and phases retain their F32 rounding boundaries;
+// exponential and trigonometric evaluation use strict F64 math. The reference
+// publishes F32 values so BF16 output error remains visible to the comparison.
+
+func.def @initialize_time(%configuration: index, %half_width: index, %negative_log_period: f32, %time_scale: f32, %parameters: buffer, %input: buffer) {
+  %origin = index.constant 0 : offset
+  %metadata = buffer.view %parameters[%origin] : buffer -> view<3xi32>
+  %half_word = index.cast %half_width : index to i32
+  %period_word = scalar.bitcast %negative_log_period : f32 to i32
+  %scale_word = scalar.bitcast %time_scale : f32 to i32
+  view.store %half_word, %metadata[0] : i32, view<3xi32>
+  view.store %period_word, %metadata[1] : i32, view<3xi32>
+  view.store %scale_word, %metadata[2] : i32, view<3xi32>
+  %c0_bf16 = scalar.constant 0.0 : bf16
+  %c1_bf16 = scalar.constant 1.0 : bf16
+  %half = scalar.constant 0.5 : bf16
+  %quarter = scalar.constant 0.25 : bf16
+  %three_quarters = scalar.constant 0.75 : bf16
+  %eighth = scalar.constant 0.125 : bf16
+  %small = scalar.constant 0.00390625 : bf16
+  %tiny = scalar.constant 1.52587890625e-05 : bf16
+  %cneg1_bf16 = scalar.constant -1.0 : bf16
+  %negative_half = scalar.constant -0.5 : bf16
+  %negative_quarter = scalar.constant -0.25 : bf16
+  %negative_tiny = scalar.constant -1.52587890625e-05 : bf16
+  %time0, %time1, %time2, %time3, %time4, %time5 = scf.lookup %configuration {
+    0 = (%c0_bf16, %c0_bf16, %c0_bf16, %c0_bf16, %c0_bf16, %c0_bf16),
+    1 = (%half, %c1_bf16, %c0_bf16, %c0_bf16, %c0_bf16, %c0_bf16),
+    2 = (%c1_bf16, %half, %quarter, %c0_bf16, %c0_bf16, %c0_bf16),
+    3 = (%c1_bf16, %three_quarters, %half, %eighth, %small, %tiny),
+    4 = (%cneg1_bf16, %negative_quarter, %negative_tiny, %c0_bf16, %c0_bf16, %c0_bf16),
+    5 = (%quarter, %c0_bf16, %c0_bf16, %c0_bf16, %c0_bf16, %c0_bf16),
+    6 = (%negative_half, %eighth, %c1_bf16, %c0_bf16, %c0_bf16, %c0_bf16),
+    7 = (%cneg1_bf16, %eighth, %c1_bf16, %c0_bf16, %c0_bf16, %c0_bf16)
+  } default(%c1_bf16, %half, %small, %c0_bf16, %c0_bf16, %c0_bf16) : bf16, bf16, bf16, bf16, bf16, bf16
+  %length = buffer.length %input
+  %bytes = index.cast %length : offset to index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %count = index.div %bytes, %c2 : index
+  %times = buffer.view %input[%origin] : buffer -> view<[%count]xbf16>
+  scf.for %row = [%c0 to %count step %c1] {
+    %time = scf.lookup %row {
+      0 = (%time0),
+      1 = (%time1),
+      2 = (%time2),
+      3 = (%time3),
+      4 = (%time4)
+    } default(%time5) : bf16
+    view.store %time, %times[%row] : bf16, view<[%count]xbf16>
+  }
+  func.return
+}
+
+func.def @time_reference(%parameters: buffer, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %metadata = buffer.view %parameters[%origin] : buffer -> view<3xi32>
+  %half_word = view.load %metadata[0] : view<3xi32> -> i32
+  %period_word = view.load %metadata[1] : view<3xi32> -> i32
+  %scale_word = view.load %metadata[2] : view<3xi32> -> i32
+  %half_value = index.cast %half_word : i32 to index
+  %half = index.assume %half_value [ge(%half_value, 1), le(%half_value, 129)] : index
+  %negative_log_period = scalar.bitcast %period_word : i32 to f32
+  %time_scale = scalar.bitcast %scale_word : i32 to f32
+  %input_length = buffer.length %input
+  %output_length = buffer.length %output
+  %input_bytes = index.cast %input_length : offset to index
+  %output_bytes = index.cast %output_length : offset to index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %count = index.div %input_bytes, %c2 : index
+  %width = index.mul %half, %c2 : index
+  %row_bytes = index.mul %width, %c4 : index
+  %rows = index.div %output_bytes, %row_bytes : index
+  %times = buffer.view %input[%origin] : buffer -> view<[%count]xbf16>
+  %values = buffer.view %output[%origin] : buffer -> view<[%rows]x2x[%half]xf32>
+  %half_f32 = scalar.uitofp %half_word : i32 to f32
+  %c0_f32 = scalar.constant 0.0 : f32
+  scf.for %row = [%c0 to %rows step %c1] {
+    %logical = index.cmp ult, %row, %count : index
+    %time = scf.if %logical -> (f32) {
+      %stored = view.load %times[%row] : view<[%count]xbf16> -> bf16
+      %time = scalar.extf %stored : bf16 to f32
+      scf.yield %time : f32
+    } else {
+      scf.yield %c0_f32 : f32
+    }
+    %scaled_time = scalar.mulf %time, %time_scale : f32
+    scf.for %frequency = [%c0 to %half step %c1] {
+      %frequency_word = index.cast %frequency : index to i32
+      %frequency_f32 = scalar.uitofp %frequency_word : i32 to f32
+      %numerator = scalar.mulf %negative_log_period, %frequency_f32 : f32
+      %exponent = scalar.divf %numerator, %half_f32 : f32
+      %exponent_f64 = scalar.extf %exponent : f32 to f64
+      %factor_f64 = scalar.expf %exponent_f64 : f64
+      %factor = scalar.fptrunc %factor_f64 : f64 to f32
+      %phase = scalar.mulf %scaled_time, %factor : f32
+      %phase_f64 = scalar.extf %phase : f32 to f64
+      %cosine_f64 = scalar.cosf %phase_f64 : f64
+      %sine_f64 = scalar.sinf %phase_f64 : f64
+      %cosine = scalar.fptrunc %cosine_f64 : f64 to f32
+      %sine = scalar.fptrunc %sine_f64 : f64 to f32
+      view.store %cosine, %values[%row, 0, %frequency] : f32, view<[%rows]x2x[%half]xf32>
+      view.store %sine, %values[%row, 1, %frequency] : f32, view<[%rows]x2x[%half]xf32>
+    }
+  }
+  func.return
+}

@@ -306,10 +306,6 @@ ones and sine zeros; native access instrumentation checks that their
 construction does not read beyond the logical input. Input bytes and output
 guards remain exact, and every shape has a benchmark declaration.
 
-```sh
-python3 -B motif/tensor/test/generate_time_oracle.py --check
-```
-
 `prefix_norm_test.loom` compares native NPU output with a serial binary64 sum of
 squares and reciprocal norm. Widths 32, 64, 96, and 1024 exercise prefix lengths
 on either side of 16- and 32-element boundaries, including single-element and
