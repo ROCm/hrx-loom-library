@@ -273,7 +273,7 @@ conversion midpoints, signed values, maxima that increase in later tiles,
 and finite scores below a conventional finite softmax sentinel.
 General accuracy cases round Q/K/V independently and include an absolute
 allowance for BF16 probability conversion, native matrix contraction, and
-F32 normalization; the generator states the input-scaled budget.
+F32 normalization. Authored inputs stay within the fixed input-scaled budget.
 
 Separate single-tile cases round unnormalized probabilities explicitly while
 leaving the denominator unrounded. Their probabilities stay away from BF16
@@ -281,14 +281,10 @@ midpoints under the declared score/transcendental budget, making this boundary
 independently observable. Uniform and value-conversion cases require twenty
 significant binary bits relative to the largest input value, including means
 that require more precision than BF16; zero output compares bitwise. The
-generator verifies sensitivity to each Q/K/V/probability conversion, omitted
+directed cases distinguish each Q/K/V/probability conversion, omitted
 score/value channels, and premature BF16 output. Complete immutable inputs
 and output guards are bitwise checks with ordinary execution or optional Loom
 address and race checks. Every scenario includes a benchmark declaration.
-
-```sh
-python3 -B motif/tensor/test/generate_image_attention_oracle.py --check
-```
 
 `channel_norm_test.loom` covers affine and SiLU epilogues with disjoint and exactly
 aliased output. Twelve cases include one and odd channel counts, the decoder's

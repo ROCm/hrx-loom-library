@@ -1,0 +1,103 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Dense F64 attention is independent of matrix tiling and online softmax.
+// Q/K/V conversion and optional unnormalized probability conversion are
+// explicit boundaries; the denominator always uses the unrounded weights.
+
+func.decl @reference_bf16_round(%value: f32) -> (f32)
+
+func.def @reference_image_attention(%round_probability: i1, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %channels = index.constant 384 : index
+  %element_bytes = index.constant 8 : offset
+  %plane_stride = index.constant 3072 : offset
+  %row_bytes = index.constant 1536 : index
+  %length = buffer.length %output
+  %length_index = index.cast %length : offset to index
+  %tokens_value = index.div %length_index, %row_bytes : index
+  %tokens = index.assume %tokens_value [ge(%tokens_value, 16), le(%tokens_value, 144)] : index
+  %plane = index.mul %tokens, %channels : index
+  %count = index.mul %plane, %c3 : index
+  %converted_bytes = index.scale %count, %element_bytes : index, offset -> offset
+  %converted = buffer.alloca<private> align(8) %converted_bytes : buffer
+  %stored = buffer.view %input[%origin] : buffer -> view<[%count]xf32>
+  %wide = buffer.view %converted[%origin] : buffer -> view<[%count]xf64>
+  scf.for %i = [%c0 to %count step %c1] {
+    %value = view.load %stored[%i] : view<[%count]xf32> -> f32
+    %rounded = func.call @reference_bf16_round(%value) : (f32) -> (f32)
+    %extended = scalar.extf %rounded : f32 to f64
+    view.store %extended, %wide[%i] : f64, view<[%count]xf64>
+  }
+  %key_origin = index.scale %tokens, %plane_stride : index, offset -> offset
+  %value_origin = index.add %key_origin, %key_origin : offset
+  %queries = buffer.view %converted[%origin] : buffer -> view<384x[%tokens]xf64>
+  %keys = buffer.view %converted[%key_origin] : buffer -> view<384x[%tokens]xf64>
+  %values = buffer.view %converted[%value_origin] : buffer -> view<[%tokens]x384xf64>
+  %outputs = buffer.view %output[%origin] : buffer -> view<384x[%tokens]xf32>
+  %row_storage_bytes = index.scale %tokens, %element_bytes : index, offset -> offset
+  %row_storage = buffer.alloca<private> align(8) %row_storage_bytes : buffer
+  %row_values = buffer.view %row_storage[%origin] : buffer -> view<[%tokens]xf64>
+  %c0_f64 = scalar.constant 0.0 : f64
+  %minimum = scalar.constant -inf : f64
+  %width = scalar.constant 384.0 : f64
+  %scale = scalar.sqrtf %width : f64
+  scf.for %query = [%c0 to %tokens step %c1] {
+    %maximum = scf.for %key = [%c0 to %tokens step %c1](%maximum = %minimum : f64) -> (f64) {
+      %dot = scf.for %channel = [%c0 to %channels step %c1](%sum = %c0_f64 : f64) -> (f64) {
+        %left = view.load %queries[%channel, %query] : view<384x[%tokens]xf64> -> f64
+        %right = view.load %keys[%channel, %key] : view<384x[%tokens]xf64> -> f64
+        %product = scalar.mulf %left, %right : f64
+        %next = scalar.addf %sum, %product : f64
+        scf.yield %next : f64
+      }
+      %score = scalar.divf %dot, %scale : f64
+      view.store %score, %row_values[%key] : f64, view<[%tokens]xf64>
+      %next = scalar.maxnumf %maximum, %score : f64
+      scf.yield %next : f64
+    }
+    %denominator = scf.for %key = [%c0 to %tokens step %c1](%sum = %c0_f64 : f64) -> (f64) {
+      %score = view.load %row_values[%key] : view<[%tokens]xf64> -> f64
+      %shifted = scalar.subf %score, %maximum : f64
+      %probability = scalar.expf %shifted : f64
+      %weight = scf.if %round_probability -> (f64) {
+        %rounded = scalar.fptrunc %probability : f64 to bf16
+        %extended = scalar.extf %rounded : bf16 to f64
+        scf.yield %extended : f64
+      } else {
+        scf.yield %probability : f64
+      }
+      view.store %weight, %row_values[%key] : f64, view<[%tokens]xf64>
+      %next = scalar.addf %sum, %probability : f64
+      scf.yield %next : f64
+    }
+    scf.for %channel = [%c0 to %channels step %c1] {
+      %numerator = scf.for %key = [%c0 to %tokens step %c1](%sum = %c0_f64 : f64) -> (f64) {
+        %weight = view.load %row_values[%key] : view<[%tokens]xf64> -> f64
+        %value = view.load %values[%key, %channel] : view<[%tokens]x384xf64> -> f64
+        %product = scalar.mulf %weight, %value : f64
+        %next = scalar.addf %sum, %product : f64
+        scf.yield %next : f64
+      }
+      %result = scalar.divf %numerator, %denominator : f64
+      %narrow = scalar.fptrunc %result : f64 to f32
+      view.store %narrow, %outputs[%channel, %query] : f32, view<384x[%tokens]xf32>
+    }
+  }
+  func.return
+}
+
+func.def @image_attention_reference(%input: buffer, %output: buffer) {
+  %round_probability = scalar.constant false : i1
+  func.call @reference_image_attention(%round_probability, %input, %output) : (i1, buffer, buffer)
+  func.return
+}
+
+func.def @image_attention_rounded_reference(%input: buffer, %output: buffer) {
+  %round_probability = scalar.constant true : i1
+  func.call @reference_image_attention(%round_probability, %input, %output) : (i1, buffer, buffer)
+  func.return
+}
