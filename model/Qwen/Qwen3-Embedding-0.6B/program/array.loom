@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Fixed 8-column x 4-core-row Strix Halo composition for one 128-token cohort.
+// Eight-column x four-core-row composition with retained projection groups.
 // This leaf owns concrete placement, local-memory banks, FIFO storage, stream
 // fanout, and barrier endpoints. Weights, request metadata, output, and mutable
 // state are distinct 64-byte-aligned regions supplied by the command program.
@@ -14,7 +14,7 @@ target.decl @qwen3_embedding.array
 
 target.decl @bfp16ebs8.core
 
-func.decl inline @qwen3_embedding.query_key_ingress_root(%sequence_storage: buffer, %origin: offset, %local_storage: buffer, %result_offset: offset, %peer_storage: buffer, %gather_storage: buffer, %activations: buffer, %activation_stream: channel<tile<2048xi32>>, %zero: index, %one: index, %constants: buffer, %embedding: buffer, %state: buffer, %incoming_arrival: channel<tile<16xi32>>, %outgoing_departure: channel<tile<16xi32>>, %projection_stream: channel<tile<4096xbf16>>, %output: buffer, %weight_stream: channel<tile<4624xi32>>, %activation_offset: offset, %probability_stream: channel<tile<4096xbf16>>, %result_stream: channel<tile<4096xbf16>>)
+func.decl inline @qwen3_embedding.query_key_ingress_root(%sequence_storage: buffer, %origin: offset, %local_storage: buffer, %result_offset: offset, %peer_storage: buffer, %gather_storage: buffer, %activations: buffer, %activation_stream: channel<tile<2048xi32>>, %zero: index, %one: index, %constants: buffer, %embedding: buffer, %state: buffer, %incoming_arrival: channel<tile<16xi32>>, %outgoing_departure: channel<tile<16xi32>>, %projection_stream: channel<tile<4096xbf16>>, %output: buffer, %weight_stream: channel<tile<4624xi32>>, %activation_offset: offset, %probability_stream: channel<tile<4096xbf16>>, %result_stream: channel<tile<4096xbf16>>, %phase_complete: channel<tile<16xi32>>)
 
 func.decl inline @qwen3_embedding.query_key_egress(%sequence_storage: buffer, %origin: offset, %local_storage: buffer, %result_offset: offset, %peer_storage: buffer, %activation_stream: channel<tile<2048xi32>>, %zero: index, %one: index, %incoming_arrival: channel<tile<16xi32>>, %outgoing_arrival: channel<tile<16xi32>>, %incoming_departure: channel<tile<16xi32>>, %outgoing_departure: channel<tile<16xi32>>, %projection_stream: channel<tile<4096xbf16>>, %output: buffer, %state: buffer, %weight_stream: channel<tile<4624xi32>>, %activation_offset: offset, %probability_stream: channel<tile<4096xbf16>>, %result_stream: channel<tile<4096xbf16>>, %column_offset: index, %row_column: index, %finish_initial: offset, %normalized_initial: offset, %skip_column: index, %query_initial: offset, %key_initial: offset, %value_initial: offset, %mlp_initial: offset, %residual_initial: offset, %output_initial: offset)
 
@@ -32,53 +32,79 @@ func.decl inline @qwen3_embedding.query_key_ingress(%sequence_storage: buffer, %
 
 func.decl inline @qwen3_embedding.query_key_egress_terminal(%sequence_storage: buffer, %origin: offset, %local_storage: buffer, %result_offset: offset, %peer_storage: buffer, %activation_stream: channel<tile<2048xi32>>, %zero: index, %one: index, %outgoing_arrival: channel<tile<16xi32>>, %incoming_departure: channel<tile<16xi32>>, %projection_stream: channel<tile<4096xbf16>>, %output: buffer, %state: buffer, %weight_stream: channel<tile<4624xi32>>, %activation_offset: offset, %probability_stream: channel<tile<4096xbf16>>, %result_stream: channel<tile<4096xbf16>>)
 
+func.decl inline @qwen3_embedding.fill_weights(%input: buffer, %base: offset, %count: index, %incoming: channel<tile<4624xi32>>)
+
+func.decl inline @qwen3_embedding.replay_weights16(%source: channel<tile<4624xi32>>, %row0: channel<tile<4624xi32>>, %row1: channel<tile<4624xi32>>, %row2: channel<tile<4624xi32>>, %row3: channel<tile<4624xi32>>, %panels: index)
+
+func.decl inline @qwen3_embedding.replay_weights24(%source: channel<tile<4624xi32>>, %row0: channel<tile<4624xi32>>, %row1: channel<tile<4624xi32>>, %row2: channel<tile<4624xi32>>, %row3: channel<tile<4624xi32>>, %panels: index)
+
+func.decl inline @qwen3_embedding.wait(%channel: channel<tile<16xi32>>)
+
 pipeline.def<kernel> public retain target(@qwen3_embedding.array) @qwen3_embedding.cohort() run(%projection0_arg: buffer, %projection1_arg: buffer, %projection2_arg: buffer, %projection3_arg: buffer, %projection4_arg: buffer, %projection5_arg: buffer, %projection6_arg: buffer, %projection7_arg: buffer, %constants_arg: buffer, %embedding_arg: buffer, %activations_arg: buffer, %output_arg: buffer, %state_arg: buffer) {
   %projection0_unique, %projection1_unique, %projection2_unique, %projection3_unique, %projection4_unique, %projection5_unique, %projection6_unique, %projection7_unique, %constants_unique, %embedding_unique, %activations_unique, %output_unique, %state_unique = buffer.assume.noalias %projection0_arg, %projection1_arg, %projection2_arg, %projection3_arg, %projection4_arg, %projection5_arg, %projection6_arg, %projection7_arg, %constants_arg, %embedding_arg, %activations_arg, %output_arg, %state_arg : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer
   %projection0, %projection1, %projection2, %projection3, %projection4, %projection5, %projection6, %projection7, %constants, %embedding, %activations, %output, %state = buffer.assume.alignment %projection0_unique, %projection1_unique, %projection2_unique, %projection3_unique, %projection4_unique, %projection5_unique, %projection6_unique, %projection7_unique, %constants_unique, %embedding_unique, %activations_unique, %output_unique, %state_unique {minimum_alignment = 64} : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
-  %records = index.constant 3360 : index
+  %panels = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %c24 = index.constant 24 : index
   %memory_tile0 = pipeline.memory<workgroup>[0, 1] : pool
-  %weight_ingress0_bytes = index.constant 18496 : offset
+  %weight_ingress0_bytes = index.constant 443904 : offset
   %weight_ingress0_storage = buffer.alloca<workgroup> pool(%memory_tile0) align(64) %weight_ingress0_bytes : buffer
-  %weight_ingress0_slots = buffer.view %weight_ingress0_storage[%origin] : buffer -> view<1x4624xi32>
-  %weight_ingress0 = channel.bind<fifo> %weight_ingress0_slots, %c1 : view<1x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress0_16_slots = buffer.view %weight_ingress0_storage[%origin] : buffer -> view<16x4624xi32>
+  %weight_ingress0_16 = channel.bind<fifo> %weight_ingress0_16_slots, %c16 : view<16x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress0_24_slots = buffer.view %weight_ingress0_storage[%origin] : buffer -> view<24x4624xi32>
+  %weight_ingress0_24 = channel.bind<fifo> %weight_ingress0_24_slots, %c24 : view<24x4624xi32>, index -> channel<tile<4624xi32>>
   %memory_tile1 = pipeline.memory<workgroup>[1, 1] : pool
-  %weight_ingress1_bytes = index.constant 18496 : offset
+  %weight_ingress1_bytes = index.constant 443904 : offset
   %weight_ingress1_storage = buffer.alloca<workgroup> pool(%memory_tile1) align(64) %weight_ingress1_bytes : buffer
-  %weight_ingress1_slots = buffer.view %weight_ingress1_storage[%origin] : buffer -> view<1x4624xi32>
-  %weight_ingress1 = channel.bind<fifo> %weight_ingress1_slots, %c1 : view<1x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress1_16_slots = buffer.view %weight_ingress1_storage[%origin] : buffer -> view<16x4624xi32>
+  %weight_ingress1_16 = channel.bind<fifo> %weight_ingress1_16_slots, %c16 : view<16x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress1_24_slots = buffer.view %weight_ingress1_storage[%origin] : buffer -> view<24x4624xi32>
+  %weight_ingress1_24 = channel.bind<fifo> %weight_ingress1_24_slots, %c24 : view<24x4624xi32>, index -> channel<tile<4624xi32>>
   %memory_tile2 = pipeline.memory<workgroup>[2, 1] : pool
-  %weight_ingress2_bytes = index.constant 18496 : offset
+  %weight_ingress2_bytes = index.constant 443904 : offset
   %weight_ingress2_storage = buffer.alloca<workgroup> pool(%memory_tile2) align(64) %weight_ingress2_bytes : buffer
-  %weight_ingress2_slots = buffer.view %weight_ingress2_storage[%origin] : buffer -> view<1x4624xi32>
-  %weight_ingress2 = channel.bind<fifo> %weight_ingress2_slots, %c1 : view<1x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress2_16_slots = buffer.view %weight_ingress2_storage[%origin] : buffer -> view<16x4624xi32>
+  %weight_ingress2_16 = channel.bind<fifo> %weight_ingress2_16_slots, %c16 : view<16x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress2_24_slots = buffer.view %weight_ingress2_storage[%origin] : buffer -> view<24x4624xi32>
+  %weight_ingress2_24 = channel.bind<fifo> %weight_ingress2_24_slots, %c24 : view<24x4624xi32>, index -> channel<tile<4624xi32>>
   %memory_tile3 = pipeline.memory<workgroup>[3, 1] : pool
-  %weight_ingress3_bytes = index.constant 18496 : offset
+  %weight_ingress3_bytes = index.constant 443904 : offset
   %weight_ingress3_storage = buffer.alloca<workgroup> pool(%memory_tile3) align(64) %weight_ingress3_bytes : buffer
-  %weight_ingress3_slots = buffer.view %weight_ingress3_storage[%origin] : buffer -> view<1x4624xi32>
-  %weight_ingress3 = channel.bind<fifo> %weight_ingress3_slots, %c1 : view<1x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress3_16_slots = buffer.view %weight_ingress3_storage[%origin] : buffer -> view<16x4624xi32>
+  %weight_ingress3_16 = channel.bind<fifo> %weight_ingress3_16_slots, %c16 : view<16x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress3_24_slots = buffer.view %weight_ingress3_storage[%origin] : buffer -> view<24x4624xi32>
+  %weight_ingress3_24 = channel.bind<fifo> %weight_ingress3_24_slots, %c24 : view<24x4624xi32>, index -> channel<tile<4624xi32>>
   %memory_tile4 = pipeline.memory<workgroup>[4, 1] : pool
-  %weight_ingress4_bytes = index.constant 18496 : offset
+  %weight_ingress4_bytes = index.constant 443904 : offset
   %weight_ingress4_storage = buffer.alloca<workgroup> pool(%memory_tile4) align(64) %weight_ingress4_bytes : buffer
-  %weight_ingress4_slots = buffer.view %weight_ingress4_storage[%origin] : buffer -> view<1x4624xi32>
-  %weight_ingress4 = channel.bind<fifo> %weight_ingress4_slots, %c1 : view<1x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress4_16_slots = buffer.view %weight_ingress4_storage[%origin] : buffer -> view<16x4624xi32>
+  %weight_ingress4_16 = channel.bind<fifo> %weight_ingress4_16_slots, %c16 : view<16x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress4_24_slots = buffer.view %weight_ingress4_storage[%origin] : buffer -> view<24x4624xi32>
+  %weight_ingress4_24 = channel.bind<fifo> %weight_ingress4_24_slots, %c24 : view<24x4624xi32>, index -> channel<tile<4624xi32>>
   %memory_tile5 = pipeline.memory<workgroup>[5, 1] : pool
-  %weight_ingress5_bytes = index.constant 18496 : offset
+  %weight_ingress5_bytes = index.constant 443904 : offset
   %weight_ingress5_storage = buffer.alloca<workgroup> pool(%memory_tile5) align(64) %weight_ingress5_bytes : buffer
-  %weight_ingress5_slots = buffer.view %weight_ingress5_storage[%origin] : buffer -> view<1x4624xi32>
-  %weight_ingress5 = channel.bind<fifo> %weight_ingress5_slots, %c1 : view<1x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress5_16_slots = buffer.view %weight_ingress5_storage[%origin] : buffer -> view<16x4624xi32>
+  %weight_ingress5_16 = channel.bind<fifo> %weight_ingress5_16_slots, %c16 : view<16x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress5_24_slots = buffer.view %weight_ingress5_storage[%origin] : buffer -> view<24x4624xi32>
+  %weight_ingress5_24 = channel.bind<fifo> %weight_ingress5_24_slots, %c24 : view<24x4624xi32>, index -> channel<tile<4624xi32>>
   %memory_tile6 = pipeline.memory<workgroup>[6, 1] : pool
-  %weight_ingress6_bytes = index.constant 18496 : offset
+  %weight_ingress6_bytes = index.constant 443904 : offset
   %weight_ingress6_storage = buffer.alloca<workgroup> pool(%memory_tile6) align(64) %weight_ingress6_bytes : buffer
-  %weight_ingress6_slots = buffer.view %weight_ingress6_storage[%origin] : buffer -> view<1x4624xi32>
-  %weight_ingress6 = channel.bind<fifo> %weight_ingress6_slots, %c1 : view<1x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress6_16_slots = buffer.view %weight_ingress6_storage[%origin] : buffer -> view<16x4624xi32>
+  %weight_ingress6_16 = channel.bind<fifo> %weight_ingress6_16_slots, %c16 : view<16x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress6_24_slots = buffer.view %weight_ingress6_storage[%origin] : buffer -> view<24x4624xi32>
+  %weight_ingress6_24 = channel.bind<fifo> %weight_ingress6_24_slots, %c24 : view<24x4624xi32>, index -> channel<tile<4624xi32>>
   %memory_tile7 = pipeline.memory<workgroup>[7, 1] : pool
-  %weight_ingress7_bytes = index.constant 18496 : offset
+  %weight_ingress7_bytes = index.constant 443904 : offset
   %weight_ingress7_storage = buffer.alloca<workgroup> pool(%memory_tile7) align(64) %weight_ingress7_bytes : buffer
-  %weight_ingress7_slots = buffer.view %weight_ingress7_storage[%origin] : buffer -> view<1x4624xi32>
-  %weight_ingress7 = channel.bind<fifo> %weight_ingress7_slots, %c1 : view<1x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress7_16_slots = buffer.view %weight_ingress7_storage[%origin] : buffer -> view<16x4624xi32>
+  %weight_ingress7_16 = channel.bind<fifo> %weight_ingress7_16_slots, %c16 : view<16x4624xi32>, index -> channel<tile<4624xi32>>
+  %weight_ingress7_24_slots = buffer.view %weight_ingress7_storage[%origin] : buffer -> view<24x4624xi32>
+  %weight_ingress7_24 = channel.bind<fifo> %weight_ingress7_24_slots, %c24 : view<24x4624xi32>, index -> channel<tile<4624xi32>>
   %payload_bytes = index.constant 64448 : offset
   %activation_offset = index.constant 18816 : offset
   %packed_offset = index.constant 26688 : offset
@@ -672,246 +698,125 @@ pipeline.def<kernel> public retain target(@qwen3_embedding.array) @qwen3_embeddi
   %gather_cache9 = buffer.alloca<workgroup> pool(%tile9) align(16) %gather_cache_bytes : buffer
   %gather_cache18 = buffer.alloca<workgroup> pool(%tile18) align(16) %gather_cache_bytes : buffer
   %gather_cache27 = buffer.alloca<workgroup> pool(%tile27) align(16) %gather_cache_bytes : buffer
+  %phase_bytes = index.constant 64 : offset
+  // The root reaches its paired value tile's memory and locks directly. Keep
+  // this notification there: the query tile already owns seven FIFO pairs.
+  %phase_storage = buffer.alloca<workgroup> pool(%tile1) align(64) %phase_bytes : buffer
+  %phase_slots = buffer.view %phase_storage[%origin] : buffer -> view<1x16xi32>
+  %phase_complete = channel.bind<fifo> %phase_slots, %c1 : view<1x16xi32>, index -> channel<tile<16xi32>>
   pipeline.strand workers([0, 2], [1, 1], [1, 1]) {
-    %base = index.constant 0 : offset
-    %stride = index.constant 18496 : offset
-    scf.for %record = [%c0 to %records step %c1] {
-      %relative = index.scale %record, %stride : index, offset -> offset
-      %offset = index.add %base, %relative : offset
-      %external = buffer.view %projection0[%offset] : buffer -> view<4624xi32>
-      %weight_ingress0_write, %weight_ingress0_destination = channel.reserve %weight_ingress0 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      %ingress_copy = kernel.async.copy %external to %weight_ingress0_destination {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<4624xi32> to view<4624xi32> -> kernel.async.token
-      %ingress_group = kernel.async.group %ingress_copy : kernel.async.token -> kernel.async.group
-      kernel.async.wait %ingress_group {newer_groups = 0} : kernel.async.group
-      channel.publish %weight_ingress0_write : write<tile<4624xi32>>
+    %layers = index.constant 28 : index
+    %c6 = index.constant 6 : index
+    %group_bytes = index.constant 295936 : offset
+    %layer_bytes = index.constant 2219520 : offset
+    %down_offset = index.constant 1775616 : offset
+    scf.for %layer = [%c0 to %layers step %c1] unroll {
+      %layer_base = index.scale %layer, %layer_bytes : index, offset -> offset
+      scf.for %group = [%c0 to %c6 step %c1] unroll {
+        %group_relative = index.scale %group, %group_bytes : index, offset -> offset
+        %group_base = index.add %layer_base, %group_relative : offset
+        func.call @qwen3_embedding.fill_weights(%projection0, %group_base, %c16, %weight_ingress0_16) : (buffer, offset, index, channel<tile<4624xi32>>)
+        func.call @qwen3_embedding.fill_weights(%projection1, %group_base, %c16, %weight_ingress1_16) : (buffer, offset, index, channel<tile<4624xi32>>)
+        func.call @qwen3_embedding.fill_weights(%projection2, %group_base, %c16, %weight_ingress2_16) : (buffer, offset, index, channel<tile<4624xi32>>)
+        func.call @qwen3_embedding.fill_weights(%projection3, %group_base, %c16, %weight_ingress3_16) : (buffer, offset, index, channel<tile<4624xi32>>)
+        func.call @qwen3_embedding.fill_weights(%projection4, %group_base, %c16, %weight_ingress4_16) : (buffer, offset, index, channel<tile<4624xi32>>)
+        func.call @qwen3_embedding.fill_weights(%projection5, %group_base, %c16, %weight_ingress5_16) : (buffer, offset, index, channel<tile<4624xi32>>)
+        func.call @qwen3_embedding.fill_weights(%projection6, %group_base, %c16, %weight_ingress6_16) : (buffer, offset, index, channel<tile<4624xi32>>)
+        func.call @qwen3_embedding.fill_weights(%projection7, %group_base, %c16, %weight_ingress7_16) : (buffer, offset, index, channel<tile<4624xi32>>)
+        func.call @qwen3_embedding.wait(%phase_complete) : (channel<tile<16xi32>>)
+      }
+      %down_base = index.add %layer_base, %down_offset : offset
+      func.call @qwen3_embedding.fill_weights(%projection0, %down_base, %c24, %weight_ingress0_24) : (buffer, offset, index, channel<tile<4624xi32>>)
+      func.call @qwen3_embedding.fill_weights(%projection1, %down_base, %c24, %weight_ingress1_24) : (buffer, offset, index, channel<tile<4624xi32>>)
+      func.call @qwen3_embedding.fill_weights(%projection2, %down_base, %c24, %weight_ingress2_24) : (buffer, offset, index, channel<tile<4624xi32>>)
+      func.call @qwen3_embedding.fill_weights(%projection3, %down_base, %c24, %weight_ingress3_24) : (buffer, offset, index, channel<tile<4624xi32>>)
+      func.call @qwen3_embedding.fill_weights(%projection4, %down_base, %c24, %weight_ingress4_24) : (buffer, offset, index, channel<tile<4624xi32>>)
+      func.call @qwen3_embedding.fill_weights(%projection5, %down_base, %c24, %weight_ingress5_24) : (buffer, offset, index, channel<tile<4624xi32>>)
+      func.call @qwen3_embedding.fill_weights(%projection6, %down_base, %c24, %weight_ingress6_24) : (buffer, offset, index, channel<tile<4624xi32>>)
+      func.call @qwen3_embedding.fill_weights(%projection7, %down_base, %c24, %weight_ingress7_24) : (buffer, offset, index, channel<tile<4624xi32>>)
+      func.call @qwen3_embedding.wait(%phase_complete) : (channel<tile<16xi32>>)
     }
   }
-
   pipeline.strand workers([0, 2], [1, 1], [1, 1]) {
-    scf.for %record = [%c0 to %records step %c1] {
-      %weight_ingress0_read, %weight_ingress0_source = channel.acquire %weight_ingress0 : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-      %branch0, %branch1, %branch2, %branch3 = channel.fanout %weight_ingress0_read : read<tile<4624xi32>> -> (read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>)
-      %weights0_write, %weights0_destination = channel.reserve %weights0 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch0 -> %weights0_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights1_write, %weights1_destination = channel.reserve %weights1 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch1 -> %weights1_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights2_write, %weights2_destination = channel.reserve %weights2 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch2 -> %weights2_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights3_write, %weights3_destination = channel.reserve %weights3 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch3 -> %weights3_write : read<tile<4624xi32>>, write<tile<4624xi32>>
+    %layers = index.constant 28 : index
+    %c6 = index.constant 6 : index
+    scf.for %layer = [%c0 to %layers step %c1] unroll {
+      scf.for %group = [%c0 to %c6 step %c1] unroll {
+        func.call @qwen3_embedding.replay_weights16(%weight_ingress0_16, %weights0, %weights1, %weights2, %weights3, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
+      }
+      func.call @qwen3_embedding.replay_weights24(%weight_ingress0_24, %weights0, %weights1, %weights2, %weights3, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
     }
   }
-
   pipeline.strand workers([1, 2], [1, 1], [1, 1]) {
-    %base = index.constant 0 : offset
-    %stride = index.constant 18496 : offset
-    scf.for %record = [%c0 to %records step %c1] {
-      %relative = index.scale %record, %stride : index, offset -> offset
-      %offset = index.add %base, %relative : offset
-      %external = buffer.view %projection1[%offset] : buffer -> view<4624xi32>
-      %weight_ingress1_write, %weight_ingress1_destination = channel.reserve %weight_ingress1 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      %ingress_copy = kernel.async.copy %external to %weight_ingress1_destination {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<4624xi32> to view<4624xi32> -> kernel.async.token
-      %ingress_group = kernel.async.group %ingress_copy : kernel.async.token -> kernel.async.group
-      kernel.async.wait %ingress_group {newer_groups = 0} : kernel.async.group
-      channel.publish %weight_ingress1_write : write<tile<4624xi32>>
+    %layers = index.constant 28 : index
+    %c6 = index.constant 6 : index
+    scf.for %layer = [%c0 to %layers step %c1] unroll {
+      scf.for %group = [%c0 to %c6 step %c1] unroll {
+        func.call @qwen3_embedding.replay_weights16(%weight_ingress1_16, %weights4, %weights5, %weights6, %weights7, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
+      }
+      func.call @qwen3_embedding.replay_weights24(%weight_ingress1_24, %weights4, %weights5, %weights6, %weights7, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
     }
   }
-
-  pipeline.strand workers([1, 2], [1, 1], [1, 1]) {
-    scf.for %record = [%c0 to %records step %c1] {
-      %weight_ingress1_read, %weight_ingress1_source = channel.acquire %weight_ingress1 : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-      %branch0, %branch1, %branch2, %branch3 = channel.fanout %weight_ingress1_read : read<tile<4624xi32>> -> (read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>)
-      %weights4_write, %weights4_destination = channel.reserve %weights4 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch0 -> %weights4_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights5_write, %weights5_destination = channel.reserve %weights5 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch1 -> %weights5_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights6_write, %weights6_destination = channel.reserve %weights6 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch2 -> %weights6_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights7_write, %weights7_destination = channel.reserve %weights7 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch3 -> %weights7_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-    }
-  }
-
   pipeline.strand workers([2, 2], [1, 1], [1, 1]) {
-    %base = index.constant 0 : offset
-    %stride = index.constant 18496 : offset
-    scf.for %record = [%c0 to %records step %c1] {
-      %relative = index.scale %record, %stride : index, offset -> offset
-      %offset = index.add %base, %relative : offset
-      %external = buffer.view %projection2[%offset] : buffer -> view<4624xi32>
-      %weight_ingress2_write, %weight_ingress2_destination = channel.reserve %weight_ingress2 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      %ingress_copy = kernel.async.copy %external to %weight_ingress2_destination {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<4624xi32> to view<4624xi32> -> kernel.async.token
-      %ingress_group = kernel.async.group %ingress_copy : kernel.async.token -> kernel.async.group
-      kernel.async.wait %ingress_group {newer_groups = 0} : kernel.async.group
-      channel.publish %weight_ingress2_write : write<tile<4624xi32>>
+    %layers = index.constant 28 : index
+    %c6 = index.constant 6 : index
+    scf.for %layer = [%c0 to %layers step %c1] unroll {
+      scf.for %group = [%c0 to %c6 step %c1] unroll {
+        func.call @qwen3_embedding.replay_weights16(%weight_ingress2_16, %weights8, %weights9, %weights10, %weights11, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
+      }
+      func.call @qwen3_embedding.replay_weights24(%weight_ingress2_24, %weights8, %weights9, %weights10, %weights11, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
     }
   }
-
-  pipeline.strand workers([2, 2], [1, 1], [1, 1]) {
-    scf.for %record = [%c0 to %records step %c1] {
-      %weight_ingress2_read, %weight_ingress2_source = channel.acquire %weight_ingress2 : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-      %branch0, %branch1, %branch2, %branch3 = channel.fanout %weight_ingress2_read : read<tile<4624xi32>> -> (read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>)
-      %weights8_write, %weights8_destination = channel.reserve %weights8 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch0 -> %weights8_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights9_write, %weights9_destination = channel.reserve %weights9 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch1 -> %weights9_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights10_write, %weights10_destination = channel.reserve %weights10 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch2 -> %weights10_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights11_write, %weights11_destination = channel.reserve %weights11 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch3 -> %weights11_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-    }
-  }
-
   pipeline.strand workers([3, 2], [1, 1], [1, 1]) {
-    %base = index.constant 0 : offset
-    %stride = index.constant 18496 : offset
-    scf.for %record = [%c0 to %records step %c1] {
-      %relative = index.scale %record, %stride : index, offset -> offset
-      %offset = index.add %base, %relative : offset
-      %external = buffer.view %projection3[%offset] : buffer -> view<4624xi32>
-      %weight_ingress3_write, %weight_ingress3_destination = channel.reserve %weight_ingress3 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      %ingress_copy = kernel.async.copy %external to %weight_ingress3_destination {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<4624xi32> to view<4624xi32> -> kernel.async.token
-      %ingress_group = kernel.async.group %ingress_copy : kernel.async.token -> kernel.async.group
-      kernel.async.wait %ingress_group {newer_groups = 0} : kernel.async.group
-      channel.publish %weight_ingress3_write : write<tile<4624xi32>>
+    %layers = index.constant 28 : index
+    %c6 = index.constant 6 : index
+    scf.for %layer = [%c0 to %layers step %c1] unroll {
+      scf.for %group = [%c0 to %c6 step %c1] unroll {
+        func.call @qwen3_embedding.replay_weights16(%weight_ingress3_16, %weights12, %weights13, %weights14, %weights15, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
+      }
+      func.call @qwen3_embedding.replay_weights24(%weight_ingress3_24, %weights12, %weights13, %weights14, %weights15, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
     }
   }
-
-  pipeline.strand workers([3, 2], [1, 1], [1, 1]) {
-    scf.for %record = [%c0 to %records step %c1] {
-      %weight_ingress3_read, %weight_ingress3_source = channel.acquire %weight_ingress3 : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-      %branch0, %branch1, %branch2, %branch3 = channel.fanout %weight_ingress3_read : read<tile<4624xi32>> -> (read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>)
-      %weights12_write, %weights12_destination = channel.reserve %weights12 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch0 -> %weights12_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights13_write, %weights13_destination = channel.reserve %weights13 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch1 -> %weights13_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights14_write, %weights14_destination = channel.reserve %weights14 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch2 -> %weights14_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights15_write, %weights15_destination = channel.reserve %weights15 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch3 -> %weights15_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-    }
-  }
-
   pipeline.strand workers([4, 2], [1, 1], [1, 1]) {
-    %base = index.constant 0 : offset
-    %stride = index.constant 18496 : offset
-    scf.for %record = [%c0 to %records step %c1] {
-      %relative = index.scale %record, %stride : index, offset -> offset
-      %offset = index.add %base, %relative : offset
-      %external = buffer.view %projection4[%offset] : buffer -> view<4624xi32>
-      %weight_ingress4_write, %weight_ingress4_destination = channel.reserve %weight_ingress4 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      %ingress_copy = kernel.async.copy %external to %weight_ingress4_destination {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<4624xi32> to view<4624xi32> -> kernel.async.token
-      %ingress_group = kernel.async.group %ingress_copy : kernel.async.token -> kernel.async.group
-      kernel.async.wait %ingress_group {newer_groups = 0} : kernel.async.group
-      channel.publish %weight_ingress4_write : write<tile<4624xi32>>
+    %layers = index.constant 28 : index
+    %c6 = index.constant 6 : index
+    scf.for %layer = [%c0 to %layers step %c1] unroll {
+      scf.for %group = [%c0 to %c6 step %c1] unroll {
+        func.call @qwen3_embedding.replay_weights16(%weight_ingress4_16, %weights16, %weights17, %weights18, %weights19, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
+      }
+      func.call @qwen3_embedding.replay_weights24(%weight_ingress4_24, %weights16, %weights17, %weights18, %weights19, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
     }
   }
-
-  pipeline.strand workers([4, 2], [1, 1], [1, 1]) {
-    scf.for %record = [%c0 to %records step %c1] {
-      %weight_ingress4_read, %weight_ingress4_source = channel.acquire %weight_ingress4 : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-      %branch0, %branch1, %branch2, %branch3 = channel.fanout %weight_ingress4_read : read<tile<4624xi32>> -> (read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>)
-      %weights16_write, %weights16_destination = channel.reserve %weights16 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch0 -> %weights16_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights17_write, %weights17_destination = channel.reserve %weights17 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch1 -> %weights17_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights18_write, %weights18_destination = channel.reserve %weights18 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch2 -> %weights18_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights19_write, %weights19_destination = channel.reserve %weights19 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch3 -> %weights19_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-    }
-  }
-
   pipeline.strand workers([5, 2], [1, 1], [1, 1]) {
-    %base = index.constant 0 : offset
-    %stride = index.constant 18496 : offset
-    scf.for %record = [%c0 to %records step %c1] {
-      %relative = index.scale %record, %stride : index, offset -> offset
-      %offset = index.add %base, %relative : offset
-      %external = buffer.view %projection5[%offset] : buffer -> view<4624xi32>
-      %weight_ingress5_write, %weight_ingress5_destination = channel.reserve %weight_ingress5 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      %ingress_copy = kernel.async.copy %external to %weight_ingress5_destination {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<4624xi32> to view<4624xi32> -> kernel.async.token
-      %ingress_group = kernel.async.group %ingress_copy : kernel.async.token -> kernel.async.group
-      kernel.async.wait %ingress_group {newer_groups = 0} : kernel.async.group
-      channel.publish %weight_ingress5_write : write<tile<4624xi32>>
+    %layers = index.constant 28 : index
+    %c6 = index.constant 6 : index
+    scf.for %layer = [%c0 to %layers step %c1] unroll {
+      scf.for %group = [%c0 to %c6 step %c1] unroll {
+        func.call @qwen3_embedding.replay_weights16(%weight_ingress5_16, %weights20, %weights21, %weights22, %weights23, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
+      }
+      func.call @qwen3_embedding.replay_weights24(%weight_ingress5_24, %weights20, %weights21, %weights22, %weights23, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
     }
   }
-
-  pipeline.strand workers([5, 2], [1, 1], [1, 1]) {
-    scf.for %record = [%c0 to %records step %c1] {
-      %weight_ingress5_read, %weight_ingress5_source = channel.acquire %weight_ingress5 : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-      %branch0, %branch1, %branch2, %branch3 = channel.fanout %weight_ingress5_read : read<tile<4624xi32>> -> (read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>)
-      %weights20_write, %weights20_destination = channel.reserve %weights20 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch0 -> %weights20_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights21_write, %weights21_destination = channel.reserve %weights21 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch1 -> %weights21_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights22_write, %weights22_destination = channel.reserve %weights22 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch2 -> %weights22_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights23_write, %weights23_destination = channel.reserve %weights23 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch3 -> %weights23_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-    }
-  }
-
   pipeline.strand workers([6, 2], [1, 1], [1, 1]) {
-    %base = index.constant 0 : offset
-    %stride = index.constant 18496 : offset
-    scf.for %record = [%c0 to %records step %c1] {
-      %relative = index.scale %record, %stride : index, offset -> offset
-      %offset = index.add %base, %relative : offset
-      %external = buffer.view %projection6[%offset] : buffer -> view<4624xi32>
-      %weight_ingress6_write, %weight_ingress6_destination = channel.reserve %weight_ingress6 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      %ingress_copy = kernel.async.copy %external to %weight_ingress6_destination {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<4624xi32> to view<4624xi32> -> kernel.async.token
-      %ingress_group = kernel.async.group %ingress_copy : kernel.async.token -> kernel.async.group
-      kernel.async.wait %ingress_group {newer_groups = 0} : kernel.async.group
-      channel.publish %weight_ingress6_write : write<tile<4624xi32>>
+    %layers = index.constant 28 : index
+    %c6 = index.constant 6 : index
+    scf.for %layer = [%c0 to %layers step %c1] unroll {
+      scf.for %group = [%c0 to %c6 step %c1] unroll {
+        func.call @qwen3_embedding.replay_weights16(%weight_ingress6_16, %weights24, %weights25, %weights26, %weights27, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
+      }
+      func.call @qwen3_embedding.replay_weights24(%weight_ingress6_24, %weights24, %weights25, %weights26, %weights27, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
     }
   }
-
-  pipeline.strand workers([6, 2], [1, 1], [1, 1]) {
-    scf.for %record = [%c0 to %records step %c1] {
-      %weight_ingress6_read, %weight_ingress6_source = channel.acquire %weight_ingress6 : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-      %branch0, %branch1, %branch2, %branch3 = channel.fanout %weight_ingress6_read : read<tile<4624xi32>> -> (read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>)
-      %weights24_write, %weights24_destination = channel.reserve %weights24 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch0 -> %weights24_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights25_write, %weights25_destination = channel.reserve %weights25 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch1 -> %weights25_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights26_write, %weights26_destination = channel.reserve %weights26 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch2 -> %weights26_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights27_write, %weights27_destination = channel.reserve %weights27 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch3 -> %weights27_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-    }
-  }
-
   pipeline.strand workers([7, 2], [1, 1], [1, 1]) {
-    %base = index.constant 0 : offset
-    %stride = index.constant 18496 : offset
-    scf.for %record = [%c0 to %records step %c1] {
-      %relative = index.scale %record, %stride : index, offset -> offset
-      %offset = index.add %base, %relative : offset
-      %external = buffer.view %projection7[%offset] : buffer -> view<4624xi32>
-      %weight_ingress7_write, %weight_ingress7_destination = channel.reserve %weight_ingress7 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      %ingress_copy = kernel.async.copy %external to %weight_ingress7_destination {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<4624xi32> to view<4624xi32> -> kernel.async.token
-      %ingress_group = kernel.async.group %ingress_copy : kernel.async.token -> kernel.async.group
-      kernel.async.wait %ingress_group {newer_groups = 0} : kernel.async.group
-      channel.publish %weight_ingress7_write : write<tile<4624xi32>>
+    %layers = index.constant 28 : index
+    %c6 = index.constant 6 : index
+    scf.for %layer = [%c0 to %layers step %c1] unroll {
+      scf.for %group = [%c0 to %c6 step %c1] unroll {
+        func.call @qwen3_embedding.replay_weights16(%weight_ingress7_16, %weights28, %weights29, %weights30, %weights31, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
+      }
+      func.call @qwen3_embedding.replay_weights24(%weight_ingress7_24, %weights28, %weights29, %weights30, %weights31, %panels) : (channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, channel<tile<4624xi32>>, index)
     }
   }
-
-  pipeline.strand workers([7, 2], [1, 1], [1, 1]) {
-    scf.for %record = [%c0 to %records step %c1] {
-      %weight_ingress7_read, %weight_ingress7_source = channel.acquire %weight_ingress7 : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-      %branch0, %branch1, %branch2, %branch3 = channel.fanout %weight_ingress7_read : read<tile<4624xi32>> -> (read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>, read<tile<4624xi32>>)
-      %weights28_write, %weights28_destination = channel.reserve %weights28 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch0 -> %weights28_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights29_write, %weights29_destination = channel.reserve %weights29 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch1 -> %weights29_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights30_write, %weights30_destination = channel.reserve %weights30 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch2 -> %weights30_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-      %weights31_write, %weights31_destination = channel.reserve %weights31 : channel<tile<4624xi32>> -> (write<tile<4624xi32>>, view<4624xi32>)
-      channel.copy %branch3 -> %weights31_write : read<tile<4624xi32>>, write<tile<4624xi32>>
-    }
-  }
-
   pipeline.strand workers([0, 2], [1, 1], [1, 1]) {
     scf.for %record = [%c0 to %query_records step %c1] {
       %activations0_read, %activations0_source = channel.acquire %activations0 : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
@@ -997,7 +902,7 @@ pipeline.def<kernel> public retain target(@qwen3_embedding.array) @qwen3_embeddi
   }
 
   pipeline.strand workers([0, 2], [1, 1], [1, 1]) {
-    func.call @qwen3_embedding.query_key_ingress_root(%sequence0_storage, %origin, %storage0, %result_offset, %storage1, %gather_cache0, %activations, %activations0, %c0, %c1, %constants, %embedding, %state, %arrival0, %departure0, %query_output0, %output, %weights0, %activation_offset, %probability0, %result0) : (buffer, offset, buffer, offset, buffer, buffer, buffer, channel<tile<2048xi32>>, index, index, buffer, buffer, buffer, channel<tile<16xi32>>, channel<tile<16xi32>>, channel<tile<4096xbf16>>, buffer, channel<tile<4624xi32>>, offset, channel<tile<4096xbf16>>, channel<tile<4096xbf16>>)
+    func.call @qwen3_embedding.query_key_ingress_root(%sequence0_storage, %origin, %storage0, %result_offset, %storage1, %gather_cache0, %activations, %activations0, %c0, %c1, %constants, %embedding, %state, %arrival0, %departure0, %query_output0, %output, %weights0, %activation_offset, %probability0, %result0, %phase_complete) : (buffer, offset, buffer, offset, buffer, buffer, buffer, channel<tile<2048xi32>>, index, index, buffer, buffer, buffer, channel<tile<16xi32>>, channel<tile<16xi32>>, channel<tile<4096xbf16>>, buffer, channel<tile<4624xi32>>, offset, channel<tile<4096xbf16>>, channel<tile<4096xbf16>>, channel<tile<16xi32>>)
   }
   pipeline.strand workers([0, 3], [1, 1], [1, 1]) {
     %column_offset = index.constant 0 : index
