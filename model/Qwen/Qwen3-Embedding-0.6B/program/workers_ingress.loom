@@ -72,7 +72,6 @@ func.def public inline @qwen3_embedding.query_key_ingress_root(%sequence_storage
   %raw_matrix = buffer.view %local_storage[%origin] : buffer -> view<32x128xbf16>
   %blocked = buffer.view %local_storage[%result_offset] : buffer -> view<4096xbf16>
 
-  %last_chunk = index.constant 7 : index
   %dense_input_stride = index.constant 32768 : offset
   %dense_packed_offset = index.constant 27008 : offset
   %dense_result_offset = index.constant 31680 : offset
@@ -155,8 +154,6 @@ func.def public inline @qwen3_embedding.query_key_ingress_root(%sequence_storage
       %wide_chunks = scf.select %down_group, %c24, %c16 : index
       %dense_chunks = scf.select %residual_group, %wide_chunks, %c8 : index
       %dense_roles = scf.select %residual_group, %one, %c2 : index
-      %last_dense_role = index.sub %dense_roles, %one : index
-      %last_chunk = index.sub %dense_chunks, %one : index
       scf.if %normalize_rows {
         %row_raw = buffer.view %local_storage[%dense_result_offset] : buffer -> view<4096xbf16>
         %row_width = index.constant 1024 : index
@@ -268,8 +265,9 @@ func.def public inline @qwen3_embedding.query_key_ingress_root(%sequence_storage
         func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
       }
       scf.if %learned_layer {
-        %initial_read, %initial_weight = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
-        %group_last_read = scf.for %dense_chunk = [%zero to %dense_chunks step %one](%chunk_read = %initial_read : read<tile<4624xi32>, mutable>) -> (read<tile<4624xi32>, mutable>) {
+        %group_last_read, %completed_chunks = scf.while(%chunk_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
+          // Projection groups contain 8, 16, or 24 chunks, with one or two roles.
+          %dense_chunk = index.assume %chunk_index [range(%chunk_index, 0, 23)] : index
           %dense_normalized_initial = index.constant 1056768 : offset
           %dense_context_initial = index.constant 1318912 : offset
           %dense_mlp_initial = index.constant 1843200 : offset
@@ -286,7 +284,9 @@ func.def public inline @qwen3_embedding.query_key_ingress_root(%sequence_storage
           kernel.async.wait %dense_input_group {newer_groups = 0} : kernel.async.group
           func.call @bfp16ebs8.pack_bf16_aie2p(%local_storage, %activation_offset, %dense_packed_offset, %left_count) : (buffer, offset, offset, i32)
           channel.publish %dense_input_write : write<tile<2048xi32>>
-          %chunk_last_read = scf.for %dense_role = [%zero to %dense_roles step %one](%weight_read = %chunk_read : read<tile<4624xi32>, mutable>) -> (read<tile<4624xi32>, mutable>) {
+          %chunk_last_read, %completed_roles = scf.while(%role_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
+            %dense_role = index.assume %role_index [range(%role_index, 0, 1)] : index
+            %weight_read, %weight_values = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
             %first_dense_projection = index.cmp eq, %dense_role, %zero : index
             %projection_output = scf.if %first_dense_projection -> (view<16x4x64xf32>) {
               scf.yield %dense_primary : view<16x4x64xf32>
@@ -295,19 +295,19 @@ func.def public inline @qwen3_embedding.query_key_ingress_root(%sequence_storage
             }
             %first_dense_chunk = index.cmp eq, %dense_chunk, %zero : index
             func.call @qwen3_embedding.dense_accumulate(%local_storage, %projection_output, %first_dense_chunk) : (buffer, view<16x4x64xf32>, i1)
-            %last_dense_projection = index.cmp eq, %dense_role, %last_dense_role : index
-            %last_dense_chunk = index.cmp eq, %dense_chunk, %last_chunk : index
-            %finish_projection = scalar.andi %last_dense_projection, %last_dense_chunk : i1
-            %following_read = scf.if %finish_projection -> (read<tile<4624xi32>, mutable>) {
-              scf.yield %weight_read : read<tile<4624xi32>, mutable>
-            } else {
-              channel.release %weight_read : read<tile<4624xi32>, mutable>
-              %next_read, %next_weight = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
-              scf.yield %next_read : read<tile<4624xi32>, mutable>
-            }
-            scf.yield %following_read : read<tile<4624xi32>, mutable>
+            %next_role = index.add %dense_role, %one : index
+            %more_roles = index.cmp ult, %next_role, %dense_roles : index
+            scf.condition %more_roles, %weight_read, %next_role : i1, read<tile<4624xi32>, mutable>, index
+          } do(%completed_weight: read<tile<4624xi32>, mutable>, %following_role: index) {
+            channel.release %completed_weight : read<tile<4624xi32>, mutable>
+            scf.yield %following_role : index
           }
-          scf.yield %chunk_last_read : read<tile<4624xi32>, mutable>
+          %next_chunk = index.add %dense_chunk, %one : index
+          %more_chunks = index.cmp ult, %next_chunk, %dense_chunks : index
+          scf.condition %more_chunks, %chunk_last_read, %next_chunk : i1, read<tile<4624xi32>, mutable>, index
+        } do(%completed_chunk: read<tile<4624xi32>, mutable>, %following_chunk: index) {
+          channel.release %completed_chunk : read<tile<4624xi32>, mutable>
+          scf.yield %following_chunk : index
         }
         %head_records = scf.select %head_group, %c2, %one : index
         %preparation_records = scf.select %residual_group, %c8, %head_records : index
@@ -582,7 +582,6 @@ func.def public inline @qwen3_embedding.probability_value_ingress(%local_storage
   %raw_matrix = buffer.view %local_storage[%origin] : buffer -> view<32x128xbf16>
   %blocked = buffer.view %local_storage[%result_offset] : buffer -> view<4096xbf16>
 
-  %last_chunk = index.constant 7 : index
   %dense_input_stride = index.constant 32768 : offset
   %dense_packed_offset = index.constant 27008 : offset
   %dense_result_offset = index.constant 48064 : offset
@@ -660,8 +659,6 @@ func.def public inline @qwen3_embedding.probability_value_ingress(%local_storage
       %wide_chunks = scf.select %down_group, %c24, %c16 : index
       %dense_chunks = scf.select %residual_group, %wide_chunks, %c8 : index
       %dense_roles = scf.select %residual_group, %one, %c2 : index
-      %last_dense_role = index.sub %dense_roles, %one : index
-      %last_chunk = index.sub %dense_chunks, %one : index
       scf.if %normalize_rows {
         %row_raw = buffer.view %local_storage[%dense_result_offset] : buffer -> view<4096xbf16>
         %row_width = index.constant 1024 : index
@@ -771,8 +768,9 @@ func.def public inline @qwen3_embedding.probability_value_ingress(%local_storage
         func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
       }
       scf.if %learned_layer {
-        %initial_read, %initial_weight = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
-        %group_last_read = scf.for %dense_chunk = [%zero to %dense_chunks step %one](%chunk_read = %initial_read : read<tile<4624xi32>, mutable>) -> (read<tile<4624xi32>, mutable>) {
+        %group_last_read, %completed_chunks = scf.while(%chunk_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
+          // Projection groups contain 8, 16, or 24 chunks, with one or two roles.
+          %dense_chunk = index.assume %chunk_index [range(%chunk_index, 0, 23)] : index
 
           %dense_residual_initial = scf.select %output_group, %dense_context_initial, %dense_mlp_initial : offset
           %dense_input_initial = scf.select %residual_group, %dense_residual_initial, %dense_normalized_initial : offset
@@ -787,7 +785,9 @@ func.def public inline @qwen3_embedding.probability_value_ingress(%local_storage
           kernel.async.wait %dense_input_group {newer_groups = 0} : kernel.async.group
           func.call @bfp16ebs8.pack_bf16_aie2p(%local_storage, %activation_offset, %dense_packed_offset, %left_count) : (buffer, offset, offset, i32)
           channel.publish %dense_input_write : write<tile<2048xi32>>
-          %chunk_last_read = scf.for %dense_role = [%zero to %dense_roles step %one](%weight_read = %chunk_read : read<tile<4624xi32>, mutable>) -> (read<tile<4624xi32>, mutable>) {
+          %chunk_last_read, %completed_roles = scf.while(%role_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
+            %dense_role = index.assume %role_index [range(%role_index, 0, 1)] : index
+            %weight_read, %weight_values = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
             %first_dense_projection = index.cmp eq, %dense_role, %zero : index
             %projection_output = scf.if %first_dense_projection -> (view<16x4x64xf32>) {
               scf.yield %dense_primary : view<16x4x64xf32>
@@ -796,19 +796,19 @@ func.def public inline @qwen3_embedding.probability_value_ingress(%local_storage
             }
             %first_dense_chunk = index.cmp eq, %dense_chunk, %zero : index
             func.call @qwen3_embedding.dense_accumulate(%local_storage, %projection_output, %first_dense_chunk) : (buffer, view<16x4x64xf32>, i1)
-            %last_dense_projection = index.cmp eq, %dense_role, %last_dense_role : index
-            %last_dense_chunk = index.cmp eq, %dense_chunk, %last_chunk : index
-            %finish_projection = scalar.andi %last_dense_projection, %last_dense_chunk : i1
-            %following_read = scf.if %finish_projection -> (read<tile<4624xi32>, mutable>) {
-              scf.yield %weight_read : read<tile<4624xi32>, mutable>
-            } else {
-              channel.release %weight_read : read<tile<4624xi32>, mutable>
-              %next_read, %next_weight = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
-              scf.yield %next_read : read<tile<4624xi32>, mutable>
-            }
-            scf.yield %following_read : read<tile<4624xi32>, mutable>
+            %next_role = index.add %dense_role, %one : index
+            %more_roles = index.cmp ult, %next_role, %dense_roles : index
+            scf.condition %more_roles, %weight_read, %next_role : i1, read<tile<4624xi32>, mutable>, index
+          } do(%completed_weight: read<tile<4624xi32>, mutable>, %following_role: index) {
+            channel.release %completed_weight : read<tile<4624xi32>, mutable>
+            scf.yield %following_role : index
           }
-          scf.yield %chunk_last_read : read<tile<4624xi32>, mutable>
+          %next_chunk = index.add %dense_chunk, %one : index
+          %more_chunks = index.cmp ult, %next_chunk, %dense_chunks : index
+          scf.condition %more_chunks, %chunk_last_read, %next_chunk : i1, read<tile<4624xi32>, mutable>, index
+        } do(%completed_chunk: read<tile<4624xi32>, mutable>, %following_chunk: index) {
+          channel.release %completed_chunk : read<tile<4624xi32>, mutable>
+          scf.yield %following_chunk : index
         }
         %head_records = scf.select %head_group, %c2, %one : index
         %preparation_records = scf.select %residual_group, %c8, %head_records : index
@@ -1082,7 +1082,6 @@ func.def public inline @qwen3_embedding.query_key_ingress(%sequence_storage: buf
   %raw_matrix = buffer.view %local_storage[%origin] : buffer -> view<32x128xbf16>
   %blocked = buffer.view %local_storage[%result_offset] : buffer -> view<4096xbf16>
 
-  %last_chunk = index.constant 7 : index
   %dense_input_stride = index.constant 32768 : offset
   %dense_packed_offset = index.constant 27008 : offset
   %dense_result_offset = index.constant 31680 : offset
@@ -1165,8 +1164,6 @@ func.def public inline @qwen3_embedding.query_key_ingress(%sequence_storage: buf
       %wide_chunks = scf.select %down_group, %c24, %c16 : index
       %dense_chunks = scf.select %residual_group, %wide_chunks, %c8 : index
       %dense_roles = scf.select %residual_group, %one, %c2 : index
-      %last_dense_role = index.sub %dense_roles, %one : index
-      %last_chunk = index.sub %dense_chunks, %one : index
       scf.if %normalize_rows {
         %row_raw = buffer.view %local_storage[%dense_result_offset] : buffer -> view<4096xbf16>
         %row_width = index.constant 1024 : index
@@ -1284,8 +1281,9 @@ func.def public inline @qwen3_embedding.query_key_ingress(%sequence_storage: buf
         func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
       }
       scf.if %learned_layer {
-        %initial_read, %initial_weight = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
-        %group_last_read = scf.for %dense_chunk = [%zero to %dense_chunks step %one](%chunk_read = %initial_read : read<tile<4624xi32>, mutable>) -> (read<tile<4624xi32>, mutable>) {
+        %group_last_read, %completed_chunks = scf.while(%chunk_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
+          // Projection groups contain 8, 16, or 24 chunks, with one or two roles.
+          %dense_chunk = index.assume %chunk_index [range(%chunk_index, 0, 23)] : index
           %dense_normalized_initial = index.constant 1073152 : offset
           %dense_context_initial = index.constant 1335296 : offset
           %dense_mlp_initial = index.constant 1859584 : offset
@@ -1302,7 +1300,9 @@ func.def public inline @qwen3_embedding.query_key_ingress(%sequence_storage: buf
           kernel.async.wait %dense_input_group {newer_groups = 0} : kernel.async.group
           func.call @bfp16ebs8.pack_bf16_aie2p(%local_storage, %activation_offset, %dense_packed_offset, %left_count) : (buffer, offset, offset, i32)
           channel.publish %dense_input_write : write<tile<2048xi32>>
-          %chunk_last_read = scf.for %dense_role = [%zero to %dense_roles step %one](%weight_read = %chunk_read : read<tile<4624xi32>, mutable>) -> (read<tile<4624xi32>, mutable>) {
+          %chunk_last_read, %completed_roles = scf.while(%role_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
+            %dense_role = index.assume %role_index [range(%role_index, 0, 1)] : index
+            %weight_read, %weight_values = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
             %first_dense_projection = index.cmp eq, %dense_role, %zero : index
             %projection_output = scf.if %first_dense_projection -> (view<16x4x64xf32>) {
               scf.yield %dense_primary : view<16x4x64xf32>
@@ -1311,19 +1311,19 @@ func.def public inline @qwen3_embedding.query_key_ingress(%sequence_storage: buf
             }
             %first_dense_chunk = index.cmp eq, %dense_chunk, %zero : index
             func.call @qwen3_embedding.dense_accumulate(%local_storage, %projection_output, %first_dense_chunk) : (buffer, view<16x4x64xf32>, i1)
-            %last_dense_projection = index.cmp eq, %dense_role, %last_dense_role : index
-            %last_dense_chunk = index.cmp eq, %dense_chunk, %last_chunk : index
-            %finish_projection = scalar.andi %last_dense_projection, %last_dense_chunk : i1
-            %following_read = scf.if %finish_projection -> (read<tile<4624xi32>, mutable>) {
-              scf.yield %weight_read : read<tile<4624xi32>, mutable>
-            } else {
-              channel.release %weight_read : read<tile<4624xi32>, mutable>
-              %next_read, %next_weight = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
-              scf.yield %next_read : read<tile<4624xi32>, mutable>
-            }
-            scf.yield %following_read : read<tile<4624xi32>, mutable>
+            %next_role = index.add %dense_role, %one : index
+            %more_roles = index.cmp ult, %next_role, %dense_roles : index
+            scf.condition %more_roles, %weight_read, %next_role : i1, read<tile<4624xi32>, mutable>, index
+          } do(%completed_weight: read<tile<4624xi32>, mutable>, %following_role: index) {
+            channel.release %completed_weight : read<tile<4624xi32>, mutable>
+            scf.yield %following_role : index
           }
-          scf.yield %chunk_last_read : read<tile<4624xi32>, mutable>
+          %next_chunk = index.add %dense_chunk, %one : index
+          %more_chunks = index.cmp ult, %next_chunk, %dense_chunks : index
+          scf.condition %more_chunks, %chunk_last_read, %next_chunk : i1, read<tile<4624xi32>, mutable>, index
+        } do(%completed_chunk: read<tile<4624xi32>, mutable>, %following_chunk: index) {
+          channel.release %completed_chunk : read<tile<4624xi32>, mutable>
+          scf.yield %following_chunk : index
         }
         %head_records = scf.select %head_group, %c2, %one : index
         %preparation_records = scf.select %residual_group, %c8, %head_records : index
