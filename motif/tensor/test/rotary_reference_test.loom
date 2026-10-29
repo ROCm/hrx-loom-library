@@ -1,0 +1,176 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Scalar pairing and integer BF16 rounding are independent of the native
+// row launch, lane ownership, and vector conversion. Normalized rows use a
+// whole-row F64 inverse before the explicit F32/BF16 tensor boundaries.
+
+func.decl @reference_bf16_value(%word: i16) -> (f32)
+
+func.decl @reference_bf16_round(%value: f32) -> (f32)
+
+func.decl @reference_bf16_bits(%value: f32) -> (i16)
+
+// Each half-pair product rounds before its signed sum and final publication.
+func.def @reference_rotary_half_pair(%left: f32, %right: f32, %left_cosine: f32, %right_cosine: f32, %left_sine: f32, %right_sine: f32) -> (i16, i16) {
+  %negative_right = scalar.negf %right : f32
+  %left_cosine_product = scalar.mulf %left, %left_cosine : f32
+  %right_cosine_product = scalar.mulf %right, %right_cosine : f32
+  %left_sine_product = scalar.mulf %negative_right, %left_sine : f32
+  %right_sine_product = scalar.mulf %left, %right_sine : f32
+  %left_cosine_rounded = func.call @reference_bf16_round(%left_cosine_product) : (f32) -> (f32)
+  %right_cosine_rounded = func.call @reference_bf16_round(%right_cosine_product) : (f32) -> (f32)
+  %left_sine_rounded = func.call @reference_bf16_round(%left_sine_product) : (f32) -> (f32)
+  %right_sine_rounded = func.call @reference_bf16_round(%right_sine_product) : (f32) -> (f32)
+  %left_sum = scalar.addf %left_cosine_rounded, %left_sine_rounded : f32
+  %right_sum = scalar.addf %right_cosine_rounded, %right_sine_rounded : f32
+  %left_result = func.call @reference_bf16_bits(%left_sum) : (f32) -> (i16)
+  %right_result = func.call @reference_bf16_bits(%right_sum) : (f32) -> (i16)
+  func.return %left_result, %right_result : i16, i16
+}
+
+// Metadata records pairing, normalization, and the caller's F32 epsilon.
+// The selected dyadic rows preserve their normalized BF16 values across the
+// native inverse's 2^-16 relative interval, so rotation compares bitwise.
+func.def @reference_rotary_rows(%parameters: buffer, %input: buffer, %weight: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %metadata = buffer.view %parameters[%origin] : buffer -> view<3xi32>
+  %adjacent_word = view.load %metadata[0] : view<3xi32> -> i32
+  %normalized_word = view.load %metadata[1] : view<3xi32> -> i32
+  %epsilon_word = view.load %metadata[2] : view<3xi32> -> i32
+  %adjacent = scalar.trunci %adjacent_word : i32 to i1
+  %normalized = scalar.trunci %normalized_word : i32 to i1
+  %epsilon = scalar.bitcast %epsilon_word : i32 to f32
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %weight_length = buffer.length %weight
+  %weight_bytes = index.cast %weight_length : offset to index
+  %element_bytes = scf.select %adjacent, %c4, %c2 : index
+  %width_value = index.div %weight_bytes, %element_bytes : index
+  %width = index.assume %width_value [ge(%width_value, 2), multiple_of(%width_value, 2)] : index
+  %half = index.div %width, %c2 : index
+  %input_length = buffer.length %input
+  %input_bytes = index.cast %input_length : offset to index
+  %row_bytes = index.mul %width, %c2 : index
+  %rows = index.div %input_bytes, %row_bytes : index
+  %table_length = buffer.length %cosine
+  %table_bytes = index.cast %table_length : offset to index
+  %tokens = index.div %table_bytes, %weight_bytes : index
+  %heads = index.div %rows, %tokens : index
+  %inputs = buffer.view %input[%origin] : buffer -> view<[%rows]x[%width]xi16>
+  %outputs = buffer.view %output[%origin] : buffer -> view<[%rows]x[%width]xi16>
+  %c1_f32 = scalar.constant 1.0 : f32
+  scf.for %row = [%c0 to %rows step %c1] {
+    %inverse = scf.if %normalized -> (f32) {
+      %c0_f64 = scalar.constant 0.0 : f64
+      %c1_f64 = scalar.constant 1.0 : f64
+      %sum = scf.for %column = [%c0 to %width step %c1](%sum = %c0_f64 : f64) -> (f64) {
+        %bits = view.load %inputs[%row, %column] : view<[%rows]x[%width]xi16> -> i16
+        %value = func.call @reference_bf16_value(%bits) : (i16) -> (f32)
+        %wide = scalar.extf %value : f32 to f64
+        %square = scalar.mulf %wide, %wide : f64
+        %next = scalar.addf %sum, %square : f64
+        scf.yield %next : f64
+      }
+      %width_word = index.cast %width : index to i32
+      %width_f64 = scalar.uitofp %width_word : i32 to f64
+      %epsilon_f64 = scalar.extf %epsilon : f32 to f64
+      %mean = scalar.divf %sum, %width_f64 : f64
+      %variance = scalar.addf %mean, %epsilon_f64 : f64
+      %root = scalar.sqrtf %variance : f64
+      %wide_inverse = scalar.divf %c1_f64, %root : f64
+      %inverse = scalar.fptrunc %wide_inverse : f64 to f32
+      scf.yield %inverse : f32
+    } else {
+      scf.yield %c1_f32 : f32
+    }
+    %token_value = index.div %row, %heads : index
+    %token = index.assume %token_value [ge(%token_value, 0), lt(%token_value, %tokens)] : index
+    scf.for %pair = [%c0 to %half step %c1] {
+      %even = index.mul %pair, %c2 : index
+      %odd = index.add %even, %c1 : index
+      %upper = index.add %pair, %half : index
+      %left_index = scf.select %adjacent, %even, %pair : index
+      %right_index = scf.select %adjacent, %odd, %upper : index
+      %left_column = index.assume %left_index [ge(%left_index, 0), lt(%left_index, %width)] : index
+      %right_column = index.assume %right_index [ge(%right_index, 0), lt(%right_index, %width)] : index
+      %left_word = view.load %inputs[%row, %left_column] : view<[%rows]x[%width]xi16> -> i16
+      %right_word = view.load %inputs[%row, %right_column] : view<[%rows]x[%width]xi16> -> i16
+      %left_input = func.call @reference_bf16_value(%left_word) : (i16) -> (f32)
+      %right_input = func.call @reference_bf16_value(%right_word) : (i16) -> (f32)
+      %left, %right = scf.if %normalized -> (f32, f32) {
+        %left_scale, %right_scale = scf.if %adjacent -> (f32, f32) {
+          %weights = buffer.view %weight[%origin] : buffer -> view<[%width]xf32>
+          %left_weight = view.load %weights[%left_column] : view<[%width]xf32> -> f32
+          %right_weight = view.load %weights[%right_column] : view<[%width]xf32> -> f32
+          %left_rounded = func.call @reference_bf16_round(%left_weight) : (f32) -> (f32)
+          %right_rounded = func.call @reference_bf16_round(%right_weight) : (f32) -> (f32)
+          %left_shifted = scalar.addf %left_rounded, %c1_f32 : f32
+          %right_shifted = scalar.addf %right_rounded, %c1_f32 : f32
+          %left_scale = func.call @reference_bf16_round(%left_shifted) : (f32) -> (f32)
+          %right_scale = func.call @reference_bf16_round(%right_shifted) : (f32) -> (f32)
+          scf.yield %left_scale, %right_scale : f32, f32
+        } else {
+          %weights = buffer.view %weight[%origin] : buffer -> view<[%width]xi16>
+          %left_bits = view.load %weights[%left_column] : view<[%width]xi16> -> i16
+          %right_bits = view.load %weights[%right_column] : view<[%width]xi16> -> i16
+          %left_scale = func.call @reference_bf16_value(%left_bits) : (i16) -> (f32)
+          %right_scale = func.call @reference_bf16_value(%right_bits) : (i16) -> (f32)
+          scf.yield %left_scale, %right_scale : f32, f32
+        }
+        %left_normalized = scalar.mulf %left_input, %inverse : f32
+        %right_normalized = scalar.mulf %right_input, %inverse : f32
+        %left_operand, %right_operand = scf.if %adjacent -> (f32, f32) {
+          scf.yield %left_normalized, %right_normalized : f32, f32
+        } else {
+          %left_rounded = func.call @reference_bf16_round(%left_normalized) : (f32) -> (f32)
+          %right_rounded = func.call @reference_bf16_round(%right_normalized) : (f32) -> (f32)
+          scf.yield %left_rounded, %right_rounded : f32, f32
+        }
+        %left_product = scalar.mulf %left_operand, %left_scale : f32
+        %right_product = scalar.mulf %right_operand, %right_scale : f32
+        %left_value = func.call @reference_bf16_round(%left_product) : (f32) -> (f32)
+        %right_value = func.call @reference_bf16_round(%right_product) : (f32) -> (f32)
+        scf.yield %left_value, %right_value : f32, f32
+      } else {
+        scf.yield %left_input, %right_input : f32, f32
+      }
+      %left_result, %right_result = scf.if %adjacent -> (i16, i16) {
+        %cosines = buffer.view %cosine[%origin] : buffer -> view<[%tokens]x[%width]xf32>
+        %sines = buffer.view %sine[%origin] : buffer -> view<[%tokens]x[%width]xf32>
+        %left_cosine = view.load %cosines[%token, %left_column] : view<[%tokens]x[%width]xf32> -> f32
+        %right_cosine = view.load %cosines[%token, %right_column] : view<[%tokens]x[%width]xf32> -> f32
+        %left_sine = view.load %sines[%token, %left_column] : view<[%tokens]x[%width]xf32> -> f32
+        %right_sine = view.load %sines[%token, %right_column] : view<[%tokens]x[%width]xf32> -> f32
+        %left_cosine_product = scalar.mulf %left, %left_cosine : f32
+        %right_cosine_product = scalar.mulf %right, %right_cosine : f32
+        %left_sine_product = scalar.mulf %right, %left_sine : f32
+        %right_sine_product = scalar.mulf %left, %right_sine : f32
+        %left_value = scalar.subf %left_cosine_product, %left_sine_product : f32
+        %right_value = scalar.addf %right_cosine_product, %right_sine_product : f32
+        %left_bits = func.call @reference_bf16_bits(%left_value) : (f32) -> (i16)
+        %right_bits = func.call @reference_bf16_bits(%right_value) : (f32) -> (i16)
+        scf.yield %left_bits, %right_bits : i16, i16
+      } else {
+        %cosines = buffer.view %cosine[%origin] : buffer -> view<[%tokens]x[%width]xi16>
+        %sines = buffer.view %sine[%origin] : buffer -> view<[%tokens]x[%width]xi16>
+        %left_cosine_bits = view.load %cosines[%token, %left_column] : view<[%tokens]x[%width]xi16> -> i16
+        %right_cosine_bits = view.load %cosines[%token, %right_column] : view<[%tokens]x[%width]xi16> -> i16
+        %left_sine_bits = view.load %sines[%token, %left_column] : view<[%tokens]x[%width]xi16> -> i16
+        %right_sine_bits = view.load %sines[%token, %right_column] : view<[%tokens]x[%width]xi16> -> i16
+        %left_cosine = func.call @reference_bf16_value(%left_cosine_bits) : (i16) -> (f32)
+        %right_cosine = func.call @reference_bf16_value(%right_cosine_bits) : (i16) -> (f32)
+        %left_sine = func.call @reference_bf16_value(%left_sine_bits) : (i16) -> (f32)
+        %right_sine = func.call @reference_bf16_value(%right_sine_bits) : (i16) -> (f32)
+        %left_bits, %right_bits = func.call @reference_rotary_half_pair(%left, %right, %left_cosine, %right_cosine, %left_sine, %right_sine) : (f32, f32, f32, f32, f32, f32) -> (i16, i16)
+        scf.yield %left_bits, %right_bits : i16, i16
+      }
+      // Both inputs and all coefficient values precede either in-place store.
+      view.store %left_result, %outputs[%row, %left_column] : i16, view<[%rows]x[%width]xi16>
+      view.store %right_result, %outputs[%row, %right_column] : i16, view<[%rows]x[%width]xi16>
+    }
+  }
+  func.return
+}
