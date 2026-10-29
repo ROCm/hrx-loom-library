@@ -494,24 +494,6 @@ references and launch bodies.
 python3 -B motif/tensor/test/generate_convolution_matrix_oracle.py --check
 ```
 
-`modulation_test.loom` uses exact rational expressions and integer nearest-even
-rounding at each F32 and BF16 boundary. The corpus includes F32 values on
-either side of BF16 midpoints, negative scales, cancellation, signed zeros,
-wide exponents, and BF16/F32 subnormal boundaries. It separately exercises
-table values already representable in BF16, as supplied by a leaf that widens
-compressed checkpoint storage.
-
-All 319 records check both direct table combinations and the complete affine
-result bitwise. The generator verifies that removing each intermediate BF16
-rounding changes an observable result in the corpus. Three launch widths
-exercise tails and multiple workgroups. Nonzero origins, exact output guards,
-and immutable input/table checks are shared by native and access-instrumented
-execution; each scenario also has a benchmark declaration.
-
-```sh
-python3 -B motif/tensor/test/generate_modulation_oracle.py --check
-```
-
 `embedding_test.loom` compares selected BF16 elements with complete row copies.
 The independent reference computes byte ranges from the requested IDs and
 copies each row without floating-point evaluation or the production lookup
