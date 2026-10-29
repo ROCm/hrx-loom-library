@@ -376,24 +376,6 @@ by the wrapper kernel. Regenerate the authored answers with:
 python3 -B motif/tensor/test/generate_pointwise_oracle.py
 ```
 
-`image_unpack_test.loom` starts from independently authored channel-first pixels
-and packs its BF16 input by traversing complete 2×2 patches. Its expected
-outputs never reconstruct coordinates from a packed index. Minimum, portrait,
-landscape, exact-group, tail, and multiple-group shapes exercise one, odd, and
-sixteen channel counts with 32-, 64-, 128-, and 256-thread leaf launches.
-
-Division and mean addition use exact rational ties-to-even references for
-their separate F32 roundings. Two cancellation cases distinguish that result
-from dividing and adding before rounding. Every output bit, prefix and suffix
-guard, input sample, and affine coefficient is compared. Both ordinary native
-execution and access instrumentation use the same scenarios; each shape also
-has a benchmark declaration. The authoring generators share the exact binary
-rounding primitive in `binary_reference.py`.
-
-```sh
-python3 -B motif/tensor/test/generate_image_unpack_oracle.py --check
-```
-
 `image_attention_matrix_test.loom` compares complete image-attention heads with
 binary64 dense contractions and a whole softmax. Thirteen scenarios span one
 through nine query/key tiles, all 384 channels, zero and uniform scores,
