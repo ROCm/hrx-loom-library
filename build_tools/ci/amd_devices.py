@@ -125,6 +125,7 @@ def configure_visibility(
     all_devices = views["amdgpu"]
     if not all_devices:
         raise ValueError("The native HAL reports no available AMD GPUs")
+    native_by_address = {device.pci_address: device for device in all_devices}
     allocation = None
     if "ROCR_VISIBLE_DEVICES" in environment:
         allocation = rocr_allocation(
@@ -142,6 +143,8 @@ def configure_visibility(
             parent_allocation.append(
                 (drm / path.name / "device").resolve(strict=True).name
             )
+        if len(set(parent_allocation)) != len(parent_allocation):
+            raise ValueError("PARENT_GPU_DEVICES contains duplicate physical devices")
         if allocation is not None and set(parent_allocation) != set(allocation):
             raise ValueError("PARENT_GPU_DEVICES conflicts with ROCR_VISIBLE_DEVICES")
         allocation = parent_allocation
@@ -154,12 +157,15 @@ def configure_visibility(
         ):
             raise ValueError(f"{variable} selects a GPU outside the runner allocation")
     elif allocation is not None:
-        by_address = {device.pci_address: device for device in all_devices}
-        if any(address not in by_address for address in allocation):
+        selected = [
+            native_by_address[address]
+            for address in allocation
+            if address in native_by_address
+        ]
+        if not selected:
             raise ValueError(
-                "The runner allocation contains a GPU unavailable to the native HAL"
+                "The runner allocation has no GPU available to the native HAL"
             )
-        selected = [by_address[address] for address in allocation]
     elif len(all_devices) == 1:
         selected = all_devices
     else:
@@ -206,6 +212,9 @@ def configure_visibility(
         "devices": [
             {"uri": device.uri, "pci_address": device.pci_address}
             for device in selected
+        ],
+        "unavailable_devices": [
+            address for address in allocation or () if address not in native_by_address
         ],
         "environment": updates,
     }

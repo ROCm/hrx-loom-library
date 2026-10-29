@@ -176,10 +176,60 @@ class AmdDevicesTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.configure(ROCR_VISIBLE_DEVICES="1")
 
+    def test_duplicate_render_allocation_is_rejected_before_native_filtering(self):
+        self.views["amdgpu"] = self.views["amdgpu"][:2]
+        for name in ("renderD128", "renderD129"):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, "duplicate"),
+            ):
+                self.configure(
+                    PARENT_GPU_DEVICES=",".join(
+                        str(self.dri / device) for device in (name, name, "renderD130")
+                    )
+                )
+
     def test_allocated_gpu_missing_from_sdk_is_rejected(self):
         self.views["amdgpu"] = self.views["amdgpu"][:2]
-        with self.assertRaisesRegex(ValueError, "unavailable to the native HAL"):
+        with self.assertRaisesRegex(ValueError, "no GPU available to the native HAL"):
             self.configure(ROCR_VISIBLE_DEVICES="1")
+
+    def test_mixed_allocation_selects_native_devices_in_allocation_order(self):
+        self.views["amdgpu"] = self.views["amdgpu"][:2]
+        self.views["rdna"] = []
+        result = self.configure(ROCR_VISIBLE_DEVICES="1,0,2")
+        self.assertEqual(
+            [device["pci_address"] for device in result["devices"]],
+            [self.addresses[0], self.addresses[2]],
+        )
+        self.assertEqual(result["unavailable_devices"], [self.addresses[1]])
+        self.assertEqual(
+            result["environment"],
+            {
+                "HAL_VISIBLE_AMDGPU_DEVICES": "1,0",
+                "HAL_VISIBLE_RDNA_DEVICES": "",
+                "HAL_VISIBLE_CDNA_DEVICES": "1,0",
+            },
+        )
+
+    def test_mixed_render_allocation_preserves_explicit_native_selection(self):
+        self.views["amdgpu"] = self.views["amdgpu"][:2]
+        self.views["rdna"] = []
+        for selection in ({}, {"HAL_VISIBLE_AMDGPU_DEVICES": "1"}):
+            with self.subTest(selection=selection):
+                result = self.configure(
+                    PARENT_GPU_DEVICES=",".join(
+                        str(self.dri / name) for name in ("renderD129", "renderD128")
+                    ),
+                    **selection,
+                )
+                self.assertEqual(
+                    result["devices"][0]["pci_address"], self.addresses[0]
+                )
+                self.assertEqual(result["unavailable_devices"], [self.addresses[1]])
+                self.assertEqual(
+                    result["environment"]["HAL_VISIBLE_CDNA_DEVICES"], "1"
+                )
 
     def test_sdk_ignoring_visibility_is_rejected(self):
         def ignores_mask(tool, scheme, environment):

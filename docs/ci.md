@@ -39,17 +39,20 @@ source-only request API check described below.
 GPU profiles serialize local execution with `exclusive-if-local` and
 the shared `gpu-device` resource group. Build concurrency remains independent.
 The hardware job also resolves the runner's `ROCR_VISIBLE_DEVICES` or
-`PARENT_GPU_DEVICES` allocation to physical PCI addresses, then selects those
-addresses in each native HAL device view. ROCr and native HAL ordinals can differ.
+`PARENT_GPU_DEVICES` allocation to physical PCI addresses, then selects the
+addresses supported by the native HAL. An allocation may include older GPUs
+that the HAL does not enumerate; the selected set must still contain at least
+one allocated GPU. ROCr and native HAL ordinals can differ.
 The preflight uses KFD/sysfs and the installed SDK's query-only `--dump_devices`;
 it needs no ROCm runtime. Explicit native selectors must stay within the
 allocation, and a multi-GPU host without an allocation fails preflight.
 
 The job verifies the filtered device lists and forwards `HAL_VISIBLE_*_DEVICES`
 into Bazel tests, including empty lists for excluded device families. Its
-`gpu-selection.json` artifact records the physical identities and selectors;
-those selections also enter the test cache identity. Local serialization alone
-cannot prevent separate runner jobs from using the same physical GPU.
+`gpu-selection.json` artifact records the physical identities, selectors, and
+allocated PCI addresses unavailable to the native HAL. Those selections also
+enter the test cache identity. Local serialization alone cannot prevent
+separate runner jobs from using the same physical GPU.
 
 Adding a model or motif with an existing resource requires no workflow edit.
 A new device family needs an SDK containing its runtime, an appropriate runner, and its execution
