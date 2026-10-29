@@ -95,34 +95,8 @@ constructions separately require exact F32 results that BF16 cannot represent.
 Input conversion midpoints distinguish rounded weights from their F32 originals.
 All immutable allocations and output guards compare bitwise.
 
-`linear_epilogue_test.loom` supplies twelve independent store, bias, and adapter
-scenarios without performing matrix contraction. Rational scalar arithmetic
-authors each F32 and BF16 boundary, including conversion midpoint parities,
-cancellation, signed zeros, and subnormals. Omission checks prove the corpus
-distinguishes bias conversion, delta rounding, scaled-delta rounding, and the
-zero-strength bypass. Both bias formats, nonzero tile origins, three physical
-layouts, and exact base/output aliasing are exercised. Every observed bit is
-exact, including the F32 result before final publication. Both corpora support
-optional Loom address and race checks and retain benchmark declarations.
-
 ```sh
 python3 -B motif/tensor/test/generate_linear_oracle.py --check
-python3 -B motif/tensor/test/generate_linear_epilogue_oracle.py --check
-```
-
-`layer_mix_test.loom` independently checks all twelve gathered values, the base
-contraction, and the composed result. Eleven scenarios cover both checkpoint
-representations, conversion midpoints, ordered cancellation, F32 accumulation,
-ranks 1/7/16/32/33, odd widths, multiple token rows, and the real width 2560.
-Exact rational arithmetic models each fused operation and rounding boundary;
-the generator verifies that removing each boundary changes an observation.
-Signed-zero strengths preserve negative-zero base results and suppress reads
-of deliberately undersized, NaN-filled factor buffers. Subnormal values,
-immutable inputs, and complete output guards compare bitwise under native,
-access, and race instrumentation. Each scenario includes a benchmark.
-
-```sh
-python3 -B motif/tensor/test/generate_layer_mix_oracle.py --check
 ```
 
 `attention_expanded_test.loom` compares nineteen causal/noncausal grouped-attention
@@ -376,24 +350,6 @@ by the wrapper kernel. Regenerate the authored answers with:
 python3 -B motif/tensor/test/generate_pointwise_oracle.py
 ```
 
-`image_unpack_test.loom` starts from independently authored channel-first pixels
-and packs its BF16 input by traversing complete 2×2 patches. Its expected
-outputs never reconstruct coordinates from a packed index. Minimum, portrait,
-landscape, exact-group, tail, and multiple-group shapes exercise one, odd, and
-sixteen channel counts with 32-, 64-, 128-, and 256-thread leaf launches.
-
-Division and mean addition use exact rational ties-to-even references for
-their separate F32 roundings. Two cancellation cases distinguish that result
-from dividing and adding before rounding. Every output bit, prefix and suffix
-guard, input sample, and affine coefficient is compared. Both ordinary native
-execution and access instrumentation use the same scenarios; each shape also
-has a benchmark declaration. The authoring generators share the exact binary
-rounding primitive in `binary_reference.py`.
-
-```sh
-python3 -B motif/tensor/test/generate_image_unpack_oracle.py --check
-```
-
 `image_attention_matrix_test.loom` compares complete image-attention heads with
 binary64 dense contractions and a whole softmax. Thirteen scenarios span one
 through nine query/key tiles, all 384 channels, zero and uniform scores,
@@ -492,24 +448,6 @@ references and launch bodies.
 
 ```sh
 python3 -B motif/tensor/test/generate_convolution_matrix_oracle.py --check
-```
-
-`modulation_test.loom` uses exact rational expressions and integer nearest-even
-rounding at each F32 and BF16 boundary. The corpus includes F32 values on
-either side of BF16 midpoints, negative scales, cancellation, signed zeros,
-wide exponents, and BF16/F32 subnormal boundaries. It separately exercises
-table values already representable in BF16, as supplied by a leaf that widens
-compressed checkpoint storage.
-
-All 319 records check both direct table combinations and the complete affine
-result bitwise. The generator verifies that removing each intermediate BF16
-rounding changes an observable result in the corpus. Three launch widths
-exercise tails and multiple workgroups. Nonzero origins, exact output guards,
-and immutable input/table checks are shared by native and access-instrumented
-execution; each scenario also has a benchmark declaration.
-
-```sh
-python3 -B motif/tensor/test/generate_modulation_oracle.py --check
 ```
 
 `embedding_test.loom` compares selected BF16 elements with complete row copies.

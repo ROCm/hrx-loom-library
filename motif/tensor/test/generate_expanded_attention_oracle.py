@@ -11,7 +11,7 @@ from pathlib import Path
 import random
 
 from binary_reference import f32, rounded_float
-from generate_linear_epilogue_oracle import encode
+from binary_reference import encode
 from generate_shared_attention_oracle import Case as SharedCase
 from generate_shared_attention_oracle import epilogue, inputs as shared_inputs, margin
 

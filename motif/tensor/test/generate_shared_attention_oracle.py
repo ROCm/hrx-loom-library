@@ -12,7 +12,7 @@ import random
 import struct
 
 from binary_reference import f32, rounded_float
-from generate_linear_epilogue_oracle import encode
+from binary_reference import encode
 
 
 @dataclass(frozen=True)

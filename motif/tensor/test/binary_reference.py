@@ -79,3 +79,14 @@ def round_binary_sqrt(value: Fraction, precision: int) -> Fraction:
     ):
         lower += 1
     return lower * spacing
+
+
+def encode(values, dtype):
+    if dtype == "f32":
+        return struct.pack(f"<{len(values)}f", *values).hex()
+    words = []
+    for value in values:
+        bits = struct.unpack("<I", struct.pack("<f", value))[0]
+        assert bits & 65535 == 0
+        words.append(bits >> 16)
+    return struct.pack(f"<{len(words)}H", *words).hex()

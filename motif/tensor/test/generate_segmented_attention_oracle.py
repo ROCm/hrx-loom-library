@@ -11,7 +11,7 @@ from pathlib import Path
 import random
 
 from binary_reference import rounded_float
-from generate_linear_epilogue_oracle import encode
+from binary_reference import encode
 
 
 @dataclass(frozen=True)
