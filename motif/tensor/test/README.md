@@ -279,9 +279,8 @@ aliased output. Twelve cases include one and odd channel counts, the decoder's
 signed zeros, and values on both sides of the norm clamp. A distinct minimum
 norm also checks that the caller owns that parameter.
 
-The reference uses exact rational F32 accumulation and arithmetic. Square
-roots use integer bounds and squared midpoint comparisons for ties-to-even
-rounding. The native implementation permits approximate roots: the
+The scalar VM reference uses ordered F32 accumulation and arithmetic with
+correctly rounded roots. The native implementation permits approximate roots: the
 [RDNA 3 ISA, section 16.8](https://gpuopen.com/download/rdna3-shader-instruction-set-architecture-feb-2023.pdf)
 specifies one-ULP F32 square-root accuracy. With `u = 2^-24`, each native root
 differs from the rounded reference by at most `3u / (1-u)` relatively.
@@ -295,10 +294,6 @@ tolerance `2e-6` for approximate root and exponential math. Tensor views expose
 live values and their guards separately, so prefix/suffix guards and immutable
 inputs remain bitwise checks for every epilogue. Normal and access-instrumented
 executions share these scenarios and their benchmark declarations.
-
-```sh
-python3 -B motif/tensor/test/generate_channel_norm_oracle.py --check
-```
 
 `time_test.loom` compares sinusoidal features with binary64 exponential and
 trigonometric evaluation after explicit F32 frequency and phase boundaries.
