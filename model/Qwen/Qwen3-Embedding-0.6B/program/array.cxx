@@ -1,9 +1,9 @@
 // Copyright 2026 AMD ROCm™ Software
 // SPDX-License-Identifier: MIT
 
-// Fixed 8-column by 4-core-row Strix Halo composition for one 128-token
-// cohort. The pipeline owns concrete placement, local memory banks, FIFO
-// storage, stream fanout, and barrier endpoints. Workers remain independently
+// Eight-column by four-core-row Strix Halo composition with retained
+// projection groups for one 128-token cohort. The pipeline owns concrete
+// placement, local memory banks, FIFO storage, stream fanout, and barriers. Workers remain independently
 // linkable providers and receive every owned resource explicitly.
 
 #include <loomcxx/kernel.h>
@@ -41,10 +41,20 @@ struct QueryOutputResources {
   FeatureStream stream;
 };
 
-[[loom::force_inline]] static WeightStream make_weight_ingress(loomt::pool memory) {
-  auto* storage = loom::buffer::alloca<loom::memory_space::workgroup, 64>(loomt::offset{18496}, memory);
-  auto slots = loom::buffer::view<1, 4624>(reinterpret_cast<unsigned*>(storage), {});
-  return loom::channel::bind<loom::channel::discipline::fifo>(slots, loomt::index{1});
+struct RetainedWeightStreams {
+  // Six short projection groups use the first sixteen records.
+  WeightStream short_group;
+  // The down projection uses all twenty-four records in the same allocation.
+  WeightStream down_group;
+};
+
+[[loom::force_inline]] static RetainedWeightStreams make_weight_ingress(loomt::pool memory) {
+  auto* storage = loom::buffer::alloca<loom::memory_space::workgroup, 64>(loomt::offset{443904}, memory);
+  auto short_slots = loom::buffer::view<16, 4624>(reinterpret_cast<unsigned*>(storage), {});
+  auto short_group = loom::channel::bind<loom::channel::discipline::fifo>(short_slots, loomt::index{16});
+  auto down_slots = loom::buffer::view<24, 4624>(reinterpret_cast<unsigned*>(storage), {});
+  auto down_group = loom::channel::bind<loom::channel::discipline::fifo>(down_slots, loomt::index{24});
+  return {.short_group = short_group, .down_group = down_group};
 }
 
 [[loom::force_inline]] static CoreStorage allocate_core(loomt::pool memory) {
@@ -85,7 +95,7 @@ struct QueryOutputResources {
 extern const loom::target::declaration array_target;
 
 [[loom::symbol("qwen3_embedding.query_key_ingress_root"), loom::force_inline]]
-void qwen3_embedding_query_key_ingress_root(Bytes sequence_storage, loomt::offset origin, Bytes local_storage, loomt::offset result_offset, Bytes peer_storage, Bytes gather_storage, Bytes activations, ActivationStream activation_stream, loomt::index zero, loomt::index one, Bytes constants, Bytes embedding, Bytes state, BarrierStream incoming_arrival, BarrierStream outgoing_departure, FeatureStream projection_stream, Bytes output, WeightStream weight_stream, loomt::offset activation_offset, FeatureStream probability_stream, FeatureStream result_stream);
+void qwen3_embedding_query_key_ingress_root(Bytes sequence_storage, loomt::offset origin, Bytes local_storage, loomt::offset result_offset, Bytes peer_storage, Bytes gather_storage, Bytes activations, ActivationStream activation_stream, loomt::index zero, loomt::index one, Bytes constants, Bytes embedding, Bytes state, BarrierStream incoming_arrival, BarrierStream outgoing_departure, FeatureStream projection_stream, Bytes output, WeightStream weight_stream, loomt::offset activation_offset, FeatureStream probability_stream, FeatureStream result_stream, BarrierStream phase_complete);
 
 [[loom::symbol("qwen3_embedding.query_key_egress"), loom::force_inline]]
 void qwen3_embedding_query_key_egress(Bytes sequence_storage, loomt::offset origin, Bytes local_storage, loomt::offset result_offset, Bytes peer_storage, ActivationStream activation_stream, loomt::index zero, loomt::index one, BarrierStream incoming_arrival, BarrierStream outgoing_arrival, BarrierStream incoming_departure, BarrierStream outgoing_departure, FeatureStream projection_stream, Bytes output, Bytes state, WeightStream weight_stream, loomt::offset activation_offset, FeatureStream probability_stream, FeatureStream result_stream, loomt::index column_offset, loomt::index row_column, loomt::offset finish_initial, loomt::offset normalized_initial, loomt::index skip_column, loomt::offset query_initial, loomt::offset key_initial, loomt::offset value_initial, loomt::offset mlp_initial, loomt::offset residual_initial, loomt::offset output_initial);
@@ -110,6 +120,29 @@ void qwen3_embedding_query_key_ingress(Bytes sequence_storage, loomt::offset ori
 
 [[loom::symbol("qwen3_embedding.query_key_egress_terminal"), loom::force_inline]]
 void qwen3_embedding_query_key_egress_terminal(Bytes sequence_storage, loomt::offset origin, Bytes local_storage, loomt::offset result_offset, Bytes peer_storage, ActivationStream activation_stream, loomt::index zero, loomt::index one, BarrierStream outgoing_arrival, BarrierStream incoming_departure, FeatureStream projection_stream, Bytes output, Bytes state, WeightStream weight_stream, loomt::offset activation_offset, FeatureStream probability_stream, FeatureStream result_stream);
+
+[[loom::symbol("qwen3_embedding.fill_weights"), loom::force_inline]]
+void fill_weights(Bytes input, loomt::offset base, loomt::index count, WeightStream incoming);
+
+[[loom::symbol("qwen3_embedding.replay_weights16"), loom::force_inline]]
+void replay_weights16(WeightStream source, WeightStream row0, WeightStream row1, WeightStream row2, WeightStream row3, loomt::index panels);
+
+[[loom::symbol("qwen3_embedding.replay_weights24"), loom::force_inline]]
+void replay_weights24(WeightStream source, WeightStream row0, WeightStream row1, WeightStream row2, WeightStream row3, loomt::index panels);
+
+[[loom::symbol("qwen3_embedding.wait"), loom::force_inline]]
+void wait_for_phase(BarrierStream channel);
+
+[[loom::force_inline]] static void replay_projection_layers(RetainedWeightStreams source, WeightStream row0, WeightStream row1, WeightStream row2, WeightStream row3) {
+  [[loom::unroll]]
+  for (int layer = 0; layer < 28; ++layer) {
+    [[loom::unroll]]
+    for (int group = 0; group < 6; ++group) {
+      replay_weights16(source.short_group, row0, row1, row2, row3, loomt::index{1});
+    }
+    replay_weights24(source.down_group, row0, row1, row2, row3, loomt::index{1});
+  }
+}
 
 [[loom::pipeline("kernel"), loom::symbol("qwen3_embedding.cohort"), loom::retain, loom::target(array_target)]]
 void qwen3_embedding_cohort([[loom::launch]] Bytes projection0_arg, Bytes projection1_arg, Bytes projection2_arg, Bytes projection3_arg, Bytes projection4_arg, Bytes projection5_arg, Bytes projection6_arg, Bytes projection7_arg, Bytes constants_arg, Bytes embedding_arg, Bytes activations_arg, Bytes output_arg, Bytes state_arg) {
@@ -371,213 +404,64 @@ void qwen3_embedding_cohort([[loom::launch]] Bytes projection0_arg, Bytes projec
   auto* gather_cache9 = loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{192}, core9.memory);
   auto* gather_cache18 = loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{192}, core18.memory);
   auto* gather_cache27 = loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{192}, core27.memory);
+  // The query root reaches its paired value tile's memory and locks.
+  // This notification stays off the query tile's seven existing FIFO pairs.
+  auto* phase_storage = loom::buffer::alloca<loom::memory_space::workgroup, 64>(loomt::offset{64}, core1.memory);
+  auto phase_slots = loom::buffer::view<1, 16>(reinterpret_cast<unsigned*>(phase_storage), {});
+  auto phase_complete = loom::channel::bind<loom::channel::discipline::fifo>(phase_slots, loomt::index{1});
   [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record = 0; record < 3360; ++record) {
-      loomt::offset relative = loom::index::scale(loom::index::cast(record), loomt::offset{18496});
-      loomt::offset offset = loomt::offset{0} + relative;
-      auto external = loom::buffer::view<4624>(loom::buffer::cast<const unsigned>(projection0), offset, {});
-      auto reservation = loom::channel::reserve(weight_ingress0);
-      auto ingress_copy = loom::kernel::async::copy<loom::kernel::async::direction::global_to_workgroup, loom::cache::scope::workgroup, loom::cache::temporal::regular>(external, reservation.payload);
-      auto ingress_copy_group = loom::kernel::async::group(ingress_copy);
-      loom::kernel::async::wait<0>(ingress_copy_group);
-      loom::channel::publish(reservation.write);
+    [[loom::unroll]]
+    for (int layer = 0; layer < 28; ++layer) {
+      auto layer_base = loom::index::scale(loom::index::cast(layer), loomt::offset{2219520});
+      [[loom::unroll]]
+      for (int group = 0; group < 6; ++group) {
+        auto group_relative = loom::index::scale(loom::index::cast(group), loomt::offset{295936});
+        auto group_base = layer_base + group_relative;
+        fill_weights(projection0, group_base, loomt::index{16}, weight_ingress0.short_group);
+        fill_weights(projection1, group_base, loomt::index{16}, weight_ingress1.short_group);
+        fill_weights(projection2, group_base, loomt::index{16}, weight_ingress2.short_group);
+        fill_weights(projection3, group_base, loomt::index{16}, weight_ingress3.short_group);
+        fill_weights(projection4, group_base, loomt::index{16}, weight_ingress4.short_group);
+        fill_weights(projection5, group_base, loomt::index{16}, weight_ingress5.short_group);
+        fill_weights(projection6, group_base, loomt::index{16}, weight_ingress6.short_group);
+        fill_weights(projection7, group_base, loomt::index{16}, weight_ingress7.short_group);
+        wait_for_phase(phase_complete);
+      }
+      auto down_base = layer_base + loomt::offset{1775616};
+      fill_weights(projection0, down_base, loomt::index{24}, weight_ingress0.down_group);
+      fill_weights(projection1, down_base, loomt::index{24}, weight_ingress1.down_group);
+      fill_weights(projection2, down_base, loomt::index{24}, weight_ingress2.down_group);
+      fill_weights(projection3, down_base, loomt::index{24}, weight_ingress3.down_group);
+      fill_weights(projection4, down_base, loomt::index{24}, weight_ingress4.down_group);
+      fill_weights(projection5, down_base, loomt::index{24}, weight_ingress5.down_group);
+      fill_weights(projection6, down_base, loomt::index{24}, weight_ingress6.down_group);
+      fill_weights(projection7, down_base, loomt::index{24}, weight_ingress7.down_group);
+      wait_for_phase(phase_complete);
     }
   }
   [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_1 = 0; record_1 < 3360; ++record_1) {
-      auto acquisition = loom::channel::acquire(weight_ingress0);
-      auto fanout = loom::channel::fanout<4>(acquisition.read);
-      auto reservation_2 = loom::channel::reserve(streams0.weights);
-      loom::channel::copy(fanout.first, reservation_2.write);
-      auto reservation_3 = loom::channel::reserve(streams1.weights);
-      loom::channel::copy(fanout.remaining.first, reservation_3.write);
-      auto reservation_4 = loom::channel::reserve(streams2.weights);
-      loom::channel::copy(fanout.remaining.remaining.first, reservation_4.write);
-      auto reservation_5 = loom::channel::reserve(streams3.weights);
-      loom::channel::copy(fanout.remaining.remaining.second, reservation_5.write);
-    }
+    replay_projection_layers(weight_ingress0, streams0.weights, streams1.weights, streams2.weights, streams3.weights);
   }
   [[loom::strand(loomt::indices{loomt::index{1}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_2 = 0; record_2 < 3360; ++record_2) {
-      loomt::offset relative_1 = loom::index::scale(loom::index::cast(record_2), loomt::offset{18496});
-      loomt::offset offset_1 = loomt::offset{0} + relative_1;
-      auto external_1 = loom::buffer::view<4624>(loom::buffer::cast<const unsigned>(projection1), offset_1, {});
-      auto reservation_6 = loom::channel::reserve(weight_ingress1);
-      auto ingress_copy_1 = loom::kernel::async::copy<loom::kernel::async::direction::global_to_workgroup, loom::cache::scope::workgroup, loom::cache::temporal::regular>(external_1, reservation_6.payload);
-      auto ingress_copy_group_1 = loom::kernel::async::group(ingress_copy_1);
-      loom::kernel::async::wait<0>(ingress_copy_group_1);
-      loom::channel::publish(reservation_6.write);
-    }
-  }
-  [[loom::strand(loomt::indices{loomt::index{1}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_3 = 0; record_3 < 3360; ++record_3) {
-      auto acquisition_2 = loom::channel::acquire(weight_ingress1);
-      auto fanout_2 = loom::channel::fanout<4>(acquisition_2.read);
-      auto reservation_7 = loom::channel::reserve(streams4.weights);
-      loom::channel::copy(fanout_2.first, reservation_7.write);
-      auto reservation_8 = loom::channel::reserve(streams5.weights);
-      loom::channel::copy(fanout_2.remaining.first, reservation_8.write);
-      auto reservation_9 = loom::channel::reserve(streams6.weights);
-      loom::channel::copy(fanout_2.remaining.remaining.first, reservation_9.write);
-      auto reservation_10 = loom::channel::reserve(streams7.weights);
-      loom::channel::copy(fanout_2.remaining.remaining.second, reservation_10.write);
-    }
+    replay_projection_layers(weight_ingress1, streams4.weights, streams5.weights, streams6.weights, streams7.weights);
   }
   [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_4 = 0; record_4 < 3360; ++record_4) {
-      loomt::offset relative_2 = loom::index::scale(loom::index::cast(record_4), loomt::offset{18496});
-      loomt::offset offset_2 = loomt::offset{0} + relative_2;
-      auto external_2 = loom::buffer::view<4624>(loom::buffer::cast<const unsigned>(projection2), offset_2, {});
-      auto reservation_11 = loom::channel::reserve(weight_ingress2);
-      auto ingress_copy_2 = loom::kernel::async::copy<loom::kernel::async::direction::global_to_workgroup, loom::cache::scope::workgroup, loom::cache::temporal::regular>(external_2, reservation_11.payload);
-      auto ingress_copy_group_2 = loom::kernel::async::group(ingress_copy_2);
-      loom::kernel::async::wait<0>(ingress_copy_group_2);
-      loom::channel::publish(reservation_11.write);
-    }
-  }
-  [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_5 = 0; record_5 < 3360; ++record_5) {
-      auto acquisition_3 = loom::channel::acquire(weight_ingress2);
-      auto fanout_3 = loom::channel::fanout<4>(acquisition_3.read);
-      auto reservation_12 = loom::channel::reserve(streams8.weights);
-      loom::channel::copy(fanout_3.first, reservation_12.write);
-      auto reservation_13 = loom::channel::reserve(streams9.weights);
-      loom::channel::copy(fanout_3.remaining.first, reservation_13.write);
-      auto reservation_14 = loom::channel::reserve(streams10.weights);
-      loom::channel::copy(fanout_3.remaining.remaining.first, reservation_14.write);
-      auto reservation_15 = loom::channel::reserve(streams11.weights);
-      loom::channel::copy(fanout_3.remaining.remaining.second, reservation_15.write);
-    }
+    replay_projection_layers(weight_ingress2, streams8.weights, streams9.weights, streams10.weights, streams11.weights);
   }
   [[loom::strand(loomt::indices{loomt::index{3}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_6 = 0; record_6 < 3360; ++record_6) {
-      loomt::offset relative_3 = loom::index::scale(loom::index::cast(record_6), loomt::offset{18496});
-      loomt::offset offset_3 = loomt::offset{0} + relative_3;
-      auto external_3 = loom::buffer::view<4624>(loom::buffer::cast<const unsigned>(projection3), offset_3, {});
-      auto reservation_16 = loom::channel::reserve(weight_ingress3);
-      auto ingress_copy_3 = loom::kernel::async::copy<loom::kernel::async::direction::global_to_workgroup, loom::cache::scope::workgroup, loom::cache::temporal::regular>(external_3, reservation_16.payload);
-      auto ingress_copy_group_3 = loom::kernel::async::group(ingress_copy_3);
-      loom::kernel::async::wait<0>(ingress_copy_group_3);
-      loom::channel::publish(reservation_16.write);
-    }
-  }
-  [[loom::strand(loomt::indices{loomt::index{3}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_7 = 0; record_7 < 3360; ++record_7) {
-      auto acquisition_4 = loom::channel::acquire(weight_ingress3);
-      auto fanout_4 = loom::channel::fanout<4>(acquisition_4.read);
-      auto reservation_17 = loom::channel::reserve(streams12.weights);
-      loom::channel::copy(fanout_4.first, reservation_17.write);
-      auto reservation_18 = loom::channel::reserve(streams13.weights);
-      loom::channel::copy(fanout_4.remaining.first, reservation_18.write);
-      auto reservation_19 = loom::channel::reserve(streams14.weights);
-      loom::channel::copy(fanout_4.remaining.remaining.first, reservation_19.write);
-      auto reservation_20 = loom::channel::reserve(streams15.weights);
-      loom::channel::copy(fanout_4.remaining.remaining.second, reservation_20.write);
-    }
+    replay_projection_layers(weight_ingress3, streams12.weights, streams13.weights, streams14.weights, streams15.weights);
   }
   [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_8 = 0; record_8 < 3360; ++record_8) {
-      loomt::offset relative_4 = loom::index::scale(loom::index::cast(record_8), loomt::offset{18496});
-      loomt::offset offset_4 = loomt::offset{0} + relative_4;
-      auto external_4 = loom::buffer::view<4624>(loom::buffer::cast<const unsigned>(projection4), offset_4, {});
-      auto reservation_21 = loom::channel::reserve(weight_ingress4);
-      auto ingress_copy_4 = loom::kernel::async::copy<loom::kernel::async::direction::global_to_workgroup, loom::cache::scope::workgroup, loom::cache::temporal::regular>(external_4, reservation_21.payload);
-      auto ingress_copy_group_4 = loom::kernel::async::group(ingress_copy_4);
-      loom::kernel::async::wait<0>(ingress_copy_group_4);
-      loom::channel::publish(reservation_21.write);
-    }
-  }
-  [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_9 = 0; record_9 < 3360; ++record_9) {
-      auto acquisition_5 = loom::channel::acquire(weight_ingress4);
-      auto fanout_5 = loom::channel::fanout<4>(acquisition_5.read);
-      auto reservation_22 = loom::channel::reserve(streams16.weights);
-      loom::channel::copy(fanout_5.first, reservation_22.write);
-      auto reservation_23 = loom::channel::reserve(streams17.weights);
-      loom::channel::copy(fanout_5.remaining.first, reservation_23.write);
-      auto reservation_24 = loom::channel::reserve(streams18.weights);
-      loom::channel::copy(fanout_5.remaining.remaining.first, reservation_24.write);
-      auto reservation_25 = loom::channel::reserve(streams19.weights);
-      loom::channel::copy(fanout_5.remaining.remaining.second, reservation_25.write);
-    }
+    replay_projection_layers(weight_ingress4, streams16.weights, streams17.weights, streams18.weights, streams19.weights);
   }
   [[loom::strand(loomt::indices{loomt::index{5}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_10 = 0; record_10 < 3360; ++record_10) {
-      loomt::offset relative_5 = loom::index::scale(loom::index::cast(record_10), loomt::offset{18496});
-      loomt::offset offset_5 = loomt::offset{0} + relative_5;
-      auto external_5 = loom::buffer::view<4624>(loom::buffer::cast<const unsigned>(projection5), offset_5, {});
-      auto reservation_26 = loom::channel::reserve(weight_ingress5);
-      auto ingress_copy_5 = loom::kernel::async::copy<loom::kernel::async::direction::global_to_workgroup, loom::cache::scope::workgroup, loom::cache::temporal::regular>(external_5, reservation_26.payload);
-      auto ingress_copy_group_5 = loom::kernel::async::group(ingress_copy_5);
-      loom::kernel::async::wait<0>(ingress_copy_group_5);
-      loom::channel::publish(reservation_26.write);
-    }
-  }
-  [[loom::strand(loomt::indices{loomt::index{5}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_11 = 0; record_11 < 3360; ++record_11) {
-      auto acquisition_6 = loom::channel::acquire(weight_ingress5);
-      auto fanout_6 = loom::channel::fanout<4>(acquisition_6.read);
-      auto reservation_27 = loom::channel::reserve(streams20.weights);
-      loom::channel::copy(fanout_6.first, reservation_27.write);
-      auto reservation_28 = loom::channel::reserve(streams21.weights);
-      loom::channel::copy(fanout_6.remaining.first, reservation_28.write);
-      auto reservation_29 = loom::channel::reserve(streams22.weights);
-      loom::channel::copy(fanout_6.remaining.remaining.first, reservation_29.write);
-      auto reservation_30 = loom::channel::reserve(streams23.weights);
-      loom::channel::copy(fanout_6.remaining.remaining.second, reservation_30.write);
-    }
+    replay_projection_layers(weight_ingress5, streams20.weights, streams21.weights, streams22.weights, streams23.weights);
   }
   [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_12 = 0; record_12 < 3360; ++record_12) {
-      loomt::offset relative_6 = loom::index::scale(loom::index::cast(record_12), loomt::offset{18496});
-      loomt::offset offset_6 = loomt::offset{0} + relative_6;
-      auto external_6 = loom::buffer::view<4624>(loom::buffer::cast<const unsigned>(projection6), offset_6, {});
-      auto reservation_31 = loom::channel::reserve(weight_ingress6);
-      auto ingress_copy_6 = loom::kernel::async::copy<loom::kernel::async::direction::global_to_workgroup, loom::cache::scope::workgroup, loom::cache::temporal::regular>(external_6, reservation_31.payload);
-      auto ingress_copy_group_6 = loom::kernel::async::group(ingress_copy_6);
-      loom::kernel::async::wait<0>(ingress_copy_group_6);
-      loom::channel::publish(reservation_31.write);
-    }
-  }
-  [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_13 = 0; record_13 < 3360; ++record_13) {
-      auto acquisition_7 = loom::channel::acquire(weight_ingress6);
-      auto fanout_7 = loom::channel::fanout<4>(acquisition_7.read);
-      auto reservation_32 = loom::channel::reserve(streams24.weights);
-      loom::channel::copy(fanout_7.first, reservation_32.write);
-      auto reservation_33 = loom::channel::reserve(streams25.weights);
-      loom::channel::copy(fanout_7.remaining.first, reservation_33.write);
-      auto reservation_34 = loom::channel::reserve(streams26.weights);
-      loom::channel::copy(fanout_7.remaining.remaining.first, reservation_34.write);
-      auto reservation_35 = loom::channel::reserve(streams27.weights);
-      loom::channel::copy(fanout_7.remaining.remaining.second, reservation_35.write);
-    }
+    replay_projection_layers(weight_ingress6, streams24.weights, streams25.weights, streams26.weights, streams27.weights);
   }
   [[loom::strand(loomt::indices{loomt::index{7}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_14 = 0; record_14 < 3360; ++record_14) {
-      loomt::offset relative_7 = loom::index::scale(loom::index::cast(record_14), loomt::offset{18496});
-      loomt::offset offset_7 = loomt::offset{0} + relative_7;
-      auto external_7 = loom::buffer::view<4624>(loom::buffer::cast<const unsigned>(projection7), offset_7, {});
-      auto reservation_36 = loom::channel::reserve(weight_ingress7);
-      auto ingress_copy_7 = loom::kernel::async::copy<loom::kernel::async::direction::global_to_workgroup, loom::cache::scope::workgroup, loom::cache::temporal::regular>(external_7, reservation_36.payload);
-      auto ingress_copy_group_7 = loom::kernel::async::group(ingress_copy_7);
-      loom::kernel::async::wait<0>(ingress_copy_group_7);
-      loom::channel::publish(reservation_36.write);
-    }
-  }
-  [[loom::strand(loomt::indices{loomt::index{7}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_15 = 0; record_15 < 3360; ++record_15) {
-      auto acquisition_8 = loom::channel::acquire(weight_ingress7);
-      auto fanout_8 = loom::channel::fanout<4>(acquisition_8.read);
-      auto reservation_37 = loom::channel::reserve(streams28.weights);
-      loom::channel::copy(fanout_8.first, reservation_37.write);
-      auto reservation_38 = loom::channel::reserve(streams29.weights);
-      loom::channel::copy(fanout_8.remaining.first, reservation_38.write);
-      auto reservation_39 = loom::channel::reserve(streams30.weights);
-      loom::channel::copy(fanout_8.remaining.remaining.first, reservation_39.write);
-      auto reservation_40 = loom::channel::reserve(streams31.weights);
-      loom::channel::copy(fanout_8.remaining.remaining.second, reservation_40.write);
-    }
+    replay_projection_layers(weight_ingress7, streams28.weights, streams29.weights, streams30.weights, streams31.weights);
   }
   [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
     for (int record_16 = 0; record_16 < 5190; ++record_16) {
@@ -660,7 +544,7 @@ void qwen3_embedding_cohort([[loom::launch]] Bytes projection0_arg, Bytes projec
     }
   }
   [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{2}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_query_key_ingress_root(loom::buffer::root(sequence0_storage), loomt::offset{0}, loom::buffer::root(core0.storage), loomt::offset{10624}, loom::buffer::root(core1.storage), loom::buffer::root(gather_cache0), activations, streams0.activations, loomt::index{0}, loomt::index{1}, constants, embedding, state, barriers0.arrival, barriers0.departure, query_output0.stream, output, streams0.weights, loomt::offset{18816}, probability0, result0);
+    qwen3_embedding_query_key_ingress_root(loom::buffer::root(sequence0_storage), loomt::offset{0}, loom::buffer::root(core0.storage), loomt::offset{10624}, loom::buffer::root(core1.storage), loom::buffer::root(gather_cache0), activations, streams0.activations, loomt::index{0}, loomt::index{1}, constants, embedding, state, barriers0.arrival, barriers0.departure, query_output0.stream, output, streams0.weights, loomt::offset{18816}, probability0, result0, phase_complete);
   }
   [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{3}}, loomt::indices{loomt::index{1}, loomt::index{1}}, loomt::indices{loomt::index{1}, loomt::index{1}})]] {
     qwen3_embedding_probability_value(true, loom::buffer::root(dimensions1_storage), loomt::offset{0}, loom::buffer::root(core1.storage), loomt::offset{10624}, loom::buffer::root(core0.storage), streams1.activations, loomt::index{0}, loomt::index{1}, barriers1.arrival, barriers0.arrival, barriers0.departure, barriers1.departure, query_output0.stream, streams1.weights, loomt::offset{18816}, probability0, result0, loomt::index{0}, loomt::index{0}, loomt::index{0}, loomt::index{0});
