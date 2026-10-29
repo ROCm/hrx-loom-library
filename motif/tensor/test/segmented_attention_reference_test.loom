@@ -1,0 +1,106 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Dense F64 contractions and whole-segment softmax are independent of native
+// wave reductions and online updates. Each query sees only its segment and
+// head; the final value narrows directly from F64 to BF16.
+
+func.decl @reference_bf16_value(%word: i16) -> (f32)
+
+func.def @segmented_attention_reference(%parameters: buffer, %query: buffer, %key: buffer, %value: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %metadata = buffer.view %parameters[%origin] : buffer -> view<3xi32>
+  %rows_word = view.load %metadata[0] : view<3xi32> -> i32
+  %length_word = view.load %metadata[1] : view<3xi32> -> i32
+  %heads_word = view.load %metadata[2] : view<3xi32> -> i32
+  %rows_value = index.cast %rows_word : i32 to index
+  %length_value = index.cast %length_word : i32 to index
+  %heads_value = index.cast %heads_word : i32 to index
+  %rows = index.assume %rows_value [ge(%rows_value, 1), le(%rows_value, 66)] : index
+  %length = index.assume %length_value [ge(%length_value, 1), le(%length_value, 33)] : index
+  %heads = index.assume %heads_value [ge(%heads_value, 1), le(%heads_value, 20)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %channels = index.constant 128 : index
+  %width = index.mul %heads, %channels : index
+  %count = index.mul %rows, %width : index
+  %operand_tuple_bytes = index.constant 24 : offset
+  %element_bytes = index.constant 8 : offset
+  %converted_bytes = index.scale %count, %operand_tuple_bytes : index, offset -> offset
+  %converted = buffer.alloca<private> align(8) %converted_bytes : buffer
+  %queries = buffer.view %query[%origin] : buffer -> view<[%rows]x[%width]xi16>
+  %keys = buffer.view %key[%origin] : buffer -> view<[%rows]x[%width]xi16>
+  %values = buffer.view %value[%origin] : buffer -> view<[%rows]x[%width]xi16>
+  %operands = buffer.view %converted[%origin] : buffer -> view<3x[%rows]x[%width]xf64>
+  %outputs = buffer.view %output[%origin] : buffer -> view<[%rows]x[%width]xbf16>
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %column = [%c0 to %width step %c1] {
+      %query_word = view.load %queries[%row, %column] : view<[%rows]x[%width]xi16> -> i16
+      %key_word = view.load %keys[%row, %column] : view<[%rows]x[%width]xi16> -> i16
+      %value_word = view.load %values[%row, %column] : view<[%rows]x[%width]xi16> -> i16
+      %query_float = func.call @reference_bf16_value(%query_word) : (i16) -> (f32)
+      %key_float = func.call @reference_bf16_value(%key_word) : (i16) -> (f32)
+      %value_float = func.call @reference_bf16_value(%value_word) : (i16) -> (f32)
+      %query_wide = scalar.extf %query_float : f32 to f64
+      %key_wide = scalar.extf %key_float : f32 to f64
+      %value_wide = scalar.extf %value_float : f32 to f64
+      view.store %query_wide, %operands[0, %row, %column] : f64, view<3x[%rows]x[%width]xf64>
+      view.store %key_wide, %operands[1, %row, %column] : f64, view<3x[%rows]x[%width]xf64>
+      view.store %value_wide, %operands[2, %row, %column] : f64, view<3x[%rows]x[%width]xf64>
+    }
+  }
+  %scratch_bytes = index.scale %length, %element_bytes : index, offset -> offset
+  %scratch = buffer.alloca<private> align(8) %scratch_bytes : buffer
+  %weights = buffer.view %scratch[%origin] : buffer -> view<[%length]xf64>
+  %c0_f64 = scalar.constant 0.0 : f64
+  %minimum = scalar.constant -inf : f64
+  %head_width = scalar.constant 128.0 : f64
+  %scale = scalar.sqrtf %head_width : f64
+  scf.for %row = [%c0 to %rows step %c1] {
+    %segment = index.div %row, %length : index
+    %begin = index.mul %segment, %length : index
+    scf.for %head = [%c0 to %heads step %c1] {
+      %head_begin = index.mul %head, %channels : index
+      %maximum = scf.for %local = [%c0 to %length step %c1](%maximum = %minimum : f64) -> (f64) {
+        %position_value = index.add %begin, %local : index
+        %position = index.assume %position_value [ge(%position_value, 0), lt(%position_value, %rows)] : index
+        %dot = scf.for %channel = [%c0 to %channels step %c1](%sum = %c0_f64 : f64) -> (f64) {
+          %column = index.add %head_begin, %channel : index
+          %left = view.load %operands[0, %row, %column] : view<3x[%rows]x[%width]xf64> -> f64
+          %right = view.load %operands[1, %position, %column] : view<3x[%rows]x[%width]xf64> -> f64
+          %product = scalar.mulf %left, %right : f64
+          %next = scalar.addf %sum, %product : f64
+          scf.yield %next : f64
+        }
+        %score = scalar.divf %dot, %scale : f64
+        view.store %score, %weights[%local] : f64, view<[%length]xf64>
+        %next = scalar.maxnumf %maximum, %score : f64
+        scf.yield %next : f64
+      }
+      %denominator = scf.for %local = [%c0 to %length step %c1](%sum = %c0_f64 : f64) -> (f64) {
+        %score = view.load %weights[%local] : view<[%length]xf64> -> f64
+        %shifted = scalar.subf %score, %maximum : f64
+        %weight = scalar.expf %shifted : f64
+        view.store %weight, %weights[%local] : f64, view<[%length]xf64>
+        %next = scalar.addf %sum, %weight : f64
+        scf.yield %next : f64
+      }
+      scf.for %channel = [%c0 to %channels step %c1] {
+        %column = index.add %head_begin, %channel : index
+        %numerator = scf.for %local = [%c0 to %length step %c1](%sum = %c0_f64 : f64) -> (f64) {
+          %position_value = index.add %begin, %local : index
+          %position = index.assume %position_value [ge(%position_value, 0), lt(%position_value, %rows)] : index
+          %weight = view.load %weights[%local] : view<[%length]xf64> -> f64
+          %value = view.load %operands[2, %position, %column] : view<3x[%rows]x[%width]xf64> -> f64
+          %product = scalar.mulf %weight, %value : f64
+          %next = scalar.addf %sum, %product : f64
+          scf.yield %next : f64
+        }
+        %result = scalar.divf %numerator, %denominator : f64
+        %narrow = scalar.fptrunc %result : f64 to bf16
+        view.store %narrow, %outputs[%row, %column] : bf16, view<[%rows]x[%width]xbf16>
+      }
+    }
+  }
+  func.return
+}

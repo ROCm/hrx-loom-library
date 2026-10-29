@@ -131,21 +131,17 @@ whole-segment softmax, and weighted-value contraction. Twelve scenarios cover
 segment lengths 1/2/3/12/31/32/33, multiple segments and heads, incomplete
 four-wave groups, the twenty-head model layout, zero scores, signed values,
 and a large common key offset. Single-key and segment-constant values compare
-bitwise. Mutation checks require crossing segment boundaries and dropping a
-channel contribution to change an observation beyond its declared budget.
+bitwise. Distinct values across segments and a directed final-channel case
+make boundary and channel errors observable.
 
 Other outputs use an absolute accuracy budget based on the input magnitude,
 132 F32 score operations, eight online operations per segment row, and a
 `2^-16` relative allowance per approximate exponential/reciprocal stage. The
-generator states the complete expression. The relative budget
+authored inputs stay within that fixed budget. The relative budget
 `2^-7 / (1 - 2^-8)` accounts for rounding both observations to BF16. These
 requirements are fixed independently of device results. Full immutable input
 allocations and output guards compare bitwise under native, access, and race
 instrumentation; every scenario also has a benchmark declaration.
-
-```sh
-python3 -B motif/tensor/test/generate_segmented_attention_oracle.py --check
-```
 
 `linear_coordinates_test.loom` is an authored scenario with eighteen grid
 configurations and one GPU kernel. A command program specializes the grid and
