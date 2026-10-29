@@ -29,6 +29,12 @@ capacity. Only the small descriptor tables are created; represented model
 storage is never materialized. These cases and their VM benchmarks need no
 weights or device.
 
+Image and video resize geometry use authored scenarios with runtime inputs.
+Their 14 image and 10 video trials retain explicit checkpoint expectations for
+alignment, ties, budgets, aspect limits, and odd frame counts. Each family shares
+one compiled subject and benchmark; its expected dimensions are independent
+data, not a second implementation of the production resize arithmetic.
+
 `storage_records_test.loom` checks the shared record writers directly against literal
 I64 tables. Guarded, nonzero-origin subviews cover first/interior/last records,
 all four view roles, partial and full zeroing extents, empty attention views,
