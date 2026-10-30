@@ -6,7 +6,7 @@ checkpoints or reference recordings. Reordered cohorts compare with isolated
 rows while complete storage observations retain inactive residents and guards.
 Shared text and tensor motifs own their reusable arithmetic and Unicode checks.
 
-The owning test overview records independent reference provenance and numerical
+Each test file records independent reference provenance and numerical
 acceptance; scenarios own geometry and directed cases. The
 [development guide](../../../../docs/development.md#build-and-check) covers
 ordinary tests, optional instrumentation, and separate benchmark execution.
@@ -24,7 +24,7 @@ can be reused. Invalid voices, empty input, unsupported speed/instructions,
 and excessive input fail with HTTP diagnostics.
 
 The checker verifies service and lifecycle invariants. The numerical
-expressions and upstream text corpus above provide independent operation-level
+expressions and upstream text corpus provide independent operation-level
 references. Perceptual model quality requires a separate evaluation corpus.
 
 Full checks retain short PCM responses, the server log, and `result.json` only
@@ -33,11 +33,3 @@ authored acquisition lock; the [developer workflow](../README.md) explains
 their cache identity and invocation. No learned-model checkpoint is a test
 input or retained output, and valid asynchronous work has no per-request
 wall-clock deadline.
-
-The audio oracle checks every output sample, block count, trimming, and padding
-for 31 upstream cases spanning eight rates and one, two, or six channels. The
-expected arrays come from Pocket revision ec569b2, SciPy 1.18.1 `resample_poly`,
-and Torch 2.9.1 `end_on_pause`, with a 2e-6 absolute sample tolerance. Rotary
-initialization checks both planes and all 32 frequencies at 24 positions across
-the default 4096-position capacity against an independent F32-rounding/libm
-oracle, within 1.2e-7 absolute error. These fixtures contain synthetic data only.
