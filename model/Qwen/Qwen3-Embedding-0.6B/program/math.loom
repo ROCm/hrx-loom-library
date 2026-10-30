@@ -1,0 +1,79 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// The parameter policy computes one immutable SiLU record and four rotary
+// records before activation. All records contain BF16 values, with explicit
+// F32 round points matching the lookup consumers. SiLU covers both signs of
+// BF16 inputs from 2^-8 through 128; unused lookup entries are zero. Rotary
+// rows contain 64 cosine values followed by 64 sine values for each position.
+
+func.def public @qwen3_embedding.prepare_math() -> (buffer) {
+  %origin = index.constant 0 : offset
+  %bytes = index.constant 40960 : offset
+  %output = buffer.alloca<private> align(64) %bytes : buffer
+  %silu = buffer.view %output[%origin] : buffer -> view<4096xbf16>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %silu_count = index.constant 4096 : index
+  %positive_count = index.constant 1921 : index
+  %negative_base = index.constant 2048 : index
+  %padding = scalar.constant 0.0 : bf16
+  scf.for %i = [%c0 to %silu_count step %c1] {
+    view.store %padding, %silu[%i] : bf16, view<4096xbf16>
+  }
+  %c1_f64 = scalar.constant 1.0 : f64
+  %first_word = scalar.constant 15232 : i32
+  %shift = scalar.constant 16 : i32
+  scf.for %i = [%c0 to %positive_count step %c1] {
+    %ordinal = index.cast %i : index to i32
+    %word = scalar.addi %first_word, %ordinal : i32
+    %bits = scalar.shli %word, %shift : i32
+    %value32 = scalar.bitcast %bits : i32 to f32
+    %value = scalar.extf %value32 : f32 to f64
+    %negative = scalar.negf %value : f64
+    %exponential = scalar.expf %negative : f64
+    %denominator = scalar.addf %c1_f64, %exponential : f64
+    %positive_value = scalar.divf %value, %denominator : f64
+    %negative_product = scalar.mulf %negative, %exponential : f64
+    %negative_value = scalar.divf %negative_product, %denominator : f64
+    %positive32 = scalar.fptrunc %positive_value : f64 to f32
+    %negative32 = scalar.fptrunc %negative_value : f64 to f32
+    %positive16 = scalar.fptrunc %positive32 : f32 to bf16
+    %negative16 = scalar.fptrunc %negative32 : f32 to bf16
+    %negative_index = index.add %negative_base, %i : index
+    view.store %positive16, %silu[%i] : bf16, view<4096xbf16>
+    view.store %negative16, %silu[%negative_index] : bf16, view<4096xbf16>
+  }
+  %rotary_origin = index.constant 8192 : offset
+  %rotary = buffer.view %output[%rotary_origin] : buffer -> view<128x128xbf16>
+  %columns = index.constant 64 : index
+  %positions = index.constant 128 : index
+  %base = scalar.constant 1000000.0 : f64
+  %width = scalar.constant 64.0 : f64
+  scf.for %channel = [%c0 to %columns step %c1] {
+    %channel64 = index.cast %channel : index to i64
+    %channel_value = scalar.uitofp %channel64 : i64 to f64
+    %exponent = scalar.divf %channel_value, %width : f64
+    %power = scalar.powf %base, %exponent : f64
+    %power32 = scalar.fptrunc %power : f64 to f32
+    %rounded_power = scalar.extf %power32 : f32 to f64
+    %reciprocal = scalar.divf %c1_f64, %rounded_power : f64
+    %frequency = scalar.fptrunc %reciprocal : f64 to f32
+    %sine_channel = index.add %channel, %columns : index
+    scf.for %position = [%c0 to %positions step %c1] {
+      %position64 = index.cast %position : index to i64
+      %position_value = scalar.uitofp %position64 : i64 to f32
+      %angle32 = scalar.mulf %position_value, %frequency : f32
+      %angle = scalar.extf %angle32 : f32 to f64
+      %cosine = scalar.cosf %angle : f64
+      %sine = scalar.sinf %angle : f64
+      %cosine32 = scalar.fptrunc %cosine : f64 to f32
+      %sine32 = scalar.fptrunc %sine : f64 to f32
+      %cosine16 = scalar.fptrunc %cosine32 : f32 to bf16
+      %sine16 = scalar.fptrunc %sine32 : f32 to bf16
+      view.store %cosine16, %rotary[%position, %channel] : bf16, view<128x128xbf16>
+      view.store %sine16, %rotary[%position, %sine_channel] : bf16, view<128x128xbf16>
+    }
+  }
+  func.return %output : buffer
+}
