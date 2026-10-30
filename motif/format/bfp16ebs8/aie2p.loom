@@ -19,7 +19,9 @@
 
 target.decl @bfp16ebs8.core
 
-low.func.def inline target<amd.xdna.aie2p.core>(@bfp16ebs8.core) @pack_bf16_native(%storage: reg<aie2p.ep>, %input_offset: reg<aie2p.er>, %output_offset: reg<aie2p.er>, %count: reg<aie2p.er>) asm {
+// The count contains complete groups of four 64-element blocks. The caller
+// continues any remaining blocks with the returned source and FIFO state.
+low.func.def inline target<amd.xdna.aie2p.core>(@bfp16ebs8.core) @pack_bf16_groups_native(%storage: reg<aie2p.ep>, %input_offset: reg<aie2p.er>, %output_offset: reg<aie2p.er>, %count: reg<aie2p.er>) -> (reg<aie2p.ep>, reg<aie2p.mpfs>, reg<aie2p.mstfifo>, reg<aie2p.mr26_fifo_st>) asm {
   %input_storage = copy %storage : reg<aie2p.ep> -> reg<aie2p.ep>
   %input_modifier = mov.modifier %input_offset
   %input = padda.modifier %input_storage, %input_modifier
@@ -30,32 +32,72 @@ low.func.def inline target<amd.xdna.aie2p.core>(@bfp16ebs8.core) @pack_bf16_nati
   %low = vlda.store-fifo.low512 %output, 0
   %fifo = vlda.store-fifo.high512 %output, %low, 64
   %position = mova.fifo.store.position 0
-  %zero = mov.short 0
-  %one = mov.short 1
-  %step = mov.i32 128
   set.rounding 12
-  low.br ^pack(%zero: reg<aie2p.er>, %input: reg<aie2p.ep>, %pointer: reg<aie2p.mpfs>, %fifo: reg<aie2p.mstfifo>, %position: reg<aie2p.mr26_fifo_st>)
-^pack(%index: reg<aie2p.er>, %source: reg<aie2p.ep>, %destination: reg<aie2p.mpfs>, %state: reg<aie2p.mstfifo>, %offset: reg<aie2p.mr26_fifo_st>):
-  %condition = lt %index, %count
-  low.cond_br %condition, ^update, ^finish : reg<aie2p.er>
+  low.br ^pack(%count: reg<aie2p.er>, %input: reg<aie2p.ep>, %pointer: reg<aie2p.mpfs>, %fifo: reg<aie2p.mstfifo>, %position: reg<aie2p.mr26_fifo_st>)
+^pack(%remaining: reg<aie2p.er>, %source: reg<aie2p.ep>, %destination: reg<aie2p.mpfs>, %state: reg<aie2p.mstfifo>, %offset: reg<aie2p.mr26_fifo_st>):
+  low.cond_br %remaining, ^update, ^finish : reg<aie2p.er>
 ^update:
-  %lower = vlda.convert.bf16x32.to.f32x32 %source, 0
-  %upper = vlda.convert.bf16x32.to.f32x32 %source, 64
-  %values = concat(%lower, %upper) : (reg<aie2p.mbms x2>, reg<aie2p.mbms x2>) -> reg<aie2p.mbms x4>
-  %pushed, %next_destination, %next_offset = vst.push.bfp16ebs8.from.fp32 %state, %values, %destination, %offset
-  %flushed, %final_destination, %final_offset = vst.flush.convert.512 %pushed, %next_destination, %next_offset
-  %base = mov.address-to-scalar %source
-  %next_address = add.rr %base, %step
-  %next_source = mov.scalar-to-address %next_address
-  %next_index = add.rr %index, %one
-  low.br ^pack(%next_index: reg<aie2p.er>, %next_source: reg<aie2p.ep>, %final_destination: reg<aie2p.mpfs>, %flushed: reg<aie2p.mstfifo>, %final_offset: reg<aie2p.mr26_fifo_st>)
+  %lower_first_lower = vlda.convert.bf16x32.to.f32x32 %source, 0
+  %lower_first_upper = vlda.convert.bf16x32.to.f32x32 %source, 64
+  %lower_first = concat(%lower_first_lower, %lower_first_upper) : (reg<aie2p.mbms x2>, reg<aie2p.mbms x2>) -> reg<aie2p.mbms x4>
+  %lower_second_source = padda %source, 128
+  %lower_second_lower = vlda.convert.bf16x32.to.f32x32 %lower_second_source, 0
+  %lower_second_upper = vlda.convert.bf16x32.to.f32x32 %lower_second_source, 64
+  %lower_second = concat(%lower_second_lower, %lower_second_upper) : (reg<aie2p.mbms x2>, reg<aie2p.mbms x2>) -> reg<aie2p.mbms x4>
+  %lower_next_source = padda %lower_second_source, 128
+  %upper_first_lower = vlda.convert.bf16x32.to.f32x32 %lower_next_source, 0
+  %upper_first_upper = vlda.convert.bf16x32.to.f32x32 %lower_next_source, 64
+  %upper_first = concat(%upper_first_lower, %upper_first_upper) : (reg<aie2p.mbms x2>, reg<aie2p.mbms x2>) -> reg<aie2p.mbms x4>
+  %upper_second_source = padda %lower_next_source, 128
+  %upper_second_lower = vlda.convert.bf16x32.to.f32x32 %upper_second_source, 0
+  %upper_second_upper = vlda.convert.bf16x32.to.f32x32 %upper_second_source, 64
+  %upper_second = concat(%upper_second_lower, %upper_second_upper) : (reg<aie2p.mbms x2>, reg<aie2p.mbms x2>) -> reg<aie2p.mbms x4>
+  %upper_next_source = padda %upper_second_source, 128
+  %lower_pair_first_pushed, %lower_pair_middle_pointer, %lower_pair_middle_position = vst.push.bfp16ebs8.from.fp32 %state, %lower_first, %destination, %offset
+  %lower_pair_first_flushed, %lower_pair_first_pointer, %lower_pair_first_position = vst.flush.convert.512 %lower_pair_first_pushed, %lower_pair_middle_pointer, %lower_pair_middle_position
+  %lower_pair_second_pushed, %lower_pair_final_pointer, %lower_pair_final_position = vst.push.bfp16ebs8.from.fp32 %lower_pair_first_flushed, %lower_second, %lower_pair_first_pointer, %lower_pair_first_position
+  %lower_pair_second_flushed, %lower_pair_output_pointer, %lower_pair_output_position = vst.flush.convert.512 %lower_pair_second_pushed, %lower_pair_final_pointer, %lower_pair_final_position
+  %upper_pair_first_pushed, %upper_pair_middle_pointer, %upper_pair_middle_position = vst.push.bfp16ebs8.from.fp32 %lower_pair_second_flushed, %upper_first, %lower_pair_output_pointer, %lower_pair_output_position
+  %upper_pair_first_flushed, %upper_pair_first_pointer, %upper_pair_first_position = vst.flush.convert.512 %upper_pair_first_pushed, %upper_pair_middle_pointer, %upper_pair_middle_position
+  %upper_pair_second_pushed, %upper_pair_final_pointer, %upper_pair_final_position = vst.push.bfp16ebs8.from.fp32 %upper_pair_first_flushed, %upper_second, %upper_pair_first_pointer, %upper_pair_first_position
+  %upper_pair_second_flushed, %upper_pair_output_pointer, %upper_pair_output_position = vst.flush.convert.512 %upper_pair_second_pushed, %upper_pair_final_pointer, %upper_pair_final_position
+  %next_remaining = add.nc.immediate %remaining, -4
+  low.br ^pack(%next_remaining: reg<aie2p.er>, %upper_next_source: reg<aie2p.ep>, %upper_pair_output_pointer: reg<aie2p.mpfs>, %upper_pair_second_flushed: reg<aie2p.mstfifo>, %upper_pair_output_position: reg<aie2p.mr26_fifo_st>)
+^finish:
+  return %source, %destination, %state, %offset
+}
+
+low.func.def inline target<amd.xdna.aie2p.core>(@bfp16ebs8.core) @pack_bf16_tail_native(%input: reg<aie2p.ep>, %pointer: reg<aie2p.mpfs>, %fifo: reg<aie2p.mstfifo>, %position: reg<aie2p.mr26_fifo_st>, %count: reg<aie2p.er>) asm {
+  low.br ^tail(%count: reg<aie2p.er>, %input: reg<aie2p.ep>, %pointer: reg<aie2p.mpfs>, %fifo: reg<aie2p.mstfifo>, %position: reg<aie2p.mr26_fifo_st>)
+^tail(%tail_remaining: reg<aie2p.er>, %tail_source: reg<aie2p.ep>, %tail_destination: reg<aie2p.mpfs>, %tail_state: reg<aie2p.mstfifo>, %tail_offset: reg<aie2p.mr26_fifo_st>):
+  low.cond_br %tail_remaining, ^tail_update, ^finish : reg<aie2p.er>
+^tail_update:
+  %tail_lower = vlda.convert.bf16x32.to.f32x32 %tail_source, 0
+  %tail_upper = vlda.convert.bf16x32.to.f32x32 %tail_source, 64
+  %tail_values = concat(%tail_lower, %tail_upper) : (reg<aie2p.mbms x2>, reg<aie2p.mbms x2>) -> reg<aie2p.mbms x4>
+  %tail_pushed, %tail_next_destination, %tail_next_offset = vst.push.bfp16ebs8.from.fp32 %tail_state, %tail_values, %tail_destination, %tail_offset
+  %tail_flushed, %tail_final_destination, %tail_final_offset = vst.flush.convert.512 %tail_pushed, %tail_next_destination, %tail_next_offset
+  %tail_next_source = padda %tail_source, 128
+  %tail_next_remaining = add.nc.immediate %tail_remaining, -1
+  low.br ^tail(%tail_next_remaining: reg<aie2p.er>, %tail_next_source: reg<aie2p.ep>, %tail_final_destination: reg<aie2p.mpfs>, %tail_flushed: reg<aie2p.mstfifo>, %tail_final_offset: reg<aie2p.mr26_fifo_st>)
 ^finish:
   return
 }
 
 // Write the leading representation, retaining the caller's surrounding bytes.
+// Source-level remainder selection removes unused tail code for complete groups.
+// The state triple stays paired so partial 72-byte records share the same FIFO.
 func.def public inline @bfp16ebs8.pack_bf16_aie2p(%storage: buffer, %input: offset, %output: offset, %count: i32) {
-  low.invoke @pack_bf16_native(%storage, %input, %output, %count) : (buffer, offset, offset, i32)
+  %group_mask = scalar.constant -4 : i32
+  %tail_mask = scalar.constant 3 : i32
+  %zero = scalar.constant 0 : i32
+  %complete_count = scalar.andi %count, %group_mask : i32
+  %tail_count = scalar.andi %count, %tail_mask : i32
+  %source, %pointer, %fifo, %position = low.invoke @pack_bf16_groups_native(%storage, %input, %output, %complete_count) : (buffer, offset, offset, i32) -> (buffer, aie2p.store_fifo.pointer, aie2p.store_fifo, aie2p.store_fifo.position)
+  %has_tail = scalar.cmpi ne, %tail_count, %zero : i32
+  scf.if %has_tail {
+    low.invoke @pack_bf16_tail_native(%source, %pointer, %fifo, %position, %tail_count) : (buffer, aie2p.store_fifo.pointer, aie2p.store_fifo, aie2p.store_fifo.position, i32)
+  }
   func.return
 }
 
