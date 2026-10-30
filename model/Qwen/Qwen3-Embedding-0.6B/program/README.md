@@ -14,8 +14,9 @@ The command passes ten independently placed parameter views to the array:
 eight projection columns, normalization/constants, and original embedding rows.
 It allocates mutable cohort state separately. The compiler owns placement;
 worker code uses offsets only within its explicit parameter view.
-`constants.loom` copies learned normalization vectors and supplies mathematical
-SiLU/rotary lookup tables embedded in the program. `targets.loom` binds the
+`math.loom` computes SiLU/rotary lookup tables once during parameter preparation.
+The policy retains those bytes alongside checkpoint ranges, and `constants.loom`
+packs them with the learned normalization vectors. `targets.loom` binds the
 same NPU target for initialization and inference.
 
 Request preparation accepts text or explicit token IDs and chooses an output

@@ -1,0 +1,122 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// SiLU is checked with the direct signed logistic expression, including the
+// unused lookup slots. Rotary rows are checked against repeated complex
+// rotations at the ideal binary64 frequency, independently of the initializer's
+// rounded per-position angles. The absolute bound covers BF16 rounding plus
+// the F32 frequency/angle round points. An exact sample pins the one BF16
+// value that differs from evaluating the ideal binary64 expression directly.
+
+func.decl @qwen3_embedding.prepare_math() -> (buffer)
+
+func.def @silu_mismatches(%data: buffer) -> (i32) {
+  %origin = index.constant 0 : offset
+  %values = buffer.view %data[%origin] : buffer -> view<4096xbf16>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %count = index.constant 4096 : index
+  %bank_size = index.constant 2048 : index
+  %active = index.constant 1921 : index
+  %first_word = scalar.constant 15232 : i32
+  %shift = scalar.constant 16 : i32
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_f64 = scalar.constant 1.0 : f64
+  %padding = scalar.constant 0.0 : bf16
+  %mismatches = scf.for %i = [%c0 to %count step %c1](%prior = %c0_i32 : i32) -> (i32) {
+    %slot = index.rem %i, %bank_size : index
+    %populated = index.cmp ult, %slot, %active : index
+    %expected = scf.if %populated -> (bf16) {
+      %ordinal = index.cast %slot : index to i32
+      %word = scalar.addi %first_word, %ordinal : i32
+      %bits = scalar.shli %word, %shift : i32
+      %positive32 = scalar.bitcast %bits : i32 to f32
+      %positive = scalar.extf %positive32 : f32 to f64
+      %negative = scalar.negf %positive : f64
+      %signed = index.cmp uge, %i, %bank_size : index
+      %input = scf.select %signed, %negative, %positive : f64
+      %exponent = scalar.negf %input : f64
+      %exp = scalar.expf %exponent : f64
+      %denominator = scalar.addf %c1_f64, %exp : f64
+      %reference = scalar.divf %input, %denominator : f64
+      %rounded = scalar.fptrunc %reference : f64 to f32
+      %result = scalar.fptrunc %rounded : f32 to bf16
+      scf.yield %result : bf16
+    } else {
+      scf.yield %padding : bf16
+    }
+    %actual = view.load %values[%i] : view<4096xbf16> -> bf16
+    %actual_bits = scalar.bitcast %actual : bf16 to i16
+    %expected_bits = scalar.bitcast %expected : bf16 to i16
+    %different = scalar.cmpi ne, %actual_bits, %expected_bits : i16
+    %increment = scalar.extui %different : i1 to i32
+    %next = scalar.addi %prior, %increment : i32
+    scf.yield %next : i32
+  }
+  func.return %mismatches : i32
+}
+
+func.def @rotary_error(%data: buffer) -> (f64) {
+  %origin = index.constant 8192 : offset
+  %values = buffer.view %data[%origin] : buffer -> view<128x128xbf16>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %channels = index.constant 64 : index
+  %positions = index.constant 128 : index
+  %base = scalar.constant 1000000.0 : f64
+  %width = scalar.constant -64.0 : f64
+  %c0_f64 = scalar.constant 0.0 : f64
+  %c1_f64 = scalar.constant 1.0 : f64
+  %maximum = scf.for %channel = [%c0 to %channels step %c1](%prior = %c0_f64 : f64) -> (f64) {
+    %ordinal = index.cast %channel : index to i64
+    %numerator = scalar.uitofp %ordinal : i64 to f64
+    %exponent = scalar.divf %numerator, %width : f64
+    %frequency = scalar.powf %base, %exponent : f64
+    %step_cosine = scalar.cosf %frequency : f64
+    %step_sine = scalar.sinf %frequency : f64
+    %sine_channel = index.add %channel, %channels : index
+    %unused_cosine, %unused_sine, %error = scf.for %position = [%c0 to %positions step %c1](%cosine = %c1_f64 : f64, %sine = %c0_f64 : f64, %error = %prior : f64) -> (f64, f64, f64) {
+      %stored_cosine = view.load %values[%position, %channel] : view<128x128xbf16> -> bf16
+      %stored_sine = view.load %values[%position, %sine_channel] : view<128x128xbf16> -> bf16
+      %actual_cosine = scalar.extf %stored_cosine : bf16 to f64
+      %actual_sine = scalar.extf %stored_sine : bf16 to f64
+      %delta_cosine = scalar.subf %actual_cosine, %cosine : f64
+      %delta_sine = scalar.subf %actual_sine, %sine : f64
+      %cosine_error = scalar.absf %delta_cosine : f64
+      %sine_error = scalar.absf %delta_sine : f64
+      %component_error = scalar.maximumf %cosine_error, %sine_error : f64
+      %next_error = scalar.maximumf %error, %component_error : f64
+      %cc = scalar.mulf %cosine, %step_cosine : f64
+      %ss = scalar.mulf %sine, %step_sine : f64
+      %sc = scalar.mulf %sine, %step_cosine : f64
+      %cs = scalar.mulf %cosine, %step_sine : f64
+      %next_cosine = scalar.subf %cc, %ss : f64
+      %next_sine = scalar.addf %sc, %cs : f64
+      scf.yield %next_cosine, %next_sine, %next_error : f64, f64, f64
+    }
+    scf.yield %error : f64
+  }
+  func.return %maximum : f64
+}
+
+func.def @rounded_cosine(%data: buffer) -> (i16) {
+  %origin = index.constant 8192 : offset
+  %values = buffer.view %data[%origin] : buffer -> view<128x128xbf16>
+  %value = view.load %values[64, 7] : view<128x128xbf16> -> bf16
+  %bits = scalar.bitcast %value : bf16 to i16
+  func.return %bits : i16
+}
+
+check.case @mathematical_initialization {
+  %data = func.call @qwen3_embedding.prepare_math() : () -> (buffer)
+  %mismatches = func.call @silu_mismatches(%data) : (buffer) -> (i32)
+  %expected = check.literal value(0) : i32
+  check.expect.equal actual(%mismatches) expected(%expected) : i32
+  %error = func.call @rotary_error(%data) : (buffer) -> (f64)
+  %exact = check.literal value(0.0) : f64
+  check.expect.approximate actual(%error) expected(%exact) atol(0.002) rtol(0.0) nan(different) : f64, f64
+  %rounded = func.call @rounded_cosine(%data) : (buffer) -> (i16)
+  %cosine_bits = check.literal value(15463) : i16
+  check.expect.equal actual(%rounded) expected(%cosine_bits) : i16
+  check.return
+}
