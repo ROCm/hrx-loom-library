@@ -24,6 +24,25 @@ class BazelTool:
     sha256: str
 
 
+def runfiles_sha256(label: str, execution_root: Path, files: dict) -> str:
+    """Hashes declared runtime files by logical path and content."""
+    identity = []
+    for name, (filename, is_symlink) in sorted(files.items()):
+        path = execution_root / filename
+        # Unresolved symlinks (such as a Python venv interpreter) are relative
+        # to their runfiles layout, not their location in the execution root.
+        # Their target bytes are declared separately in the same closure.
+        if is_symlink:
+            identity.append((name, "symlink", str(path.readlink())))
+            continue
+        if not path.is_file():
+            raise UserError(f"Bazel did not materialize {label} runtime input: {path}")
+        with path.open("rb") as source:
+            digest = hashlib.file_digest(source, "sha256").hexdigest()
+        identity.append((name, "file", digest))
+    return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+
 def resolve_tool(
     label: str, options: list[str], bazel: Callable[..., str]
 ) -> BazelTool:
@@ -45,24 +64,11 @@ def resolve_tool(
     execution_root = Path(
         bazel(["info", *options, "execution_root"], capture_output=True).strip()
     )
-    identity = []
-    for name, (filename, is_symlink) in sorted(record["files"].items()):
-        path = execution_root / filename
-        # Unresolved symlinks (such as a Python venv interpreter) are relative
-        # to their runfiles layout, not their location in the execution root.
-        # Their target bytes are declared separately in the same closure.
-        if is_symlink:
-            identity.append((name, "symlink", str(path.readlink())))
-            continue
-        if not path.is_file():
-            raise UserError(f"Bazel did not materialize {label} runtime input: {path}")
-        with path.open("rb") as source:
-            digest = hashlib.file_digest(source, "sha256").hexdigest()
-        identity.append((name, "file", digest))
+    sha256 = runfiles_sha256(label, execution_root, record["files"])
     executable = execution_root / record["executable"]
     if not executable.is_file():
         raise UserError(f"Bazel did not materialize {label} executable: {executable}")
     return BazelTool(
         path=executable,
-        sha256=hashlib.sha256(json.dumps(identity).encode()).hexdigest(),
+        sha256=sha256,
     )

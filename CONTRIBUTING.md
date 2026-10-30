@@ -78,7 +78,7 @@ The [component-authoring guide](docs/component-authoring.md) connects these
 requirements to production callers, bounded tests, and complete ownership
 changes using examples from the library.
 
-A `check.case` is an executable statement of behavior, not merely sample data. Cases cover the contracts most likely to be lost during specialization: signedness, byte and lane order, extrema, tails, non-power-of-two extents, dynamic dimensions, aliasing, and numerical tolerance. Expected values come from a transparent reference or independently established oracle.
+A `check.case` is an executable statement of behavior, not merely sample data. Cases cover the contracts most likely to be lost during specialization: signedness, byte and lane order, extrema, tails, non-power-of-two extents, dynamic dimensions, aliasing, and numerical tolerance. Expected values come from a transparent reference or independently established oracle. Arithmetic oracles live in Loom IR. Small captured observations from an independent implementation can be declared with `loom_test(data = [...])`; the complete capture for a test is limited to 32 KiB. These files are runtime inputs, not generated Loom source.
 
 Production `.loom` sources and adjacent `_test.loom` sources have separate owners. `loom_kernel_library` owns production code; `loom_test` owns cases, scenarios, benchmarks, and independent oracles, and depends on the production provider. Test sources never enter production archives or model-card file lists. A test edit changes its test module and result without invalidating models that consume the kernel. The [component guide](docs/component-authoring.md#keep-tests-out-of-production-dependencies) shows the declarations.
 
