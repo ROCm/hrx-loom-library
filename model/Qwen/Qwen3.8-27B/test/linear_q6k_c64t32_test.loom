@@ -1,0 +1,132 @@
+// The ordinary projection uses the shared scalar-byte F64 oracle. The residual
+// case uses exact dyadic inputs with a closed-form dot product, so every output
+// is checked without interpreting a full model-width matrix multiplication.
+
+kernel.decl @qwen38_linear_q6k_f16_wmma_c64t32_f32acc(%tokens: index, %inputs: index, %outputs: index) launch(%control: buffer, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_linear_q6k_f16_wmma_c64t32_f32acc_residual(%tokens: index, %inputs: index, %outputs: index) launch(%control: buffer, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @initialize_q6(%uniform: i1, %quantized: i1, %tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
+
+func.decl @q6_f32_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.def @q6_padded_reference(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %tokens = index.constant 32 : index
+  func.call @q6_f32_reference(%tokens, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+// Every activation in a row is (row - 16) / 16. All products and partial sums
+// are exactly representable in F32, including the kernel's F16 staging.
+func.def @q6_residual_rows(%input: buffer) {
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %rows = index.constant 32 : index
+  %columns = index.constant 256 : index
+  %origin = index.constant 0 : offset
+  %center = scalar.constant 16.0 : f32
+  %scale = scalar.constant 0.0625 : f32
+  %view = buffer.view %input[%origin] : buffer -> view<32x256xf32>
+  scf.for %row = [%begin to %rows step %unit] {
+    %integer = index.cast %row : index to i32
+    %floating = scalar.uitofp %integer : i32 to f32
+    %centered = scalar.subf %floating, %center : f32
+    %value = scalar.mulf %centered, %scale : f32
+    scf.for %column = [%begin to %columns step %unit] {
+      view.store %value, %view[%row, %column] : f32, view<32x256xf32>
+    }
+  }
+  func.return
+}
+
+// Low/high bytes 1 decode each 128-value half to 32 copies of
+// -15,-31,-32,-32. Unit signed scales give a block sum of -7040*d.
+// initialize_q6 varies d by channel; the input and initial residual vary by row
+// and element. This distinguishes publication coordinates and checks all 5120
+// channels while retaining the production residual ABI.
+func.def @q6_residual_reference(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %rows = index.constant 32 : index
+  %origin = index.constant 0 : offset
+  %block_bytes = index.constant 210 : offset
+  %factor_add = index.constant 208 : offset
+  %coefficient = scalar.constant -7040.0 : f32
+  %activations = buffer.view %input[%origin] : buffer -> view<32x256xf32>
+  %results = buffer.view %output[%origin] : buffer -> view<32x[%outputs]xf32>
+  scf.for %row = [%begin to %rows step %unit] {
+    %activation = view.load %activations[%row, 0] : view<32x256xf32> -> f32
+    %row_sum = scalar.mulf %coefficient, %activation : f32
+    scf.for %channel = [%begin to %outputs step %unit] {
+      %block_origin = index.scale %channel, %block_bytes : index, offset -> offset
+      %factor_origin = index.add %block_origin, %factor_add : offset
+      %factor_view = buffer.view %weight[%factor_origin] : buffer -> view<1xf16>
+      %factor_half = view.load %factor_view[0] : view<1xf16> -> f16
+      %factor = scalar.extf %factor_half : f16 to f32
+      %projection = scalar.mulf %row_sum, %factor : f32
+      %residual = view.load %results[%row, %channel] : view<32x[%outputs]xf32> -> f32
+      %sum = scalar.addf %residual, %projection : f32
+      view.store %sum, %results[%row, %channel] : f32, view<32x[%outputs]xf32>
+    }
+  }
+  func.return
+}
+
+check.scenario public @q6_c64t32_two_panels {
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %uniform = check.literal value(false) : i1
+    %quantized = check.literal value(false) : i1
+    %tokens = check.literal value(32) : index
+    %inputs = check.literal value(512) : index
+    %outputs = check.literal value(128) : index
+    %control = check.generate.fill value(32) : tensor<1xi32>
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0 to 1.0) : tensor<32x512xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<53760xi8>
+    check.generate<@initialize_q6>(%uniform, %quantized, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<32x512xf32>, tensor<53760xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<4104xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<4104xf32> -> tensor<32x128xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<4104xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(16400) : tensor<4104xf32> -> tensor<4xf32>
+    check.compare<@qwen38_linear_q6k_f16_wmma_c64t32_f32acc, @q6_padded_reference>[%tokens, %inputs, %outputs](%control, %inputs, %outputs, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<32x512xf32>, tensor<53760xi8>, tensor<32x128xf32>) -> () {
+      check.expect.approximate actual(%output) expected(%output) atol(0.5) rtol(0.02) nan(different) : tensor<32x128xf32>, tensor<32x128xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<32x512xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<53760xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @q6_c64t32_residual {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %uniform = check.literal value(false) : i1
+    %quantized = check.literal value(false) : i1
+    %tokens = check.literal value(32) : index
+    %inputs = check.literal value(256) : index
+    %outputs = check.literal value(5120) : index
+    %control = check.generate.fill value(32) : tensor<1xi32>
+    %input = check.generate.fill value(0.0) : tensor<32x256xf32>
+    %weight = check.generate.fill value(1) : tensor<1075200xi8>
+    check.generate<@q6_residual_rows>(%input) : (tensor<32x256xf32>) -> ()
+    check.generate<@initialize_q6>(%uniform, %quantized, %tokens, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<32x256xf32>, tensor<1075200xi8>) -> ()
+    %storage = check.generate.iota offset(-0.5) step(0.0009765625) : tensor<163848xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<163848xf32> -> tensor<32x5120xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<163848xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(655376) : tensor<163848xf32> -> tensor<4xf32>
+    check.compare<@qwen38_linear_q6k_f16_wmma_c64t32_f32acc_residual, @q6_residual_reference>[%tokens, %inputs, %outputs](%control, %inputs, %outputs, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<32x256xf32>, tensor<1075200xi8>, tensor<32x5120xf32>) -> () {
+      check.expect.bitwise actual(%storage) expected(%storage) : tensor<163848xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<32x256xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<1075200xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q6_c64t32_two_panels> @q6_c64t32_two_panels_benchmark
+
+check.benchmark<@q6_c64t32_residual> @q6_c64t32_residual_benchmark
