@@ -1,8 +1,8 @@
 // Scalar rotary pairs preserve four BF16 product boundaries before addition.
 // An integer-rounding oracle checks randomized inputs and explicit signed-zero,
 // subnormal, and large-exponent cases, with nonzero origins and storage guards.
-
-amdgpu.target<gfx11-generic> @rotary_scalar_wave32 {subgroup_size = 32}
+// Rounding checks are bitwise; directed underflow cases have separate bounds
+// for native subnormal flushing.
 
 template.decl @attention.half_pair_bf16(%left: bf16, %right: bf16, %left_cosine: bf16, %right_cosine: bf16, %left_sine: bf16, %right_sine: bf16) -> (vector<2xbf16>)
 
@@ -80,7 +80,7 @@ func.def @initialize_pair_inputs(%input: buffer) {
   func.return
 }
 
-kernel.def target(@rotary_scalar_wave32) @apply_pairs() {
+kernel.def @apply_pairs() {
   %groups = index.constant 3 : index
   %threads = index.constant 128 : index
   %unit = index.constant 1 : index
@@ -138,7 +138,6 @@ func.def @pair_reference(%input: buffer, %output: buffer) {
 }
 
 check.scenario public @pair_rounding {
-  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   check.trial[1](%trial: index, %entropy: check.entropy) {
     %seed = check.entropy.read %entropy[%trial] : check.entropy -> i64
     %input_storage = check.generate.random.uniform seed(%seed) range(-4.0 to 4.0) : tensor<1856xbf16>
@@ -146,10 +145,23 @@ check.scenario public @pair_rounding {
     check.generate<@initialize_pair_inputs>(%input) : (tensor<1824xbf16>) -> ()
     %output_storage = check.generate.fill value(-12345) : tensor<640xi16>
     %output = check.tensor.view %output_storage offset(32) : tensor<640xi16> -> tensor<608xbf16>
+    %rounding = check.tensor.view %output offset(0) : tensor<608xbf16> -> tensor<544xbf16>
+    %subnormal = check.tensor.view %output offset(1088) : tensor<608xbf16> -> tensor<32xbf16>
+    %underflow = check.tensor.view %output offset(1152) : tensor<608xbf16> -> tensor<16xbf16>
+    %large = check.tensor.view %output offset(1184) : tensor<608xbf16> -> tensor<16xbf16>
     %prefix = check.tensor.view %output_storage offset(0) : tensor<640xi16> -> tensor<16xi16>
     %suffix = check.tensor.view %output_storage offset(1248) : tensor<640xi16> -> tensor<16xi16>
     check.compare<@apply_pairs, @pair_reference>(%input, %output) : (tensor<1824xbf16>, tensor<608xbf16>) -> () {
-      check.expect.bitwise actual(%output) expected(%output) : tensor<608xbf16>
+      check.expect.bitwise actual(%rounding) expected(%rounding) : tensor<544xbf16>
+      // Signed minimum BF16 subnormals have coefficients no larger than one.
+      // Two preserved unit products can sum to 2^-132; flushing loses at most
+      // that value. The fractional products round to zero even when preserved.
+      check.expect.approximate actual(%subnormal) expected(%subnormal) atol(1.8367099231598242e-40) rtol(0.0) nan(different) : tensor<32xbf16>, tensor<32xbf16>
+      // Minimum-normal inputs underflow in the half/eighth products. Two half
+      // products can sum back to 2^-126; flushing can lose that normal result.
+      // Unit products stay normal, so their sum does not enlarge this bound.
+      check.expect.approximate actual(%underflow) expected(%underflow) atol(1.1754943508222875e-38) rtol(0.0) nan(different) : tensor<16xbf16>, tensor<16xbf16>
+      check.expect.bitwise actual(%large) expected(%large) : tensor<16xbf16>
       check.expect.bitwise actual(%input_storage) expected(%input_storage) : tensor<1856xbf16>
       check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<16xi16>
       check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<16xi16>
