@@ -1,17 +1,21 @@
-// The ordinary projection uses the shared scalar-byte F64 oracle. The residual
-// case uses exact dyadic inputs with a closed-form dot product, so every output
-// is checked without interpreting a full model-width matrix multiplication.
+// The production commands select and launch the shared Q6 kernels using the
+// device target supplied by the command request. The ordinary projection uses
+// the shared scalar-byte F64 oracle. The residual case uses exact dyadic inputs
+// with a closed-form dot product, so every output is checked without interpreting
+// a full model-width matrix multiplication.
 
-kernel.decl @qwen38_linear_q6k_f16_wmma_c64t32_f32acc(%tokens: index, %inputs: index, %outputs: index) launch(%control: buffer, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer)
+command.program.decl @qwen38_dispatch_linear_q6k_f16_c64t32_f32acc(%tokens: index, %inputs: index, %outputs: index, %input_size: index, %output_size: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
-kernel.decl @qwen38_linear_q6k_f16_wmma_c64t32_f32acc_residual(%tokens: index, %inputs: index, %outputs: index) launch(%control: buffer, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer)
+command.program.decl @qwen38_dispatch_linear_q6k_f16_c64t32_f32acc_residual(%tokens: index, %inputs: index, %outputs: index, %input_size: index, %output_size: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 func.decl @initialize_q6(%uniform: i1, %quantized: i1, %tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
 
 func.decl @q6_f32_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
 
-func.def @q6_padded_reference(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+func.def @q6_padded_reference(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %tokens = index.constant 32 : index
+  %inputs = index.constant 512 : index
+  %outputs = index.constant 128 : index
   func.call @q6_f32_reference(%tokens, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
   func.return
 }
@@ -44,10 +48,11 @@ func.def @q6_residual_rows(%input: buffer) {
 // initialize_q6 varies d by channel; the input and initial residual vary by row
 // and element. This distinguishes publication coordinates and checks all 5120
 // channels while retaining the production residual ABI.
-func.def @q6_residual_reference(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+func.def @q6_residual_reference(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %begin = index.constant 0 : index
   %unit = index.constant 1 : index
   %rows = index.constant 32 : index
+  %outputs = index.constant 5120 : index
   %origin = index.constant 0 : offset
   %block_bytes = index.constant 210 : offset
   %factor_add = index.constant 208 : offset
@@ -73,12 +78,12 @@ func.def @q6_residual_reference(%control: buffer, %inputs: index, %outputs: inde
 }
 
 check.scenario public @q6_c64t32_two_panels {
+  %tokens = check.literal value(32) : index
+  %inputs = check.literal value(512) : index
+  %outputs = check.literal value(128) : index
   check.trial[2](%trial: index, %entropy: check.entropy) {
     %uniform = check.literal value(false) : i1
     %quantized = check.literal value(false) : i1
-    %tokens = check.literal value(32) : index
-    %inputs = check.literal value(512) : index
-    %outputs = check.literal value(128) : index
     %control = check.generate.fill value(32) : tensor<1xi32>
     %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
     %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
@@ -89,7 +94,7 @@ check.scenario public @q6_c64t32_two_panels {
     %output = check.tensor.view %storage offset(16) : tensor<4104xf32> -> tensor<32x128xf32>
     %prefix = check.tensor.view %storage offset(0) : tensor<4104xf32> -> tensor<4xf32>
     %suffix = check.tensor.view %storage offset(16400) : tensor<4104xf32> -> tensor<4xf32>
-    check.compare<@qwen38_linear_q6k_f16_wmma_c64t32_f32acc, @q6_padded_reference>[%tokens, %inputs, %outputs](%control, %inputs, %outputs, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<32x512xf32>, tensor<53760xi8>, tensor<32x128xf32>) -> () {
+    check.compare<@qwen38_dispatch_linear_q6k_f16_c64t32_f32acc, @q6_padded_reference>[%tokens, %inputs, %outputs, %inputs, %outputs](%control, %input, %weight, %output) : [index, index, index, index, index](tensor<1xi32>, tensor<32x512xf32>, tensor<53760xi8>, tensor<32x128xf32>) -> () {
       check.expect.approximate actual(%output) expected(%output) atol(0.5) rtol(0.02) nan(different) : tensor<32x128xf32>, tensor<32x128xf32>
       check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
       check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
@@ -101,12 +106,12 @@ check.scenario public @q6_c64t32_two_panels {
 }
 
 check.scenario public @q6_c64t32_residual {
+  %tokens = check.literal value(32) : index
+  %inputs = check.literal value(256) : index
+  %outputs = check.literal value(5120) : index
   check.trial[1](%trial: index, %entropy: check.entropy) {
     %uniform = check.literal value(false) : i1
     %quantized = check.literal value(false) : i1
-    %tokens = check.literal value(32) : index
-    %inputs = check.literal value(256) : index
-    %outputs = check.literal value(5120) : index
     %control = check.generate.fill value(32) : tensor<1xi32>
     %input = check.generate.fill value(0.0) : tensor<32x256xf32>
     %weight = check.generate.fill value(1) : tensor<1075200xi8>
@@ -116,7 +121,7 @@ check.scenario public @q6_c64t32_residual {
     %output = check.tensor.view %storage offset(16) : tensor<163848xf32> -> tensor<32x5120xf32>
     %prefix = check.tensor.view %storage offset(0) : tensor<163848xf32> -> tensor<4xf32>
     %suffix = check.tensor.view %storage offset(655376) : tensor<163848xf32> -> tensor<4xf32>
-    check.compare<@qwen38_linear_q6k_f16_wmma_c64t32_f32acc_residual, @q6_residual_reference>[%tokens, %inputs, %outputs](%control, %inputs, %outputs, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<32x256xf32>, tensor<1075200xi8>, tensor<32x5120xf32>) -> () {
+    check.compare<@qwen38_dispatch_linear_q6k_f16_c64t32_f32acc_residual, @q6_residual_reference>[%tokens, %inputs, %outputs, %inputs, %outputs](%control, %input, %weight, %output) : [index, index, index, index, index](tensor<1xi32>, tensor<32x256xf32>, tensor<1075200xi8>, tensor<32x5120xf32>) -> () {
       check.expect.bitwise actual(%storage) expected(%storage) : tensor<163848xf32>
       check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
       check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
