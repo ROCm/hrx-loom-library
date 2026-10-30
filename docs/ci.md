@@ -86,12 +86,13 @@ recorded checksum, replacing the download step in the single setup action.
 [Maintaining Loom SDK releases](https://github.com/ROCm/hrx-system/blob/main/loom/packaging/python/RELEASING.md)
 owns production, platform qualification, and publication of those artifacts.
 
-The pinned SDK includes native AMD GPU and XDNA execution but lacks the Vulkan
-HAL. A Vulkan lane requires enabling that HAL in HRX's `loom-sdk` configuration,
-qualifying and publishing the resulting wheel, and then adding a Vulkan runner
-here. Windows likewise requires a qualified Windows wheel at the selected HRX
-revision. A Linux cross-build input archive does not establish native Windows
-qualification. Neither lane is represented by a source-built substitute.
+The pinned SDK includes native AMD GPU, XDNA, and Vulkan execution. Vulkan
+loads the execution host's Vulkan loader and driver; the wheel does not bundle
+them. A Vulkan lane requires a qualified runner with that runtime and the
+matching execution resource in the matrix. Windows likewise requires selecting
+a qualified Windows wheel at the pinned HRX revision. A Linux cross-build input
+archive does not establish native Windows qualification. Neither lane is
+represented by a source-built substitute.
 
 ## Cache and diagnostic evidence
 

@@ -94,6 +94,10 @@ For focused iteration, select a package and its execution configuration:
 python dev.py test --target=//kernel/ggml/... -- --config=loom-asan --config=amdgpu
 ```
 
+`--config=vulkan` selects Vulkan execution profiles when the selected SDK or
+source toolchain includes the Vulkan HAL. Execution also needs a Vulkan loader,
+driver, and compatible device on the test host.
+
 `dev.py test` first checks formatting across the repository, including
 experimental sources, public Loom authoring lint, repository source policy,
 and managed model-card compiler lists,
