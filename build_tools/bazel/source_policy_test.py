@@ -434,7 +434,7 @@ class SourcePolicyTest(unittest.TestCase):
                         "program.loom",
                         "config.decl @layers : %value: index\n"
                         "func.def public @prepare() { func.return }\n"
-                        "command.program.def public @decode() launch() { command.return }\n"
+                        "command.def public @decode() launch() { command.return }\n"
                         "kernel.def @project() {} launch() { kernel.return }\n",
                     )
                 ],
