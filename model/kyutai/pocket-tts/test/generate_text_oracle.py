@@ -5,44 +5,53 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-# /// script
-# requires-python = ">=3.12,<3.13"
-# dependencies = [
-#   "pocket-tts @ git+https://github.com/kyutai-labs/pocket-tts@ec569b2dd3fec4a601b391aace185791e92b3785",
-#   "torch==2.9.1",
-#   "numpy==2.5.4",
-#   "scipy==1.18.1",
-#   "soundfile==0.14.0",
-#   "safetensors==0.8.0",
-# ]
-# [tool.uv.sources]
-# torch = { index = "pytorch-cpu" }
-# [[tool.uv.index]]
-# name = "pytorch-cpu"
-# url = "https://download.pytorch.org/whl/cpu"
-# explicit = true
-# ///
-
 """Records normalization output from the pinned Pocket TTS 3.3.0 reference.
 
-Run in the reference environment with CPython 3.12 and pocket-tts==3.3.0.
-Only text preparation is imported; no checkpoint is loaded.
+The Bazel input pins the upstream text module by revision and digest. Only its
+preparation functions and constants are evaluated; tokenizer-dependent sentence
+chunking is outside this oracle. Normalization runs unchanged on CPython 3.12.
 """
 
-import importlib.metadata
+import argparse
+import ast
+import re
 import struct
 import unicodedata
 from pathlib import Path
 
-from pocket_tts.models.text_chunking import prepare_text_prompt
-
 
 def main() -> None:
-    if (
-        importlib.metadata.version("pocket-tts") != "3.3.0"
-        or unicodedata.unidata_version != "15.0.0"
-    ):
-        raise SystemExit("The oracle requires Pocket TTS 3.3.0 and Unicode 15.0.0")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--upstream-source", type=Path, required=True)
+    parser.add_argument("--output-directory", type=Path, required=True)
+    args = parser.parse_args()
+    if unicodedata.unidata_version != "15.0.0":
+        raise SystemExit("The oracle requires Unicode 15.0.0 (CPython 3.12)")
+    functions = {"prepare_text_prompt", "_ensure_terminal_punctuation"}
+    constants = {"_TERMINAL_PUNCTUATION", "_WEAK_PUNCTUATION", "_CLOSERS"}
+    source = ast.parse(args.upstream_source.read_text(encoding="utf-8"))
+    definitions = [
+        node
+        for node in source.body
+        if (isinstance(node, ast.FunctionDef) and node.name in functions)
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in constants
+                for target in node.targets
+            )
+        )
+    ]
+    namespace = {"re": re}
+    exec(
+        compile(
+            ast.Module(body=definitions, type_ignores=[]),
+            str(args.upstream_source),
+            "exec",
+        ),
+        namespace,
+    )
+    prepare_text_prompt = namespace["prepare_text_prompt"]
     examples = [
         "",
         " \t\r\n",
@@ -93,23 +102,18 @@ def main() -> None:
         inputs.extend(input_bytes)
         outputs.extend(output_bytes)
     records = b"".join(struct.pack("<5I", *row) for row in rows)
-    declarations = [f"global.constant @normalization_count : index = {len(rows)}"]
-    for name, data in (("records", records), ("inputs", inputs), ("outputs", outputs)):
-        if len(data) * 2 + 100 >= 65535:
-            raise ValueError("Oracle literal exceeds the text format's source columns")
-        declarations.append(
-            f'global.rodata.def @normalization_{name} = align(4) bytes("{data.hex()}")'
+    for name, data, dtype, shape in (
+        ("records", records, "<i4", (len(rows), 5)),
+        ("inputs", inputs, "|i1", (len(inputs),)),
+        ("outputs", outputs, "|i1", (len(outputs),)),
+    ):
+        header = str(
+            {"descr": dtype, "fortran_order": False, "shape": shape}
+        ).encode("ascii")
+        header += b" " * ((-len(header) - 11) % 64) + b"\n"
+        (args.output_directory / f"text_normalization_{name}.npy").write_bytes(
+            b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header)) + header + data
         )
-    path = Path(__file__).with_name("text_normalization_test.loom")
-    prefix, body = path.read_text().split("// BEGIN GENERATED POCKET ORACLE\n", 1)
-    _, suffix = body.split("// END GENERATED POCKET ORACLE", 1)
-    path.write_text(
-        prefix
-        + "// BEGIN GENERATED POCKET ORACLE\n"
-        + "\n\n".join(declarations)
-        + "\n\n// END GENERATED POCKET ORACLE"
-        + suffix
-    )
 
 
 if __name__ == "__main__":

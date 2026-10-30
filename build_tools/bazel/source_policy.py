@@ -25,6 +25,7 @@ LAYER_OPERATION_PATTERN = re.compile(
 )
 LOCAL_RULES_LABEL = '"//build_tools/bazel:defs.bzl"'
 UPSTREAM_RULES_LABEL = '"@hrx//loom/build_tools/bazel:defs.bzl"'
+MAX_FIXTURE_BYTES = 32 * 1024
 TEST_SOURCE_SUFFIXES = ("_test.loom", "_stress.loom")
 
 
@@ -105,6 +106,17 @@ def check_sources(layer: str, sources: Iterable[tuple[str, str]]) -> list[str]:
         names = ", ".join(name for name, _ in source_definitions)
         violations.append(f"kernel package has no kernel.def declaration: {names}")
     return violations
+
+
+def check_fixture_size(paths: Iterable[Path]) -> list[str]:
+    """Bounds the complete declared binary capture for one test module."""
+    size = sum(path.stat().st_size for path in set(paths))
+    if size > MAX_FIXTURE_BYTES:
+        return [
+            f"test data totals {size} bytes, exceeding the {MAX_FIXTURE_BYTES}-byte "
+            "fixture budget; compute arithmetic oracles in Loom IR"
+        ]
+    return []
 
 
 def _package_policy(layer: str, relative_directory: Path) -> tuple[str, str]:
@@ -278,6 +290,7 @@ def _create_parser() -> argparse.ArgumentParser:
         "--layer", choices=["kernel", "model", "motif", "program", "test"]
     )
     parser.add_argument("--repository-root", type=Path)
+    parser.add_argument("--data", type=Path, nargs="+", default=[])
     parser.add_argument(
         "--staged", action="store_true", help="Check source ownership in the Git index."
     )
@@ -289,11 +302,11 @@ def main() -> int:
     parser = _create_parser()
     args = parser.parse_args()
     if args.staged:
-        if args.layer or args.sources:
+        if args.layer or args.sources or args.data:
             parser.error("--staged cannot be combined with source checks")
         violations = check_staged_sources(args.repository_root or Path.cwd())
     elif args.repository_root:
-        if args.layer or args.sources:
+        if args.layer or args.sources or args.data:
             parser.error("--repository-root cannot be combined with source checks")
         violations = check_repository(args.repository_root.resolve())
     else:
@@ -304,6 +317,7 @@ def main() -> int:
             args.layer,
             [(str(path), path.read_text()) for path in source_paths],
         )
+    violations.extend(check_fixture_size(args.data))
     for violation in violations:
         print(violation, file=sys.stderr)
     return 1 if violations else 0

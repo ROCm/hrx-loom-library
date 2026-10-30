@@ -7,10 +7,12 @@ import argparse
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from build_tools.py.hrx_loom_library.bazel_tool import runfiles_sha256
 from build_tools.py.hrx_loom_library.commands import benchmark
 
 
@@ -44,6 +46,13 @@ class BenchmarkCommandTest(unittest.TestCase):
             args.benchmark_args,
             ["--", "--measure=dispatch_complete"],
         )
+
+    def test_vm_benchmarks_need_no_device_configuration(self):
+        parser = argparse.ArgumentParser()
+        benchmark.register(parser.add_subparsers(dest="command", required=True))
+        args = parser.parse_args(["benchmark", "--output-dir=evidence"])
+        self.assertEqual(args.configs, [])
+        self.assertIsNone(args.device)
 
     def test_resolves_recursive_and_overlapping_target_patterns(self):
         catalog = [
@@ -121,45 +130,85 @@ class BenchmarkCommandTest(unittest.TestCase):
             first_module.parent.mkdir(parents=True)
             first_module.write_bytes(b"first")
             second_module.write_bytes(b"second")
-            selection_output = (
-                "@@//kernel/example:first_benchmark_module"
-                "\tbazel-out/bin/first_benchmark_module.loombc\n"
-                "@@//motif/example/test:second_benchmark_module"
-                "\tbazel-out/bin/second_benchmark_module.loombc\n"
+            fixture = first_module.with_name("observations.npy")
+            fixture.write_bytes(b"independent observations")
+            selection_output = "\n".join(
+                json.dumps(record)
+                for record in (
+                    {
+                        "label": "@@//kernel/example:first_benchmark_module",
+                        "modules": [[
+                            str(first_module.relative_to(repository_root)),
+                            "kernel/example/first.loombc",
+                        ]],
+                        "data": {
+                            "kernel/example/observations.npy": [
+                                str(fixture.relative_to(repository_root)),
+                                False,
+                            ]
+                        },
+                    },
+                    {
+                        "label": "@@//motif/example/test:second_benchmark_module",
+                        "modules": [[
+                            str(second_module.relative_to(repository_root)),
+                            "motif/example/second.loombc",
+                        ]],
+                        "data": {},
+                    },
+                )
             )
 
-            bazel = mock.Mock(return_value=selection_output)
+            def bazel(arguments, *, capture_output):
+                self.assertTrue(capture_output)
+                if arguments[0] == "info":
+                    return str(repository_root)
+                self.assertEqual(
+                    arguments[1],
+                    'set("//kernel/example:first_benchmark_module" '
+                    '"//motif/example/test:second_benchmark_module")',
+                )
+                return selection_output
+
+            targets = [
+                "//kernel/example:first_benchmark_module",
+                "//motif/example/test:second_benchmark_module",
+            ]
             modules = benchmark.resolve_modules(
                 repository_root,
-                [
-                    "//kernel/example:first_benchmark_module",
-                    "//motif/example/test:second_benchmark_module",
-                ],
+                targets,
                 ["-c", "opt", "--config=amdgpu"],
                 bazel,
             )
+            with benchmark.module_input(modules[0]) as input_path:
+                self.assertEqual(input_path.read_bytes(), b"first")
+                self.assertEqual(
+                    input_path.with_name("observations.npy").read_bytes(),
+                    b"independent observations",
+                )
+                self.assertNotEqual(input_path, first_module)
+            self.assertFalse(input_path.exists())
+            with benchmark.module_input(modules[1]) as input_path:
+                self.assertEqual(input_path, second_module)
+            fixture.write_bytes(b"changed observations")
+            changed = benchmark.resolve_modules(repository_root, targets, [], bazel)
+            self.assertNotEqual(modules[0].data_sha256, changed[0].data_sha256)
+            self.assertEqual(modules[1], changed[1])
 
         self.assertEqual(
-            modules,
+            [(module.selection_label, module.label, module.path) for module in modules],
             [
-                benchmark.BenchmarkModule(
+                (
                     "//kernel/example:first_benchmark_module",
                     "//kernel/example:first",
                     first_module,
                 ),
-                benchmark.BenchmarkModule(
+                (
                     "//motif/example/test:second_benchmark_module",
                     "//motif/example/test:second",
                     second_module,
                 ),
             ],
-        )
-        bazel.assert_called_once()
-        self.assertEqual(bazel.call_args.kwargs, {"capture_output": True})
-        self.assertEqual(
-            bazel.call_args.args[0][1],
-            'set("//kernel/example:first_benchmark_module" '
-            '"//motif/example/test:second_benchmark_module")',
         )
 
     def test_parses_configured_source_closures(self):
@@ -240,6 +289,7 @@ class BenchmarkCommandTest(unittest.TestCase):
             runtime = runner.with_name("libloomc.so")
             first_module = repository_root / "bazel-out/bin/first.loombc"
             second_module = repository_root / "bazel-out/bin/second.loombc"
+            first_data = first_module.with_suffix(".npy")
             first_source = repository_root / "kernel/example/first.loom"
             second_source = repository_root / "kernel/example/second.loom"
             shared_source = repository_root / "motif/example/shared.loom"
@@ -248,6 +298,7 @@ class BenchmarkCommandTest(unittest.TestCase):
                 (runtime, b"shared compiler"),
                 (first_module, b"first module"),
                 (second_module, b"second module"),
+                (first_data, b"fixture"),
                 (first_source, b"first source"),
                 (second_source, b"second source"),
                 (shared_source, b"shared source"),
@@ -267,11 +318,17 @@ class BenchmarkCommandTest(unittest.TestCase):
                     "//kernel/example:first",
                     "//kernel/example:first",
                     first_module,
+                    runfiles_sha256("//kernel/example:first", repository_root, {}),
+                    "kernel/example/first.loombc",
+                    (("kernel/example/first.npy", first_data, False),),
                 ),
                 benchmark.BenchmarkModule(
                     "//kernel/example:second",
                     "//kernel/example:second",
                     second_module,
+                    runfiles_sha256("//kernel/example:second", repository_root, {}),
+                    "kernel/example/second.loombc",
+                    (),
                 ),
             ]
             closures = {
@@ -292,13 +349,31 @@ class BenchmarkCommandTest(unittest.TestCase):
                 unused_repository_root, targets, unused_bazel_options, unused_bazel
             ):
                 return [
-                    module for module in modules if module.selection_label in targets
+                    replace(
+                        module,
+                        data_sha256=runfiles_sha256(
+                            module.label,
+                            repository_root,
+                            {"first.npy": [str(first_data), False]}
+                            if module.path == first_module
+                            else {},
+                        ),
+                    )
+                    for module in modules
+                    if module.selection_label in targets
                 ]
 
             def resolve_selected_closures(targets, unused_bazel_options, unused_bazel):
                 return {target: closures[target] for target in targets}
 
             def write_bundle(command):
+                input_path = Path(command[1])
+                if input_path.name == "first.loombc":
+                    self.assertEqual(input_path.read_bytes(), first_module.read_bytes())
+                    self.assertEqual(
+                        input_path.with_suffix(".npy").read_bytes(),
+                        first_data.read_bytes(),
+                    )
                 bundle_argument = next(
                     argument
                     for argument in command
@@ -352,6 +427,8 @@ class BenchmarkCommandTest(unittest.TestCase):
                         ("run-6", "2026-08-12T00:05:00Z"),
                         ("run-7", "2026-08-12T00:06:00Z"),
                         ("run-8", "2026-08-12T00:07:00Z"),
+                        ("run-9", "2026-08-12T00:08:00Z"),
+                        ("run-10", "2026-08-12T00:09:00Z"),
                     ],
                 ),
                 mock.patch.object(
@@ -408,6 +485,36 @@ class BenchmarkCommandTest(unittest.TestCase):
                     (output_root / "latest.json").read_text(encoding="utf-8")
                 )
                 self.assertEqual(second_manifest["summary"]["reused_module_count"], 2)
+
+                # Runtime data can change without changing the linked module.
+                first_data.write_bytes(b"changed fixture")
+                run.reset_mock()
+                benchmark.run(
+                    args,
+                    repository_root=repository_root,
+                    bazel=bazel,
+                    run_command=run,
+                )
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(Path(run.call_args.args[0][1]).name, first_module.name)
+                data_manifest = json.loads(
+                    (output_root / "latest.json").read_text(encoding="utf-8")
+                )
+                changed_data = data_manifest["modules"][0]
+                self.assertEqual(changed_data["reasons"], ["data_changed"])
+                self.assertTrue(changed_data["artifact_changed"])
+                self.assertEqual(
+                    changed_data["module"], first_manifest["modules"][0]["module"]
+                )
+
+                run.reset_mock()
+                benchmark.run(
+                    args,
+                    repository_root=repository_root,
+                    bazel=bazel,
+                    run_command=run,
+                )
+                run.assert_not_called()
 
                 shared_source.write_bytes(b"source-only change")
                 run.reset_mock()
@@ -469,7 +576,7 @@ class BenchmarkCommandTest(unittest.TestCase):
                     run_command=run,
                 )
                 self.assertEqual(run.call_count, 1)
-                self.assertEqual(Path(run.call_args.args[0][1]), first_module)
+                self.assertEqual(Path(run.call_args.args[0][1]).name, first_module.name)
                 third_manifest = json.loads(
                     (output_root / "latest.json").read_text(encoding="utf-8")
                 )

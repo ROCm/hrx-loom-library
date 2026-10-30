@@ -77,7 +77,7 @@ def _validate_program_dependencies(package, deps):
                 "supply model identity and preparation from the model composition",
             )
 
-def _declare_source_policy_test(name, layer, srcs, tags):
+def _declare_source_policy_test(name, layer, srcs, tags, data = []):
     text_srcs = [src for src in srcs if str(src).endswith(".loom")]
     if not text_srcs:
         fail("%s requires at least one .loom text source" % name)
@@ -88,8 +88,8 @@ def _declare_source_policy_test(name, layer, srcs, tags):
         args = ["--layer=" + layer] + [
             "$(location %s)" % src
             for src in text_srcs
-        ],
-        data = text_srcs,
+        ] + (["--data"] + ["$(locations %s)" % item for item in data] if data else []),
+        data = text_srcs + data,
         tags = tags + ["hostonly"],
         visibility = ["//visibility:private"],
     )
@@ -248,6 +248,7 @@ def loom_test(
         name,
         srcs,
         deps = [],
+        data = [],
         args = [],
         configs = {},
         variants = None,
@@ -273,6 +274,7 @@ def loom_test(
     _loom_test(
         name = name,
         srcs = srcs,
+        data = data,
         args = args,
         configs = configs,
         variants = variants,
@@ -288,4 +290,4 @@ def loom_test(
         ":" + name + "_module",
         tags,
     )
-    _declare_source_policy_test(name, "test", srcs, tags)
+    _declare_source_policy_test(name, "test", srcs, tags, data = data)

@@ -5,14 +5,18 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""Refreshes independent text oracles using CPython's Unicode 15.0 behavior."""
+"""Produces compact NPY observations of CPython's Unicode 15.0 behavior."""
 
+import argparse
 import struct
 import unicodedata
 from pathlib import Path
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-directory", type=Path, required=True)
+    args = parser.parse_args()
     if unicodedata.unidata_version != "15.0.0":
         raise SystemExit("The oracle requires Unicode 15.0.0 (CPython 3.12)")
     points = set()
@@ -37,27 +41,24 @@ def main() -> None:
                 int(character.isdigit()),
             )
         )
-    # Each literal stays within the text format's 16-bit source columns.
-    blocks = [rows[:1280], rows[1280:2560], rows[2560:]]
-    declarations = []
-    for name, block in zip(("low", "middle", "high"), blocks):
-        data = b"".join(struct.pack("<6I", *row) for row in block)
-        declarations.extend(
-            [
-                f"global.constant @oracle_{name}_count : index = {len(block)}",
-                f'global.rodata.def @oracle_{name}_rows = align(4) bytes("{data.hex()}")',
-            ]
+    uppercase = sorted({(a - point, b, c) for point, a, b, c, _, _ in rows})
+    indices = {record: index for index, record in enumerate(uppercase)}
+    records = [
+        (point | (space << 21) | (digit << 22), indices[a - point, b, c])
+        for point, a, b, c, space, digit in rows
+    ]
+    for name, values, width in (
+        ("unicode_records.npy", records, 2),
+        ("unicode_uppercase.npy", uppercase, 3),
+    ):
+        data = b"".join(struct.pack("<" + "i" * width, *row) for row in values)
+        header = str(
+            {"descr": "<i4", "fortran_order": False, "shape": (len(values), width)}
+        ).encode("ascii")
+        header += b" " * ((-len(header) - 11) % 64) + b"\n"
+        (args.output_directory / name).write_bytes(
+            b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header)) + header + data
         )
-    path = Path(__file__).with_name("unicode_test.loom")
-    prefix, body = path.read_text().split("// BEGIN GENERATED UNICODE ORACLE\n", 1)
-    _, suffix = body.split("// END GENERATED UNICODE ORACLE", 1)
-    path.write_text(
-        prefix
-        + "// BEGIN GENERATED UNICODE ORACLE\n"
-        + "\n\n".join(declarations)
-        + "\n\n// END GENERATED UNICODE ORACLE"
-        + suffix
-    )
 
 
 if __name__ == "__main__":

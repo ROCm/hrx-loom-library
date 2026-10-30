@@ -34,16 +34,6 @@ their cache identity and invocation. No learned-model checkpoint is a test
 input or retained output, and valid asynchronous work has no per-request
 wall-clock deadline.
 
-Regenerate the normalization literals from the pinned upstream implementation:
-
-```sh
-uv run model/kyutai/pocket-tts/test/generate_text_oracle.py
-python dev.py format model/kyutai/pocket-tts/test/text_normalization_test.loom
-```
-
-The generator requires Pocket TTS 3.3.0 and Unicode 15.0.0, imports only prompt
-preparation, and does not load model weights.
-
 The audio oracle checks every output sample, block count, trimming, and padding
 for 31 upstream cases spanning eight rates and one, two, or six channels. The
 expected arrays come from Pocket revision ec569b2, SciPy 1.18.1 `resample_poly`,

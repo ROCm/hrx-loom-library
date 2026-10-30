@@ -13,6 +13,24 @@ from build_tools.bazel import source_policy
 
 
 class SourcePolicyTest(unittest.TestCase):
+    def test_fixture_budget_applies_to_the_complete_capture(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.npy"
+            second = root / "second.npy"
+            first.write_bytes(b"x" * (source_policy.MAX_FIXTURE_BYTES - 1))
+            second.write_bytes(b"x")
+            self.assertEqual(source_policy.check_fixture_size([first, second]), [])
+            self.assertEqual(source_policy.check_fixture_size([first, first]), [])
+            second.write_bytes(b"xx")
+            self.assertEqual(
+                source_policy.check_fixture_size([first, second]),
+                [
+                    "test data totals 32769 bytes, exceeding the 32768-byte "
+                    "fixture budget; compute arithmetic oracles in Loom IR"
+                ],
+            )
+
     def test_motif_accepts_functions_and_templates(self):
         violations = source_policy.check_sources(
             "motif",

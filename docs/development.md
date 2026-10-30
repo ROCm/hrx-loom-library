@@ -221,8 +221,9 @@ python dev.py benchmark \
 ```
 
 Repeating the command is incremental. Bazel rebuilds only invalidated actions,
-and the sweep executes only roots whose closed benchmark `.loombc`, benchmark
-runner and its shared libraries, or invocation identity changed. A shared motif
+and the sweep executes only roots whose closed benchmark `.loombc`, declared
+runtime fixtures, benchmark runner and its shared libraries, or invocation
+identity changed. A shared motif
 edit therefore reruns the exact consumers whose linked runner input changed;
 an edit that produces a byte-identical module is reported as potentially affected
 without repeating the physical benchmark.

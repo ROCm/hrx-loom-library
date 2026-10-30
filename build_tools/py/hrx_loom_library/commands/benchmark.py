@@ -10,16 +10,18 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from ..bazel_tool import resolve_tool
+from ..bazel_tool import resolve_tool, runfiles_sha256
 from ..context import RepositoryContext, UserError
 from ..qualification import benchmark_query_expression
 
@@ -51,9 +53,18 @@ class Error(UserError):
 class BenchmarkModule:
     """One selected, closed benchmark module materialized by Bazel."""
 
+    # Filegroup admitting this module to the benchmark corpus.
     selection_label: str
+    # Source owner's label used in sweep results.
     label: str
+    # Linked module materialized in the worktree's Bazel output.
     path: Path
+    # Content digest of declared runtime files other than the linked module.
+    data_sha256: str
+    # Module location within the declared workspace runfiles.
+    short_path: str
+    # Logical paths, materialized files, and unresolved-symlink markers.
+    data: tuple[tuple[str, Path, bool], ...]
 
 
 @dataclass(frozen=True)
@@ -173,31 +184,50 @@ def resolve_modules(
             _target_expression(targets),
             *bazel_options,
             "--output=starlark",
-            "--starlark:expr="
-            'str(target.label) + "\\t" + "\\t".join('
-            "[file.path for file in target.files.to_list()])",
+            "--starlark:expr=json.encode({"
+            '"label": str(target.label), '
+            '"modules": [[file.path, file.short_path] for file in target.files.to_list()], '
+            '"data": {file.short_path: [file.path, file.is_symlink] for file in '
+            "target.default_runfiles.files.to_list() "
+            "if file not in target.files.to_list()}})",
         ],
         capture_output=True,
+    )
+    execution_root = Path(
+        bazel(["info", *bazel_options, "execution_root"], capture_output=True).strip()
     )
     modules = []
     for line in output.splitlines():
         if not line.strip():
             continue
-        fields = line.split("\t")
-        if len(fields) != 2 or not fields[1].endswith(".loombc"):
+        record = json.loads(line)
+        files = record["modules"]
+        if len(files) != 1 or not files[0][0].endswith(".loombc"):
             raise Error(
                 "Each benchmark selection must forward exactly one .loombc module"
             )
-        selection_label = _normalize_cquery_label(fields[0])
+        selection_label = _normalize_cquery_label(record["label"])
         if not selection_label.endswith(LOOM_BENCHMARK_TARGET_SUFFIX):
             raise Error(f"Invalid benchmark selection label: {selection_label}")
         label = selection_label.removesuffix(LOOM_BENCHMARK_TARGET_SUFFIX)
-        module_path = repository_root / fields[1]
+        module_path = repository_root / files[0][0]
         if not module_path.is_file():
             raise Error(
                 f"Bazel did not materialize benchmark module {label}: {module_path}"
             )
-        modules.append(BenchmarkModule(selection_label, label, module_path))
+        modules.append(
+            BenchmarkModule(
+                selection_label,
+                label,
+                module_path,
+                runfiles_sha256(label, execution_root, record["data"]),
+                files[0][1],
+                tuple(
+                    (name, execution_root / filename, is_symlink)
+                    for name, (filename, is_symlink) in sorted(record["data"].items())
+                ),
+            )
+        )
 
     selected_labels = {_normalize_cquery_label(target) for target in targets}
     resolved_labels = {module.selection_label for module in modules}
@@ -210,6 +240,28 @@ def resolve_modules(
     if len(set(module_labels)) != len(module_labels):
         raise Error("Multiple benchmark selections resolved to the same module")
     return sorted(modules, key=lambda module: module.label)
+
+
+@contextmanager
+def module_input(module: BenchmarkModule) -> Iterator[Path]:
+    """Keeps module-relative fixture reads inside its declared Bazel layout."""
+    if not module.data:
+        yield module.path
+        return
+    with tempfile.TemporaryDirectory(prefix="loom-benchmark-input-") as directory:
+        workspace = Path(directory) / "_main"
+        path = workspace / module.short_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(module.path, path)
+        for name, source, is_symlink in module.data:
+            destination = workspace / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if is_symlink:
+                # Bazel's unresolved links are relative to the runfiles layout.
+                destination.symlink_to(source.readlink())
+            else:
+                shutil.copyfile(source, destination)
+        yield path
 
 
 def _parse_source_closures(
@@ -564,6 +616,7 @@ def _cache_entry(module_entry: dict[str, Any]) -> dict[str, Any]:
         "artifact_bundle": module_entry["artifact_bundle"],
         "benchmarks": module_entry["benchmarks"],
         "dependencies": module_entry["dependencies"],
+        "data_sha256": module_entry["data_sha256"],
         "execution_key": module_entry["execution_key"],
         "invocation_sha256": module_entry["invocation_sha256"],
         "module_sha256": module_entry["module"]["sha256"],
@@ -659,7 +712,11 @@ def run(
     targets = resolve_target_patterns(repository_root, args.targets, bazel)
     bazel_options = [
         "--config=opt",
-        *[f"--config={configuration}" for configuration in args.configs],
+        *[
+            f"--config={configuration}"
+            for configuration in args.configs
+            if configuration != "opt"
+        ],
     ]
     bazel(["build", *bazel_options, LOOM_BENCHMARK_TARGET, *targets])
     modules = resolve_modules(repository_root, targets, bazel_options, bazel)
@@ -701,6 +758,7 @@ def run(
         previous_sources = cached.get("sources", []) if cached else []
         changed_sources = _source_changes(previous_sources, sources)
         module_changed = cached is None or cached.get("module_sha256") != module_sha256
+        data_changed = cached is None or cached.get("data_sha256") != module.data_sha256
         runner_changed = cached is None or cached.get("runner_sha256") != runner_sha256
         invocation_changed = (
             cached is None or cached.get("invocation_sha256") != invocation_sha256
@@ -710,6 +768,7 @@ def run(
                 "invocation_sha256": invocation_sha256,
                 "label": module.label,
                 "module_sha256": module_sha256,
+                "data_sha256": module.data_sha256,
                 "runner_sha256": runner_sha256,
                 "schema": SWEEP_SCHEMA,
             }
@@ -731,6 +790,8 @@ def run(
                 reasons.append("source_changed")
             if module_changed:
                 reasons.append("module_changed")
+            if data_changed:
+                reasons.append("data_changed")
             if runner_changed:
                 reasons.append("runner_changed")
             if invocation_changed:
@@ -742,12 +803,13 @@ def run(
 
         entry: dict[str, Any] = {
             "artifact_bundle": None,
-            "artifact_changed": module_changed,
+            "artifact_changed": module_changed or data_changed,
             "artifact_run_id": None,
             "attempted": False,
             "benchmarks": [],
             "changed_sources": changed_sources,
             "dependencies": dependencies,
+            "data_sha256": module.data_sha256,
             "executed": False,
             "execution_key": execution_key,
             "invocation_sha256": invocation_sha256,
@@ -815,15 +877,16 @@ def run(
         )
         entry["attempted"] = True
         try:
-            run_command(
-                [
-                    str(runner_path),
-                    str(module.path),
-                    *runner_args,
-                    f"--device={args.device}",
-                    f"--artifact-bundle-dir={bundle_path}",
-                ]
-            )
+            with module_input(module) as input_path:
+                run_command(
+                    [
+                        str(runner_path),
+                        str(input_path),
+                        *runner_args,
+                        *([f"--device={args.device}"] if args.device is not None else []),
+                        f"--artifact-bundle-dir={bundle_path}",
+                    ]
+                )
             results, benchmarks, work_item_count = _read_bundle_index(
                 output_root, bundle_path
             )
@@ -892,13 +955,12 @@ def register(subparsers: Any) -> None:
         action="append",
         dest="configs",
         metavar="NAME",
-        required=True,
+        default=[],
         help="Bazel configuration enabling the selected device (repeatable).",
     )
     parser.add_argument(
         "--device",
-        required=True,
-        help="Explicit loom-benchmark device URI.",
+        help="Loom device URI for native kernels; omit for VM function benchmarks.",
     )
     parser.add_argument(
         "--output-dir",
@@ -924,6 +986,6 @@ def register(subparsers: Any) -> None:
     parser.add_argument(
         "benchmark_args",
         nargs=argparse.REMAINDER,
-        help="Arguments after -- are forwarded to iree-benchmark-loom.",
+        help="Arguments after -- are forwarded to loom-benchmark.",
     )
     parser.set_defaults(handler=_run_command)
