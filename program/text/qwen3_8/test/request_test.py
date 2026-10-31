@@ -382,9 +382,7 @@ class RequestCheckTest(unittest.TestCase):
         escaped = request.replace('"low"', '"l\\u006fw"')
         self.assertEqual(self.success(self.execute(escaped)), expected)
         duplicate = request.replace('"low"', '"low", "reasoning_effort": "low"')
-        result = self.execute(duplicate)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.success(self.execute(duplicate)), expected)
 
     def test_template_controls_merge_semantics_independent_of_member_order(self):
         selections = (
@@ -415,7 +413,7 @@ class RequestCheckTest(unittest.TestCase):
         del request["chat_template_kwargs"]
         self.assertEqual(self.success(self.execute(request)), expected)
 
-    def test_template_controls_reject_conflicts_types_duplicates_and_unknown_keys(self):
+    def test_template_controls_reject_conflicts_and_wrong_types(self):
         for name, top, nested in (
             ("enable_thinking", True, False),
             ("preserve_thinking", True, False),
@@ -433,7 +431,6 @@ class RequestCheckTest(unittest.TestCase):
             None,
             [],
             True,
-            {"unknown": True},
             {"enable_thinking": "false"},
             {"reasoning_effort": None},
             {"preserve_thinking": 1},
@@ -450,9 +447,23 @@ class RequestCheckTest(unittest.TestCase):
             '"preserve_thinking": true',
             '"preserve_thinking": true, "preserve_thinking": true',
         )
-        result = self.execute(request)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            self.success(self.execute(request)),
+            self.success(self.execute(self.request(preserve_thinking=True))),
+        )
+
+    def test_unused_template_keywords_do_not_change_model_controls(self):
+        controls = {
+            "enable_thinking": False,
+            "reasoning_effort": "none",
+            "preserve_thinking": True,
+            "custom_option": True,
+            "another_option": [1, 2],
+        }
+        self.assertEqual(
+            self.success(self.execute(self.request(chat_template_kwargs=controls))),
+            self.success(self.execute(self.request())),
+        )
 
     def history(self):
         return [
@@ -1036,11 +1047,16 @@ class RequestCheckTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
 
-    def test_tool_permission_is_request_local_and_preserves_history(self):
+    def test_tool_token_suppression_is_request_local_and_preserves_history(self):
         for thinking in (False, True):
             request = self.request(enable_thinking=thinking, tools=TOOLS)
             ordinary = self.success(self.execute(request))
-            for choice, expected_flag in (("auto", 0), ("none", 2)):
+            for choice, expected_flag in (
+                ("auto", 0),
+                ("none", 2),
+                ("required", 0),
+                ({"type": "function", "function": {"name": 'yield\\"λ'}}, 0),
+            ):
                 request["tool_choice"] = choice
                 value = self.success(self.execute(request))
                 self.assertEqual(value["prompt"], ordinary["prompt"])
@@ -1055,7 +1071,7 @@ class RequestCheckTest(unittest.TestCase):
                     struct.unpack("<ffiiq", bytes(value["request_options"])),
                     (0, 1, 0, expected_flag, 1),
                 )
-            # Seed and turn permission compose regardless of JSON field order,
+            # Seed and tool-token suppression compose regardless of field order,
             # and a request-local choice does not modify deployment defaults.
             for order in (
                 {"seed": 17, "tool_choice": "none"},
@@ -1074,6 +1090,25 @@ class RequestCheckTest(unittest.TestCase):
                 struct.unpack("<ffiiq", bytes(value["request_options"])),
                 (0, 1, 0, 3, 19),
             )
+
+    def test_tool_output_does_not_enforce_request_permissions(self):
+        response = "<tool_call><function=yield><parameter=result>done</parameter></function></tool_call>"
+        for tools, choice in (
+            ([], "auto"),
+            (TOOLS, "none"),
+            (TOOLS, "required"),
+            (TOOLS, {"type": "function", "function": {"name": "read"}}),
+        ):
+            with self.subTest(tools=tools, choice=choice):
+                value = self.success(
+                    self.execute(
+                        self.request(tools=tools, tool_choice=choice), response
+                    )
+                )
+                self.assertEqual(
+                    value["tool_calls"][0]["function"],
+                    {"name": "yield", "arguments": '{"result":"done"}'},
+                )
 
     def test_sampling_spelling_and_extreme_exponents(self):
         request = json.dumps(
