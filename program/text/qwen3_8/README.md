@@ -6,7 +6,7 @@ v1 exports; each composing model supplies `text_model_name_v1`, its tokenizer,
 preparation, and numerical stages. The program chooses no physical device and
 contains no checkpoint paths.
 
-`chat.loom` consumes the native service's validated request records and its
+`chat.loom` consumes the native service's request records and its
 JSON, tokenizer, input-validation, and tool host imports. It owns the ChatML
 framing, optional reasoning block, XML tool syntax, media markers, and sampling
 packet. Generated text becomes reusable retained history only when canonical
@@ -48,10 +48,17 @@ Both plain and ordered multimodal content use this boundary. The optional
 history scan follows ranges in the original request without copying history or
 image payloads, and normal preserving requests skip that scan.
 
-`chat_template_kwargs` accepts the same three controls. Top-level and nested
-values must agree after effort alias resolution; member order never overrides
-an explicit preference. Unknown keys, duplicate members within one object, and
-wrongly typed values reject.
+`chat_template_kwargs` consumes the same three controls. Top-level, nested,
+and repeated values must agree after effort alias resolution; member order
+never overrides an explicit preference. Unused keywords do not affect the
+template. The policy checks the types and values of controls it consumes.
+
+Tool declarations are prompt data, not an execution allowlist. The string
+`tool_choice: "none"` suppresses the tool token through the model's sampling
+packet without changing retained history. The policy does not validate tool
+permissions or argument schemas, and named or required choices do not imply a
+constrained-generation guarantee. Generated calls are translated for the client
+to interpret and execute.
 
 Queued execution separates packed cohort position, resident row, source
 position, and first-cohort policy identity. Preparation owns the retained

@@ -877,11 +877,17 @@ func.def @sampling_overlay(%source: buffer, %strict: i1, %configuration: buffer)
       %value_length = view.load %records[%i, 3] : view<[%extent]x5xi64> -> i64
       %value_type = view.load %records[%i, 4] : view<[%extent]x5xi64> -> i64
       scf.if %is_choice {
-        // Native chat validation owns the accepted choice vocabulary. Keep
-        // turn permission in the device packet, not in the rendered history.
-        %value = func.call @option_key(%source, %value_begin, %value_length) : (buffer, i64, i64) -> (buffer)
-        %none = global.load @tool_choice_none : buffer
-        %disabled = func.call @chat_equal(%value, %none) : (buffer, buffer) -> (i1)
+        // Only the string "none" suppresses the tool token. Other choices are
+        // not permission checks on generated names or arguments.
+        %string = scalar.cmpi eq, %value_type, %zero64 : i64
+        %disabled = scf.if %string -> (i1) {
+          %value = func.call @option_key(%source, %value_begin, %value_length) : (buffer, i64, i64) -> (buffer)
+          %none = global.load @tool_choice_none : buffer
+          %matches = func.call @chat_equal(%value, %none) : (buffer, buffer) -> (i1)
+          scf.yield %matches : i1
+        } else {
+          scf.yield %false : i1
+        }
         %flags = view.load %words[3] : view<6xi32> -> i32
         %choice_flag = scf.select %disabled, %c2_i32, %zero32 : i32
         %updated = scalar.ori %flags, %choice_flag : i32
@@ -1091,8 +1097,8 @@ func.def @chat_effort(%value: buffer) -> (i64) {
   func.return %result : i64
 }
 
-// Zero means absent. The native boundary validates types and uniqueness within
-// each object; source merges semantic aliases across the two spellings.
+// Zero means absent. Source merges repeated controls and semantic aliases
+// across the two spellings without changing an explicit preference.
 func.def @chat_merge_control(%prior: i64, %value: i64) -> (i64) {
   %c0 = scalar.constant 0 : i64
   %absent = scalar.cmpi eq, %prior, %c0 : i64
@@ -1115,6 +1121,15 @@ func.def @chat_control(%source: buffer, %key: buffer, %begin: i64, %length: i64,
   %is_effort = func.call @chat_equal(%key, %effort_key) : (buffer, buffer) -> (i1)
   %is_preserve = func.call @chat_equal(%key, %preserve_key) : (buffer, buffer) -> (i1)
   %enabled = scalar.cmpi eq, %type, %true_type : i64
+  %boolean_control = scalar.ori %is_thinking, %is_preserve : i1
+  scf.if %boolean_control {
+    %false_type = scalar.constant 5 : i64
+    %disabled = scalar.cmpi eq, %type, %false_type : i64
+    %valid = scalar.ori %enabled, %disabled : i1
+    %valid32 = scalar.extui %valid : i1 to i32
+    %error = buffer.constant utf8("Qwen enable_thinking and preserve_thinking must be booleans") : buffer
+    func.call @require(%valid32, %error) : (i32, buffer)
+  }
   %boolean = scf.select %enabled, %c2, %c1 : i64
   %next_thinking = scf.if %is_thinking -> (i64) {
     %merged = func.call @chat_merge_control(%thinking, %boolean) : (i64, i64) -> (i64)
@@ -1129,6 +1144,11 @@ func.def @chat_control(%source: buffer, %key: buffer, %begin: i64, %length: i64,
     scf.yield %preserve : i64
   }
   %next_effort = scf.if %is_effort -> (i64) {
+    %string_type = scalar.constant 0 : i64
+    %valid = scalar.cmpi eq, %type, %string_type : i64
+    %valid32 = scalar.extui %valid : i1 to i32
+    %error = global.load @chat_effort_error : buffer
+    func.call @require(%valid32, %error) : (i32, buffer)
     %value = func.call @option_key(%source, %begin, %length) : (buffer, i64, i64) -> (buffer)
     %parsed = func.call @chat_effort(%value) : (buffer) -> (i64)
     %merged = func.call @chat_merge_control(%effort, %parsed) : (i64, i64) -> (i64)
@@ -1141,7 +1161,12 @@ func.def @chat_control(%source: buffer, %key: buffer, %begin: i64, %length: i64,
 
 func.def @chat_template_controls(%request: buffer, %begin: i64, %length: i64, %thinking: i64, %effort: i64, %preserve: i64) -> (i64, i64, i64) {
   %fields, %type, %count = func.call @members_range(%request, %begin, %length) : (buffer, i64, i64) -> (buffer, i32, i64)
-  %bounded = scalar.assume %count [range(%count, 0, 3)] : i64
+  %object_type = scalar.constant 2 : i32
+  %object = scalar.cmpi eq, %type, %object_type : i32
+  %valid = scalar.extui %object : i1 to i32
+  %error = buffer.constant utf8("Qwen chat_template_kwargs must be an object") : buffer
+  func.call @require(%valid, %error) : (i32, buffer)
+  %bounded = scalar.assume %count [range(%count, 0, 2147483647)] : i64
   %extent = index.cast %bounded : i64 to index
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
