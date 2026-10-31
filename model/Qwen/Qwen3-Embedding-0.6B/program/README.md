@@ -26,7 +26,7 @@ token positions travel with the packed request, so attention cannot cross a
 request boundary and each returned vector comes from its own final token.
 The service executes one stage and publishes results only after completion.
 
-The pipeline places four token-row groups across eight columns and four core
+`array.cxx` places four token-row groups across eight columns and four core
 rows. Each column streams its packed projection records once per cohort and
 fans them out to the local workers. The array owns all memory banks, channel
 capacities, endpoints, and fanout; worker providers receive those resources
