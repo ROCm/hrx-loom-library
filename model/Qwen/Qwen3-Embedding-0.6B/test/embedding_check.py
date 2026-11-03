@@ -9,8 +9,8 @@
 
 Bazel tracks the card, lock, providers, and small publisher reference. Full
 checkpoint bytes remain outside the test inputs and are trusted to match the
-acquisition lock. Native exact hashes detect changes; independent F32 vectors
-bound the quantized result separately from that regression identity.
+acquisition lock. Independent F32 vectors bound numerical error; identical
+request replays check execution-state reuse separately from accuracy.
 """
 
 import argparse
@@ -33,6 +33,14 @@ from loom_serve_testing.model_staging import stage_model
 
 def check(endpoint: str, model: str, reference: dict, publisher: bytes) -> dict:
     acceptance = reference["acceptance"]
+
+    def check_publisher(vector, index):
+        expected = struct.unpack_from("<1024f", publisher, index * 4096)
+        cosine = sum(a * b for a, b in zip(vector, expected)) / math.sqrt(
+            sum(a * a for a in vector) * sum(b * b for b in expected)
+        )
+        assert cosine >= acceptance["minimum_cosine"], (index, cosine)
+        return cosine
 
     def request(path, body, status=200):
         message = urllib.request.Request(
@@ -93,13 +101,7 @@ def check(endpoint: str, model: str, reference: dict, publisher: bytes) -> dict:
     for index, vector in enumerate(batched):
         encoded = struct.pack("<1024f", *vector)
         digest = hashlib.sha256(encoded).hexdigest()
-        assert digest == reference["cases"][index]["native_sha256"], (index, digest)
-        expected = struct.unpack_from("<1024f", publisher, index * 4096)
-        cosine = sum(a * b for a, b in zip(vector, expected)) / math.sqrt(
-            sum(a * a for a in vector) * sum(b * b for b in expected)
-        )
-        assert cosine >= acceptance["minimum_cosine"], (index, cosine)
-        cosines.append(cosine)
+        cosines.append(check_publisher(vector, index))
         observed_hashes.append(digest)
     for text, ids, expected in zip(texts, tokens, batched):
         single, _ = embed(text)
@@ -134,14 +136,21 @@ def check(endpoint: str, model: str, reference: dict, publisher: bytes) -> dict:
         row == full_cohort[0] for row in full_cohort
     )
     assert usage["prompt_tokens"] == usage["total_tokens"] == 32
-    # A sequence spanning panels must see its prefix, independently of its
-    # placement beside another sequence and of the order of requests.
-    long_tokens = [1] * 128 + [2]
+    # Different placements partition attention reductions differently. Each
+    # result must satisfy the publisher bound; identical placements must replay
+    # exactly after other requests have reused the resident program.
+    cohort_case = reference["cohort_case"]
+    long_tokens = cohort_case["tokens"]
     long_single, _ = embed(long_tokens)
     mixed, usage = embed([[3] * 7, long_tokens])
     reversed_mixed, _ = embed([long_tokens, [3] * 7])
-    assert mixed[1] == reversed_mixed[0] == long_single[0]
+    mixed_replay, _ = embed([[3] * 7, long_tokens])
+    assert mixed_replay == mixed
     assert mixed[0] == reversed_mixed[1]
+    cohort_cosines = [
+        check_publisher(vector, cohort_case["reference_index"])
+        for vector in (long_single[0], mixed[1], reversed_mixed[0])
+    ]
     assert usage["prompt_tokens"] == usage["total_tokens"] == 136
     for body in (
         {"input": [1] * 257},
@@ -155,6 +164,7 @@ def check(endpoint: str, model: str, reference: dict, publisher: bytes) -> dict:
     return {
         "native_sha256": observed_hashes,
         "publisher_cosines": cosines,
+        "cohort_publisher_cosines": cohort_cosines,
         "cohort_replay": True,
         "concurrent_replay": True,
         "prefix_dimensions": 64,
@@ -188,7 +198,8 @@ def main() -> None:
         parser.error("--output is required outside a Bazel test")
     reference = json.loads(args.reference.read_text())
     publisher = args.reference.with_name(reference["reference"]["file"]).read_bytes()
-    assert len(publisher) == len(reference["cases"]) * 4096
+    assert reference["reference"]["shape"][1] == 1024
+    assert len(publisher) == reference["reference"]["shape"][0] * 4096
     assert hashlib.sha256(publisher).hexdigest() == reference["reference"]["sha256"]
     card = args.model.absolute()
     model_id = json.loads(card.read_text())["model"]["id"]

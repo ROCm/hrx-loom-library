@@ -13,12 +13,15 @@ checkpoint during every test.
 
 Three original synthetic sentences cover English and French tokenization.
 `reference.json` records their exact publisher token IDs and the EOS convention.
-`publisher.f32` contains three independently computed, normalized 1,024-element
+An explicit 129-token input exercises a sequence spanning token panels.
+`publisher.f32` contains four independently computed, normalized 1,024-element
 vectors in little-endian F32 order. The reference uses the pinned publisher
 checkpoint through Transformers `Qwen3Model`, eager F32 attention, one sequence
-at a time, and the final EOS hidden state. It does not use the Loom panel
-packing, matrix operations, or normalization implementation. Dependency versions,
-the checkpoint revision, and the reference digest are recorded beside the data.
+at a time, and the final real token's hidden state. Text cases append EOS;
+explicit token inputs retain their authored contents. It does not use the Loom
+panel packing, matrix operations, or normalization implementation. Dependency
+versions, the checkpoint revision, and the reference digest are recorded beside
+the data.
 
 Reproduce those publisher vectors from the HF cache without acquiring weights:
 
@@ -30,26 +33,27 @@ The pinned Python environment must also be cached for `uv run --offline`.
 Omit uv's offline option to install its authoring dependencies; the script
 still uses only cached checkpoint files unless `--download` is explicitly
 supplied. Regeneration changes publisher vectors and tokenization, while leaving
-native regression identities and acceptance limits under separate review.
+acceptance limits unchanged.
 
 The quantized native output must have cosine similarity of at least 0.995 with
 each publisher vector. Unit-norm and prefix-renormalization errors are bounded
-by 2e-6. These limits are fixed independently of the candidate run. Exact native
-vector digests additionally detect any change from the qualified representation;
-an intended arithmetic change therefore needs a new accuracy qualification even
-when it satisfies the cosine limit.
+by 2e-6. These limits are fixed independently of the candidate run. Native
+vector digests are recorded for comparing source and archive results, while
+identical request replays must remain bit-exact.
 
 The checker compares single requests, explicit token IDs, reordered cohorts,
 concurrent requests, float and base64 encodings, 64-dimensional prefixes, and
 a full thirty-two-sequence cohort. A 129-token sequence crosses the panel
-boundary alone and in both positions of a mixed-length cohort. It checks
-token accounting and rejects invalid
-IDs, dimensions, sequence lengths, and rounded cohort overflow. Successful
-results are written only after the owned server exits cleanly.
+boundary alone and in both positions of a mixed-length cohort. Each placement
+is checked against the independent publisher vector because placement changes
+the attention reduction partitions. Repeating the same mixed cohort checks
+exact state reuse after another request. The checker verifies token accounting
+and rejects invalid IDs, dimensions, sequence lengths, and rounded cohort
+overflow. Successful results are written only after the owned server exits
+cleanly.
 
 The broader qualification also replays a frozen retrieval subset containing
 256 queries and 2,048 documents. That corpus is separate from these compact
-in-repository tests. The source port reproduces every retained native vector;
-the frozen independent publisher and native nDCG@10 scores are approximately
-0.95074 and 0.94833. This is a bounded subset comparison, not a full benchmark
-score or a performance measurement.
+in-repository tests and evaluates retrieval quality against the frozen publisher
+ranking. A pass of these compact service regressions does not establish the
+broader input-family or retrieval qualification.

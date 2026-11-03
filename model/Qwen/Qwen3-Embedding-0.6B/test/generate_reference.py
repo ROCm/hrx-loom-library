@@ -18,7 +18,7 @@
 """Reproduce the independent publisher vectors from the pinned cached checkpoint.
 
 This authoring tool updates only the publisher reference and tokenization.
-Native regression digests and acceptance limits retain their separate evidence.
+Acceptance limits remain independent of the generated output.
 The default is offline; --download explicitly permits checkpoint acquisition.
 """
 
@@ -67,6 +67,16 @@ def main() -> None:
             normalized = torch.nn.functional.normalize(output, p=2, dim=-1)[0]
             vectors.append(normalized.numpy().astype("<f4"))
             case["tokens"] = ids
+        cohort_case = reference["cohort_case"]
+        tokens = torch.tensor([cohort_case["tokens"]], dtype=torch.int64)
+        output = model(
+            input_ids=tokens,
+            attention_mask=torch.ones_like(tokens),
+            use_cache=False,
+        ).last_hidden_state[:, -1]
+        normalized = torch.nn.functional.normalize(output, p=2, dim=-1)[0]
+        cohort_case["reference_index"] = len(vectors)
+        vectors.append(normalized.numpy().astype("<f4"))
     payload = b"".join(vector.tobytes() for vector in vectors)
     provenance = reference["reference"]
     provenance.update(
