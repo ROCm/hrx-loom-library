@@ -21,18 +21,31 @@ same NPU target for initialization and inference.
 
 Request preparation accepts text or explicit token IDs and chooses an output
 dimension between one and 1,024. Batch preparation assigns each sequence a
-multiple of eight slots in a 128-slot cohort. Sequence identities and final
+multiple of eight slots in a 256-slot cohort. Sequence identities and final
 token positions travel with the packed request, so attention cannot cross a
 request boundary and each returned vector comes from its own final token.
 The service executes one stage and publishes results only after completion.
 
 `array.cxx` places four token-row groups across eight columns and four core
-rows. Each column streams its packed projection records once per cohort and
-fans them out to the local workers. The array owns all memory banks, channel
-capacities, endpoints, and fanout; worker providers receive those resources
-explicitly. Arrival and departure messages retire each shared-row phase before
-its storage is reused. Interior, ingress, and terminal roles retain distinct
-barrier ownership. The shared probability/value worker receives its peer-row
+rows. Its resident loop executes seven dense groups and one attention phase
+per layer, followed by final normalization. `pipeline.serial` joins each
+phase's cores and DMA before the next phase uses the shared storage. One
+invocation covers all 28 layers.
+
+Each column reads its packed projection records once per cohort, retains them
+in memory-tile SRAM, and replays them over two 128-token panels. The complete
+dense weight pass is 497,172,480 bytes, independent of the two panel replays.
+Attention retains K/V windows while processing 128 queries; sequence masks
+keep independent requests separate. Mutable activations still pass through
+global memory between model phases.
+
+`array_resources.h` owns core-local storage and channel layouts;
+`array_phases.h` composes the dense and attention workers through the explicit
+provider interfaces in `array_workers.h`. The root owns storage spanning
+phases. Each child starts fresh ingress FIFO cursors over retained SRAM.
+Arrival and departure messages retire each shared-row phase before its storage
+is reused. Interior, ingress, and terminal roles retain distinct barrier
+ownership. The shared probability/value worker receives its peer-row
 normalization responsibility as a constant from the placed strand.
 
 Dense workers receive and pack activations before acquiring their corresponding
@@ -45,7 +58,10 @@ Dense projections use N8/K8 BFP16EBS8 panels and F32 accumulators. Attention
 uses compensated BF16 operands. BF16 normalization, rotary transforms,
 sequence-masked softmax, and the SiLU lookup table keep their defined rounding
 boundaries. `tile_math.cxx` expresses these structured view and vector operations
-in C++ and retains the two contract-bound AIE2P assembly leaves inline. Generic
+in C++ and retains the contract-bound AIE2P assembly leaves inline.
+`tile_state.loom` supplies the architectural load-FIFO state read used by the
+dense leaf. `attention.loom` owns the compensated attention recurrence and
+shared callable row operations. Generic
 native packing and requested-prefix L2 normalization come from the format and
 tensor motifs. Model-specific panel shapes and the offsets within each logical
 parameter remain in these providers.

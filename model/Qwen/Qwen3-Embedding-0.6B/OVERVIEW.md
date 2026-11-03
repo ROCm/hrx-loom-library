@@ -61,10 +61,10 @@ installation with the same device and pool options.
 
 ## Input and cohort contract
 
-One execution cohort contains 128 token slots and at most sixteen independent
+One execution cohort contains 256 token slots and at most thirty-two independent
 sequences. Each sequence consumes its token count rounded upward to eight
-slots. Four 32-token inputs or sixteen inputs of at most eight tokens therefore
-share one complete weight pass. A sequence longer than 128 tokens, or a request
+slots. Eight 32-token inputs or thirty-two inputs of at most eight tokens therefore
+share one complete weight pass. A sequence longer than 256 tokens, or a request
 whose rounded sequences exceed the cohort, is rejected.
 
 Text tokenization includes the publisher's end token; explicit token IDs are
@@ -77,15 +77,15 @@ Query: When is the library open?
 ```
 
 Documents use their ordinary text. Instruction tokens count against the same
-128-token limit. The `embedding` preset selects a 256-dimensional normalized
+256-token limit. The `embedding` preset selects a 256-dimensional normalized
 prefix and a 32-request pending queue. Queue size does not enlarge a cohort.
 
 ## Storage and qualification
 
 The immutable device parameters account for the 808,069,120-byte memory estimate.
 Loading also uses 420 MiB of temporary conversion staging, retired after
-activation. The composition also declares 2,924,544 bytes of mutable state,
-8,192 bytes of control data, and a 524,288-byte output region. These counts do not include
+activation. The composition also declares 5,849,088 bytes of mutable state,
+16,384 bytes of control data, and a 1,048,576-byte output region. These counts do not include
 every allocator, compiler, or runtime cost and do not establish a complete
 transient-memory peak. A resident invocation still transfers intermediate data
 through global memory; it does not imply that every intermediate stays in NPU
