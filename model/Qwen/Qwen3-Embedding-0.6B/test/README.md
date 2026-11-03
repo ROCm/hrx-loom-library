@@ -57,3 +57,9 @@ The broader qualification also replays a frozen retrieval subset containing
 in-repository tests and evaluates retrieval quality against the frozen publisher
 ranking. A pass of these compact service regressions does not establish the
 broader input-family or retrieval qualification.
+
+Replacement implementations preserve or improve aggregate nDCG@10 and
+recall@10 against the qualified baseline, while retaining the 0.995 publisher
+cosine requirement for every embedding. Individual query rankings can change
+within that numerical envelope. Such changes remain qualification diagnostics;
+they are not an exact-ranking requirement on the quantized implementation.

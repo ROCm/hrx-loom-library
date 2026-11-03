@@ -4,8 +4,8 @@
 // Resident compensated-BF16 attention for a 256-slot cohort. Each query/value
 // pair retains one 128-query panel and visits four 64-token K/V windows. The
 // channel protocol owns operand credits; paired workers exchange probabilities
-// and result tiles. Sequence IDs mask cross-request attention. F32 online
-// maxima, sums, and output accumulators preserve normalization across windows.
+// and result tiles. Sequence IDs mask cross-request attention. Online maxima
+// and sums use BF16 storage; F32 output accumulators span K/V windows.
 // Dense-block packing and the callable arithmetic leaves share tile storage
 // with the dense phases, whose completion precedes attention entry.
 
@@ -73,69 +73,11 @@ func.decl inline @bfp16ebs8.pack_bf16_aie2p(%storage: buffer, %input: offset, %o
 
 func.decl inline @bfp16ebs8.pack_bf16_residual_aie2p(%storage: buffer, %input: offset, %output: offset, %identity: offset, %count: i32)
 
+// Softmax uses the native approximate exponential; the complete embedding is
+// qualified against the publisher's F32 output, including cross-window reuse.
 func.def inline @qwen3_embedding.attention_exp(%input: vector<16xf32>) -> (vector<16xf32>) {
-  %floor = vector.splatf -86.900000000000006 : vector<16xf32>
-  %bounded = vector.maxnumf<nnan|nsz> %input, %floor : vector<16xf32>
-  %c0_value = vector.splatf 0.0 : vector<16xf32>
-  %high = vector.fptrunc<daz> %bounded : vector<16xf32> to vector<16xbf16>
-  %high_f32 = vector.extf<daz> %high : vector<16xbf16> to vector<16xf32>
-  %remainder = vector.subf %bounded, %high_f32 : vector<16xf32>
-  %middle = vector.fptrunc<daz> %remainder : vector<16xf32> to vector<16xbf16>
-  %middle_f32 = vector.extf<daz> %middle : vector<16xbf16> to vector<16xf32>
-  %tail_f32 = vector.subf %remainder, %middle_f32 : vector<16xf32>
-  %tail = vector.fptrunc<daz> %tail_f32 : vector<16xf32> to vector<16xbf16>
-  %coefficient_high = vector.splatf 1.4453125 : vector<16xbf16>
-  %coefficient_middle = vector.splatf -0.00262451171875 : vector<16xbf16>
-  %coefficient_tail = vector.splatf 7.0631504058837891e-06 : vector<16xbf16>
-  %input0 = vector.interleave<0> %high, %middle : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %factor0 = vector.interleave<0> %coefficient_high, %coefficient_high : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %partial0 = vector.dot2f %input0, %factor0, %c0_value : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
-  %input1 = vector.interleave<0> %tail, %high : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %factor1 = vector.interleave<0> %coefficient_high, %coefficient_middle : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %partial1 = vector.dot2f %input1, %factor1, %partial0 : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
-  %input2 = vector.interleave<0> %middle, %high : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %factor2 = vector.interleave<0> %coefficient_middle, %coefficient_tail : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %scaled = vector.dot2f %input2, %factor2, %partial1 : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
-  %hybrid_zero = vector.splatf 0.0 : vector<16xf32>
-  %hybrid_narrow_zero = vector.splatf 0.0 : vector<16xbf16>
-  %hybrid_high = vector.fptrunc<daz> %scaled : vector<16xf32> to vector<16xbf16>
-  %hybrid_high_f32 = vector.extf<daz> %hybrid_high : vector<16xbf16> to vector<16xf32>
-  %hybrid_residual = vector.subf<nnan|ninf|nsz> %scaled, %hybrid_high_f32 : vector<16xf32>
-  %hybrid_residual_bf16 = vector.fptrunc<daz> %hybrid_residual : vector<16xf32> to vector<16xbf16>
-  %hybrid_native = vector.exp2f<nnan|ninf|nsz|afn> %hybrid_high_f32 : vector<16xf32>
-  %hybrid_magic = vector.splatf 12582912.0 : vector<16xf32>
-  %hybrid_biased = vector.addf<nnan|ninf|nsz> %hybrid_high_f32, %hybrid_magic : vector<16xf32>
-  %hybrid_integer = vector.subf<nnan|ninf|nsz> %hybrid_biased, %hybrid_magic : vector<16xf32>
-  %hybrid_centered = vector.subf<nnan|ninf|nsz> %hybrid_high_f32, %hybrid_integer : vector<16xf32>
-  %hybrid_centered_bits = vector.bitcast %hybrid_centered : vector<16xf32> to vector<16xi32>
-  %hybrid_sign_shift = vector.splati 31 : vector<16xi32>
-  %hybrid_sign_mask = vector.shrsi %hybrid_centered_bits, %hybrid_sign_shift : vector<16xi32>
-  %hybrid_one_bits = vector.splati 1065353216 : vector<16xi32>
-  %hybrid_wrap_bits = vector.andi %hybrid_sign_mask, %hybrid_one_bits : vector<16xi32>
-  %hybrid_wrap = vector.bitcast %hybrid_wrap_bits : vector<16xi32> to vector<16xf32>
-  %hybrid_fraction = vector.addf<nnan|ninf|nsz> %hybrid_centered, %hybrid_wrap : vector<16xf32>
-  %hybrid_fraction_bf16 = vector.fptrunc<daz> %hybrid_fraction : vector<16xf32> to vector<16xbf16>
-  %hybrid_quadratic = vector.splatf 0.23985324739716779 : vector<16xbf16>
-  %hybrid_linear = vector.splatf -0.23464084701717214 : vector<16xf32>
-  %hybrid_fraction_zero = vector.interleave<0> %hybrid_fraction_bf16, %hybrid_narrow_zero : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %hybrid_quadratic_zero = vector.interleave<0> %hybrid_quadratic, %hybrid_narrow_zero : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %hybrid_partial = vector.dot2f %hybrid_fraction_zero, %hybrid_quadratic_zero, %hybrid_linear : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
-  %hybrid_partial_bf16 = vector.fptrunc<daz> %hybrid_partial : vector<16xf32> to vector<16xbf16>
-  %hybrid_residual_coefficient = vector.splatf 0.67764579207252162 : vector<16xbf16>
-  %hybrid_variables = vector.interleave<0> %hybrid_fraction_bf16, %hybrid_residual_bf16 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %hybrid_coefficients = vector.interleave<0> %hybrid_partial_bf16, %hybrid_residual_coefficient : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %hybrid_constant = vector.splatf 1.0070049627383595 : vector<16xf32>
-  %hybrid_correction = vector.dot2f %hybrid_variables, %hybrid_coefficients, %hybrid_constant : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
-  %hybrid_correction_bf16 = vector.fptrunc<daz> %hybrid_correction : vector<16xf32> to vector<16xbf16>
-  %hybrid_native_bf16 = vector.fptrunc<daz> %hybrid_native : vector<16xf32> to vector<16xbf16>
-  %hybrid_native_zero = vector.interleave<0> %hybrid_native_bf16, %hybrid_narrow_zero : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %hybrid_correction_zero = vector.interleave<0> %hybrid_correction_bf16, %hybrid_narrow_zero : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %hybrid_product = vector.dot2f %hybrid_native_zero, %hybrid_correction_zero, %hybrid_zero : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
-  %hybrid_rounded = vector.fptrunc<daz> %hybrid_product : vector<16xf32> to vector<16xbf16>
-  %hybrid_result = vector.extf<daz> %hybrid_rounded : vector<16xbf16> to vector<16xf32>
-  %below = vector.cmpf olt, %input, %floor : vector<16xf32> -> vector<16xi1>
-  %finite = vector.select %below, %c0_value, %hybrid_result : vector<16xf32>
-  func.return %finite : vector<16xf32>
+  %result = vector.expf<afn> %input : vector<16xf32>
+  func.return %result : vector<16xf32>
 }
 
 func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurrence_prepare_row(%workspace: buffer, %query: index) where [range(%query, 0, 63)] {
