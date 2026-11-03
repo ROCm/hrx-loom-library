@@ -128,14 +128,25 @@ def check(endpoint: str, model: str, reference: dict, publisher: bytes) -> dict:
         )
         < acceptance["prefix_absolute_error"]
     )
-    # A complete cohort exercises all sixteen independently masked rows.
-    sixteen, usage = embed([[1]] * 16)
-    assert len(sixteen) == 16 and all(row == sixteen[0] for row in sixteen)
-    assert usage["prompt_tokens"] == usage["total_tokens"] == 16
+    # A complete cohort exercises both token panels and all sequence identities.
+    full_cohort, usage = embed([[1]] * 32)
+    assert len(full_cohort) == 32 and all(
+        row == full_cohort[0] for row in full_cohort
+    )
+    assert usage["prompt_tokens"] == usage["total_tokens"] == 32
+    # A sequence spanning panels must see its prefix, independently of its
+    # placement beside another sequence and of the order of requests.
+    long_tokens = [1] * 128 + [2]
+    long_single, _ = embed(long_tokens)
+    mixed, usage = embed([[3] * 7, long_tokens])
+    reversed_mixed, _ = embed([long_tokens, [3] * 7])
+    assert mixed[1] == reversed_mixed[0] == long_single[0]
+    assert mixed[0] == reversed_mixed[1]
+    assert usage["prompt_tokens"] == usage["total_tokens"] == 136
     for body in (
-        {"input": [1] * 129},
-        {"input": [[1]] * 17},
-        {"input": [[1] * 65, [2] * 65]},
+        {"input": [1] * 257},
+        {"input": [[1]] * 33},
+        {"input": [[1] * 129, [2] * 121]},
         {"input": [151669]},
         {"input": [-1]},
         {"input": [1], "dimensions": 1025},

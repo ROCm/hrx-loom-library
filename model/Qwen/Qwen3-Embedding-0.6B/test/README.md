@@ -41,7 +41,9 @@ when it satisfies the cosine limit.
 
 The checker compares single requests, explicit token IDs, reordered cohorts,
 concurrent requests, float and base64 encodings, 64-dimensional prefixes, and
-a full sixteen-sequence cohort. It checks token accounting and rejects invalid
+a full thirty-two-sequence cohort. A 129-token sequence crosses the panel
+boundary alone and in both positions of a mixed-length cohort. It checks
+token accounting and rejects invalid
 IDs, dimensions, sequence lengths, and rounded cohort overflow. Successful
 results are written only after the owned server exits cleanly.
 
