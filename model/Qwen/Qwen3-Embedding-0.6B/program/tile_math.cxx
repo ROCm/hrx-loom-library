@@ -542,34 +542,63 @@ struct QwenFifos {
   // Weight stream state retained across output panels.
   QwenLoadFifo weight;
 };
-struct QwenDensePanel {
-  // First eight-token result block.
-  Float32x64 value0;
-  // Second eight-token result block.
-  Float32x64 value1;
-  // Third eight-token result block.
-  Float32x64 value2;
-  // Fourth eight-token result block.
-  Float32x64 value3;
-  // Activation load FIFO after the reduction.
-  QwenLoadFifo activation;
-  // Weight load FIFO after the reduction.
-  QwenLoadFifo weight;
-};
 [[loom::symbol("qwen3_embedding.load_fifos"), loom::force_inline]]
 QwenFifos qwen3_embedding_load_fifos();
 
-[[loom::force_inline]]
-static QwenDensePanel qwen3_embedding_dense_panel(loom::type::buffer<unsigned char> weights, loom::type::offset weight_offset, loom::type::buffer<unsigned char> activations, loom::type::offset activation_offset, Float32x64 initial0, Float32x64 initial1, Float32x64 initial2, Float32x64 initial3, QwenLoadFifo activation_fifo, QwenLoadFifo weight_fifo) {
-  return loom::low::assembly<Aie2pCore, QwenDensePanel>(R"loom(
-(%weights: reg<aie2p.ep>, %weight_offset: reg<aie2p.er>, %activations: reg<aie2p.ep>, %activation_offset: reg<aie2p.er>, %initial0: reg<aie2p.mbms x4>, %initial1: reg<aie2p.mbms x4>, %initial2: reg<aie2p.mbms x4>, %initial3: reg<aie2p.mbms x4>, %activation_fifo: reg<aie2p.eldfiforeg>, %weight_fifo: reg<aie2p.eldfiforeg>) -> (reg<aie2p.mbms x4>, reg<aie2p.mbms x4>, reg<aie2p.mbms x4>, reg<aie2p.mbms x4>, reg<aie2p.eldfiforeg>, reg<aie2p.eldfiforeg>) {
+[[loom::symbol("qwen3_embedding.dense_accumulate")]]
+void qwen3_embedding_dense_accumulate(loom::type::buffer<unsigned char> storage, loom::type::buffer<float> output_storage, loom::type::offset output_offset, bool first_chunk) {
+  // The native leaf retains its physical operand and result addresses across
+  // all sixteen panels. Public buffer values remain zero-origin storage roots.
+  QwenFifos fifos = qwen3_embedding_load_fifos();
+  loom::low::assembly<Aie2pCore, void>(R"loom(
+(%storage: reg<aie2p.ep>, %results: reg<aie2p.ep>, %output_offset: reg<aie2p.er>, %first_chunk: reg<aie2p.er>, %initial_activation_fifo: reg<aie2p.eldfiforeg>, %initial_weight_fifo: reg<aie2p.eldfiforeg>) {
+  %activation_offset = mov.i32 27008
+  %activation_modifier = mov.modifier %activation_offset
+  %activation_origin = copy %storage : reg<aie2p.ep> -> reg<aie2p.ep>
+  %activations = padda.modifier %activation_origin, %activation_modifier
+  %initial_result_modifier = mov.modifier %output_offset
+  %initial_lower = padda.modifier %results, %initial_result_modifier
+  %upper_offset = mov.i32 512
+  %upper_modifier = mov.modifier %upper_offset
+  %upper_origin = copy %initial_lower : reg<aie2p.ep> -> reg<aie2p.ep>
+  %initial_upper = padda.modifier %upper_origin, %upper_modifier
   %control = mova.i32 780
-  %a_modifier = mov.modifier %activation_offset
-  %a_base = padda.modifier %activations, %a_modifier
-  %w_modifier = mov.modifier %weight_offset
-  %w_base = padda.modifier %weights, %w_modifier
-  %a_pointer = copy %a_base : reg<aie2p.ep> -> reg<aie2p.eps>
-  %w_pointer = copy %w_base : reg<aie2p.ep> -> reg<aie2p.eps>
+  %weight_step = mov.i32 1152
+  %result_step = mov.i32 1024
+  %zero = mov.short 0
+  %one = mov.short 1
+  %panels = mov.short 16
+  low.br ^panel_loop(%storage: reg<aie2p.ep>, %initial_lower: reg<aie2p.ep>, %initial_upper: reg<aie2p.ep>, %initial_activation_fifo: reg<aie2p.eldfiforeg>, %initial_weight_fifo: reg<aie2p.eldfiforeg>, %zero: reg<aie2p.er>)
+^panel_loop(%weights: reg<aie2p.ep>, %lower: reg<aie2p.ep>, %upper: reg<aie2p.ep>, %activation_fifo: reg<aie2p.eldfiforeg>, %weight_fifo: reg<aie2p.eldfiforeg>, %panel: reg<aie2p.er>):
+  low.cond_br %first_chunk, ^initialize, ^accumulate : reg<aie2p.er>
+^initialize:
+  %zeros = acc.clear.f32x64
+  low.br ^contract(%zeros: reg<aie2p.mbms x4>, %zeros: reg<aie2p.mbms x4>, %zeros: reg<aie2p.mbms x4>, %zeros: reg<aie2p.mbms x4>)
+^accumulate:
+  %c0_q0 = vlda.acc %lower, 0
+  %c0_q1 = vlda.acc %lower, 64
+  %c0_q2 = vlda.acc %lower, 128
+  %c0_q3 = vlda.acc %lower, 192
+  %c0_initial = concat(%c0_q0, %c0_q1, %c0_q2, %c0_q3) : (reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>) -> reg<aie2p.mbms x4>
+  %c1_q0 = vlda.acc %lower, 256
+  %c1_q1 = vlda.acc %lower, 320
+  %c1_q2 = vlda.acc %lower, 384
+  %c1_q3 = vlda.acc %lower, 448
+  %c1_initial = concat(%c1_q0, %c1_q1, %c1_q2, %c1_q3) : (reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>) -> reg<aie2p.mbms x4>
+  %c2_q0 = vlda.acc %upper, 0
+  %c2_q1 = vlda.acc %upper, 64
+  %c2_q2 = vlda.acc %upper, 128
+  %c2_q3 = vlda.acc %upper, 192
+  %c2_initial = concat(%c2_q0, %c2_q1, %c2_q2, %c2_q3) : (reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>) -> reg<aie2p.mbms x4>
+  %c3_q0 = vlda.acc %upper, 256
+  %c3_q1 = vlda.acc %upper, 320
+  %c3_q2 = vlda.acc %upper, 384
+  %c3_q3 = vlda.acc %upper, 448
+  %c3_initial = concat(%c3_q0, %c3_q1, %c3_q2, %c3_q3) : (reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>) -> reg<aie2p.mbms x4>
+  low.br ^contract(%c0_initial: reg<aie2p.mbms x4>, %c1_initial: reg<aie2p.mbms x4>, %c2_initial: reg<aie2p.mbms x4>, %c3_initial: reg<aie2p.mbms x4>)
+^contract(%c0_entry: reg<aie2p.mbms x4>, %c1_entry: reg<aie2p.mbms x4>, %c2_entry: reg<aie2p.mbms x4>, %c3_entry: reg<aie2p.mbms x4>):
+  %a_pointer = copy %activations : reg<aie2p.ep> -> reg<aie2p.eps>
+  %w_pointer = copy %weights : reg<aie2p.ep> -> reg<aie2p.eps>
   %a_position = mova.fifo.position 0
   %w_position = mova.fifo.position 0
   %a_pointer_fill0, %a_fifo_fill0, %a_position_fill0 = vlda.fill.512 %a_pointer, %activation_fifo, %a_position
@@ -579,10 +608,10 @@ static QwenDensePanel qwen3_embedding_dense_panel(loom::type::buffer<unsigned ch
   %a_0_1, %a_pointer_0_1, %a_fifo_0_1, %a_position_0_1 = vldb.pop.bfp16ebs8 %a_pointer_0_0, %a_fifo_0_0, %a_position_0_0
   %a_0_2, %a_pointer_0_2, %a_fifo_0_2, %a_position_0_2 = vlda.pop.bfp16ebs8 %a_pointer_0_1, %a_fifo_0_1, %a_position_0_1
   %a_0_3, %a_pointer_0_3, %a_fifo_0_3, %a_position_0_3 = vldb.pop.bfp16ebs8 %a_pointer_0_2, %a_fifo_0_2, %a_position_0_2
-  %c0_0 = mma.bfp16ebs8.m8n8k8 %initial0, %w_0_0, %a_0_0, %control
-  %c1_0 = mma.bfp16ebs8.m8n8k8 %initial1, %w_0_0, %a_0_1, %control
-  %c2_0 = mma.bfp16ebs8.m8n8k8 %initial2, %w_0_0, %a_0_2, %control
-  %c3_0 = mma.bfp16ebs8.m8n8k8 %initial3, %w_0_0, %a_0_3, %control
+  %c0_0 = mma.bfp16ebs8.m8n8k8 %c0_entry, %w_0_0, %a_0_0, %control
+  %c1_0 = mma.bfp16ebs8.m8n8k8 %c1_entry, %w_0_0, %a_0_1, %control
+  %c2_0 = mma.bfp16ebs8.m8n8k8 %c2_entry, %w_0_0, %a_0_2, %control
+  %c3_0 = mma.bfp16ebs8.m8n8k8 %c3_entry, %w_0_0, %a_0_3, %control
   %w_1_0, %w_pointer_1_0, %w_fifo_1_0, %w_position_1_0 = vldb.pop.bfp16ebs8 %w_pointer_0_0, %w_fifo_0_0, %w_position_0_0
   %a_1_0, %a_pointer_1_0, %a_fifo_1_0, %a_position_1_0 = vlda.pop.bfp16ebs8 %a_pointer_0_3, %a_fifo_0_3, %a_position_0_3
   %a_1_1, %a_pointer_1_1, %a_fifo_1_1, %a_position_1_1 = vldb.pop.bfp16ebs8 %a_pointer_1_0, %a_fifo_1_0, %a_position_1_0
@@ -726,67 +755,52 @@ static QwenDensePanel qwen3_embedding_dense_panel(loom::type::buffer<unsigned ch
   %c1_15 = mma.bfp16ebs8.m8n8k8 %c1_14, %w_15_0, %a_15_1, %control
   %c2_15 = mma.bfp16ebs8.m8n8k8 %c2_14, %w_15_0, %a_15_2, %control
   %c3_15 = mma.bfp16ebs8.m8n8k8 %c3_14, %w_15_0, %a_15_3, %control
-  return %c0_15, %c1_15, %c2_15, %c3_15, %a_fifo_15_3, %w_fifo_15_0
+  %c0_result_q0 = slice %c0_15[0] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c0_result_q0, %lower, 0
+  %c0_result_q1 = slice %c0_15[1] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c0_result_q1, %lower, 64
+  %c0_result_q2 = slice %c0_15[2] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c0_result_q2, %lower, 128
+  %c0_result_q3 = slice %c0_15[3] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c0_result_q3, %lower, 192
+  %c1_result_q0 = slice %c1_15[0] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c1_result_q0, %lower, 256
+  %c1_result_q1 = slice %c1_15[1] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c1_result_q1, %lower, 320
+  %c1_result_q2 = slice %c1_15[2] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c1_result_q2, %lower, 384
+  %c1_result_q3 = slice %c1_15[3] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c1_result_q3, %lower, 448
+  %c2_result_q0 = slice %c2_15[0] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c2_result_q0, %upper, 0
+  %c2_result_q1 = slice %c2_15[1] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c2_result_q1, %upper, 64
+  %c2_result_q2 = slice %c2_15[2] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c2_result_q2, %upper, 128
+  %c2_result_q3 = slice %c2_15[3] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c2_result_q3, %upper, 192
+  %c3_result_q0 = slice %c3_15[0] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c3_result_q0, %upper, 256
+  %c3_result_q1 = slice %c3_15[1] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c3_result_q1, %upper, 320
+  %c3_result_q2 = slice %c3_15[2] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c3_result_q2, %upper, 384
+  %c3_result_q3 = slice %c3_15[3] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
+  vst.acc %c3_result_q3, %upper, 448
+  %weight_modifier = mov.modifier %weight_step
+  %next_weight = padda.modifier %weights, %weight_modifier
+  %result_modifier = mov.modifier %result_step
+  %next_lower = padda.modifier %lower, %result_modifier
+  %next_upper = padda.modifier %upper, %result_modifier
+  %next_panel = add.rr %panel, %one
+  %more = ltu %next_panel, %panels
+  low.cond_br %more, ^advance, ^finish : reg<aie2p.er>
+^advance:
+  low.br ^panel_loop(%next_weight: reg<aie2p.ep>, %next_lower: reg<aie2p.ep>, %next_upper: reg<aie2p.ep>, %a_fifo_15_3: reg<aie2p.eldfiforeg>, %w_fifo_15_0: reg<aie2p.eldfiforeg>, %next_panel: reg<aie2p.er>)
+^finish:
+  return
 }
-  )loom", weights, weight_offset, activations, activation_offset, initial0, initial1, initial2, initial3, activation_fifo, weight_fifo);
-}
-
-[[loom::symbol("qwen3_embedding.dense_accumulate")]]
-void qwen3_embedding_dense_accumulate(loom::type::buffer<unsigned char> storage, loom::type::buffer<float> output_storage, loom::type::offset output_offset, bool first_chunk) {
-  // Both destinations are 64-byte-aligned tile workspaces. The caller selects
-  // the existing 31680- or 48064-byte result region without moving the root.
-  auto aligned_output = loom::buffer::assume::alignment<64>(output_storage);
-  auto output = loom::buffer::view<16, 4, 64>(aligned_output, output_offset, {});
-  QwenFifos fifos = qwen3_embedding_load_fifos();
-  for (int panel = 0; panel < 16; ++panel) {
-    loom::type::offset weight_offset = loom::index::scale(loom::index::cast(panel), loom::type::offset{1152});
-    Float32x64 initial0 = Float32x64{};
-    Float32x64 initial1 = Float32x64{};
-    Float32x64 initial2 = Float32x64{};
-    Float32x64 initial3 = Float32x64{};
-    if (first_chunk) {
-      Float32x64 c0 = Float32x64{};
-      Float32x64 initial = loom::vector::fragment::attach<loom::vector::fragment::role::init>(c0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-      auto next_initial0 = initial;
-      auto next_initial1 = initial;
-      auto next_initial2 = initial;
-      auto next_initial3 = initial;
-      initial0 = next_initial0;
-      initial1 = next_initial1;
-      initial2 = next_initial2;
-      initial3 = next_initial3;
-    } else {
-      Float32x64 previous0 = loom::vector::load<Float32x64>(output, {panel, 0, 0});
-      initial0 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-      Float32x64 previous1 = loom::vector::load<Float32x64>(output, {panel, 1, 0});
-      initial1 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-      Float32x64 previous2 = loom::vector::load<Float32x64>(output, {panel, 2, 0});
-      initial2 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-      Float32x64 previous3 = loom::vector::load<Float32x64>(output, {panel, 3, 0});
-      initial3 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-    }
-    QwenDensePanel call_result = qwen3_embedding_dense_panel(storage, weight_offset, storage, loom::type::offset{27008}, initial0, initial1, initial2, initial3, fifos.activation, fifos.weight);
-    fifos = {call_result.activation, call_result.weight};
-    Float32x64 sum0 = call_result.value0;
-    Float32x64 sum1 = call_result.value1;
-    Float32x64 sum2 = call_result.value2;
-    Float32x64 sum3 = call_result.value3;
-    auto panel_span = loom::view::subview<1, 4, 64>(output, {panel, 0, 0}, {});
-    auto fragments = loom::view::bitcast<loom::type::view<loom::type::shape<4, 64>, float>>(panel_span);
-    auto span0 = loom::view::subview<1, 64>(fragments, {0, 0}, {});
-    auto tile0 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(span0);
-    loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(sum0, tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-    auto span1 = loom::view::subview<1, 64>(fragments, {1, 0}, {});
-    auto tile1 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(span1);
-    loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(sum1, tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-    auto span2 = loom::view::subview<1, 64>(fragments, {2, 0}, {});
-    auto tile2 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(span2);
-    loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(sum2, tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-    auto span3 = loom::view::subview<1, 64>(fragments, {3, 0}, {});
-    auto tile3 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(span3);
-    loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(sum3, tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-  }
-  return;
+  )loom", storage, output_storage, output_offset, first_chunk, fifos.activation, fifos.weight);
 }
 
 [[loom::symbol("qwen3_embedding.dense_rows"), loom::force_inline]]
