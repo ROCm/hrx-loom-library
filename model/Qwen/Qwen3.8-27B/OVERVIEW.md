@@ -20,7 +20,53 @@ loom-serve --model="$HOME/models/qwen3.8-27b/model.json" \
 
 The `chat` preset uses checkpoint MTP without the image projector;
 `target-only` selects ordinary target decoding. Select `vision` to fetch the
-image projector, or `dflash2` to fetch the separate draft checkpoint. For example:
+image projector, or `dflash2` to fetch the separate draft checkpoint.
+
+## Choose the context and cache capacities
+
+The selected model preset, rather than Loom globally, supplies the serving
+capacities. `chat`, `vision`, `target-only`, and `dflash2` start with a
+32,768-token limit for one context and 65,536 pooled token positions shared by
+active and retained conversations. These are canonical starting points, not
+limits baked into the program.
+
+To select a different window, place a deployment document beside the fetched
+card. This example permits one 131,072-token context and gives the shared cache
+the same logical capacity:
+
+```sh
+cat > "$HOME/models/qwen3.8-27b/serve.json" <<'JSON'
+{
+  "name": "Qwen/Qwen3.8-27B",
+  "model": {"path": "model.json", "preset": "chat"},
+  "definition": {
+    "kind": "text",
+    "context_capacity": 131072,
+    "pool_capacity": 131072
+  }
+}
+JSON
+loom-serve --model="$HOME/models/qwen3.8-27b/serve.json" \
+  --device=amdgpu://0
+```
+
+`context_capacity` is the logical ceiling for one conversation.
+`pool_capacity` is the total KV capacity shared across live conversations,
+retained histories, and checkpoints; it does not multiply by the execution-row
+count. Use at least the context capacity when one request must be able to reach
+the full window, and increase it for concurrently retained histories. Qwen's
+cache uses 64-token pages, so the pool capacity must be a multiple of 64.
+Physical cache slabs are committed as admitted work uses them rather than
+eagerly reserving every row's maximum.
+
+At full use, target KV state consumes 64 KiB per pooled token. Checkpoint MTP
+adds 4 KiB per token, and DFlash2 adds 20 KiB instead; model weights, recurrent
+state, workspaces, and cache metadata need additional memory. The
+131,072-token example therefore permits up to 8.5 GiB of target-plus-MTP KV
+state. A deployment can deliberately set a smaller pool than its context limit,
+but requests that cannot fit the pool are rejected.
+
+For DFlash2, fetch and reference its matching preset:
 
 ```sh
 loom-fetch https://raw.githubusercontent.com/ROCm/hrx-loom-library/main/model/Qwen/Qwen3.8-27B/model.json \
