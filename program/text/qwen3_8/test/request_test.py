@@ -1132,6 +1132,13 @@ class RequestCheckTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
 
+    def test_context_capacity_uses_native_token_coordinates(self):
+        request = self.request(
+            messages=[{"role": "user", "content": "x" * 262145}],
+        )
+        value = self.success(self.execute(request, capacity=1048576))
+        self.assertGreater(len(value["tokens"]), 262144)
+
     def test_capacity_and_model_identity_rejections_are_atomic(self):
         for request, capacity, diagnostic in (
             (self.request(), 1, "input exceeds the available context size"),
