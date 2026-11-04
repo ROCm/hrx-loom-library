@@ -12,6 +12,7 @@
 // SiLU preserve the round points of the qualified resident representation.
 // Portable prefix normalization and native packing are separate motif inputs.
 
+#include <loomcxx/encoding.h>
 #include <loomcxx/low.h>
 #include <loomcxx/numeric.h>
 #include <loomcxx/scalar.h>
@@ -77,7 +78,7 @@ static void qwen3_embedding_normalize_dense_head(loom::type::index length, loom:
 static void qwen3_embedding_rotate(loom::type::view<loom::type::shape<2, 64>, std::bfloat16_t> rope, loom::type::view<loom::type::shape<128>, std::bfloat16_t> output_head);
 
 [[loom::symbol("qwen3_embedding.dense_accumulate")]]
-void qwen3_embedding_dense_accumulate(loom::type::buffer<unsigned char> storage, loom::type::buffer<float> output_storage, loom::type::offset output_offset, bool first_chunk);
+void qwen3_embedding_dense_accumulate(loom::type::view<loom::type::shape<16, 2, 576>, unsigned char> weights, loom::type::view<loom::type::shape<2, 4, 576>, unsigned char> activations, loom::type::view<loom::type::shape<16, 4, 64>, float> primary, loom::type::view<loom::type::shape<16, 4, 64>, float> secondary, bool use_secondary, bool first);
 
 [[loom::symbol("qwen3_embedding.dense_rows"), loom::force_inline]]
 void qwen3_embedding_dense_rows(loom::type::view<loom::type::shape<16, 4, 64>, float> input, loom::type::view<loom::type::shape<16, 4, 64>, float> secondary, bool first, loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> output);
@@ -535,272 +536,113 @@ static void qwen3_embedding_rotate(loom::type::view<loom::type::shape<2, 64>, st
   return;
 }
 
-struct [[loom::type("aie2p.load_fifo")]] QwenLoadFifo {};
-struct QwenFifos {
-  // Activation stream state retained across output panels.
-  QwenLoadFifo activation;
-  // Weight stream state retained across output panels.
-  QwenLoadFifo weight;
+using WeightPanel = unsigned char __attribute__((ext_vector_type(1152)));
+using ActivationPanel = unsigned char __attribute__((ext_vector_type(4608)));
+using PackedRecord = unsigned char __attribute__((ext_vector_type(72)));
+using Accumulator = float __attribute__((ext_vector_type(64)));
+using Schema = loom::type::encoding<loom::encoding::role::schema>;
+using FragmentRole = loom::vector::fragment::role;
+
+enum class Rounding { flush_subnormal };
+struct PackedParameters {
+  // Native block-floating format shared with the parameter packer.
+  loom::encoding::numeric_format element_format = loom::encoding::numeric_format::bfp16ebs8;
+  // Logical elements in one N8/K8 block.
+  unsigned payload_elements = 64;
+  // Payload bytes map directly to the target fragment representation.
+  loom::encoding::payload_packing payload_packing = loom::encoding::payload_packing::target_fragment;
+  // Eighteen 32-bit words contain the 72-byte packed block.
+  unsigned payload_registers = 18;
+  // Matches the native encoder's subnormal treatment.
+  Rounding rounding = Rounding::flush_subnormal;
 };
-[[loom::symbol("qwen3_embedding.load_fifos"), loom::force_inline]]
-QwenFifos qwen3_embedding_load_fifos();
+template <PackedParameters Parameters>
+[[loom::op("encoding.define", "encoding.operand")]] Schema packed_schema();
+struct FragmentParameters {
+  // Explicit operand schema retained by the fragment attachment.
+  Schema schema;
+};
+struct Accumulators {
+  // Output for the first eight-token block.
+  Accumulator first;
+  // Output for the second eight-token block.
+  Accumulator second;
+  // Output for the third eight-token block.
+  Accumulator third;
+  // Output for the fourth eight-token block.
+  Accumulator fourth;
+};
+
+// Each weight block contributes to four independent token accumulators.
+// Whole-panel loads let the compiler retain the FIFO stream across blocks.
+template <unsigned Weight>
+[[loom::force_inline]] static Accumulators contract_record(
+    WeightPanel weights, ActivationPanel activations, Accumulators current,
+    Schema schema) {
+  auto tile = loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}};
+  auto weight_bytes = loom::vector::slice<PackedRecord>(weights, {Weight * 72});
+  auto weight = loom::vector::fragment::attach<FragmentRole::lhs>(weight_bytes, tile, FragmentParameters{schema});
+  auto first_bytes = loom::vector::slice<PackedRecord>(activations, {(Weight * 4) * 72});
+  auto second_bytes = loom::vector::slice<PackedRecord>(activations, {(Weight * 4 + 1) * 72});
+  auto third_bytes = loom::vector::slice<PackedRecord>(activations, {(Weight * 4 + 2) * 72});
+  auto fourth_bytes = loom::vector::slice<PackedRecord>(activations, {(Weight * 4 + 3) * 72});
+  auto first = loom::vector::fragment::attach<FragmentRole::rhs>(first_bytes, tile, FragmentParameters{schema});
+  auto second = loom::vector::fragment::attach<FragmentRole::rhs>(second_bytes, tile, FragmentParameters{schema});
+  auto third = loom::vector::fragment::attach<FragmentRole::rhs>(third_bytes, tile, FragmentParameters{schema});
+  auto fourth = loom::vector::fragment::attach<FragmentRole::rhs>(fourth_bytes, tile, FragmentParameters{schema});
+  return {loom::vector::mma(weight, first, current.first),
+          loom::vector::mma(weight, second, current.second),
+          loom::vector::mma(weight, third, current.third),
+          loom::vector::mma(weight, fourth, current.fourth)};
+}
 
 [[loom::symbol("qwen3_embedding.dense_accumulate")]]
-void qwen3_embedding_dense_accumulate(loom::type::buffer<unsigned char> storage, loom::type::buffer<float> output_storage, loom::type::offset output_offset, bool first_chunk) {
-  // The native leaf retains its physical operand and result addresses across
-  // all sixteen panels. Public buffer values remain zero-origin storage roots.
-  QwenFifos fifos = qwen3_embedding_load_fifos();
-  loom::low::assembly<Aie2pCore, void>(R"loom(
-(%storage: reg<aie2p.ep>, %results: reg<aie2p.ep>, %output_offset: reg<aie2p.er>, %first_chunk: reg<aie2p.er>, %initial_activation_fifo: reg<aie2p.eldfiforeg>, %initial_weight_fifo: reg<aie2p.eldfiforeg>) {
-  %activation_offset = mov.i32 27008
-  %activation_modifier = mov.modifier %activation_offset
-  %activation_origin = copy %storage : reg<aie2p.ep> -> reg<aie2p.ep>
-  %activations = padda.modifier %activation_origin, %activation_modifier
-  %initial_result_modifier = mov.modifier %output_offset
-  %initial_lower = padda.modifier %results, %initial_result_modifier
-  %upper_offset = mov.i32 512
-  %upper_modifier = mov.modifier %upper_offset
-  %upper_origin = copy %initial_lower : reg<aie2p.ep> -> reg<aie2p.ep>
-  %initial_upper = padda.modifier %upper_origin, %upper_modifier
-  %control = mova.i32 780
-  %weight_step = mov.i32 1152
-  %result_step = mov.i32 1024
-  %zero = mov.short 0
-  %one = mov.short 1
-  %panels = mov.short 16
-  low.br ^panel_loop(%storage: reg<aie2p.ep>, %initial_lower: reg<aie2p.ep>, %initial_upper: reg<aie2p.ep>, %initial_activation_fifo: reg<aie2p.eldfiforeg>, %initial_weight_fifo: reg<aie2p.eldfiforeg>, %zero: reg<aie2p.er>)
-^panel_loop(%weights: reg<aie2p.ep>, %lower: reg<aie2p.ep>, %upper: reg<aie2p.ep>, %activation_fifo: reg<aie2p.eldfiforeg>, %weight_fifo: reg<aie2p.eldfiforeg>, %panel: reg<aie2p.er>):
-  low.cond_br %first_chunk, ^initialize, ^accumulate : reg<aie2p.er>
-^initialize:
-  %zeros = acc.clear.f32x64
-  low.br ^contract(%zeros: reg<aie2p.mbms x4>, %zeros: reg<aie2p.mbms x4>, %zeros: reg<aie2p.mbms x4>, %zeros: reg<aie2p.mbms x4>)
-^accumulate:
-  %c0_q0 = vlda.acc %lower, 0
-  %c0_q1 = vlda.acc %lower, 64
-  %c0_q2 = vlda.acc %lower, 128
-  %c0_q3 = vlda.acc %lower, 192
-  %c0_initial = concat(%c0_q0, %c0_q1, %c0_q2, %c0_q3) : (reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>) -> reg<aie2p.mbms x4>
-  %c1_q0 = vlda.acc %lower, 256
-  %c1_q1 = vlda.acc %lower, 320
-  %c1_q2 = vlda.acc %lower, 384
-  %c1_q3 = vlda.acc %lower, 448
-  %c1_initial = concat(%c1_q0, %c1_q1, %c1_q2, %c1_q3) : (reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>) -> reg<aie2p.mbms x4>
-  %c2_q0 = vlda.acc %upper, 0
-  %c2_q1 = vlda.acc %upper, 64
-  %c2_q2 = vlda.acc %upper, 128
-  %c2_q3 = vlda.acc %upper, 192
-  %c2_initial = concat(%c2_q0, %c2_q1, %c2_q2, %c2_q3) : (reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>) -> reg<aie2p.mbms x4>
-  %c3_q0 = vlda.acc %upper, 256
-  %c3_q1 = vlda.acc %upper, 320
-  %c3_q2 = vlda.acc %upper, 384
-  %c3_q3 = vlda.acc %upper, 448
-  %c3_initial = concat(%c3_q0, %c3_q1, %c3_q2, %c3_q3) : (reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>) -> reg<aie2p.mbms x4>
-  low.br ^contract(%c0_initial: reg<aie2p.mbms x4>, %c1_initial: reg<aie2p.mbms x4>, %c2_initial: reg<aie2p.mbms x4>, %c3_initial: reg<aie2p.mbms x4>)
-^contract(%c0_entry: reg<aie2p.mbms x4>, %c1_entry: reg<aie2p.mbms x4>, %c2_entry: reg<aie2p.mbms x4>, %c3_entry: reg<aie2p.mbms x4>):
-  %a_pointer = copy %activations : reg<aie2p.ep> -> reg<aie2p.eps>
-  %w_pointer = copy %weights : reg<aie2p.ep> -> reg<aie2p.eps>
-  %a_position = mova.fifo.position 0
-  %w_position = mova.fifo.position 0
-  %a_pointer_fill0, %a_fifo_fill0, %a_position_fill0 = vlda.fill.512 %a_pointer, %activation_fifo, %a_position
-  %w_pointer_fill0, %w_fifo_fill0, %w_position_fill0 = vldb.fill.512 %w_pointer, %weight_fifo, %w_position
-  %w_0_0, %w_pointer_0_0, %w_fifo_0_0, %w_position_0_0 = vlda.pop.bfp16ebs8 %w_pointer_fill0, %w_fifo_fill0, %w_position_fill0
-  %a_0_0, %a_pointer_0_0, %a_fifo_0_0, %a_position_0_0 = vlda.pop.bfp16ebs8 %a_pointer_fill0, %a_fifo_fill0, %a_position_fill0
-  %a_0_1, %a_pointer_0_1, %a_fifo_0_1, %a_position_0_1 = vldb.pop.bfp16ebs8 %a_pointer_0_0, %a_fifo_0_0, %a_position_0_0
-  %a_0_2, %a_pointer_0_2, %a_fifo_0_2, %a_position_0_2 = vlda.pop.bfp16ebs8 %a_pointer_0_1, %a_fifo_0_1, %a_position_0_1
-  %a_0_3, %a_pointer_0_3, %a_fifo_0_3, %a_position_0_3 = vldb.pop.bfp16ebs8 %a_pointer_0_2, %a_fifo_0_2, %a_position_0_2
-  %c0_0 = mma.bfp16ebs8.m8n8k8 %c0_entry, %w_0_0, %a_0_0, %control
-  %c1_0 = mma.bfp16ebs8.m8n8k8 %c1_entry, %w_0_0, %a_0_1, %control
-  %c2_0 = mma.bfp16ebs8.m8n8k8 %c2_entry, %w_0_0, %a_0_2, %control
-  %c3_0 = mma.bfp16ebs8.m8n8k8 %c3_entry, %w_0_0, %a_0_3, %control
-  %w_1_0, %w_pointer_1_0, %w_fifo_1_0, %w_position_1_0 = vldb.pop.bfp16ebs8 %w_pointer_0_0, %w_fifo_0_0, %w_position_0_0
-  %a_1_0, %a_pointer_1_0, %a_fifo_1_0, %a_position_1_0 = vlda.pop.bfp16ebs8 %a_pointer_0_3, %a_fifo_0_3, %a_position_0_3
-  %a_1_1, %a_pointer_1_1, %a_fifo_1_1, %a_position_1_1 = vldb.pop.bfp16ebs8 %a_pointer_1_0, %a_fifo_1_0, %a_position_1_0
-  %a_1_2, %a_pointer_1_2, %a_fifo_1_2, %a_position_1_2 = vlda.pop.bfp16ebs8 %a_pointer_1_1, %a_fifo_1_1, %a_position_1_1
-  %a_1_3, %a_pointer_1_3, %a_fifo_1_3, %a_position_1_3 = vldb.pop.bfp16ebs8 %a_pointer_1_2, %a_fifo_1_2, %a_position_1_2
-  %c0_1 = mma.bfp16ebs8.m8n8k8 %c0_0, %w_1_0, %a_1_0, %control
-  %c1_1 = mma.bfp16ebs8.m8n8k8 %c1_0, %w_1_0, %a_1_1, %control
-  %c2_1 = mma.bfp16ebs8.m8n8k8 %c2_0, %w_1_0, %a_1_2, %control
-  %c3_1 = mma.bfp16ebs8.m8n8k8 %c3_0, %w_1_0, %a_1_3, %control
-  %a_pointer_fill2, %a_fifo_fill2, %a_position_fill2 = vlda.fill.512 %a_pointer_1_3, %a_fifo_1_3, %a_position_1_3
-  %w_2_0, %w_pointer_2_0, %w_fifo_2_0, %w_position_2_0 = vlda.pop.bfp16ebs8 %w_pointer_1_0, %w_fifo_1_0, %w_position_1_0
-  %a_2_0, %a_pointer_2_0, %a_fifo_2_0, %a_position_2_0 = vlda.pop.bfp16ebs8 %a_pointer_fill2, %a_fifo_fill2, %a_position_fill2
-  %a_2_1, %a_pointer_2_1, %a_fifo_2_1, %a_position_2_1 = vldb.pop.bfp16ebs8 %a_pointer_2_0, %a_fifo_2_0, %a_position_2_0
-  %a_2_2, %a_pointer_2_2, %a_fifo_2_2, %a_position_2_2 = vlda.pop.bfp16ebs8 %a_pointer_2_1, %a_fifo_2_1, %a_position_2_1
-  %a_2_3, %a_pointer_2_3, %a_fifo_2_3, %a_position_2_3 = vldb.pop.bfp16ebs8 %a_pointer_2_2, %a_fifo_2_2, %a_position_2_2
-  %c0_2 = mma.bfp16ebs8.m8n8k8 %c0_1, %w_2_0, %a_2_0, %control
-  %c1_2 = mma.bfp16ebs8.m8n8k8 %c1_1, %w_2_0, %a_2_1, %control
-  %c2_2 = mma.bfp16ebs8.m8n8k8 %c2_1, %w_2_0, %a_2_2, %control
-  %c3_2 = mma.bfp16ebs8.m8n8k8 %c3_1, %w_2_0, %a_2_3, %control
-  %w_3_0, %w_pointer_3_0, %w_fifo_3_0, %w_position_3_0 = vldb.pop.bfp16ebs8 %w_pointer_2_0, %w_fifo_2_0, %w_position_2_0
-  %a_3_0, %a_pointer_3_0, %a_fifo_3_0, %a_position_3_0 = vlda.pop.bfp16ebs8 %a_pointer_2_3, %a_fifo_2_3, %a_position_2_3
-  %a_3_1, %a_pointer_3_1, %a_fifo_3_1, %a_position_3_1 = vldb.pop.bfp16ebs8 %a_pointer_3_0, %a_fifo_3_0, %a_position_3_0
-  %a_3_2, %a_pointer_3_2, %a_fifo_3_2, %a_position_3_2 = vlda.pop.bfp16ebs8 %a_pointer_3_1, %a_fifo_3_1, %a_position_3_1
-  %a_3_3, %a_pointer_3_3, %a_fifo_3_3, %a_position_3_3 = vldb.pop.bfp16ebs8 %a_pointer_3_2, %a_fifo_3_2, %a_position_3_2
-  %c0_3 = mma.bfp16ebs8.m8n8k8 %c0_2, %w_3_0, %a_3_0, %control
-  %c1_3 = mma.bfp16ebs8.m8n8k8 %c1_2, %w_3_0, %a_3_1, %control
-  %c2_3 = mma.bfp16ebs8.m8n8k8 %c2_2, %w_3_0, %a_3_2, %control
-  %c3_3 = mma.bfp16ebs8.m8n8k8 %c3_2, %w_3_0, %a_3_3, %control
-  %a_pointer_fill4, %a_fifo_fill4, %a_position_fill4 = vlda.fill.512 %a_pointer_3_3, %a_fifo_3_3, %a_position_3_3
-  %w_4_0, %w_pointer_4_0, %w_fifo_4_0, %w_position_4_0 = vlda.pop.bfp16ebs8 %w_pointer_3_0, %w_fifo_3_0, %w_position_3_0
-  %a_4_0, %a_pointer_4_0, %a_fifo_4_0, %a_position_4_0 = vlda.pop.bfp16ebs8 %a_pointer_fill4, %a_fifo_fill4, %a_position_fill4
-  %a_4_1, %a_pointer_4_1, %a_fifo_4_1, %a_position_4_1 = vldb.pop.bfp16ebs8 %a_pointer_4_0, %a_fifo_4_0, %a_position_4_0
-  %a_4_2, %a_pointer_4_2, %a_fifo_4_2, %a_position_4_2 = vlda.pop.bfp16ebs8 %a_pointer_4_1, %a_fifo_4_1, %a_position_4_1
-  %a_4_3, %a_pointer_4_3, %a_fifo_4_3, %a_position_4_3 = vldb.pop.bfp16ebs8 %a_pointer_4_2, %a_fifo_4_2, %a_position_4_2
-  %c0_4 = mma.bfp16ebs8.m8n8k8 %c0_3, %w_4_0, %a_4_0, %control
-  %c1_4 = mma.bfp16ebs8.m8n8k8 %c1_3, %w_4_0, %a_4_1, %control
-  %c2_4 = mma.bfp16ebs8.m8n8k8 %c2_3, %w_4_0, %a_4_2, %control
-  %c3_4 = mma.bfp16ebs8.m8n8k8 %c3_3, %w_4_0, %a_4_3, %control
-  %w_5_0, %w_pointer_5_0, %w_fifo_5_0, %w_position_5_0 = vldb.pop.bfp16ebs8 %w_pointer_4_0, %w_fifo_4_0, %w_position_4_0
-  %a_5_0, %a_pointer_5_0, %a_fifo_5_0, %a_position_5_0 = vlda.pop.bfp16ebs8 %a_pointer_4_3, %a_fifo_4_3, %a_position_4_3
-  %a_5_1, %a_pointer_5_1, %a_fifo_5_1, %a_position_5_1 = vldb.pop.bfp16ebs8 %a_pointer_5_0, %a_fifo_5_0, %a_position_5_0
-  %a_5_2, %a_pointer_5_2, %a_fifo_5_2, %a_position_5_2 = vlda.pop.bfp16ebs8 %a_pointer_5_1, %a_fifo_5_1, %a_position_5_1
-  %a_5_3, %a_pointer_5_3, %a_fifo_5_3, %a_position_5_3 = vldb.pop.bfp16ebs8 %a_pointer_5_2, %a_fifo_5_2, %a_position_5_2
-  %c0_5 = mma.bfp16ebs8.m8n8k8 %c0_4, %w_5_0, %a_5_0, %control
-  %c1_5 = mma.bfp16ebs8.m8n8k8 %c1_4, %w_5_0, %a_5_1, %control
-  %c2_5 = mma.bfp16ebs8.m8n8k8 %c2_4, %w_5_0, %a_5_2, %control
-  %c3_5 = mma.bfp16ebs8.m8n8k8 %c3_4, %w_5_0, %a_5_3, %control
-  %a_pointer_fill6, %a_fifo_fill6, %a_position_fill6 = vlda.fill.512 %a_pointer_5_3, %a_fifo_5_3, %a_position_5_3
-  %w_6_0, %w_pointer_6_0, %w_fifo_6_0, %w_position_6_0 = vlda.pop.bfp16ebs8 %w_pointer_5_0, %w_fifo_5_0, %w_position_5_0
-  %a_6_0, %a_pointer_6_0, %a_fifo_6_0, %a_position_6_0 = vlda.pop.bfp16ebs8 %a_pointer_fill6, %a_fifo_fill6, %a_position_fill6
-  %a_6_1, %a_pointer_6_1, %a_fifo_6_1, %a_position_6_1 = vldb.pop.bfp16ebs8 %a_pointer_6_0, %a_fifo_6_0, %a_position_6_0
-  %a_6_2, %a_pointer_6_2, %a_fifo_6_2, %a_position_6_2 = vlda.pop.bfp16ebs8 %a_pointer_6_1, %a_fifo_6_1, %a_position_6_1
-  %a_6_3, %a_pointer_6_3, %a_fifo_6_3, %a_position_6_3 = vldb.pop.bfp16ebs8 %a_pointer_6_2, %a_fifo_6_2, %a_position_6_2
-  %c0_6 = mma.bfp16ebs8.m8n8k8 %c0_5, %w_6_0, %a_6_0, %control
-  %c1_6 = mma.bfp16ebs8.m8n8k8 %c1_5, %w_6_0, %a_6_1, %control
-  %c2_6 = mma.bfp16ebs8.m8n8k8 %c2_5, %w_6_0, %a_6_2, %control
-  %c3_6 = mma.bfp16ebs8.m8n8k8 %c3_5, %w_6_0, %a_6_3, %control
-  %w_7_0, %w_pointer_7_0, %w_fifo_7_0, %w_position_7_0 = vldb.pop.bfp16ebs8 %w_pointer_6_0, %w_fifo_6_0, %w_position_6_0
-  %a_7_0, %a_pointer_7_0, %a_fifo_7_0, %a_position_7_0 = vlda.pop.bfp16ebs8 %a_pointer_6_3, %a_fifo_6_3, %a_position_6_3
-  %a_7_1, %a_pointer_7_1, %a_fifo_7_1, %a_position_7_1 = vldb.pop.bfp16ebs8 %a_pointer_7_0, %a_fifo_7_0, %a_position_7_0
-  %a_7_2, %a_pointer_7_2, %a_fifo_7_2, %a_position_7_2 = vlda.pop.bfp16ebs8 %a_pointer_7_1, %a_fifo_7_1, %a_position_7_1
-  %a_7_3, %a_pointer_7_3, %a_fifo_7_3, %a_position_7_3 = vldb.pop.bfp16ebs8 %a_pointer_7_2, %a_fifo_7_2, %a_position_7_2
-  %c0_7 = mma.bfp16ebs8.m8n8k8 %c0_6, %w_7_0, %a_7_0, %control
-  %c1_7 = mma.bfp16ebs8.m8n8k8 %c1_6, %w_7_0, %a_7_1, %control
-  %c2_7 = mma.bfp16ebs8.m8n8k8 %c2_6, %w_7_0, %a_7_2, %control
-  %c3_7 = mma.bfp16ebs8.m8n8k8 %c3_6, %w_7_0, %a_7_3, %control
-  %a_pointer_fill8, %a_fifo_fill8, %a_position_fill8 = vlda.fill.512 %a_pointer_7_3, %a_fifo_7_3, %a_position_7_3
-  %w_pointer_fill8, %w_fifo_fill8, %w_position_fill8 = vldb.fill.512 %w_pointer_7_0, %w_fifo_7_0, %w_position_7_0
-  %w_8_0, %w_pointer_8_0, %w_fifo_8_0, %w_position_8_0 = vlda.pop.bfp16ebs8 %w_pointer_fill8, %w_fifo_fill8, %w_position_fill8
-  %a_8_0, %a_pointer_8_0, %a_fifo_8_0, %a_position_8_0 = vlda.pop.bfp16ebs8 %a_pointer_fill8, %a_fifo_fill8, %a_position_fill8
-  %a_8_1, %a_pointer_8_1, %a_fifo_8_1, %a_position_8_1 = vldb.pop.bfp16ebs8 %a_pointer_8_0, %a_fifo_8_0, %a_position_8_0
-  %a_8_2, %a_pointer_8_2, %a_fifo_8_2, %a_position_8_2 = vlda.pop.bfp16ebs8 %a_pointer_8_1, %a_fifo_8_1, %a_position_8_1
-  %a_8_3, %a_pointer_8_3, %a_fifo_8_3, %a_position_8_3 = vldb.pop.bfp16ebs8 %a_pointer_8_2, %a_fifo_8_2, %a_position_8_2
-  %c0_8 = mma.bfp16ebs8.m8n8k8 %c0_7, %w_8_0, %a_8_0, %control
-  %c1_8 = mma.bfp16ebs8.m8n8k8 %c1_7, %w_8_0, %a_8_1, %control
-  %c2_8 = mma.bfp16ebs8.m8n8k8 %c2_7, %w_8_0, %a_8_2, %control
-  %c3_8 = mma.bfp16ebs8.m8n8k8 %c3_7, %w_8_0, %a_8_3, %control
-  %w_9_0, %w_pointer_9_0, %w_fifo_9_0, %w_position_9_0 = vldb.pop.bfp16ebs8 %w_pointer_8_0, %w_fifo_8_0, %w_position_8_0
-  %a_9_0, %a_pointer_9_0, %a_fifo_9_0, %a_position_9_0 = vlda.pop.bfp16ebs8 %a_pointer_8_3, %a_fifo_8_3, %a_position_8_3
-  %a_9_1, %a_pointer_9_1, %a_fifo_9_1, %a_position_9_1 = vldb.pop.bfp16ebs8 %a_pointer_9_0, %a_fifo_9_0, %a_position_9_0
-  %a_9_2, %a_pointer_9_2, %a_fifo_9_2, %a_position_9_2 = vlda.pop.bfp16ebs8 %a_pointer_9_1, %a_fifo_9_1, %a_position_9_1
-  %a_9_3, %a_pointer_9_3, %a_fifo_9_3, %a_position_9_3 = vldb.pop.bfp16ebs8 %a_pointer_9_2, %a_fifo_9_2, %a_position_9_2
-  %c0_9 = mma.bfp16ebs8.m8n8k8 %c0_8, %w_9_0, %a_9_0, %control
-  %c1_9 = mma.bfp16ebs8.m8n8k8 %c1_8, %w_9_0, %a_9_1, %control
-  %c2_9 = mma.bfp16ebs8.m8n8k8 %c2_8, %w_9_0, %a_9_2, %control
-  %c3_9 = mma.bfp16ebs8.m8n8k8 %c3_8, %w_9_0, %a_9_3, %control
-  %a_pointer_fill10, %a_fifo_fill10, %a_position_fill10 = vlda.fill.512 %a_pointer_9_3, %a_fifo_9_3, %a_position_9_3
-  %w_10_0, %w_pointer_10_0, %w_fifo_10_0, %w_position_10_0 = vlda.pop.bfp16ebs8 %w_pointer_9_0, %w_fifo_9_0, %w_position_9_0
-  %a_10_0, %a_pointer_10_0, %a_fifo_10_0, %a_position_10_0 = vlda.pop.bfp16ebs8 %a_pointer_fill10, %a_fifo_fill10, %a_position_fill10
-  %a_10_1, %a_pointer_10_1, %a_fifo_10_1, %a_position_10_1 = vldb.pop.bfp16ebs8 %a_pointer_10_0, %a_fifo_10_0, %a_position_10_0
-  %a_10_2, %a_pointer_10_2, %a_fifo_10_2, %a_position_10_2 = vlda.pop.bfp16ebs8 %a_pointer_10_1, %a_fifo_10_1, %a_position_10_1
-  %a_10_3, %a_pointer_10_3, %a_fifo_10_3, %a_position_10_3 = vldb.pop.bfp16ebs8 %a_pointer_10_2, %a_fifo_10_2, %a_position_10_2
-  %c0_10 = mma.bfp16ebs8.m8n8k8 %c0_9, %w_10_0, %a_10_0, %control
-  %c1_10 = mma.bfp16ebs8.m8n8k8 %c1_9, %w_10_0, %a_10_1, %control
-  %c2_10 = mma.bfp16ebs8.m8n8k8 %c2_9, %w_10_0, %a_10_2, %control
-  %c3_10 = mma.bfp16ebs8.m8n8k8 %c3_9, %w_10_0, %a_10_3, %control
-  %w_11_0, %w_pointer_11_0, %w_fifo_11_0, %w_position_11_0 = vldb.pop.bfp16ebs8 %w_pointer_10_0, %w_fifo_10_0, %w_position_10_0
-  %a_11_0, %a_pointer_11_0, %a_fifo_11_0, %a_position_11_0 = vlda.pop.bfp16ebs8 %a_pointer_10_3, %a_fifo_10_3, %a_position_10_3
-  %a_11_1, %a_pointer_11_1, %a_fifo_11_1, %a_position_11_1 = vldb.pop.bfp16ebs8 %a_pointer_11_0, %a_fifo_11_0, %a_position_11_0
-  %a_11_2, %a_pointer_11_2, %a_fifo_11_2, %a_position_11_2 = vlda.pop.bfp16ebs8 %a_pointer_11_1, %a_fifo_11_1, %a_position_11_1
-  %a_11_3, %a_pointer_11_3, %a_fifo_11_3, %a_position_11_3 = vldb.pop.bfp16ebs8 %a_pointer_11_2, %a_fifo_11_2, %a_position_11_2
-  %c0_11 = mma.bfp16ebs8.m8n8k8 %c0_10, %w_11_0, %a_11_0, %control
-  %c1_11 = mma.bfp16ebs8.m8n8k8 %c1_10, %w_11_0, %a_11_1, %control
-  %c2_11 = mma.bfp16ebs8.m8n8k8 %c2_10, %w_11_0, %a_11_2, %control
-  %c3_11 = mma.bfp16ebs8.m8n8k8 %c3_10, %w_11_0, %a_11_3, %control
-  %a_pointer_fill12, %a_fifo_fill12, %a_position_fill12 = vlda.fill.512 %a_pointer_11_3, %a_fifo_11_3, %a_position_11_3
-  %w_12_0, %w_pointer_12_0, %w_fifo_12_0, %w_position_12_0 = vlda.pop.bfp16ebs8 %w_pointer_11_0, %w_fifo_11_0, %w_position_11_0
-  %a_12_0, %a_pointer_12_0, %a_fifo_12_0, %a_position_12_0 = vlda.pop.bfp16ebs8 %a_pointer_fill12, %a_fifo_fill12, %a_position_fill12
-  %a_12_1, %a_pointer_12_1, %a_fifo_12_1, %a_position_12_1 = vldb.pop.bfp16ebs8 %a_pointer_12_0, %a_fifo_12_0, %a_position_12_0
-  %a_12_2, %a_pointer_12_2, %a_fifo_12_2, %a_position_12_2 = vlda.pop.bfp16ebs8 %a_pointer_12_1, %a_fifo_12_1, %a_position_12_1
-  %a_12_3, %a_pointer_12_3, %a_fifo_12_3, %a_position_12_3 = vldb.pop.bfp16ebs8 %a_pointer_12_2, %a_fifo_12_2, %a_position_12_2
-  %c0_12 = mma.bfp16ebs8.m8n8k8 %c0_11, %w_12_0, %a_12_0, %control
-  %c1_12 = mma.bfp16ebs8.m8n8k8 %c1_11, %w_12_0, %a_12_1, %control
-  %c2_12 = mma.bfp16ebs8.m8n8k8 %c2_11, %w_12_0, %a_12_2, %control
-  %c3_12 = mma.bfp16ebs8.m8n8k8 %c3_11, %w_12_0, %a_12_3, %control
-  %w_13_0, %w_pointer_13_0, %w_fifo_13_0, %w_position_13_0 = vldb.pop.bfp16ebs8 %w_pointer_12_0, %w_fifo_12_0, %w_position_12_0
-  %a_13_0, %a_pointer_13_0, %a_fifo_13_0, %a_position_13_0 = vlda.pop.bfp16ebs8 %a_pointer_12_3, %a_fifo_12_3, %a_position_12_3
-  %a_13_1, %a_pointer_13_1, %a_fifo_13_1, %a_position_13_1 = vldb.pop.bfp16ebs8 %a_pointer_13_0, %a_fifo_13_0, %a_position_13_0
-  %a_13_2, %a_pointer_13_2, %a_fifo_13_2, %a_position_13_2 = vlda.pop.bfp16ebs8 %a_pointer_13_1, %a_fifo_13_1, %a_position_13_1
-  %a_13_3, %a_pointer_13_3, %a_fifo_13_3, %a_position_13_3 = vldb.pop.bfp16ebs8 %a_pointer_13_2, %a_fifo_13_2, %a_position_13_2
-  %c0_13 = mma.bfp16ebs8.m8n8k8 %c0_12, %w_13_0, %a_13_0, %control
-  %c1_13 = mma.bfp16ebs8.m8n8k8 %c1_12, %w_13_0, %a_13_1, %control
-  %c2_13 = mma.bfp16ebs8.m8n8k8 %c2_12, %w_13_0, %a_13_2, %control
-  %c3_13 = mma.bfp16ebs8.m8n8k8 %c3_12, %w_13_0, %a_13_3, %control
-  %a_pointer_fill14, %a_fifo_fill14, %a_position_fill14 = vlda.fill.512 %a_pointer_13_3, %a_fifo_13_3, %a_position_13_3
-  %w_14_0, %w_pointer_14_0, %w_fifo_14_0, %w_position_14_0 = vlda.pop.bfp16ebs8 %w_pointer_13_0, %w_fifo_13_0, %w_position_13_0
-  %a_14_0, %a_pointer_14_0, %a_fifo_14_0, %a_position_14_0 = vlda.pop.bfp16ebs8 %a_pointer_fill14, %a_fifo_fill14, %a_position_fill14
-  %a_14_1, %a_pointer_14_1, %a_fifo_14_1, %a_position_14_1 = vldb.pop.bfp16ebs8 %a_pointer_14_0, %a_fifo_14_0, %a_position_14_0
-  %a_14_2, %a_pointer_14_2, %a_fifo_14_2, %a_position_14_2 = vlda.pop.bfp16ebs8 %a_pointer_14_1, %a_fifo_14_1, %a_position_14_1
-  %a_14_3, %a_pointer_14_3, %a_fifo_14_3, %a_position_14_3 = vldb.pop.bfp16ebs8 %a_pointer_14_2, %a_fifo_14_2, %a_position_14_2
-  %c0_14 = mma.bfp16ebs8.m8n8k8 %c0_13, %w_14_0, %a_14_0, %control
-  %c1_14 = mma.bfp16ebs8.m8n8k8 %c1_13, %w_14_0, %a_14_1, %control
-  %c2_14 = mma.bfp16ebs8.m8n8k8 %c2_13, %w_14_0, %a_14_2, %control
-  %c3_14 = mma.bfp16ebs8.m8n8k8 %c3_13, %w_14_0, %a_14_3, %control
-  %w_15_0, %w_pointer_15_0, %w_fifo_15_0, %w_position_15_0 = vldb.pop.bfp16ebs8 %w_pointer_14_0, %w_fifo_14_0, %w_position_14_0
-  %a_15_0, %a_pointer_15_0, %a_fifo_15_0, %a_position_15_0 = vlda.pop.bfp16ebs8 %a_pointer_14_3, %a_fifo_14_3, %a_position_14_3
-  %a_15_1, %a_pointer_15_1, %a_fifo_15_1, %a_position_15_1 = vldb.pop.bfp16ebs8 %a_pointer_15_0, %a_fifo_15_0, %a_position_15_0
-  %a_15_2, %a_pointer_15_2, %a_fifo_15_2, %a_position_15_2 = vlda.pop.bfp16ebs8 %a_pointer_15_1, %a_fifo_15_1, %a_position_15_1
-  %a_15_3, %a_pointer_15_3, %a_fifo_15_3, %a_position_15_3 = vldb.pop.bfp16ebs8 %a_pointer_15_2, %a_fifo_15_2, %a_position_15_2
-  %c0_15 = mma.bfp16ebs8.m8n8k8 %c0_14, %w_15_0, %a_15_0, %control
-  %c1_15 = mma.bfp16ebs8.m8n8k8 %c1_14, %w_15_0, %a_15_1, %control
-  %c2_15 = mma.bfp16ebs8.m8n8k8 %c2_14, %w_15_0, %a_15_2, %control
-  %c3_15 = mma.bfp16ebs8.m8n8k8 %c3_14, %w_15_0, %a_15_3, %control
-  %c0_result_q0 = slice %c0_15[0] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c0_result_q0, %lower, 0
-  %c0_result_q1 = slice %c0_15[1] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c0_result_q1, %lower, 64
-  %c0_result_q2 = slice %c0_15[2] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c0_result_q2, %lower, 128
-  %c0_result_q3 = slice %c0_15[3] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c0_result_q3, %lower, 192
-  %c1_result_q0 = slice %c1_15[0] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c1_result_q0, %lower, 256
-  %c1_result_q1 = slice %c1_15[1] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c1_result_q1, %lower, 320
-  %c1_result_q2 = slice %c1_15[2] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c1_result_q2, %lower, 384
-  %c1_result_q3 = slice %c1_15[3] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c1_result_q3, %lower, 448
-  %c2_result_q0 = slice %c2_15[0] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c2_result_q0, %upper, 0
-  %c2_result_q1 = slice %c2_15[1] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c2_result_q1, %upper, 64
-  %c2_result_q2 = slice %c2_15[2] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c2_result_q2, %upper, 128
-  %c2_result_q3 = slice %c2_15[3] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c2_result_q3, %upper, 192
-  %c3_result_q0 = slice %c3_15[0] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c3_result_q0, %upper, 256
-  %c3_result_q1 = slice %c3_15[1] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c3_result_q1, %upper, 320
-  %c3_result_q2 = slice %c3_15[2] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c3_result_q2, %upper, 384
-  %c3_result_q3 = slice %c3_15[3] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>
-  vst.acc %c3_result_q3, %upper, 448
-  %weight_modifier = mov.modifier %weight_step
-  %next_weight = padda.modifier %weights, %weight_modifier
-  %result_modifier = mov.modifier %result_step
-  %next_lower = padda.modifier %lower, %result_modifier
-  %next_upper = padda.modifier %upper, %result_modifier
-  %next_panel = add.rr %panel, %one
-  %more = ltu %next_panel, %panels
-  low.cond_br %more, ^advance, ^finish : reg<aie2p.er>
-^advance:
-  low.br ^panel_loop(%next_weight: reg<aie2p.ep>, %next_lower: reg<aie2p.ep>, %next_upper: reg<aie2p.ep>, %a_fifo_15_3: reg<aie2p.eldfiforeg>, %w_fifo_15_0: reg<aie2p.eldfiforeg>, %next_panel: reg<aie2p.er>)
-^finish:
-  return
-}
-  )loom", storage, output_storage, output_offset, first_chunk, fifos.activation, fifos.weight);
+void qwen3_embedding_dense_accumulate(loom::type::view<loom::type::shape<16, 2, 576>, unsigned char> weights, loom::type::view<loom::type::shape<2, 4, 576>, unsigned char> activations, loom::type::view<loom::type::shape<16, 4, 64>, float> primary, loom::type::view<loom::type::shape<16, 4, 64>, float> secondary, bool use_secondary, bool first) {
+  auto results = use_secondary ? secondary : primary;
+  auto schema = packed_schema<PackedParameters{}>();
+  auto tile = loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}};
+  auto weight_shape = loom::vector::fragment::batched_shape{loom::type::index{16}, loom::type::index{8}, loom::type::index{8}};
+  auto activation_shape = loom::vector::fragment::batched_shape{loom::type::index{64}, loom::type::index{8}, loom::type::index{8}};
+  auto weight_rows = loom::view::bitcast<loom::type::view<loom::type::shape<16, 1152>, unsigned char>>(weights);
+  auto activation_row = loom::view::bitcast<loom::type::view<loom::type::shape<4608>, unsigned char>>(activations);
+  for (int panel = 0; panel < 16; ++panel) {
+    Accumulator first_value{}, second_value{}, third_value{}, fourth_value{};
+    if (!first) {
+      first_value = loom::vector::load<Accumulator>(results, {panel, 0, 0});
+      second_value = loom::vector::load<Accumulator>(results, {panel, 1, 0});
+      third_value = loom::vector::load<Accumulator>(results, {panel, 2, 0});
+      fourth_value = loom::vector::load<Accumulator>(results, {panel, 3, 0});
+    }
+    Accumulators current{
+        loom::vector::fragment::attach<FragmentRole::init>(first_value, tile),
+        loom::vector::fragment::attach<FragmentRole::init>(second_value, tile),
+        loom::vector::fragment::attach<FragmentRole::init>(third_value, tile),
+        loom::vector::fragment::attach<FragmentRole::init>(fourth_value, tile)};
+    auto weight_bytes = loom::vector::load<WeightPanel>(weight_rows, {panel, 0});
+    auto weight_panel = loom::vector::fragment::attach<FragmentRole::lhs>(weight_bytes, weight_shape, FragmentParameters{schema});
+    auto activation_bytes = loom::vector::load<ActivationPanel>(activation_row, {0});
+    auto activation_panel = loom::vector::fragment::attach<FragmentRole::rhs>(activation_bytes, activation_shape, FragmentParameters{schema});
+    current = contract_record<0>(weight_panel, activation_panel, current, schema);
+    current = contract_record<1>(weight_panel, activation_panel, current, schema);
+    current = contract_record<2>(weight_panel, activation_panel, current, schema);
+    current = contract_record<3>(weight_panel, activation_panel, current, schema);
+    current = contract_record<4>(weight_panel, activation_panel, current, schema);
+    current = contract_record<5>(weight_panel, activation_panel, current, schema);
+    current = contract_record<6>(weight_panel, activation_panel, current, schema);
+    current = contract_record<7>(weight_panel, activation_panel, current, schema);
+    current = contract_record<8>(weight_panel, activation_panel, current, schema);
+    current = contract_record<9>(weight_panel, activation_panel, current, schema);
+    current = contract_record<10>(weight_panel, activation_panel, current, schema);
+    current = contract_record<11>(weight_panel, activation_panel, current, schema);
+    current = contract_record<12>(weight_panel, activation_panel, current, schema);
+    current = contract_record<13>(weight_panel, activation_panel, current, schema);
+    current = contract_record<14>(weight_panel, activation_panel, current, schema);
+    current = contract_record<15>(weight_panel, activation_panel, current, schema);
+    loom::vector::store(current.first, results, {panel, 0, 0});
+    loom::vector::store(current.second, results, {panel, 1, 0});
+    loom::vector::store(current.third, results, {panel, 2, 0});
+    loom::vector::store(current.fourth, results, {panel, 3, 0});
+  }
 }
 
 [[loom::symbol("qwen3_embedding.dense_rows"), loom::force_inline]]

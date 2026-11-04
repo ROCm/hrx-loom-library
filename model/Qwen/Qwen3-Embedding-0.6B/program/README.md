@@ -54,13 +54,21 @@ overlap activation preparation. Continuing loop edges release the consumed
 record; the final edge retains it through preparation, protecting the shared
 weight storage until that phase finishes.
 
+Ingress workers start the next raw activation transfer while computing the
+current chunk's final projection. The channel releases the previous raw view
+after fanout, while packed activations remain in a separate live range. The
+next chunk starts after its transfer completes. The final chunk keeps its
+weight reservation through the phase's preparation boundary.
+
 Dense projections use N8/K8 BFP16EBS8 panels and F32 accumulators. Attention
 uses compensated BF16 operands. BF16 normalization, rotary transforms,
 sequence-masked softmax, and the SiLU lookup table keep their defined rounding
-boundaries. `tile_math.cxx` expresses these structured view and vector operations
-in C++ and retains the contract-bound AIE2P assembly leaves inline.
-`tile_state.loom` supplies the architectural load-FIFO state read used by the
-dense leaf. `attention.loom` owns the compensated attention recurrence and
+boundaries. `tile_math.cxx` expresses dense projections as complete packed-panel
+loads, fragment attachments, and matrix products in C++. Each weight block feeds
+four independent eight-token accumulators; the compiler owns native FIFO
+state, instruction selection, and packet scheduling. The other native
+attention and lookup leaves retain their contract-bound AIE2P implementations.
+`attention.loom` owns the compensated attention recurrence and
 shared callable row operations. Generic
 native packing and requested-prefix L2 normalization come from the format and
 tensor motifs. Model-specific panel shapes and the offsets within each logical
