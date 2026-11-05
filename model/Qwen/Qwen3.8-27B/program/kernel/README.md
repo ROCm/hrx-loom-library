@@ -14,6 +14,12 @@ activation, and metadata panels, preserving staging reuse and read-ahead.
 Canonical and channel-eight weight orders share this body and their command
 ABI; the matrix motif supplies the target's operand carrier.
 
+The narrow alpha projection retains seven aligned K partitions and its ordered
+reducer. Four subgroups share each decoded panel; their width determines the
+staging stride, matrix carrier, and publication packets. Each partition owns
+one 32x48 F32 plane, so changing subgroup width leaves the command's partial
+storage and subsequent reduction unchanged.
+
 Attention separates preparation, cache publication, history partitions, and
 merge. Gated DeltaNet retains causal state within each span. Capture and
 accepted-prefix replay keep rejected proposals from advancing committed history.
