@@ -1,7 +1,9 @@
-// Independent GGUF scalar-byte Q5 decoding and ordered F64 dot products.
+// Independent GGUF scalar-byte decoding and ordered F64 dot products.
 // Inputs round to F16 exactly once; selected K intervals preserve complete
 // source strides and can check either a whole projection or one split plane.
 // Signed-unit activation construction supports exact dyadic ownership tests.
+
+func.decl @qwen_cohort_reference_q6(%weight: buffer, %row_origin: offset, %element: index) -> (f64)
 
 func.decl @qwen_cohort_reference_q5(%weight: buffer, %block_origin: offset, %element: index) -> (f64, f64)
 
@@ -35,13 +37,31 @@ func.def @q5_projection_expected(%control: buffer, %inputs: index, %outputs: ind
 // The interval selects logical K values while retaining complete source row
 // strides. This checks independently published split planes with the same
 // scalar-byte decoder and ordered arithmetic as a complete contraction.
-func.def @q5_projection_expected_range(%token_count_data: buffer, %inputs0: index, %outputs: index, %weight_channels: index, %begin0: index, %end0: index, %output_origin: offset, %input: buffer, %weight: buffer, %output: buffer) {
+func.def @q5_projection_expected_range(%control: buffer, %inputs: index, %outputs: index, %weight_channels: index, %begin: index, %end: index, %output_origin: offset, %input: buffer, %weight: buffer, %output: buffer) {
+  %format = index.constant 5 : index
+  func.call @matrix_projection_expected_range(%format, %control, %inputs, %outputs, %weight_channels, %begin, %end, %output_origin, %input, %weight, %output) : (index, buffer, index, index, index, index, index, offset, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @matrix_projection_expected_range(%format: index, %token_count_data: buffer, %inputs0: index, %outputs: index, %weight_channels: index, %begin0: index, %end0: index, %output_origin: offset, %input: buffer, %weight: buffer, %output: buffer) {
   %c0 = index.constant 0 : index
   %begin, %end, %inputs = index.assume %begin0, %end0, %inputs0 [le(%c0, %begin0), le(%begin0, %end0), le(%end0, %inputs0)] : index, index, index
   %origin = index.constant 0 : offset
   %c1 = index.constant 1 : index
-  %block_width = index.constant 256 : index
-  %block_bytes = index.constant 176 : offset
+  %q5 = index.constant 5 : index
+  %q6 = index.constant 6 : index
+  %q8 = index.constant 8 : index
+  %is_q5 = index.cmp eq, %format, %q5 : index
+  %is_q6 = index.cmp eq, %format, %q6 : index
+  %is_q8 = index.cmp eq, %format, %q8 : index
+  %k_block_width = index.constant 256 : index
+  %q8_block_width = index.constant 32 : index
+  %block_width = scf.select %is_q8, %q8_block_width, %k_block_width : index
+  %q5_bytes = index.constant 176 : offset
+  %q6_bytes = index.constant 210 : offset
+  %q8_bytes = index.constant 34 : offset
+  %k_block_bytes = scf.select %is_q5, %q5_bytes, %q6_bytes : offset
+  %block_bytes = scf.select %is_q8, %q8_bytes, %k_block_bytes : offset
   %blocks = index.div %inputs, %block_width : index
   %zero_float = scalar.constant 0.0 : f64
   %element_bytes = index.constant 8 : offset
@@ -68,6 +88,8 @@ func.def @q5_projection_expected_range(%token_count_data: buffer, %inputs0: inde
     }
   }
   scf.for %channel = [%c0 to %outputs step %c1] {
+    %row_block = index.mul %channel, %blocks : index
+    %row_origin = index.scale %row_block, %block_bytes : index, offset -> offset
     scf.for %element = [%begin to %end step %c1] {
       %block = index.div %element, %block_width : index
       %within = index.rem %element, %block_width : index
@@ -76,8 +98,29 @@ func.def @q5_projection_expected_range(%token_count_data: buffer, %inputs0: inde
       %group_block = index.madd %channel_group, %blocks, %block : index
       %block_index = index.madd %group_block, %weight_channels, %channel_within_group : index
       %block_origin = index.scale %block_index, %block_bytes : index, offset -> offset
-      %positive, %minimum = func.call @qwen_cohort_reference_q5(%weight, %block_origin, %within) : (buffer, offset, index) -> (f64, f64)
-      %weight_value = scalar.subf %positive, %minimum : f64
+      %weight_value = scf.if %is_q5 -> (f64) {
+        %positive, %minimum = func.call @qwen_cohort_reference_q5(%weight, %block_origin, %within) : (buffer, offset, index) -> (f64, f64)
+        %value = scalar.subf %positive, %minimum : f64
+        scf.yield %value : f64
+      } else {
+        %value = scf.if %is_q6 -> (f64) {
+          %decoded = func.call @qwen_cohort_reference_q6(%weight, %row_origin, %element) : (buffer, offset, index) -> (f64)
+          scf.yield %decoded : f64
+        } else {
+          %scale_bytes = index.constant 2 : offset
+          %code_origin = index.add %block_origin, %scale_bytes : offset
+          %scales = buffer.view %weight[%block_origin] : buffer -> view<1xf16>
+          %codes = buffer.view %weight[%code_origin] : buffer -> view<32xi8>
+          %scale_half = view.load %scales[0] : view<1xf16> -> f16
+          %code_index = index.rem %element, %q8_block_width : index
+          %code_byte = view.load %codes[%code_index] : view<32xi8> -> i8
+          %scale = scalar.extf %scale_half : f16 to f64
+          %code = scalar.sitofp %code_byte : i8 to f64
+          %decoded = scalar.mulf %scale, %code : f64
+          scf.yield %decoded : f64
+        }
+        scf.yield %value : f64
+      }
       %weight_half = scalar.fptrunc %weight_value : f64 to f16
       %weight_double = scalar.extf %weight_half : f16 to f64
       view.store %weight_double, %decoded_weights[%element] : f64, view<[%inputs]xf64>
@@ -97,7 +140,7 @@ func.def @q5_projection_expected_range(%token_count_data: buffer, %inputs0: inde
   func.return
 }
 
-func.def @q5_projection_unit_activations(%count: index, %codes: buffer, %input: buffer) {
+func.def @matrix_projection_unit_activations(%count: index, %codes: buffer, %input: buffer) {
   %begin = index.constant 0 : index
   %step = index.constant 1 : index
   %origin = index.constant 0 : offset
