@@ -1,0 +1,82 @@
+// Native page lookup keeps token coordinates compact and byte offsets wide.
+// The map crosses the old 16-bit page boundary, 128M token positions, and the
+// last complete page representable by a signed 32-bit token index. The oracle
+// uses independent I64 arithmetic; no cache payload is allocated or accessed.
+
+func.decl @qwen38_kv_position(%capacity: index, %map: buffer, %origin: offset, %position: index, %pool: index) -> (index)
+
+func.def @initialize_pages(%map: buffer) {
+  // Physical pages: 0, 65535, 65536, 2097151, and 33554430.
+  %data = buffer.constant align(4) bytes("00000000ffff000000000100ffff1f00feffff01") : buffer
+  %origin = index.constant 0 : offset
+  %length = index.constant 20 : offset
+  buffer.copy %data[%origin], %map[%origin], %length
+  func.return
+}
+
+kernel.def @observe_addresses() {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%map: buffer, %output: buffer) {
+  %capacity = index.constant 320 : index
+  %pool = index.constant 2147483584 : index
+  %origin = index.constant 0 : offset
+  %plane = index.constant 17179869184 : offset
+  %token_bytes = index.constant 1024 : offset
+  %step = index.constant 64 : index
+  %lane = kernel.workitem.id<x> : index
+  %results = buffer.view %output[%origin] : buffer -> view<320x2xi64>
+  scf.for %position = [%lane to %capacity step %step] {
+    %physical = func.call @qwen38_kv_position(%capacity, %map, %origin, %position, %pool) : (index, buffer, offset, index, index) -> (index)
+    %relative = index.scale %physical, %token_bytes : index, offset -> offset
+    %address = index.add %plane, %relative : offset
+    %token_word = index.cast %physical : index to i64
+    %address_word = index.cast %address : offset to i64
+    view.store %token_word, %results[%position, 0] : i64, view<320x2xi64>
+    view.store %address_word, %results[%position, 1] : i64, view<320x2xi64>
+  }
+  kernel.return
+}
+
+func.def @reference_addresses(%map: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %end = index.constant 320 : index
+  %c1 = index.constant 1 : index
+  %page_tokens = index.constant 64 : index
+  %page_shift = scalar.constant 6 : i64
+  %byte_shift = scalar.constant 10 : i64
+  %plane = scalar.constant 17179869184 : i64
+  %pages = buffer.view %map[%origin] : buffer -> view<5xi32>
+  %results = buffer.view %output[%origin] : buffer -> view<320x2xi64>
+  scf.for %position = [%begin to %end step %c1] {
+    %logical_page = index.div %position, %page_tokens : index
+    %within = index.rem %position, %page_tokens : index
+    %page_word = view.load %pages[%logical_page] : view<5xi32> -> i32
+    %page = scalar.extui %page_word : i32 to i64
+    %page_begin = scalar.shli %page, %page_shift : i64
+    %within_word = index.cast %within : index to i64
+    %token = scalar.addi %page_begin, %within_word : i64
+    %relative = scalar.shli %token, %byte_shift : i64
+    %address = scalar.addi %plane, %relative : i64
+    view.store %token, %results[%position, 0] : i64, view<320x2xi64>
+    view.store %address, %results[%position, 1] : i64, view<320x2xi64>
+  }
+  func.return
+}
+
+check.scenario public @native_page_addresses {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %map = check.generate.fill value(-1) : tensor<5xi32>
+    check.generate<@initialize_pages>(%map) : (tensor<5xi32>) -> ()
+    %output = check.generate.fill value(-1) : tensor<320x2xi64>
+    check.compare<@observe_addresses, @reference_addresses>(%map, %output) : (tensor<5xi32>, tensor<320x2xi64>) -> () {
+      check.expect.bitwise actual(%map) expected(%map) : tensor<5xi32>
+      check.expect.bitwise actual(%output) expected(%output) : tensor<320x2xi64>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@native_page_addresses> @wide_page_offsets
