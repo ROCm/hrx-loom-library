@@ -1,0 +1,124 @@
+// Independent GGUF scalar-byte Q5 decoding and ordered F64 dot products.
+// Inputs round to F16 exactly once; selected K intervals preserve complete
+// source strides and can check either a whole projection or one split plane.
+// Signed-unit activation construction supports exact dyadic ownership tests.
+
+func.decl @qwen_cohort_reference_q5(%weight: buffer, %block_origin: offset, %element: index) -> (f64, f64)
+
+func.def @q5_projection_headers(%inputs: index, %outputs: index, %weight: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %block_width = index.constant 256 : index
+  %block_bytes = index.constant 176 : offset
+  %blocks = index.div %inputs, %block_width : index
+  %count = index.mul %blocks, %outputs : index
+  %scale = scalar.constant 0.015625 : f16
+  %minimum = scalar.constant 0.0078125 : f16
+  scf.for %block = [%c0 to %count step %c1] {
+    %origin = index.scale %block, %block_bytes : index, offset -> offset
+    %header = buffer.view %weight[%origin] : buffer -> view<2xf16>
+    view.store %scale, %header[0] : f16, view<2xf16>
+    view.store %minimum, %header[1] : f16, view<2xf16>
+  }
+  func.return
+}
+
+// The independent GGUF byte decoder is shared with the existing cohort oracle.
+// Matrix operands round to F16, followed by a sequential F64 dot product.
+func.def @q5_projection_expected(%control: buffer, %inputs: index, %outputs: index, %weight_channels: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %begin = index.constant 0 : index
+  %origin = index.constant 0 : offset
+  func.call @q5_projection_expected_range(%control, %inputs, %outputs, %weight_channels, %begin, %inputs, %origin, %input, %weight, %output) : (buffer, index, index, index, index, index, offset, buffer, buffer, buffer)
+  func.return
+}
+
+// The interval selects logical K values while retaining complete source row
+// strides. This checks independently published split planes with the same
+// scalar-byte decoder and ordered arithmetic as a complete contraction.
+func.def @q5_projection_expected_range(%token_count_data: buffer, %inputs0: index, %outputs: index, %weight_channels: index, %begin0: index, %end0: index, %output_origin: offset, %input: buffer, %weight: buffer, %output: buffer) {
+  %c0 = index.constant 0 : index
+  %begin, %end, %inputs = index.assume %begin0, %end0, %inputs0 [le(%c0, %begin0), le(%begin0, %end0), le(%end0, %inputs0)] : index, index, index
+  %origin = index.constant 0 : offset
+  %c1 = index.constant 1 : index
+  %block_width = index.constant 256 : index
+  %block_bytes = index.constant 176 : offset
+  %blocks = index.div %inputs, %block_width : index
+  %zero_float = scalar.constant 0.0 : f64
+  %element_bytes = index.constant 8 : offset
+  %token_count_view = buffer.view %token_count_data[%origin] : buffer -> view<1xi32>
+  %token_count_i32 = view.load %token_count_view[0] : view<1xi32> -> i32
+  %tokens = index.cast %token_count_i32 : i32 to index
+  %activations = buffer.view %input[%origin] : buffer -> view<[%tokens]x[%inputs]xf32>
+  %results = buffer.view %output[%output_origin] : buffer -> view<[%tokens]x[%outputs]xf32>
+  // Decode each input once and each weight row once. The ordered F64 dot
+  // product is unchanged; rows share decoding rather than repeating it.
+  %activation_count = index.mul %tokens, %inputs : index
+  %activation_bytes = index.scale %activation_count, %element_bytes : index, offset -> offset
+  %weight_bytes = index.scale %inputs, %element_bytes : index, offset -> offset
+  %activation_storage = buffer.alloca<private> align(8) %activation_bytes : buffer
+  %weight_storage = buffer.alloca<private> align(8) %weight_bytes : buffer
+  %decoded_activations = buffer.view %activation_storage[%origin] : buffer -> view<[%tokens]x[%inputs]xf64>
+  %decoded_weights = buffer.view %weight_storage[%origin] : buffer -> view<[%inputs]xf64>
+  scf.for %token = [%c0 to %tokens step %c1] {
+    scf.for %element = [%begin to %end step %c1] {
+      %input_value = view.load %activations[%token, %element] : view<[%tokens]x[%inputs]xf32> -> f32
+      %input_half = scalar.fptrunc %input_value : f32 to f16
+      %input_double = scalar.extf %input_half : f16 to f64
+      view.store %input_double, %decoded_activations[%token, %element] : f64, view<[%tokens]x[%inputs]xf64>
+    }
+  }
+  scf.for %channel = [%c0 to %outputs step %c1] {
+    scf.for %element = [%begin to %end step %c1] {
+      %block = index.div %element, %block_width : index
+      %within = index.rem %element, %block_width : index
+      %channel_group = index.div %channel, %weight_channels : index
+      %channel_within_group = index.rem %channel, %weight_channels : index
+      %group_block = index.madd %channel_group, %blocks, %block : index
+      %block_index = index.madd %group_block, %weight_channels, %channel_within_group : index
+      %block_origin = index.scale %block_index, %block_bytes : index, offset -> offset
+      %positive, %minimum = func.call @qwen_cohort_reference_q5(%weight, %block_origin, %within) : (buffer, offset, index) -> (f64, f64)
+      %weight_value = scalar.subf %positive, %minimum : f64
+      %weight_half = scalar.fptrunc %weight_value : f64 to f16
+      %weight_double = scalar.extf %weight_half : f16 to f64
+      view.store %weight_double, %decoded_weights[%element] : f64, view<[%inputs]xf64>
+    }
+    scf.for %token = [%c0 to %tokens step %c1] {
+      %sum = scf.for %element = [%begin to %end step %c1](%accumulator = %zero_float : f64) -> (f64) {
+        %weight_value = view.load %decoded_weights[%element] : view<[%inputs]xf64> -> f64
+        %input_value = view.load %decoded_activations[%token, %element] : view<[%tokens]x[%inputs]xf64> -> f64
+        %product = scalar.mulf %weight_value, %input_value : f64
+        %next = scalar.addf %accumulator, %product : f64
+        scf.yield %next : f64
+      }
+      %rounded = scalar.fptrunc %sum : f64 to f32
+      view.store %rounded, %results[%token, %channel] : f32, view<[%tokens]x[%outputs]xf32>
+    }
+  }
+  func.return
+}
+
+func.def @q5_projection_unit_activations(%count: index, %codes: buffer, %input: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %origin = index.constant 0 : offset
+  %source = buffer.view %codes[%origin] : buffer -> view<[%count]xi8>
+  %destination = buffer.view %input[%origin] : buffer -> view<[%count]xf32>
+  scf.for %element = [%begin to %count step %step] {
+    %code = view.load %source[%element] : view<[%count]xi8> -> i8
+    %value = scalar.sitofp %code : i8 to f32
+    view.store %value, %destination[%element] : f32, view<[%count]xf32>
+  }
+  func.return
+}
+
+func.def @q5_projection_canonical_expected(%token_count_data: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %weight_channels = index.constant 1 : index
+  func.call @q5_projection_expected(%token_count_data, %inputs, %outputs, %weight_channels, %input, %weight, %output) : (buffer, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @q5_projection_channel8_expected(%token_count_data: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %weight_channels = index.constant 8 : index
+  func.call @q5_projection_expected(%token_count_data, %inputs, %outputs, %weight_channels, %input, %weight, %output) : (buffer, index, index, index, buffer, buffer, buffer)
+  func.return
+}
