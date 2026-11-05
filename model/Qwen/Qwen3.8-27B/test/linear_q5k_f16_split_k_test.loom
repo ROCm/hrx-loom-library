@@ -1,0 +1,118 @@
+// The production command writes seven distinct K ranges before its reducer.
+// An independent scalar-byte decoder and F64 dot product check every partial
+// plane and the complete result. Random packed fields, signed unit inputs,
+// and d=dmin=2^-10 keep all operands and partial sums exact in F16/F32;
+// the existing 2^-12 bound isolates coverage and publication errors.
+// A disabled launch must preserve both destinations and their guards.
+
+target.decl @qwen38_execution
+
+command.decl @qwen38_dispatch_linear_q5k_f16_alpha_split_k(%tokens: index, %inputs: index, %outputs: index, %input_size: index, %output_size: index) launch(%control: buffer, %input: buffer, %weight: buffer, %partials: buffer)
+
+kernel.decl @qwen38_linear_q5k_f16_alpha_split_k_reduce(%tokens: index) launch(%control: buffer, %partials: buffer, %output: buffer)
+
+func.decl @q5_projection_unit_activations(%count: index, %codes: buffer, %input: buffer)
+
+func.decl @q5_projection_expected(%control: buffer, %inputs: index, %outputs: index, %weight_channels: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @q5_projection_expected_range(%control: buffer, %inputs: index, %outputs: index, %weight_channels: index, %begin: index, %end: index, %output_origin: offset, %input: buffer, %weight: buffer, %output: buffer)
+
+template.decl pure @q5.alpha.tokens(%configuration: index) -> (index)
+
+template.def<@q5.alpha.tokens> pure @q5_alpha_tokens(%configuration: index) -> (index) {
+  %c0 = index.constant 0 : index
+  %tile = index.constant 32 : index
+  %enabled = index.cmp eq, %configuration, %c0 : index
+  %tokens = scf.select %enabled, %tile, %c0 : index
+  template.return %tokens : index
+}
+
+command.def public target(@qwen38_execution) @q5_alpha_projection(%configuration: index) launch(%control: buffer, %input: buffer, %weight: buffer, %partials: buffer, %output: buffer) {
+  %tokens = template.apply<@q5.alpha.tokens>(%configuration) pure : (index) -> (index)
+  %inputs = index.constant 5120 : index
+  %outputs = index.constant 48 : index
+  command.launch @qwen38_dispatch_linear_q5k_f16_alpha_split_k[%tokens, %inputs, %outputs, %inputs, %outputs](%control, %input, %weight, %partials) : [index, index, index, index, index](buffer, buffer, buffer, buffer)
+  kernel.launch @qwen38_linear_q5k_f16_alpha_split_k_reduce[%tokens](%control, %partials, %output) : [index](buffer, buffer, buffer)
+  command.return
+}
+
+func.def @q5_alpha_initialize(%configuration: index, %control: buffer, %weight: buffer) {
+  %tokens = template.apply<@q5.alpha.tokens>(%configuration) pure : (index) -> (index)
+  %origin = index.constant 0 : offset
+  %word = index.cast %tokens : index to i32
+  %metadata = buffer.view %control[%origin] : buffer -> view<1xi32>
+  view.store %word, %metadata[0] : i32, view<1xi32>
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %blocks = index.constant 960 : index
+  %block_bytes = index.constant 176 : offset
+  %scale = scalar.constant 0.0009765625 : f16
+  scf.for %block = [%begin to %blocks step %step] {
+    %block_origin = index.scale %block, %block_bytes : index, offset -> offset
+    %header = buffer.view %weight[%block_origin] : buffer -> view<2xf16>
+    view.store %scale, %header[0] : f16, view<2xf16>
+    view.store %scale, %header[1] : f16, view<2xf16>
+  }
+  func.return
+}
+
+func.def @q5_alpha_reference(%control: buffer, %input: buffer, %weight: buffer, %partials: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %partitions = index.constant 7 : index
+  %inputs = index.constant 5120 : index
+  %outputs = index.constant 48 : index
+  %partition_width = index.constant 768 : index
+  %plane_bytes = index.constant 6144 : offset
+  %metadata = buffer.view %control[%origin] : buffer -> view<1xi32>
+  %word = view.load %metadata[0] : view<1xi32> -> i32
+  %tokens = index.cast %word : i32 to index
+  %enabled = index.cmp ne, %tokens, %c0 : index
+  scf.if %enabled {
+    scf.for %partition = [%c0 to %partitions step %c1] {
+      %begin = index.mul %partition, %partition_width : index
+      %limit = index.add %begin, %partition_width : index
+      %end = index.min %limit, %inputs : index
+      %plane_origin = index.scale %partition, %plane_bytes : index, offset -> offset
+      func.call @q5_projection_expected_range(%control, %inputs, %outputs, %c1, %begin, %end, %plane_origin, %input, %weight, %partials) : (buffer, index, index, index, index, index, offset, buffer, buffer, buffer)
+    }
+    func.call @q5_projection_expected(%control, %inputs, %outputs, %c1, %input, %weight, %output) : (buffer, index, index, index, buffer, buffer, buffer)
+  }
+  func.return
+}
+
+check.scenario public @q5_alpha_projection_check configure[2](%configuration: index, %configuration_entropy: check.entropy) {
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %control = check.generate.fill value(0) : tensor<1xi32>
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %codes = check.generate.random.uniform seed(%input_seed) range(-1 to 1) : tensor<32x5120xi8>
+    %input = check.generate.fill value(0.0) : tensor<32x5120xf32>
+    %activation_count = check.literal value(163840) : index
+    check.generate<@q5_projection_unit_activations>(%activation_count, %codes, %input) : (index, tensor<32x5120xi8>, tensor<32x5120xf32>) -> ()
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<48x20x176xi8>
+    check.generate<@q5_alpha_initialize>(%configuration, %control, %weight) : (index, tensor<1xi32>, tensor<48x20x176xi8>) -> ()
+    %partial_storage = check.generate.fill value(-99.0) : tensor<10760xf32>
+    %partials = check.tensor.view %partial_storage offset(16) : tensor<10760xf32> -> tensor<7x32x48xf32>
+    %partial_prefix = check.tensor.view %partial_storage offset(0) : tensor<10760xf32> -> tensor<4xf32>
+    %partial_suffix = check.tensor.view %partial_storage offset(43024) : tensor<10760xf32> -> tensor<4xf32>
+    %output_storage = check.generate.fill value(-99.0) : tensor<1544xf32>
+    %output = check.tensor.view %output_storage offset(16) : tensor<1544xf32> -> tensor<32x48xf32>
+    %output_prefix = check.tensor.view %output_storage offset(0) : tensor<1544xf32> -> tensor<4xf32>
+    %output_suffix = check.tensor.view %output_storage offset(6160) : tensor<1544xf32> -> tensor<4xf32>
+    check.compare<@q5_alpha_projection, @q5_alpha_reference>[%configuration](%control, %input, %weight, %partials, %output) : [index](tensor<1xi32>, tensor<32x5120xf32>, tensor<48x20x176xi8>, tensor<7x32x48xf32>, tensor<32x48xf32>) -> () {
+      check.expect.approximate actual(%partials) expected(%partials) atol(0.000244140625) rtol(0.0) nan(different) : tensor<7x32x48xf32>, tensor<7x32x48xf32>
+      check.expect.approximate actual(%output) expected(%output) atol(0.000244140625) rtol(0.0) nan(different) : tensor<32x48xf32>, tensor<32x48xf32>
+      check.expect.bitwise actual(%partial_prefix) expected(%partial_prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%partial_suffix) expected(%partial_suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%output_prefix) expected(%output_prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%output_suffix) expected(%output_suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<32x5120xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<48x20x176xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_alpha_projection_check> @q5_alpha_projection_workload

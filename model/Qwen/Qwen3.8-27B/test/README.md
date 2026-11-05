@@ -15,7 +15,9 @@ operand exact and bound every partial sum below the F32 integer precision
 limit. This isolates fragment ownership, both weight orders, and partial
 channel tiles without depending on a driver's matrix rounding order. The
 reference reuses decoded activations and one weight row; output guards and
-input immutability are checked independently.
+input immutability are checked independently. The split projection also checks
+each published K interval independently before checking the reduced output,
+including the shorter final partition and disabled launches.
 
 Test overviews explain reference independence and numerical acceptance;
 scenarios and BUILD declarations own workload and target coverage. Large
