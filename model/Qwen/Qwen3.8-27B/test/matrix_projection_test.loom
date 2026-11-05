@@ -35,29 +35,49 @@ func.def @q5_projection_expected(%token_count_data: buffer, %inputs: index, %out
   %block_bytes = index.constant 176 : offset
   %blocks = index.div %inputs, %block_width : index
   %zero_float = scalar.constant 0.0 : f64
+  %element_bytes = index.constant 8 : offset
   %token_count_view = buffer.view %token_count_data[%origin] : buffer -> view<1xi32>
   %token_count_i32 = view.load %token_count_view[0] : view<1xi32> -> i32
   %tokens = index.cast %token_count_i32 : i32 to index
   %activations = buffer.view %input[%origin] : buffer -> view<[%tokens]x[%inputs]xf32>
   %results = buffer.view %output[%origin] : buffer -> view<[%tokens]x[%outputs]xf32>
+  // Decode each input once and each weight row once. The ordered F64 dot
+  // product is unchanged; rows share decoding rather than repeating it.
+  %activation_count = index.mul %tokens, %inputs : index
+  %activation_bytes = index.scale %activation_count, %element_bytes : index, offset -> offset
+  %weight_bytes = index.scale %inputs, %element_bytes : index, offset -> offset
+  %activation_storage = buffer.alloca<private> align(8) %activation_bytes : buffer
+  %weight_storage = buffer.alloca<private> align(8) %weight_bytes : buffer
+  %decoded_activations = buffer.view %activation_storage[%origin] : buffer -> view<[%tokens]x[%inputs]xf64>
+  %decoded_weights = buffer.view %weight_storage[%origin] : buffer -> view<[%inputs]xf64>
   scf.for %token = [%c0 to %tokens step %c1] {
-    scf.for %channel = [%c0 to %outputs step %c1] {
+    scf.for %element = [%c0 to %inputs step %c1] {
+      %input_value = view.load %activations[%token, %element] : view<[%tokens]x[%inputs]xf32> -> f32
+      %input_half = scalar.fptrunc %input_value : f32 to f16
+      %input_double = scalar.extf %input_half : f16 to f64
+      view.store %input_double, %decoded_activations[%token, %element] : f64, view<[%tokens]x[%inputs]xf64>
+    }
+  }
+  scf.for %channel = [%c0 to %outputs step %c1] {
+    scf.for %element = [%c0 to %inputs step %c1] {
+      %block = index.div %element, %block_width : index
+      %within = index.rem %element, %block_width : index
+      %channel_group = index.div %channel, %weight_channels : index
+      %channel_within_group = index.rem %channel, %weight_channels : index
+      %group_block = index.madd %channel_group, %blocks, %block : index
+      %block_index = index.madd %group_block, %weight_channels, %channel_within_group : index
+      %block_origin = index.scale %block_index, %block_bytes : index, offset -> offset
+      %positive, %minimum = func.call @qwen_cohort_reference_q5(%weight, %block_origin, %within) : (buffer, offset, index) -> (f64, f64)
+      %weight_value = scalar.subf %positive, %minimum : f64
+      %weight_half = scalar.fptrunc %weight_value : f64 to f16
+      %weight_double = scalar.extf %weight_half : f16 to f64
+      view.store %weight_double, %decoded_weights[%element] : f64, view<[%inputs]xf64>
+    }
+    scf.for %token = [%c0 to %tokens step %c1] {
       %sum = scf.for %element = [%c0 to %inputs step %c1](%accumulator = %zero_float : f64) -> (f64) {
-        %block = index.div %element, %block_width : index
-        %within = index.rem %element, %block_width : index
-        %channel_group = index.div %channel, %weight_channels : index
-        %channel_within_group = index.rem %channel, %weight_channels : index
-        %group_block = index.madd %channel_group, %blocks, %block : index
-        %block_index = index.madd %group_block, %weight_channels, %channel_within_group : index
-        %block_origin = index.scale %block_index, %block_bytes : index, offset -> offset
-        %positive, %minimum = func.call @qwen_cohort_reference_q5(%weight, %block_origin, %within) : (buffer, offset, index) -> (f64, f64)
-        %weight_value = scalar.subf %positive, %minimum : f64
-        %weight_half = scalar.fptrunc %weight_value : f64 to f16
-        %weight_double = scalar.extf %weight_half : f16 to f64
-        %input_value = view.load %activations[%token, %element] : view<[%tokens]x[%inputs]xf32> -> f32
-        %input_half = scalar.fptrunc %input_value : f32 to f16
-        %input_double = scalar.extf %input_half : f16 to f64
-        %product = scalar.mulf %weight_double, %input_double : f64
+        %weight_value = view.load %decoded_weights[%element] : view<[%inputs]xf64> -> f64
+        %input_value = view.load %decoded_activations[%token, %element] : view<[%tokens]x[%inputs]xf64> -> f64
+        %product = scalar.mulf %weight_value, %input_value : f64
         %next = scalar.addf %accumulator, %product : f64
         scf.yield %next : f64
       }
