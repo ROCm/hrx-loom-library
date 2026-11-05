@@ -1,0 +1,141 @@
+// Whole and partitioned C64/T64 projections share the production Q5 body.
+// Independent scalar-byte GGUF decoding and an ordered F64 dot product check
+// both storage orders, token/channel tails, and uneven or empty K partitions.
+
+func.decl @q5_projection_headers(%inputs: index, %outputs: index, %weight: buffer)
+
+kernel.decl @qwen38_linear_q5k_f16_c64t64(%dispatch_tokens: index, %dispatch_inputs: index, %dispatch_outputs: index) launch(%token_count_data: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @q5_projection_canonical_expected(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+check.scenario public @q5_projection_check {
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(17) : index
+    %token_count_data = check.generate.fill value(17) : tensor<1xi32>
+    %inputs = check.literal value(512) : index
+    %outputs = check.literal value(72) : index
+    %seed0 = check.entropy.read %entropy[0] : check.entropy -> i64
+    %seed1 = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed0) range(-1.0 to 1.0) : tensor<17x512xf32>
+    %weight = check.generate.random.uniform seed(%seed1) range(-128 to 127) : tensor<72x2x176xi8>
+    check.generate<@q5_projection_headers>(%inputs, %outputs, %weight) : (index, index, tensor<72x2x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<17x72xf32>
+    check.compare<@qwen38_linear_q5k_f16_c64t64, @q5_projection_canonical_expected>[%tokens, %inputs, %outputs](%token_count_data, %inputs, %outputs, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<17x512xf32>, tensor<72x2x176xi8>, tensor<17x72xf32>) -> () {
+      check.expect.approximate actual(%output) expected(%output) atol(0.00050000000000000001) rtol(3.0000000000000001e-05) nan(different) : tensor<17x72xf32>, tensor<17x72xf32>
+    }
+  }
+  check.return
+}
+
+kernel.decl @qwen38_linear_q5k_f16_c64t64_channel8(%dispatch_tokens: index, %dispatch_inputs: index, %dispatch_outputs: index) launch(%token_count_data: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @q5_projection_channel8_expected(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+check.scenario public @q5_projection_channel8_check {
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %tokens = check.literal value(17) : index
+    %token_count_data = check.generate.fill value(17) : tensor<1xi32>
+    %inputs = check.literal value(512) : index
+    %outputs = check.literal value(72) : index
+    %seed0 = check.entropy.read %entropy[0] : check.entropy -> i64
+    %seed1 = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed0) range(-1.0 to 1.0) : tensor<17x512xf32>
+    %weight = check.generate.random.uniform seed(%seed1) range(-128 to 127) : tensor<72x2x176xi8>
+    check.generate<@q5_projection_headers>(%inputs, %outputs, %weight) : (index, index, tensor<72x2x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<17x72xf32>
+    check.compare<@qwen38_linear_q5k_f16_c64t64_channel8, @q5_projection_channel8_expected>[%tokens, %inputs, %outputs](%token_count_data, %inputs, %outputs, %input, %weight, %output) : [index, index, index](tensor<1xi32>, index, index, tensor<17x512xf32>, tensor<72x2x176xi8>, tensor<17x72xf32>) -> () {
+      check.expect.approximate actual(%output) expected(%output) atol(0.00050000000000000001) rtol(3.0000000000000001e-05) nan(different) : tensor<17x72xf32>, tensor<17x72xf32>
+    }
+  }
+  check.return
+}
+
+kernel.decl @qwen38_linear_q5k_f16_c64t64_split(%dispatch_partitions: index, %dispatch_tokens: index, %dispatch_inputs: index, %dispatch_outputs: index) launch(%partitions: index, %count: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %partials: buffer)
+
+command.def public @split_q5_projection(%partitions: index, %tokens: index, %inputs: index, %outputs: index) launch(%count: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %element_bytes = index.constant 4 : offset
+  %plane_elements = index.mul %tokens, %outputs : index
+  %partial_elements = index.mul %partitions, %plane_elements : index
+  %partial_bytes = index.scale %partial_elements, %element_bytes : index, offset -> offset
+  %partials = buffer.alloca<global> align(256) %partial_bytes : buffer
+  kernel.launch @qwen38_linear_q5k_f16_c64t64_split[%partitions, %tokens, %inputs, %outputs](%partitions, %count, %inputs, %outputs, %input, %weight, %partials) : [index, index, index, index](index, buffer, index, index, buffer, buffer, buffer)
+  kernel.launch @qwen38_linear_split_reduce[%partitions, %tokens, %outputs](%partitions, %count, %outputs, %partials, %output) : [index, index, index](index, buffer, index, buffer, buffer)
+  command.return
+}
+
+func.def @split_q5_expected(%count: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %inputs = index.constant 1792 : index
+  %outputs = index.constant 5 : index
+  func.call @q5_projection_canonical_expected(%count, %inputs, %outputs, %input, %weight, %output) : (buffer, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @split_q5_projection_check {
+  %partitions = check.literal value(8) : index
+  %tokens = check.literal value(128) : index
+  %inputs = check.literal value(1792) : index
+  %outputs = check.literal value(5) : index
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %count = check.generate.fill value(65) : tensor<1xi32>
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0 to 1.0) : tensor<128x1792xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<5x7x176xi8>
+    check.generate<@q5_projection_headers>(%inputs, %outputs, %weight) : (index, index, tensor<5x7x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<128x5xf32>
+    check.compare<@split_q5_projection, @split_q5_expected>[%partitions, %tokens, %inputs, %outputs](%count, %input, %weight, %output) : [index, index, index, index](tensor<1xi32>, tensor<128x1792xf32>, tensor<5x7x176xi8>, tensor<128x5xf32>) -> () {
+      check.expect.approximate actual(%output) expected(%output) atol(0.00050000000000000001) rtol(3.0000000000000001e-05) nan(different) : tensor<128x5xf32>, tensor<128x5xf32>
+    }
+  }
+  check.return
+}
+
+kernel.decl @qwen38_linear_q5k_f16_c64t64_split_channel8(%dispatch_partitions: index, %dispatch_tokens: index, %dispatch_inputs: index, %dispatch_outputs: index) launch(%partitions: index, %count: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %partials: buffer)
+
+command.def public @split_q5_channel8_projection(%partitions: index, %tokens: index, %inputs: index, %outputs: index) launch(%count: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %element_bytes = index.constant 4 : offset
+  %plane_elements = index.mul %tokens, %outputs : index
+  %partial_elements = index.mul %partitions, %plane_elements : index
+  %partial_bytes = index.scale %partial_elements, %element_bytes : index, offset -> offset
+  %partials = buffer.alloca<global> align(256) %partial_bytes : buffer
+  kernel.launch @qwen38_linear_q5k_f16_c64t64_split_channel8[%partitions, %tokens, %inputs, %outputs](%partitions, %count, %inputs, %outputs, %input, %weight, %partials) : [index, index, index, index](index, buffer, index, index, buffer, buffer, buffer)
+  kernel.launch @qwen38_linear_split_reduce[%partitions, %tokens, %outputs](%partitions, %count, %outputs, %partials, %output) : [index, index, index](index, buffer, index, buffer, buffer)
+  command.return
+}
+
+func.def @split_q5_channel8_expected(%count: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %inputs = index.constant 1792 : index
+  %outputs = index.constant 72 : index
+  func.call @q5_projection_channel8_expected(%count, %inputs, %outputs, %input, %weight, %output) : (buffer, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @split_q5_channel8_projection_check {
+  %partitions = check.literal value(4) : index
+  %tokens = check.literal value(4) : index
+  %inputs = check.literal value(1792) : index
+  %outputs = check.literal value(72) : index
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %count = check.generate.fill value(3) : tensor<1xi32>
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0 to 1.0) : tensor<4x1792xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<72x7x176xi8>
+    check.generate<@q5_projection_headers>(%inputs, %outputs, %weight) : (index, index, tensor<72x7x176xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<4x72xf32>
+    check.compare<@split_q5_channel8_projection, @split_q5_channel8_expected>[%partitions, %tokens, %inputs, %outputs](%count, %input, %weight, %output) : [index, index, index, index](tensor<1xi32>, tensor<4x1792xf32>, tensor<72x7x176xi8>, tensor<4x72xf32>) -> () {
+      check.expect.approximate actual(%output) expected(%output) atol(0.00050000000000000001) rtol(3.0000000000000001e-05) nan(different) : tensor<4x72xf32>, tensor<4x72xf32>
+    }
+  }
+  check.return
+}
+
+kernel.decl @qwen38_linear_split_reduce(%dispatch_partitions: index, %dispatch_tokens: index, %dispatch_outputs: index) launch(%partitions: index, %count: buffer, %outputs: index, %partials: buffer, %output: buffer)
+
+check.benchmark<@q5_projection_check> @q5_projection_check_workload
+
+check.benchmark<@q5_projection_channel8_check> @q5_projection_channel8_check_workload
+
+check.benchmark<@split_q5_projection_check> @split_q5_projection_check_workload
+
+check.benchmark<@split_q5_channel8_projection_check> @split_q5_channel8_projection_check_workload
