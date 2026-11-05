@@ -1,0 +1,268 @@
+// The shared range body has paired C64/T64 staging and independently striped
+// C64/T128 and C128/T128 staging. Check each with nonuniform signed operands,
+// token/channel tails, and disabled launches. Unit activations and dyadic
+// headers make all rounded products and sums representable in F32. The
+// established 2^-12 native matrix bound is below the 2^-10 value lattice.
+
+func.decl @matrix_projection_unit_activations(%count: index, %codes: buffer, %input: buffer)
+
+func.decl @matrix_projection_expected_range(%format: index, %control: buffer, %inputs: index, %outputs: index, %weight_channels: index, %begin: index, %end: index, %output_origin: offset, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_linear_q6k_f16_wmma_x64(%dispatch_tokens: index, %dispatch_inputs: index, %dispatch_outputs: index) launch(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_linear_q6k_f16_wmma_x128(%dispatch_tokens: index, %dispatch_inputs: index, %dispatch_outputs: index) launch(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_linear_q6k_f16_wmma_c128_t128(%dispatch_tokens: index, %dispatch_inputs: index, %dispatch_outputs: index) launch(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_linear_q8_0_f16_wmma_x128(%dispatch_tokens: index, %dispatch_inputs: index, %dispatch_outputs: index) launch(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+template.decl pure @wide.signed.dimensions(%configuration: index) -> (index, index, index, index)
+
+template.def<@wide.signed.dimensions> pure @wide_signed_dimensions(%configuration: index) -> (index, index, index, index) {
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c6 = index.constant 6 : index
+  %c8 = index.constant 8 : index
+  %c65 = index.constant 65 : index
+  %c129 = index.constant 129 : index
+  %variant = index.rem %configuration, %c4 : index
+  %disabled = index.cmp uge, %configuration, %c4 : index
+  %q8 = index.cmp eq, %variant, %c3 : index
+  %format = scf.select %q8, %c8, %c6 : index
+  %wide_channels = index.cmp eq, %variant, %c2 : index
+  %outputs = scf.select %wide_channels, %c129, %c65 : index
+  %short_tokens = index.cmp eq, %variant, %c0 : index
+  %fewer_tokens = scalar.ori %short_tokens, %wide_channels : i1
+  %active_tokens = scf.select %fewer_tokens, %c65, %c129 : index
+  %tokens = scf.select %disabled, %c0, %active_tokens : index
+  template.return %variant, %format, %tokens, %outputs : index, index, index, index
+}
+
+command.def public @wide_signed_projection(%configuration: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %variant, %format, %tokens, %outputs = template.apply<@wide.signed.dimensions>(%configuration) pure : (index) -> (index, index, index, index)
+  %inputs = index.constant 512 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %direct64 = index.cmp eq, %variant, %c0 : index
+  %direct128 = index.cmp eq, %variant, %c1 : index
+  %wide128 = index.cmp eq, %variant, %c2 : index
+  scf.if %direct64 {
+    kernel.launch @qwen38_linear_q6k_f16_wmma_x64[%tokens, %inputs, %outputs](%control, %inputs, %outputs, %input, %weight, %output) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+  } else {
+    scf.if %direct128 {
+      kernel.launch @qwen38_linear_q6k_f16_wmma_x128[%tokens, %inputs, %outputs](%control, %inputs, %outputs, %input, %weight, %output) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+    } else {
+      scf.if %wide128 {
+        kernel.launch @qwen38_linear_q6k_f16_wmma_c128_t128[%tokens, %inputs, %outputs](%control, %inputs, %outputs, %input, %weight, %output) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+      } else {
+        kernel.launch @qwen38_linear_q8_0_f16_wmma_x128[%tokens, %inputs, %outputs](%control, %inputs, %outputs, %input, %weight, %output) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+      }
+    }
+  }
+  command.return
+}
+
+func.def @signed_projection_headers(%format: index, %inputs: index, %outputs: index, %weight: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c6 = index.constant 6 : index
+  %q6 = index.cmp eq, %format, %c6 : index
+  %q6_block_width = index.constant 256 : index
+  %q8_block_width = index.constant 32 : index
+  %block_width = scf.select %q6, %q6_block_width, %q8_block_width : index
+  %q6_block_bytes = index.constant 210 : offset
+  %q8_block_bytes = index.constant 34 : offset
+  %block_bytes = scf.select %q6, %q6_block_bytes, %q8_block_bytes : offset
+  %q6_header = index.constant 208 : offset
+  %q8_header = index.constant 0 : offset
+  %header_add = scf.select %q6, %q6_header, %q8_header : offset
+  %blocks = index.div %inputs, %block_width : index
+  %count = index.mul %blocks, %outputs : index
+  %scale = scalar.constant 0.0009765625 : f16
+  scf.for %block = [%c0 to %count step %c1] {
+    %block_origin = index.scale %block, %block_bytes : index, offset -> offset
+    %header_origin = index.add %block_origin, %header_add : offset
+    %header = buffer.view %weight[%header_origin] : buffer -> view<1xf16>
+    view.store %scale, %header[0] : f16, view<1xf16>
+  }
+  func.return
+}
+
+func.def @wide_signed_initialize(%configuration: index, %control: buffer, %weight: buffer) {
+  %variant, %format, %tokens, %outputs = template.apply<@wide.signed.dimensions>(%configuration) pure : (index) -> (index, index, index, index)
+  %origin = index.constant 0 : offset
+  %inputs = index.constant 512 : index
+  %metadata = buffer.view %control[%origin] : buffer -> view<3xi32>
+  %token_word = index.cast %tokens : index to i32
+  %output_word = index.cast %outputs : index to i32
+  %format_word = index.cast %format : index to i32
+  view.store %token_word, %metadata[0] : i32, view<3xi32>
+  view.store %output_word, %metadata[1] : i32, view<3xi32>
+  view.store %format_word, %metadata[2] : i32, view<3xi32>
+  func.call @signed_projection_headers(%format, %inputs, %outputs, %weight) : (index, index, index, buffer)
+  func.return
+}
+
+func.def @wide_signed_reference(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %inputs = index.constant 512 : index
+  %weight_channels = index.constant 1 : index
+  %metadata = buffer.view %control[%origin] : buffer -> view<3xi32>
+  %output_word = view.load %metadata[1] : view<3xi32> -> i32
+  %format_word = view.load %metadata[2] : view<3xi32> -> i32
+  %outputs = index.cast %output_word : i32 to index
+  %format = index.cast %format_word : i32 to index
+  func.call @matrix_projection_expected_range(%format, %control, %inputs, %outputs, %weight_channels, %begin, %inputs, %origin, %input, %weight, %output) : (index, buffer, index, index, index, index, index, offset, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @wide_signed_projection_check configure[8](%configuration: index, %configuration_entropy: check.entropy) {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %control = check.generate.fill value(0) : tensor<3xi32>
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %codes = check.generate.random.uniform seed(%input_seed) range(-1 to 1) : tensor<129x512xi8>
+    %input = check.generate.fill value(0.0) : tensor<129x512xf32>
+    %activation_count = check.literal value(66048) : index
+    check.generate<@matrix_projection_unit_activations>(%activation_count, %codes, %input) : (index, tensor<129x512xi8>, tensor<129x512xf32>) -> ()
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<70176xi8>
+    check.generate<@wide_signed_initialize>(%configuration, %control, %weight) : (index, tensor<3xi32>, tensor<70176xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<16649xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<16649xf32> -> tensor<129x129xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<16649xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(66580) : tensor<16649xf32> -> tensor<4xf32>
+    check.compare<@wide_signed_projection, @wide_signed_reference>[%configuration](%control, %input, %weight, %output) : [index](tensor<3xi32>, tensor<129x512xf32>, tensor<70176xi8>, tensor<129x129xf32>) -> () {
+      check.expect.approximate actual(%storage) expected(%storage) atol(0.000244140625) rtol(0.0) nan(different) : tensor<16649xf32>, tensor<16649xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<129x512xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<70176xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@wide_signed_projection_check> @wide_signed_projection_workload
+
+kernel.decl @qwen38_linear_q6k_f16_mfma_split(%dispatch_partitions: index, %dispatch_tokens: index, %dispatch_inputs: index, %dispatch_outputs: index) launch(%partitions: index, %control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %partials: buffer)
+
+kernel.decl @qwen38_linear_split_reduce(%dispatch_partitions: index, %dispatch_tokens: index, %dispatch_outputs: index) launch(%partitions: index, %control: buffer, %outputs: index, %partials: buffer, %output: buffer)
+
+template.decl pure @signed.split.dimensions(%configuration: index) -> (index, index)
+
+template.def<@signed.split.dimensions> pure @signed_split_dimensions(%configuration: index) -> (index, index) {
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c128 = index.constant 128 : index
+  %two_partitions = index.cmp eq, %configuration, %c0 : index
+  %partitions = scf.select %two_partitions, %c2, %c4 : index
+  %disabled = index.cmp eq, %configuration, %c2 : index
+  %tokens = scf.select %disabled, %c0, %c128 : index
+  template.return %partitions, %tokens : index, index
+}
+
+command.def public @signed_split_projection(%configuration: index) launch(%control: buffer, %input: buffer, %weight: buffer, %partials: buffer, %output: buffer) {
+  %partitions, %tokens = template.apply<@signed.split.dimensions>(%configuration) pure : (index) -> (index, index)
+  %inputs = index.constant 768 : index
+  %outputs = index.constant 17 : index
+  kernel.launch @qwen38_linear_q6k_f16_mfma_split[%partitions, %tokens, %inputs, %outputs](%partitions, %control, %inputs, %outputs, %input, %weight, %partials) : [index, index, index, index](index, buffer, index, index, buffer, buffer, buffer)
+  kernel.launch @qwen38_linear_split_reduce[%partitions, %tokens, %outputs](%partitions, %control, %outputs, %partials, %output) : [index, index, index](index, buffer, index, buffer, buffer)
+  command.return
+}
+
+func.def @signed_split_initialize(%configuration: index, %control: buffer, %weight: buffer) {
+  %partitions, %dispatch_tokens = template.apply<@signed.split.dimensions>(%configuration) pure : (index) -> (index, index)
+  %c0 = index.constant 0 : index
+  %c65 = index.constant 65 : index
+  %enabled = index.cmp ne, %dispatch_tokens, %c0 : index
+  %tokens = scf.select %enabled, %c65, %c0 : index
+  %origin = index.constant 0 : offset
+  %metadata = buffer.view %control[%origin] : buffer -> view<2xi32>
+  %token_word = index.cast %tokens : index to i32
+  %partition_word = index.cast %partitions : index to i32
+  view.store %token_word, %metadata[0] : i32, view<2xi32>
+  view.store %partition_word, %metadata[1] : i32, view<2xi32>
+  %format = index.constant 6 : index
+  %inputs = index.constant 768 : index
+  %outputs = index.constant 17 : index
+  func.call @signed_projection_headers(%format, %inputs, %outputs, %weight) : (index, index, index, buffer)
+  func.return
+}
+
+// Three complete quantization blocks divide unevenly into two partitions;
+// four partitions include an empty first range. Check each plane independently
+// before checking the ordered reducer and the untouched padded output rows.
+func.def @signed_split_reference(%control: buffer, %input: buffer, %weight: buffer, %partials: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %blocks = index.constant 3 : index
+  %block_width = index.constant 256 : index
+  %inputs = index.constant 768 : index
+  %outputs = index.constant 17 : index
+  %format = index.constant 6 : index
+  %element_bytes = index.constant 4 : offset
+  %metadata = buffer.view %control[%origin] : buffer -> view<2xi32>
+  %token_word = view.load %metadata[0] : view<2xi32> -> i32
+  %partition_word = view.load %metadata[1] : view<2xi32> -> i32
+  %tokens = index.cast %token_word : i32 to index
+  %partitions = index.cast %partition_word : i32 to index
+  %plane_elements = index.mul %tokens, %outputs : index
+  %plane_bytes = index.scale %plane_elements, %element_bytes : index, offset -> offset
+  %enabled = index.cmp ne, %tokens, %c0 : index
+  scf.if %enabled {
+    scf.for %partition = [%c0 to %partitions step %c1] {
+      %next_partition = index.add %partition, %c1 : index
+      %begin_scaled = index.mul %partition, %blocks : index
+      %end_scaled = index.mul %next_partition, %blocks : index
+      %begin_block = index.div %begin_scaled, %partitions : index
+      %end_block = index.div %end_scaled, %partitions : index
+      %begin = index.mul %begin_block, %block_width : index
+      %end = index.mul %end_block, %block_width : index
+      %plane_origin = index.scale %partition, %plane_bytes : index, offset -> offset
+      func.call @matrix_projection_expected_range(%format, %control, %inputs, %outputs, %c1, %begin, %end, %plane_origin, %input, %weight, %partials) : (index, buffer, index, index, index, index, index, offset, buffer, buffer, buffer)
+    }
+    func.call @matrix_projection_expected_range(%format, %control, %inputs, %outputs, %c1, %c0, %inputs, %origin, %input, %weight, %output) : (index, buffer, index, index, index, index, index, offset, buffer, buffer, buffer)
+  }
+  func.return
+}
+
+check.scenario public @signed_split_projection_check configure[3](%configuration: index, %configuration_entropy: check.entropy) {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %control = check.generate.fill value(0) : tensor<2xi32>
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %codes = check.generate.random.uniform seed(%input_seed) range(-1 to 1) : tensor<128x768xi8>
+    %input = check.generate.fill value(0.0) : tensor<128x768xf32>
+    %activation_count = check.literal value(98304) : index
+    check.generate<@matrix_projection_unit_activations>(%activation_count, %codes, %input) : (index, tensor<128x768xi8>, tensor<128x768xf32>) -> ()
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<17x3x210xi8>
+    check.generate<@signed_split_initialize>(%configuration, %control, %weight) : (index, tensor<2xi32>, tensor<17x3x210xi8>) -> ()
+    %partial_storage = check.generate.fill value(-99.0) : tensor<8712xf32>
+    %partials = check.tensor.view %partial_storage offset(16) : tensor<8712xf32> -> tensor<4x128x17xf32>
+    %output_storage = check.generate.fill value(-99.0) : tensor<2184xf32>
+    %output = check.tensor.view %output_storage offset(16) : tensor<2184xf32> -> tensor<128x17xf32>
+    %partial_prefix = check.tensor.view %partial_storage offset(0) : tensor<8712xf32> -> tensor<4xf32>
+    %partial_suffix = check.tensor.view %partial_storage offset(34832) : tensor<8712xf32> -> tensor<4xf32>
+    %output_prefix = check.tensor.view %output_storage offset(0) : tensor<2184xf32> -> tensor<4xf32>
+    %output_suffix = check.tensor.view %output_storage offset(8720) : tensor<2184xf32> -> tensor<4xf32>
+    check.compare<@signed_split_projection, @signed_split_reference>[%configuration](%control, %input, %weight, %partials, %output) : [index](tensor<2xi32>, tensor<128x768xf32>, tensor<17x3x210xi8>, tensor<4x128x17xf32>, tensor<128x17xf32>) -> () {
+      check.expect.approximate actual(%partial_storage) expected(%partial_storage) atol(0.000244140625) rtol(0.0) nan(different) : tensor<8712xf32>, tensor<8712xf32>
+      check.expect.approximate actual(%output_storage) expected(%output_storage) atol(0.000244140625) rtol(0.0) nan(different) : tensor<2184xf32>, tensor<2184xf32>
+      check.expect.bitwise actual(%partial_prefix) expected(%partial_prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%partial_suffix) expected(%partial_suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%output_prefix) expected(%output_prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%output_suffix) expected(%output_suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<128x768xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<17x3x210xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@signed_split_projection_check> @signed_split_projection_workload
