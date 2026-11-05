@@ -74,10 +74,20 @@ incompatible with installed SDK mode rather than rebuilding serving internals.
 The [SDK pin](../build_tools/ci/sdk.json) records the HRX commit, qualified
 workflow artifact, wheel filename, and wheel digest. Updating the compiler is
 one reviewed change to that pin and the HRX commit in `MODULE.bazel`. Setup
-rejects mismatched revisions. Select an artifact exported after installed-wheel
-qualification (`loom-sdk-wheel-*`), not the Windows input handoff
-(`loom-sdk-inputs-*`). The action installs only the recorded wheel and fails if
-its content differs; there is no latest-success or source-build fallback.
+rejects mismatched revisions. The **Loom SDK / Qualification** workflow accepts
+the run ID or URL of a successful, manually dispatched HRX **Loom / SDK**
+workflow. It verifies the producer and its qualified Linux Release artifact,
+derives the wheel name and digest, updates both pins, and opens a draft pull
+request. Because a pull request created by `GITHUB_TOKEN` does not emit another
+workflow event, the updater explicitly dispatches the normal library workflow
+on the generated branch. That run supplies the same host and hardware evidence
+as an ordinary library change.
+
+The selected HRX workflow must have completed successfully; a general HRX CI
+run or a partially successful SDK build is not a release qualification input.
+The updater rejects expired, ambiguous, mismatched, and non-Release artifacts.
+The setup action installs only the recorded wheel and fails if its content
+differs; there is no latest-success or source-build fallback.
 
 Workflow artifacts have finite retention. They bootstrap qualification before
 an SDK release exists; a missing or expired artifact requires a new reviewed
