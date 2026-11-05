@@ -1,0 +1,123 @@
+// Both storage orders use the production command boundary. Configurations
+// cover every 16-channel tail class, a complete tile, and a disabled launch.
+// The independent scalar-byte F64 oracle checks full-depth dot products.
+// Unit signed activations and d=dmin=2^-10 make every decoded weight exactly
+// representable in F16. Every partial sum has numerator at most 5120*1953,
+// below 2^24; native matrix arithmetic retains the established 2^-12 bound.
+
+target.decl @qwen38_execution
+
+command.decl @qwen38_dispatch_linear_q5k_f16_c64t32_f32acc(%tokens: index, %inputs: index, %outputs: index, %input_size: index, %output_size: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer)
+
+command.decl @qwen38_dispatch_linear_q5k_f16_c64t32_f32acc_channel8(%tokens: index, %inputs: index, %outputs: index, %input_size: index, %output_size: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @q5_projection_expected(%control: buffer, %inputs: index, %outputs: index, %weight_channels: index, %input: buffer, %weight: buffer, %output: buffer)
+
+template.decl @q5.c64t32.dimensions(%configuration: index) -> (index, index, i1)
+
+template.def<@q5.c64t32.dimensions> @q5_c64t32_dimensions(%configuration: index) -> (index, index, i1) {
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c10 = index.constant 10 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  %extent = index.div %configuration, %c2 : index
+  %outputs = index.madd %extent, %c16, %c48 : index
+  %disabled = index.cmp uge, %configuration, %c10 : index
+  %tokens = scf.select %disabled, %c0, %c32 : index
+  %order = index.rem %configuration, %c2 : index
+  %channel8 = index.cmp ne, %order, %c0 : index
+  template.return %tokens, %outputs, %channel8 : index, index, i1
+}
+
+command.def public target(@qwen38_execution) @q5_c64t32_projection(%configuration: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %tokens, %outputs, %channel8 = template.apply<@q5.c64t32.dimensions>(%configuration) : (index) -> (index, index, i1)
+  %inputs = index.constant 5120 : index
+  scf.if %channel8 {
+    command.launch @qwen38_dispatch_linear_q5k_f16_c64t32_f32acc_channel8[%tokens, %inputs, %outputs, %inputs, %outputs](%control, %input, %weight, %output) : [index, index, index, index, index](buffer, buffer, buffer, buffer)
+  } else {
+    command.launch @qwen38_dispatch_linear_q5k_f16_c64t32_f32acc[%tokens, %inputs, %outputs, %inputs, %outputs](%control, %input, %weight, %output) : [index, index, index, index, index](buffer, buffer, buffer, buffer)
+  }
+  command.return
+}
+
+func.def @q5_c64t32_initialize(%configuration: index, %control: buffer, %weight: buffer) {
+  %tokens, %outputs, %channel8 = template.apply<@q5.c64t32.dimensions>(%configuration) : (index) -> (index, index, i1)
+  %origin = index.constant 0 : offset
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %weight_channels = scf.select %channel8, %c8, %c1 : index
+  %token_word = index.cast %tokens : index to i32
+  %output_word = index.cast %outputs : index to i32
+  %order_word = index.cast %weight_channels : index to i32
+  %metadata = buffer.view %control[%origin] : buffer -> view<3xi32>
+  view.store %token_word, %metadata[0] : i32, view<3xi32>
+  view.store %output_word, %metadata[1] : i32, view<3xi32>
+  view.store %order_word, %metadata[2] : i32, view<3xi32>
+  %begin = index.constant 0 : index
+  %block_count = index.constant 2560 : index
+  %block_bytes = index.constant 176 : offset
+  %scale = scalar.constant 0.0009765625 : f16
+  scf.for %block = [%begin to %block_count step %c1] {
+    %block_origin = index.scale %block, %block_bytes : index, offset -> offset
+    %header = buffer.view %weight[%block_origin] : buffer -> view<2xf16>
+    view.store %scale, %header[0] : f16, view<2xf16>
+    view.store %scale, %header[1] : f16, view<2xf16>
+  }
+  func.return
+}
+
+func.def @q5_c64t32_activations(%codes: buffer, %input: buffer) {
+  %begin = index.constant 0 : index
+  %end = index.constant 163840 : index
+  %step = index.constant 1 : index
+  %origin = index.constant 0 : offset
+  %source = buffer.view %codes[%origin] : buffer -> view<163840xi8>
+  %destination = buffer.view %input[%origin] : buffer -> view<163840xf32>
+  scf.for %element = [%begin to %end step %step] {
+    %code = view.load %source[%element] : view<163840xi8> -> i8
+    %value = scalar.sitofp %code : i8 to f32
+    view.store %value, %destination[%element] : f32, view<163840xf32>
+  }
+  func.return
+}
+
+func.def @q5_c64t32_reference(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %inputs = index.constant 5120 : index
+  %metadata = buffer.view %control[%origin] : buffer -> view<3xi32>
+  %output_word = view.load %metadata[1] : view<3xi32> -> i32
+  %order_word = view.load %metadata[2] : view<3xi32> -> i32
+  %outputs = index.cast %output_word : i32 to index
+  %weight_channels = index.cast %order_word : i32 to index
+  func.call @q5_projection_expected(%control, %inputs, %outputs, %weight_channels, %input, %weight, %output) : (buffer, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @q5_c64t32_projection_check configure[12](%configuration: index, %configuration_entropy: check.entropy) {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %control = check.generate.fill value(0) : tensor<3xi32>
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %codes = check.generate.random.uniform seed(%input_seed) range(-1 to 1) : tensor<32x5120xi8>
+    %input = check.generate.fill value(0.0) : tensor<32x5120xf32>
+    check.generate<@q5_c64t32_activations>(%codes, %input) : (tensor<32x5120xi8>, tensor<32x5120xf32>) -> ()
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<128x20x176xi8>
+    check.generate<@q5_c64t32_initialize>(%configuration, %control, %weight) : (index, tensor<3xi32>, tensor<128x20x176xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<4104xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<4104xf32> -> tensor<32x128xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<4104xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(16400) : tensor<4104xf32> -> tensor<4xf32>
+    check.compare<@q5_c64t32_projection, @q5_c64t32_reference>[%configuration](%control, %input, %weight, %output) : [index](tensor<3xi32>, tensor<32x5120xf32>, tensor<128x20x176xi8>, tensor<32x128xf32>) -> () {
+      check.expect.approximate actual(%output) expected(%output) atol(0.000244140625) rtol(0.0) nan(different) : tensor<32x128xf32>, tensor<32x128xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<32x5120xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<128x20x176xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_c64t32_projection_check> @q5_c64t32_projection_workload

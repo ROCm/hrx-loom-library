@@ -8,6 +8,15 @@ Shared [projection](../../../../kernel/ggml/linear/test/),
 reusable numerical and protocol contracts. Model tests add only the boundaries
 those packages cannot establish independently.
 
+The fixed-depth Q5 projection scenarios call the production commands and check
+them against a scalar-byte GGUF decoder with ordered F64 accumulation. Random
+packed fields, dyadic block scales, and signed unit activations make every F16
+operand exact and bound every partial sum below the F32 integer precision
+limit. This isolates fragment ownership, both weight orders, and partial
+channel tiles without depending on a driver's matrix rounding order. The
+reference reuses decoded activations and one weight row; output guards and
+input immutability are checked independently.
+
 Test overviews explain reference independence and numerical acceptance;
 scenarios and BUILD declarations own workload and target coverage. Large
 vocabulary and full-width performance workloads remain explicit stress tests,
