@@ -20,6 +20,14 @@ staging stride, matrix carrier, and publication packets. Each partition owns
 one 32x48 F32 plane, so changing subgroup width leaves the command's partial
 storage and subsequent reduction unchanged.
 
+The wider Q6_K and Q8_0 projections share one signed-weight contraction.
+Four, eight, or sixteen subgroups retain the existing C64/T64, C64/T128, or
+C128/T128 panels. Subgroup width determines accumulator carriers, staging
+strides, and publication packets while the decoded panels and F32 recurrence
+remain unchanged. Whole and partitioned Q6 contractions use the same range
+body; command selection retains the tuned split preference. The matrix motif
+owns native operand layouts, so these entries inherit the execution target.
+
 Attention separates preparation, cache publication, history partitions, and
 merge. Gated DeltaNet retains causal state within each span. Capture and
 accepted-prefix replay keep rejected proposals from advancing committed history.
