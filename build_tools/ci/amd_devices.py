@@ -33,8 +33,9 @@ def parse_device_dump(output: str, scheme: str) -> list[Device]:
     """Reads endpoint identity and PCI address from the SDK's query-only dump."""
     if f"# Enumerated devices for driver '{scheme}'" not in output:
         raise ValueError(f"Missing {scheme} enumeration in the SDK device dump")
+    device_path = rf"(?:id/[0-9a-f]{{32}}|GPU-[0-9a-f]{{16}})"
     pattern = (
-        rf"^# --device=({scheme}://id/[0-9a-f]{{32}})\n"
+        rf"^# --device=({scheme}://{device_path})\n"
         r"#   AMD GPU [0-9a-f:]+ \(([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])\)$"
     )
     devices = [Device(*match) for match in re.findall(pattern, output, re.MULTILINE)]

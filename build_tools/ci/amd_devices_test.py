@@ -253,6 +253,21 @@ class AmdDevicesTest(unittest.TestCase):
                 device_dump("amdgpu", [self.views["amdgpu"][0]] * 2), "amdgpu"
             )
 
+    def test_device_dump_accepts_endpoint_and_native_gpu_identities(self):
+        for scheme in amd_devices.GPU_SCHEMES:
+            devices = [
+                Device(
+                    f"{scheme}://id/00000000000000010000000000000002",
+                    self.addresses[0],
+                ),
+                Device(f"{scheme}://GPU-0000000000000065", self.addresses[1]),
+            ]
+            with self.subTest(scheme=scheme):
+                self.assertEqual(
+                    amd_devices.parse_device_dump(device_dump(scheme, devices), scheme),
+                    devices,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
