@@ -49,6 +49,9 @@ class UpdateSDKTest(unittest.TestCase):
         package: str = "hrx-loom",
         metadata_version: str | None = None,
         artifact_name: str | None = None,
+        catalog: str | None = (
+            "github:ROCm/hrx-loom-library@" + "4" * 40
+        ),
     ) -> tuple[Path, bytes, str]:
         filename = (
             artifact_name
@@ -61,6 +64,7 @@ class UpdateSDKTest(unittest.TestCase):
                 prefix + "METADATA",
                 f"Name: {package}\nVersion: {metadata_version or version}\n",
             )
+            wheel.writestr(prefix + "loom.json", json.dumps({"catalog": catalog}))
         contents = wheel_path.read_bytes()
         artifact_path = self.root / "artifact.zip"
         with ZipFile(artifact_path, "w") as artifact:
@@ -78,6 +82,7 @@ class UpdateSDKTest(unittest.TestCase):
                     "artifact_id": 2,
                     "wheel": "old.whl",
                     "sha256": "3" * 64,
+                    "catalog": "github:ROCm/hrx-loom-library@" + "4" * 40,
                 }
             )
         )
@@ -144,7 +149,10 @@ class UpdateSDKTest(unittest.TestCase):
         self.assertEqual(
             update_sdk.inspect_artifact(path),
             update_sdk.Wheel(
-                filename, "0.2.0.dev0", hashlib.sha256(contents).hexdigest()
+                filename,
+                "0.2.0.dev0",
+                hashlib.sha256(contents).hexdigest(),
+                "github:ROCm/hrx-loom-library@" + "4" * 40,
             ),
         )
 
@@ -153,6 +161,7 @@ class UpdateSDKTest(unittest.TestCase):
             {"package": "other"},
             {"metadata_version": "0.2.0"},
             {"artifact_name": "other.whl"},
+            {"catalog": "not-a-catalog"},
         )
         for arguments in cases:
             with self.subTest(arguments=arguments):
@@ -171,7 +180,10 @@ class UpdateSDKTest(unittest.TestCase):
         old_revision = "2" * 40
         self.write_pin(old_revision)
         candidate = update_sdk.Candidate(123, self.revision, 789)
-        wheel = update_sdk.Wheel("candidate.whl", "0.2.0.dev0", "4" * 64)
+        catalog = "github:ROCm/hrx-loom-library@v0.2.0"
+        wheel = update_sdk.Wheel(
+            "candidate.whl", "0.2.0.dev0", "4" * 64, catalog
+        )
         update_sdk.update_pin(self.root, candidate, wheel)
         self.assertEqual(
             json.loads((self.root / update_sdk.SDK_PIN).read_text()),
@@ -182,6 +194,7 @@ class UpdateSDKTest(unittest.TestCase):
                 "artifact_id": 789,
                 "wheel": "candidate.whl",
                 "sha256": "4" * 64,
+                "catalog": catalog,
             },
         )
         module = (self.root / update_sdk.MODULE).read_text()
@@ -198,7 +211,9 @@ class UpdateSDKTest(unittest.TestCase):
             update_sdk.update_pin(
                 self.root,
                 update_sdk.Candidate(123, self.revision, 789),
-                update_sdk.Wheel("candidate.whl", "0.2.0.dev0", "4" * 64),
+                update_sdk.Wheel(
+                    "candidate.whl", "0.2.0.dev0", "4" * 64, None
+                ),
             )
         self.assertEqual(before, (sdk_path.read_bytes(), module_path.read_bytes()))
 

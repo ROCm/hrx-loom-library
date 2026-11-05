@@ -96,6 +96,51 @@ recorded checksum, replacing the download step in the single setup action.
 [Maintaining Loom SDK releases](https://github.com/ROCm/hrx-system/blob/main/loom/packaging/python/RELEASING.md)
 owns production, platform qualification, and publication of those artifacts.
 
+## Publish a coordinated library release
+
+An SDK release names this library's same-version tag as its default catalog,
+while the library pins the exact SDK candidate used to qualify its programs.
+The stable tag name keeps those two identities acyclic: the SDK can contain
+`github:ROCm/hrx-loom-library@vX.Y.ZrcN` before the tag exists, and the admitted
+library tree can later select the exact candidate SDK commit and wheel.
+
+Merge the generated SDK qualification change after its host and hardware
+workflow passes. The reviewed pin records the candidate wheel's authored
+catalog association as well as its source revision, workflow artifact, name,
+and SHA-256. For publication, that association must name this repository at the
+tag derived from the wheel version; a development wheel, commit association, or
+different tag cannot publish accidentally.
+
+The **Loom Library / Release** workflow requires the reviewed default branch and
+admitted release tree, creates or verifies the exact source tag and an empty
+draft release, and installs the pinned candidate wheel. It then invokes that
+installation's ordinary `loom-fetch --list` path without an explicit catalog.
+The result must resolve the tag back to the selected commit and reproduce the
+tagged tree's `catalog.json`. Only after that production-path proof passes does
+the workflow publish the empty immutable library release. The matching HRX SDK
+release follows, so its default catalog is already immutable when users install
+it.
+
+Repository owners enable GitHub immutable releases before the first library
+release. The setting applies only to future releases. An administrator can
+verify it before dispatching the workflow:
+
+```sh
+gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+  repos/ROCm/hrx-loom-library/immutable-releases
+```
+
+The response must report `"enabled": true`. Dispatch the publication from
+`main`; the workflow rejects development SDK versions, catalog/tag mismatches,
+conflicting tags or release metadata, binary assets, discovery results that do
+not reproduce the admitted tree, and any public release that GitHub does not
+report as immutable. A failed retry may resume only the exact tag and draft; it
+never retargets or repairs them:
+
+```sh
+gh workflow run release_library.yml --repo ROCm/hrx-loom-library --ref main
+```
+
 The pinned SDK includes native AMD GPU, XDNA, and Vulkan execution. Vulkan
 loads the execution host's Vulkan loader and driver; the wheel does not bundle
 them. A Vulkan lane requires a qualified runner with that runtime and the

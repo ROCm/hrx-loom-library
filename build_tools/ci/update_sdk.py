@@ -32,6 +32,7 @@ _VERSION = re.compile(r"[0-9]+(?:\.[0-9]+){2}(?:(?:a|b|rc)[0-9]+|\.dev[0-9]+)?")
 _WHEEL = re.compile(
     r"hrx_loom-(?P<version>[^/]+)-py3-none-manylinux_2_39_x86_64\.whl"
 )
+_CATALOG = re.compile(r"github:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)@[^\s]+")
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ class Wheel:
     filename: str
     version: str
     digest: str
+    catalog: str | None
 
 
 def parse_run_id(value: str) -> int:
@@ -192,9 +194,22 @@ def inspect_artifact(path: Path) -> Wheel:
                 raise ValueError("SDK wheel has an invalid package name")
             if metadata.get_all("Version") != [version]:
                 raise ValueError("SDK wheel filename and metadata versions differ")
+            catalog_name = prefix + "loom.json"
+            if names.count(catalog_name) != 1:
+                raise ValueError("SDK wheel has an invalid catalog identity")
+            catalog_document = _require_mapping(
+                json.loads(wheel.read(catalog_name)), "SDK catalog identity"
+            )
+            if set(catalog_document) != {"catalog"}:
+                raise ValueError("SDK wheel has an invalid catalog identity")
+            catalog = catalog_document["catalog"]
+            if catalog is not None:
+                match = _CATALOG.fullmatch(catalog) if isinstance(catalog, str) else None
+                if match is None or any(part in (".", "..") for part in match.groups()):
+                    raise ValueError("SDK wheel has an invalid catalog association")
     except BadZipFile as error:
         raise ValueError("SDK artifact or wheel is not a valid ZIP archive") from error
-    return Wheel(filename, version, hashlib.sha256(contents).hexdigest())
+    return Wheel(filename, version, hashlib.sha256(contents).hexdigest(), catalog)
 
 
 def update_pin(root: Path, candidate: Candidate, wheel: Wheel) -> None:
@@ -211,6 +226,7 @@ def update_pin(root: Path, candidate: Candidate, wheel: Wheel) -> None:
         "artifact_id",
         "wheel",
         "sha256",
+        "catalog",
     }
     if set(current) != expected_keys or current.get("repository") != HRX_REPOSITORY:
         raise ValueError("sdk.json has an unexpected schema or repository")
@@ -234,6 +250,7 @@ def update_pin(root: Path, candidate: Candidate, wheel: Wheel) -> None:
         "artifact_id": candidate.artifact_id,
         "wheel": wheel.filename,
         "sha256": wheel.digest,
+        "catalog": wheel.catalog,
     }
     sdk_path.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
     module_path.write_text(
