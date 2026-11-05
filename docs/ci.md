@@ -72,9 +72,11 @@ incompatible with installed SDK mode rather than rebuilding serving internals.
 ## Update the SDK
 
 The [SDK pin](../build_tools/ci/sdk.json) records the HRX commit, qualified
-workflow artifact, wheel filename, and wheel digest. Updating the compiler is
-one reviewed change to that pin and the HRX commit in `MODULE.bazel`. Setup
-rejects mismatched revisions. The **Loom SDK / Qualification** workflow accepts
+workflow artifact, matching public release tag for non-development versions,
+wheel filename and digest, and authored catalog association. Updating the
+compiler is one reviewed change to that pin and the HRX commit in
+`MODULE.bazel`. Setup rejects mismatched revisions. The **Loom SDK /
+Qualification** workflow accepts
 the run ID or URL of a successful, manually dispatched HRX **Loom / SDK**
 workflow. It verifies the producer and its qualified Linux Release artifact,
 derives the wheel name and digest, updates both pins, and opens a draft pull
@@ -87,12 +89,18 @@ The selected HRX workflow must have completed successfully; a general HRX CI
 run or a partially successful SDK build is not a release qualification input.
 The updater rejects expired, ambiguous, mismatched, and non-Release artifacts.
 The setup action installs only the recorded wheel and fails if its content
-differs; there is no latest-success or source-build fallback.
+differs; there is no latest-success or source-build fallback. Before the
+matching immutable SDK release exists, it downloads the reviewed workflow
+artifact. Once that public release exists, setup requires its exact tag, wheel
+name, service-reported digest, and downloaded bytes, then uses it instead. A
+present but mutable or conflicting release is an error rather than permission
+to fall back.
 
 Workflow artifacts have finite retention. They bootstrap qualification before
-an SDK release exists; a missing or expired artifact requires a new reviewed
-pin. Durable library publication uses a published SDK release asset and its
-recorded checksum, replacing the download step in the single setup action.
+an SDK release exists; a missing or expired artifact before publication
+requires a new reviewed pin. The same pin becomes durable when the exact public
+release appears, without changing the immutable library tag or its selected
+bytes.
 [Maintaining Loom SDK releases](https://github.com/ROCm/hrx-system/blob/main/loom/packaging/python/RELEASING.md)
 owns production, platform qualification, and publication of those artifacts.
 
@@ -100,7 +108,7 @@ owns production, platform qualification, and publication of those artifacts.
 
 An SDK release names this library's same-version tag as its default catalog,
 while the library pins the exact SDK candidate used to qualify its programs.
-The stable tag name keeps those two identities acyclic: the SDK can contain
+The versioned tag name keeps those two identities acyclic: the SDK can contain
 `github:ROCm/hrx-loom-library@vX.Y.ZrcN` before the tag exists, and the admitted
 library tree can later select the exact candidate SDK commit and wheel.
 

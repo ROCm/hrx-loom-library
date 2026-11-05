@@ -50,10 +50,8 @@ class ReleaseLibraryTest(unittest.TestCase):
                     "revision": "b" * 40,
                     "run_id": 123,
                     "artifact_id": 456,
-                    "wheel": (
-                        f"hrx_loom-{version}-py3-none-"
-                        "manylinux_2_39_x86_64.whl"
-                    ),
+                    "release_tag": f"v{version}",
+                    "wheel": (f"hrx_loom-{version}-py3-none-manylinux_2_39_x86_64.whl"),
                     "sha256": "c" * 64,
                     "catalog": f"github:ROCm/hrx-loom-library@v{version}",
                 }
@@ -101,9 +99,10 @@ class ReleaseLibraryTest(unittest.TestCase):
         self.assertEqual(self.identity.version, "1.2.3rc1")
         self.assertEqual(self.identity.tag, "v1.2.3rc1")
         self.assertTrue(self.identity.prerelease)
-        self.assertEqual(self.identity.wheel, (
-            "hrx_loom-1.2.3rc1-py3-none-manylinux_2_39_x86_64.whl"
-        ))
+        self.assertEqual(
+            self.identity.wheel,
+            ("hrx_loom-1.2.3rc1-py3-none-manylinux_2_39_x86_64.whl"),
+        )
         self.assertEqual(self.identity.digest, "c" * 64)
         self.assertEqual(
             self.identity.catalog,
@@ -230,9 +229,7 @@ class ReleaseLibraryTest(unittest.TestCase):
         with patch.object(
             release_library.subprocess, "run", return_value=completed
         ) as run:
-            self.assertEqual(
-                release_library._read_catalog(self.loom_fetch), listing
-            )
+            self.assertEqual(release_library._read_catalog(self.loom_fetch), listing)
         arguments = run.call_args.args[0]
         self.assertEqual(arguments[0], str(self.loom_fetch))
         self.assertIn("--list", arguments)
@@ -250,8 +247,7 @@ class ReleaseLibraryTest(unittest.TestCase):
             ],
             [
                 self.tag_document(),
-                self.library_release_document()
-                | {"assets": [{"name": "unexpected"}]},
+                self.library_release_document() | {"assets": [{"name": "unexpected"}]},
             ],
             [
                 self.tag_document(),
@@ -261,9 +257,7 @@ class ReleaseLibraryTest(unittest.TestCase):
         for responses in conflicts:
             with (
                 self.subTest(responses=responses),
-                patch.object(
-                    release_library, "_get_optional", side_effect=responses
-                ),
+                patch.object(release_library, "_get_optional", side_effect=responses),
                 patch.object(release_library, "_gh") as gh,
                 patch.object(release_library, "_read_catalog") as read_catalog,
             ):

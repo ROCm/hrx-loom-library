@@ -28,9 +28,7 @@ _COMMIT = re.compile(r"[0-9a-f]{40}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _NUMBER = r"(?:0|[1-9][0-9]*)"
 _VERSION = re.compile(rf"{_NUMBER}\.{_NUMBER}\.{_NUMBER}(?:(?:a|b|rc){_NUMBER})?")
-_WHEEL = re.compile(
-    r"hrx_loom-(?P<version>[^/]+)-py3-none-manylinux_2_39_x86_64\.whl"
-)
+_WHEEL = re.compile(r"hrx_loom-(?P<version>[^/]+)-py3-none-manylinux_2_39_x86_64\.whl")
 
 
 @dataclass(frozen=True)
@@ -57,6 +55,7 @@ def read_identity(root: Path) -> Identity:
         "revision",
         "run_id",
         "artifact_id",
+        "release_tag",
         "wheel",
         "sha256",
         "catalog",
@@ -65,9 +64,10 @@ def read_identity(root: Path) -> Identity:
         raise ValueError("sdk.json has an unexpected schema")
     if document["repository"] != HRX_REPOSITORY:
         raise ValueError(f"SDK source must be {HRX_REPOSITORY}")
-    if not isinstance(document["revision"], str) or _COMMIT.fullmatch(
-        document["revision"]
-    ) is None:
+    if (
+        not isinstance(document["revision"], str)
+        or _COMMIT.fullmatch(document["revision"]) is None
+    ):
         raise ValueError("SDK source revision must be a Git commit")
     if (
         type(document["run_id"]) is not int
@@ -85,6 +85,8 @@ def read_identity(root: Path) -> Identity:
     if _VERSION.fullmatch(version) is None:
         raise ValueError("library publication requires a release SDK wheel")
     tag = "v" + version
+    if document["release_tag"] != tag:
+        raise ValueError("qualified SDK does not name its matching release tag")
     catalog = document["catalog"]
     if catalog != f"github:ROCm/hrx-loom-library@{tag}":
         raise ValueError("qualified SDK does not name this coordinated library tag")
@@ -139,9 +141,7 @@ def _validate_tag(document: Any, commit: str) -> None:
         raise ValueError("existing library tag does not select this commit")
 
 
-def _validate_library_release(
-    document: Any, identity: Identity
-) -> tuple[int, bool]:
+def _validate_library_release(document: Any, identity: Identity) -> tuple[int, bool]:
     expected = {
         "tag_name": identity.tag,
         "name": f"Loom Library {identity.tag}",

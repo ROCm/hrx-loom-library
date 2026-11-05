@@ -49,13 +49,10 @@ class UpdateSDKTest(unittest.TestCase):
         package: str = "hrx-loom",
         metadata_version: str | None = None,
         artifact_name: str | None = None,
-        catalog: str | None = (
-            "github:ROCm/hrx-loom-library@" + "4" * 40
-        ),
+        catalog: str | None = ("github:ROCm/hrx-loom-library@" + "4" * 40),
     ) -> tuple[Path, bytes, str]:
         filename = (
-            artifact_name
-            or f"hrx_loom-{version}-py3-none-manylinux_2_39_x86_64.whl"
+            artifact_name or f"hrx_loom-{version}-py3-none-manylinux_2_39_x86_64.whl"
         )
         wheel_path = self.root / "wheel.zip"
         prefix = f"hrx_loom-{version}.dist-info/"
@@ -80,6 +77,7 @@ class UpdateSDKTest(unittest.TestCase):
                     "revision": revision,
                     "run_id": 1,
                     "artifact_id": 2,
+                    "release_tag": None,
                     "wheel": "old.whl",
                     "sha256": "3" * 64,
                     "catalog": "github:ROCm/hrx-loom-library@" + "4" * 40,
@@ -87,10 +85,7 @@ class UpdateSDKTest(unittest.TestCase):
             )
         )
         (self.root / update_sdk.MODULE).write_text(
-            "git_override(\n"
-            '    module_name = "hrx",\n'
-            f'    commit = "{revision}",\n'
-            ")\n"
+            f'git_override(\n    module_name = "hrx",\n    commit = "{revision}",\n)\n'
         )
 
     def test_run_id_accepts_the_github_run_and_job_forms(self):
@@ -180,10 +175,8 @@ class UpdateSDKTest(unittest.TestCase):
         old_revision = "2" * 40
         self.write_pin(old_revision)
         candidate = update_sdk.Candidate(123, self.revision, 789)
-        catalog = "github:ROCm/hrx-loom-library@v0.2.0"
-        wheel = update_sdk.Wheel(
-            "candidate.whl", "0.2.0.dev0", "4" * 64, catalog
-        )
+        catalog = "github:ROCm/hrx-loom-library@v0.2.0rc1"
+        wheel = update_sdk.Wheel("candidate.whl", "0.2.0rc1", "4" * 64, catalog)
         update_sdk.update_pin(self.root, candidate, wheel)
         self.assertEqual(
             json.loads((self.root / update_sdk.SDK_PIN).read_text()),
@@ -192,6 +185,7 @@ class UpdateSDKTest(unittest.TestCase):
                 "revision": self.revision,
                 "run_id": 123,
                 "artifact_id": 789,
+                "release_tag": "v0.2.0rc1",
                 "wheel": "candidate.whl",
                 "sha256": "4" * 64,
                 "catalog": catalog,
@@ -211,9 +205,7 @@ class UpdateSDKTest(unittest.TestCase):
             update_sdk.update_pin(
                 self.root,
                 update_sdk.Candidate(123, self.revision, 789),
-                update_sdk.Wheel(
-                    "candidate.whl", "0.2.0.dev0", "4" * 64, None
-                ),
+                update_sdk.Wheel("candidate.whl", "0.2.0.dev0", "4" * 64, None),
             )
         self.assertEqual(before, (sdk_path.read_bytes(), module_path.read_bytes()))
 
