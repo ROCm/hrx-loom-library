@@ -11,7 +11,7 @@ template.decl @qwen38.dense_q5k_f16_wmma.x128.body(%token_count: index, %input_s
 
 template.decl @qwen38.dense_q5k_f16_wmma.x128.direct.body(%token_count_data: buffer, %input_size0: index, %output_size0: index, %channel_tile: index, %token_tile: index, %workitem0: index, %subgroup0: index, %input: buffer, %weight: buffer, %output: buffer)
 
-template.decl @qwen38.dense_q5k_f16_wmma.x64.body(%weight_channels: index, %token_count: index, %input_size0: index, %output_size0: index, %channel_tile: index, %token_tile: index, %input: buffer, %weight: buffer, %output: buffer)
+template.decl @qwen38.dense_q5k_f16.c64t64.body(%weight_channels: index, %token_count: index, %input_size0: index, %output_size0: index, %channel_tile: index, %token_tile: index, %input: buffer, %weight: buffer, %output: buffer)
 
 template.decl pure @qwen38.dense_q5k_f16.c64t32.partition() -> (index, i1)
 
@@ -101,26 +101,26 @@ func.def inline @qwen38_q5k_f16_vector4(%weight: buffer, %row_byte_base: offset,
   func.return %values : vector<4xf16>
 }
 
-// The four-wave schedule keeps one 64-token activation tile resident while
+// Four subgroups keep one 64-token activation tile resident while
 // decoding each 64-channel weight tile exactly once.
-template.def<@qwen38.dense_q5k_f16_wmma.x64.body> device @qwen38_dense_q5k_f16_wmma_x64_body(%weight_channels: index, %token_count: index, %input_size0: index, %output_size0: index, %channel_tile: index, %token_tile: index, %input: buffer, %weight: buffer, %output: buffer) {
+template.def<@qwen38.dense_q5k_f16.c64t64.body> device @qwen38_dense_q5k_f16_c64t64_body(%weight_channels: index, %token_count: index, %input_size0: index, %output_size0: index, %channel_tile: index, %token_tile: index, %input: buffer, %weight: buffer, %output: buffer) {
   %begin = index.constant 0 : index
   %block_width = index.constant 256 : index
   %bounded_inputs = index.assume %input_size0 [range(%input_size0, 256, 32768), multiple_of(%input_size0, 256)] : index
   %end = index.div %bounded_inputs, %block_width : index
   %origin = index.constant 0 : offset
-  template.apply<@qwen38.dense_q5k_f16_wmma.x64.range>(%weight_channels, %token_count, %input_size0, %output_size0, %channel_tile, %token_tile, %begin, %end, %origin, %input, %weight, %output) : (index, index, index, index, index, index, index, index, offset, buffer, buffer, buffer)
+  template.apply<@qwen38.dense_q5k_f16.c64t64.range>(%weight_channels, %token_count, %input_size0, %output_size0, %channel_tile, %token_tile, %begin, %end, %origin, %input, %weight, %output) : (index, index, index, index, index, index, index, index, offset, buffer, buffer, buffer)
   template.return
 }
 
-template.decl @qwen38.dense_q5k_f16_wmma.x64.range(%weight_channels: index, %token_count: index, %input_size0: index, %output_size0: index, %channel_tile: index, %token_tile: index, %block_begin: index, %block_end: index, %output_origin: offset, %input: buffer, %weight: buffer, %output: buffer)
+template.decl @qwen38.dense_q5k_f16.c64t64.range(%weight_channels: index, %token_count: index, %input_size0: index, %output_size0: index, %channel_tile: index, %token_tile: index, %block_begin: index, %block_end: index, %output_origin: offset, %input: buffer, %weight: buffer, %output: buffer)
 
 // A contiguous range of quantization blocks retains the same weight and token
 // panels as the full contraction. Each 256-element block starts an independent
-// WMMA chain, and the block partials combine in F32. This bounds the matrix
+// matrix multiply chain, and the block partials combine in F32. This bounds the
 // recurrence while preserving the decoded-F16/F32 contraction contract. The
 // output origin selects the range's partial plane.
-template.def<@qwen38.dense_q5k_f16_wmma.x64.range> device @qwen38_dense_q5k_f16_wmma_x64_body_range(%weight_channels: index, %token_count: index, %input_size0: index, %output_size0: index, %channel_tile: index, %token_tile: index, %block_begin: index, %block_end: index, %output_origin: offset, %input: buffer, %weight: buffer, %output: buffer) {
+template.def<@qwen38.dense_q5k_f16.c64t64.range> device @qwen38_dense_q5k_f16_c64t64_range(%weight_channels: index, %token_count: index, %input_size0: index, %output_size0: index, %channel_tile: index, %token_tile: index, %block_begin: index, %block_end: index, %output_origin: offset, %input: buffer, %weight: buffer, %output: buffer) {
   %operand_elements = template.apply<@tensor.matrix.f16_16x16x16.operand_elements>() : () -> (index)
   %bounded_token_count = index.assume %token_count [range(%token_count, 1, 512)] : index
   %bounded_input_size = index.assume %input_size0 [range(%input_size0, 256, 32768), multiple_of(%input_size0, 256)] : index
@@ -147,7 +147,11 @@ template.def<@qwen38.dense_q5k_f16_wmma.x64.range> device @qwen38_dense_q5k_f16_
   %result_stage_bytes = index.constant 4096 : offset
   %c0_f16x4 = vector.splatf 0.0 : vector<4xf16>
   %c0_f32x4 = vector.splatf 0.0 : vector<4xf32>
-  %zero_accumulator = vector.splatf 0.0 : vector<4xf32>
+  %subgroup_size = target.subgroup.size : index
+  %workgroup_size = index.mul %c4, %subgroup_size : index
+  %load_row_stride = index.div %workgroup_size, %c8 : index
+  %accumulator_size = index.div %c256, %subgroup_size : index
+  %zero_accumulator = vector.splatf 0.0 : vector<[%accumulator_size]xf32>
   %m = index.constant 16 : index
   %n = index.constant 16 : index
   %k = index.constant 16 : index
@@ -174,18 +178,18 @@ template.def<@qwen38.dense_q5k_f16_wmma.x64.range> device @qwen38_dense_q5k_f16_
   %load_packet = index.rem %workitem, %c8 : index
   %load_k = index.mul %load_packet, %c4 : index
   %load_row0 = index.div %workitem, %c8 : index
-  %load_row = index.assume %load_row0 [range(%load_row0, 0, 31)] : index
+  %load_row = index.assume %load_row0 [range(%load_row0, 0, 63)] : index
   %subgroup_channel_add = index.mul %subgroup, %c16 : index
-  %init00 = vector.fragment<init> %zero_accumulator shape [%m, %n] : vector<4xf32>
-  %init01 = vector.fragment<init> %zero_accumulator shape [%m, %n] : vector<4xf32>
-  %init10 = vector.fragment<init> %zero_accumulator shape [%m, %n] : vector<4xf32>
-  %init11 = vector.fragment<init> %zero_accumulator shape [%m, %n] : vector<4xf32>
-  %result00, %result01, %result10, %result11 = scf.for %quant_block = [%block_begin to %block_end step %c1](%block_acc00 = %init00 : vector<4xf32>, %block_acc01 = %init01 : vector<4xf32>, %block_acc10 = %init10 : vector<4xf32>, %block_acc11 = %init11 : vector<4xf32>) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
-    %block_result00, %block_result01, %block_result10, %block_result11 = scf.for %quant_group = [%c0 to %c8 step %c1](%acc00 = %init00 : vector<4xf32>, %acc01 = %init01 : vector<4xf32>, %acc10 = %init10 : vector<4xf32>, %acc11 = %init11 : vector<4xf32>) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+  %init00 = vector.fragment<init> %zero_accumulator shape [%m, %n] : vector<[%accumulator_size]xf32>
+  %init01 = vector.fragment<init> %zero_accumulator shape [%m, %n] : vector<[%accumulator_size]xf32>
+  %init10 = vector.fragment<init> %zero_accumulator shape [%m, %n] : vector<[%accumulator_size]xf32>
+  %init11 = vector.fragment<init> %zero_accumulator shape [%m, %n] : vector<[%accumulator_size]xf32>
+  %result00, %result01, %result10, %result11 = scf.for %quant_block = [%block_begin to %block_end step %c1](%block_acc00 = %init00 : vector<[%accumulator_size]xf32>, %block_acc01 = %init01 : vector<[%accumulator_size]xf32>, %block_acc10 = %init10 : vector<[%accumulator_size]xf32>, %block_acc11 = %init11 : vector<[%accumulator_size]xf32>) -> (vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>) {
+    %block_result00, %block_result01, %block_result10, %block_result11 = scf.for %quant_group = [%c0 to %c8 step %c1](%acc00 = %init00 : vector<[%accumulator_size]xf32>, %acc01 = %init01 : vector<[%accumulator_size]xf32>, %acc10 = %init10 : vector<[%accumulator_size]xf32>, %acc11 = %init11 : vector<[%accumulator_size]xf32>) -> (vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>) {
       %block_k_base = index.mul %quant_block, %c256 : index
       %group_k_add = index.mul %quant_group, %c32 : index
       %k_origin = index.add %block_k_base, %group_k_add : index
-      scf.for %row_offset = [%c0 to %c64 step %c32] unroll {
+      scf.for %row_offset = [%c0 to %c64 step %load_row_stride] unroll {
         %local_row0 = index.add %load_row, %row_offset : index
         %local_row = index.assume %local_row0 [range(%local_row0, 0, 63)] : index
         %channel = index.add %channel_tile_base, %local_row : index
@@ -219,87 +223,112 @@ template.def<@qwen38.dense_q5k_f16_wmma.x64.range> device @qwen38_dense_q5k_f16_
         vector.store %activation_values, %activation_stage_physical_view[%activation_row, %load_k] : vector<4xf16>, view<64x40xf16>
       }
       kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-      %next00, %next01, %next10, %next11 = scf.for %k_half = [%c0 to %c32 step %c16](%half_acc00 = %acc00 : vector<4xf32>, %half_acc01 = %acc01 : vector<4xf32>, %half_acc10 = %acc10 : vector<4xf32>, %half_acc11 = %acc11 : vector<4xf32>) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) unroll {
+      %next00, %next01, %next10, %next11 = scf.for %k_half = [%c0 to %c32 step %c16](%half_acc00 = %acc00 : vector<[%accumulator_size]xf32>, %half_acc01 = %acc01 : vector<[%accumulator_size]xf32>, %half_acc10 = %acc10 : vector<[%accumulator_size]xf32>, %half_acc11 = %acc11 : vector<[%accumulator_size]xf32>) -> (vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>) unroll {
         %lhs0 = vector.fragment.load<lhs> %weight_stage_view[%subgroup_channel_add, %k_half] shape [%m, %k] : view<64x40xf16> -> vector<[%operand_elements]xf16>
         %rhs0 = vector.fragment.load<rhs> %activation_fragment_view[%k_half, %c0] shape [%k, %n] : view<32x64xf16, %activation_fragment_layout> -> vector<[%operand_elements]xf16>
         %rhs1 = vector.fragment.load<rhs> %activation_fragment_view[%k_half, %c16] shape [%k, %n] : view<32x64xf16, %activation_fragment_layout> -> vector<[%operand_elements]xf16>
         %rhs2 = vector.fragment.load<rhs> %activation_fragment_view[%k_half, %c32] shape [%k, %n] : view<32x64xf16, %activation_fragment_layout> -> vector<[%operand_elements]xf16>
         %rhs3 = vector.fragment.load<rhs> %activation_fragment_view[%k_half, %c48] shape [%k, %n] : view<32x64xf16, %activation_fragment_layout> -> vector<[%operand_elements]xf16>
-        %half_next00 = vector.mma %lhs0, %rhs0, %half_acc00 : vector<[%operand_elements]xf16>, vector<[%operand_elements]xf16>, vector<4xf32>
-        %half_next01 = vector.mma %lhs0, %rhs1, %half_acc01 : vector<[%operand_elements]xf16>, vector<[%operand_elements]xf16>, vector<4xf32>
-        %half_next10 = vector.mma %lhs0, %rhs2, %half_acc10 : vector<[%operand_elements]xf16>, vector<[%operand_elements]xf16>, vector<4xf32>
-        %half_next11 = vector.mma %lhs0, %rhs3, %half_acc11 : vector<[%operand_elements]xf16>, vector<[%operand_elements]xf16>, vector<4xf32>
-        scf.yield %half_next00, %half_next01, %half_next10, %half_next11 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
+        %half_next00 = vector.mma %lhs0, %rhs0, %half_acc00 : vector<[%operand_elements]xf16>, vector<[%operand_elements]xf16>, vector<[%accumulator_size]xf32>
+        %half_next01 = vector.mma %lhs0, %rhs1, %half_acc01 : vector<[%operand_elements]xf16>, vector<[%operand_elements]xf16>, vector<[%accumulator_size]xf32>
+        %half_next10 = vector.mma %lhs0, %rhs2, %half_acc10 : vector<[%operand_elements]xf16>, vector<[%operand_elements]xf16>, vector<[%accumulator_size]xf32>
+        %half_next11 = vector.mma %lhs0, %rhs3, %half_acc11 : vector<[%operand_elements]xf16>, vector<[%operand_elements]xf16>, vector<[%accumulator_size]xf32>
+        scf.yield %half_next00, %half_next01, %half_next10, %half_next11 : vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>
       }
       kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-      scf.yield %next00, %next01, %next10, %next11 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
+      scf.yield %next00, %next01, %next10, %next11 : vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>
     }
-    %combined00 = vector.addf %block_acc00, %block_result00 : vector<4xf32>
-    %combined01 = vector.addf %block_acc01, %block_result01 : vector<4xf32>
-    %combined10 = vector.addf %block_acc10, %block_result10 : vector<4xf32>
-    %combined11 = vector.addf %block_acc11, %block_result11 : vector<4xf32>
-    scf.yield %combined00, %combined01, %combined10, %combined11 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
+    %combined00 = vector.addf %block_acc00, %block_result00 : vector<[%accumulator_size]xf32>
+    %combined01 = vector.addf %block_acc01, %block_result01 : vector<[%accumulator_size]xf32>
+    %combined10 = vector.addf %block_acc10, %block_result10 : vector<[%accumulator_size]xf32>
+    %combined11 = vector.addf %block_acc11, %block_result11 : vector<[%accumulator_size]xf32>
+    scf.yield %combined00, %combined01, %combined10, %combined11 : vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>
   }
-  // Matrix accumulators own [channel][token] fragments. Each wave transposes
-  // one fragment through its private LDS slice so every lane publishes four
-  // contiguous F32 channels for one logical token.
-  %publish_token0 = index.div %lane, %c4 : index
-  %publish_token = index.assume %publish_token0 [range(%publish_token0, 0, 15)] : index
-  %publish_packet0 = index.rem %lane, %c4 : index
-  %publish_packet = index.assume %publish_packet0 [range(%publish_packet0, 0, 3)] : index
-  %publish_channel_add = index.mul %publish_packet, %c4 : index
-  %token0 = index.add %token_tile_base, %publish_token : index
-  %publish_token1 = index.add %publish_token, %c16 : index
-  %token1 = index.add %token_tile_base, %publish_token1 : index
-  %publish_token2 = index.add %publish_token, %c32 : index
-  %token2 = index.add %token_tile_base, %publish_token2 : index
-  %publish_token3 = index.add %publish_token, %c48 : index
-  %token3 = index.add %token_tile_base, %publish_token3 : index
+  // Each subgroup transposes one opaque matrix fragment through its private
+  // shared slice. Lane-strided packets cover all 16x16 results at either width.
   %subgroup_channel_base = index.add %channel_tile_base, %subgroup_channel_add : index
-  %channel0 = index.add %subgroup_channel_base, %publish_channel_add : index
-  %valid_token0 = index.cmp ult, %token0, %bounded_token_count : index
-  %valid_token1 = index.cmp ult, %token1, %bounded_token_count : index
-  %valid_token2 = index.cmp ult, %token2, %bounded_token_count : index
-  %valid_token3 = index.cmp ult, %token3, %bounded_token_count : index
-  %valid_channel0 = index.cmp ult, %channel0, %bounded_output_size : index
-  %writes00 = scalar.andi %valid_token0, %valid_channel0 : i1
-  %writes01 = scalar.andi %valid_token1, %valid_channel0 : i1
-  %writes10 = scalar.andi %valid_token2, %valid_channel0 : i1
-  %writes11 = scalar.andi %valid_token3, %valid_channel0 : i1
-  vector.fragment.store<result> %result00, %result_fragment_view[%c0, %c0] shape [%m, %n] : vector<4xf32>, view<16x16xf32, %result_fragment_layout>
+  vector.fragment.store<result> %result00, %result_fragment_view[%c0, %c0] shape [%m, %n] : vector<[%accumulator_size]xf32>, view<16x16xf32, %result_fragment_layout>
   kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
-  scf.if %writes00 {
-    %bounded_token, %output_token_count = index.assume %token0, %bounded_token_count [lt(%token0, %bounded_token_count)] : index, index
-    %values = vector.load %result_physical_view[%publish_token, %publish_channel_add] : view<16x16xf32> -> vector<4xf32>
-    %mask = vector.mask.range [%channel0 to %bounded_output_size step %c1] : index -> vector<4xi1>
-    vector.store.mask %values, %output_view[%bounded_token, %channel0], %mask : vector<4xf32>, view<[%bounded_token_count]x[%bounded_output_size]xf32>, vector<4xi1>
+  scf.for %publish = [%lane to %c64 step %subgroup_size] unroll {
+    %publish_token0 = index.div %publish, %c4 : index
+    %publish_token = index.assume %publish_token0 [range(%publish_token0, 0, 15)] : index
+    %publish_packet = index.rem %publish, %c4 : index
+    %publish_channel_add = index.mul %publish_packet, %c4 : index
+    %local_token = index.add %publish_token, %c0 : index
+    %token = index.add %token_tile_base, %local_token : index
+    %channel = index.add %subgroup_channel_base, %publish_channel_add : index
+    %valid_token = index.cmp ult, %token, %bounded_token_count : index
+    %valid_channel = index.cmp ult, %channel, %bounded_output_size : index
+    %writes = scalar.andi %valid_token, %valid_channel : i1
+    scf.if %writes {
+      %bounded_token, %output_token_count = index.assume %token, %bounded_token_count [lt(%token, %bounded_token_count)] : index, index
+      %values = vector.load %result_physical_view[%publish_token, %publish_channel_add] : view<16x16xf32> -> vector<4xf32>
+      %mask = vector.mask.range [%channel to %bounded_output_size step %c1] : index -> vector<4xi1>
+      vector.store.mask %values, %output_view[%bounded_token, %channel], %mask : vector<4xf32>, view<[%bounded_token_count]x[%bounded_output_size]xf32>, vector<4xi1>
+    }
   }
   kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
-  vector.fragment.store<result> %result01, %result_fragment_view[%c0, %c0] shape [%m, %n] : vector<4xf32>, view<16x16xf32, %result_fragment_layout>
+  vector.fragment.store<result> %result01, %result_fragment_view[%c0, %c0] shape [%m, %n] : vector<[%accumulator_size]xf32>, view<16x16xf32, %result_fragment_layout>
   kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
-  scf.if %writes01 {
-    %bounded_token, %output_token_count = index.assume %token1, %bounded_token_count [lt(%token1, %bounded_token_count)] : index, index
-    %values = vector.load %result_physical_view[%publish_token, %publish_channel_add] : view<16x16xf32> -> vector<4xf32>
-    %mask = vector.mask.range [%channel0 to %bounded_output_size step %c1] : index -> vector<4xi1>
-    vector.store.mask %values, %output_view[%bounded_token, %channel0], %mask : vector<4xf32>, view<[%bounded_token_count]x[%bounded_output_size]xf32>, vector<4xi1>
+  scf.for %publish = [%lane to %c64 step %subgroup_size] unroll {
+    %publish_token0 = index.div %publish, %c4 : index
+    %publish_token = index.assume %publish_token0 [range(%publish_token0, 0, 15)] : index
+    %publish_packet = index.rem %publish, %c4 : index
+    %publish_channel_add = index.mul %publish_packet, %c4 : index
+    %local_token = index.add %publish_token, %c16 : index
+    %token = index.add %token_tile_base, %local_token : index
+    %channel = index.add %subgroup_channel_base, %publish_channel_add : index
+    %valid_token = index.cmp ult, %token, %bounded_token_count : index
+    %valid_channel = index.cmp ult, %channel, %bounded_output_size : index
+    %writes = scalar.andi %valid_token, %valid_channel : i1
+    scf.if %writes {
+      %bounded_token, %output_token_count = index.assume %token, %bounded_token_count [lt(%token, %bounded_token_count)] : index, index
+      %values = vector.load %result_physical_view[%publish_token, %publish_channel_add] : view<16x16xf32> -> vector<4xf32>
+      %mask = vector.mask.range [%channel to %bounded_output_size step %c1] : index -> vector<4xi1>
+      vector.store.mask %values, %output_view[%bounded_token, %channel], %mask : vector<4xf32>, view<[%bounded_token_count]x[%bounded_output_size]xf32>, vector<4xi1>
+    }
   }
   kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
-  vector.fragment.store<result> %result10, %result_fragment_view[%c0, %c0] shape [%m, %n] : vector<4xf32>, view<16x16xf32, %result_fragment_layout>
+  vector.fragment.store<result> %result10, %result_fragment_view[%c0, %c0] shape [%m, %n] : vector<[%accumulator_size]xf32>, view<16x16xf32, %result_fragment_layout>
   kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
-  scf.if %writes10 {
-    %bounded_token, %output_token_count = index.assume %token2, %bounded_token_count [lt(%token2, %bounded_token_count)] : index, index
-    %values = vector.load %result_physical_view[%publish_token, %publish_channel_add] : view<16x16xf32> -> vector<4xf32>
-    %mask = vector.mask.range [%channel0 to %bounded_output_size step %c1] : index -> vector<4xi1>
-    vector.store.mask %values, %output_view[%bounded_token, %channel0], %mask : vector<4xf32>, view<[%bounded_token_count]x[%bounded_output_size]xf32>, vector<4xi1>
+  scf.for %publish = [%lane to %c64 step %subgroup_size] unroll {
+    %publish_token0 = index.div %publish, %c4 : index
+    %publish_token = index.assume %publish_token0 [range(%publish_token0, 0, 15)] : index
+    %publish_packet = index.rem %publish, %c4 : index
+    %publish_channel_add = index.mul %publish_packet, %c4 : index
+    %local_token = index.add %publish_token, %c32 : index
+    %token = index.add %token_tile_base, %local_token : index
+    %channel = index.add %subgroup_channel_base, %publish_channel_add : index
+    %valid_token = index.cmp ult, %token, %bounded_token_count : index
+    %valid_channel = index.cmp ult, %channel, %bounded_output_size : index
+    %writes = scalar.andi %valid_token, %valid_channel : i1
+    scf.if %writes {
+      %bounded_token, %output_token_count = index.assume %token, %bounded_token_count [lt(%token, %bounded_token_count)] : index, index
+      %values = vector.load %result_physical_view[%publish_token, %publish_channel_add] : view<16x16xf32> -> vector<4xf32>
+      %mask = vector.mask.range [%channel to %bounded_output_size step %c1] : index -> vector<4xi1>
+      vector.store.mask %values, %output_view[%bounded_token, %channel], %mask : vector<4xf32>, view<[%bounded_token_count]x[%bounded_output_size]xf32>, vector<4xi1>
+    }
   }
   kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
-  vector.fragment.store<result> %result11, %result_fragment_view[%c0, %c0] shape [%m, %n] : vector<4xf32>, view<16x16xf32, %result_fragment_layout>
+  vector.fragment.store<result> %result11, %result_fragment_view[%c0, %c0] shape [%m, %n] : vector<[%accumulator_size]xf32>, view<16x16xf32, %result_fragment_layout>
   kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
-  scf.if %writes11 {
-    %bounded_token, %output_token_count = index.assume %token3, %bounded_token_count [lt(%token3, %bounded_token_count)] : index, index
-    %values = vector.load %result_physical_view[%publish_token, %publish_channel_add] : view<16x16xf32> -> vector<4xf32>
-    %mask = vector.mask.range [%channel0 to %bounded_output_size step %c1] : index -> vector<4xi1>
-    vector.store.mask %values, %output_view[%bounded_token, %channel0], %mask : vector<4xf32>, view<[%bounded_token_count]x[%bounded_output_size]xf32>, vector<4xi1>
+  scf.for %publish = [%lane to %c64 step %subgroup_size] unroll {
+    %publish_token0 = index.div %publish, %c4 : index
+    %publish_token = index.assume %publish_token0 [range(%publish_token0, 0, 15)] : index
+    %publish_packet = index.rem %publish, %c4 : index
+    %publish_channel_add = index.mul %publish_packet, %c4 : index
+    %local_token = index.add %publish_token, %c48 : index
+    %token = index.add %token_tile_base, %local_token : index
+    %channel = index.add %subgroup_channel_base, %publish_channel_add : index
+    %valid_token = index.cmp ult, %token, %bounded_token_count : index
+    %valid_channel = index.cmp ult, %channel, %bounded_output_size : index
+    %writes = scalar.andi %valid_token, %valid_channel : i1
+    scf.if %writes {
+      %bounded_token, %output_token_count = index.assume %token, %bounded_token_count [lt(%token, %bounded_token_count)] : index, index
+      %values = vector.load %result_physical_view[%publish_token, %publish_channel_add] : view<16x16xf32> -> vector<4xf32>
+      %mask = vector.mask.range [%channel to %bounded_output_size step %c1] : index -> vector<4xi1>
+      vector.store.mask %values, %output_view[%bounded_token, %channel], %mask : vector<4xf32>, view<[%bounded_token_count]x[%bounded_output_size]xf32>, vector<4xi1>
+    }
   }
   template.return
 }
@@ -531,19 +560,21 @@ template.def<@qwen38.dense_q5k_f16_wmma.x128.body> device @qwen38_dense_q5k_f16_
 // Workload token counts may be zero so a command program can select exactly one
 // schedule without rerecording. token_count_data always carries the nonzero
 // logical token count used for body bounds.
-kernel.def target(@qwen38_dense_gfx11_wave64) export("qwen38_linear_q5k_f16_wmma") @qwen38_linear_q5k_f16_wmma(%token_count0: index, %input_size0: index, %output_size0: index) {
+kernel.def export("qwen38_linear_q5k_f16_c64t64") @qwen38_linear_q5k_f16_c64t64(%token_count0: index, %input_size0: index, %output_size0: index) {
   %token_count = index.assume %token_count0 [range(%token_count0, 0, 512)] : index
   %input_size = index.assume %input_size0 [range(%input_size0, 256, 32768), multiple_of(%input_size0, 256)] : index
   %output_size = index.assume %output_size0 [range(%output_size0, 1, 32768)] : index
   %c1 = index.constant 1 : index
   %c63 = index.constant 63 : index
   %c64 = index.constant 64 : index
-  %c256 = index.constant 256 : index
+  %subgroup_count = index.constant 4 : index
+  %subgroup_size = target.subgroup.size : index
+  %workgroup_size = index.mul %subgroup_count, %subgroup_size : index
   %padded_output_size = index.add %output_size, %c63 : index
   %output_tiles = index.div %padded_output_size, %c64 : index
   %padded_token_count = index.add %token_count, %c63 : index
   %token_tiles = index.div %padded_token_count, %c64 : index
-  kernel.launch.config workgroups(%output_tiles, %token_tiles, %c1) workgroup_size(%c256, %c1, %c1) : index
+  kernel.launch.config workgroups(%output_tiles, %token_tiles, %c1) workgroup_size(%workgroup_size, %c1, %c1) : index
 } launch(%token_count_data: buffer, %input_size0: index, %output_size0: index, %input: buffer, %weight: buffer, %output: buffer) {
   %weight_channels = index.constant 1 : index
   %c0_offset = index.constant 0 : offset
@@ -556,24 +587,26 @@ kernel.def target(@qwen38_dense_gfx11_wave64) export("qwen38_linear_q5k_f16_wmma
   %output_size = index.assume %output_size0 [range(%output_size0, 1, 32768)] : index
   %channel_tile = kernel.workgroup.id<x> : index
   %token_tile = kernel.workgroup.id<y> : index
-  template.apply<@qwen38.dense_q5k_f16_wmma.x64.body>(%weight_channels, %token_count, %input_size, %output_size, %channel_tile, %token_tile, %input, %weight, %output) : (index, index, index, index, index, index, buffer, buffer, buffer)
+  template.apply<@qwen38.dense_q5k_f16.c64t64.body>(%weight_channels, %token_count, %input_size, %output_size, %channel_tile, %token_tile, %input, %weight, %output) : (index, index, index, index, index, index, buffer, buffer, buffer)
   kernel.return
 }
 
 // Eight-channel block order; arithmetic and local staging match canonical Q5.
-kernel.def target(@qwen38_dense_gfx11_wave64) export("qwen38_linear_q5k_f16_wmma_channel8") @qwen38_linear_q5k_f16_wmma_channel8(%token_count0: index, %input_size0: index, %output_size0: index) {
+kernel.def export("qwen38_linear_q5k_f16_c64t64_channel8") @qwen38_linear_q5k_f16_c64t64_channel8(%token_count0: index, %input_size0: index, %output_size0: index) {
   %token_count = index.assume %token_count0 [range(%token_count0, 0, 512)] : index
   %input_size = index.assume %input_size0 [range(%input_size0, 256, 32768), multiple_of(%input_size0, 256)] : index
   %output_size = index.assume %output_size0 [range(%output_size0, 8, 32768), multiple_of(%output_size0, 8)] : index
   %c1 = index.constant 1 : index
   %c63 = index.constant 63 : index
   %c64 = index.constant 64 : index
-  %c256 = index.constant 256 : index
+  %subgroup_count = index.constant 4 : index
+  %subgroup_size = target.subgroup.size : index
+  %workgroup_size = index.mul %subgroup_count, %subgroup_size : index
   %padded_output_size = index.add %output_size, %c63 : index
   %output_tiles = index.div %padded_output_size, %c64 : index
   %padded_token_count = index.add %token_count, %c63 : index
   %token_tiles = index.div %padded_token_count, %c64 : index
-  kernel.launch.config workgroups(%output_tiles, %token_tiles, %c1) workgroup_size(%c256, %c1, %c1) : index
+  kernel.launch.config workgroups(%output_tiles, %token_tiles, %c1) workgroup_size(%workgroup_size, %c1, %c1) : index
 } launch(%token_count_data: buffer, %input_size0: index, %output_size0: index, %input: buffer, %weight: buffer, %output: buffer) {
   %weight_channels = index.constant 8 : index
   %c0_offset = index.constant 0 : offset
@@ -586,7 +619,7 @@ kernel.def target(@qwen38_dense_gfx11_wave64) export("qwen38_linear_q5k_f16_wmma
   %output_size = index.assume %output_size0 [range(%output_size0, 8, 32768), multiple_of(%output_size0, 8)] : index
   %channel_tile = kernel.workgroup.id<x> : index
   %token_tile = kernel.workgroup.id<y> : index
-  template.apply<@qwen38.dense_q5k_f16_wmma.x64.body>(%weight_channels, %token_count, %input_size, %output_size, %channel_tile, %token_tile, %input, %weight, %output) : (index, index, index, index, index, index, buffer, buffer, buffer)
+  template.apply<@qwen38.dense_q5k_f16.c64t64.body>(%weight_channels, %token_count, %input_size, %output_size, %channel_tile, %token_tile, %input, %weight, %output) : (index, index, index, index, index, index, buffer, buffer, buffer)
   kernel.return
 }
 
