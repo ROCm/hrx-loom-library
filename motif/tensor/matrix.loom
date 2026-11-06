@@ -1,16 +1,18 @@
 // Native F16-input, F32-accumulating 16x16 matrix tiles for caller-owned panels.
 //
-// product_to_f32 contracts left[16,K] with a 16-column window of right.
+// accumulate_f32 adds left[16,K] times a 16-column window of right to an
+// incoming native F32 fragment and returns the updated fragment.
 // K is a compile-time positive multiple of 16 and does not exceed left_columns.
 // The caller's left_layout owns physical strides; right is row-major at its
 // byte origin, with right_row+K <= right_rows and right_column+16 <=
-// right_columns. Output is row-major F32 with output_column+16 <= output_columns.
-// Both column origins are multiples of 16. Buffers are aligned to 16 bytes;
-// inputs are immutable and disjoint from output, and storage covers each view.
+// right_columns. The right column origin is a multiple of 16. Buffers are
+// aligned to 16 bytes, inputs are immutable, and storage covers each view.
+// The incoming fragment has shape 16x16 and 256/subgroup_size F32 carrier elements.
 // Callers publish staged inputs before entry and retire readers before reuse.
 // This motif allocates no memory and inserts no barriers.
 //
-// The accumulator remains F32 across every reduction tile and publication.
+// Callers retain the F32 accumulator across contractions and choose when to
+// publish it with vector.fragment.store. No intermediate store is required.
 // Its carrier follows subgroup size; native RDNA3 operands require replication,
 // supplied by the composition's tensor_matrix_rdna3 binding. Other native
 // targets use compact operands. SPIR-V cooperative fragments are opaque: their
@@ -37,23 +39,17 @@ template.def<@tensor.matrix.f16_16x16x16.operand_elements> target(@tensor_matrix
   template.return %elements : index
 }
 
-template.decl @tensor.matrix.f16_16x16.product_to_f32(%reduction_size: index, %left_columns: index, %left_layout: encoding<layout>, %left: buffer, %right_rows: index, %right_columns: index, %right: buffer, %right_origin: offset, %right_row: index, %right_column: index, %output_columns: index, %output: buffer, %output_column: index)
+template.decl @tensor.matrix.f16_16x16.accumulate_f32(%accumulator_elements: index, %reduction_size: index, %left_columns: index, %left_layout: encoding<layout>, %left: buffer, %right_rows: index, %right_columns: index, %right: buffer, %right_origin: offset, %right_row: index, %right_column: index, %initial: vector<[%accumulator_elements]xf32>) -> (vector<[%accumulator_elements]xf32>)
 
-template.def<@tensor.matrix.f16_16x16.product_to_f32> @tensor_matrix_f16_product_to_f32(%reduction_size: index, %left_columns: index, %left_layout: encoding<layout>, %left: buffer, %right_rows: index, %right_columns: index, %right: buffer, %right_origin: offset, %right_row: index, %right_column: index, %output_columns: index, %output: buffer, %output_column: index) {
-  %tile_elements = index.constant 256 : index
-  %subgroup_size = target.subgroup.size : index
-  %accumulator_elements = index.div %tile_elements, %subgroup_size : index
+template.def<@tensor.matrix.f16_16x16.accumulate_f32> @tensor_matrix_f16_accumulate_f32(%accumulator_elements: index, %reduction_size: index, %left_columns: index, %left_layout: encoding<layout>, %left: buffer, %right_rows: index, %right_columns: index, %right: buffer, %right_origin: offset, %right_row: index, %right_column: index, %initial: vector<[%accumulator_elements]xf32>) -> (vector<[%accumulator_elements]xf32>) {
   %operand_elements = template.apply<@tensor.matrix.f16_16x16x16.operand_elements>() : () -> (index)
   %origin = index.constant 0 : offset
   %left_view = buffer.view %left[%origin] : buffer -> view<16x[%left_columns]xf16, %left_layout>
   %right_view = buffer.view %right[%right_origin] : buffer -> view<[%right_rows]x[%right_columns]xf16>
-  %output_view = buffer.view %output[%origin] : buffer -> view<16x[%output_columns]xf32>
   %begin = index.constant 0 : index
   %tile = index.constant 16 : index
   %padding = index.constant 15 : index
   %last_tile_start = index.sub %right_rows, %padding : index
-  %initial_values = vector.splatf 0.0 : vector<[%accumulator_elements]xf32>
-  %initial = vector.fragment<init> %initial_values shape [%tile, %tile] : vector<[%accumulator_elements]xf32>
   %product = scf.for %reduction = [%begin to %reduction_size step %tile](%accumulator = %initial : vector<[%accumulator_elements]xf32>) -> (vector<[%accumulator_elements]xf32>) unroll schedule(recurrence) {
     %row_value = index.add %right_row, %reduction : index
     %row = index.assume %row_value [lt(%row_value, %last_tile_start)] : index
@@ -62,6 +58,5 @@ template.def<@tensor.matrix.f16_16x16.product_to_f32> @tensor_matrix_f16_product
     %next = vector.mma %left_fragment, %right_fragment, %accumulator : vector<[%operand_elements]xf16>, vector<[%operand_elements]xf16>, vector<[%accumulator_elements]xf32>
     scf.yield %next : vector<[%accumulator_elements]xf32>
   }
-  vector.fragment.store<result> %product, %output_view[%begin, %output_column] shape [%tile, %tile] : vector<[%accumulator_elements]xf32>, view<16x[%output_columns]xf32>
-  template.return
+  template.return %product : vector<[%accumulator_elements]xf32>
 }

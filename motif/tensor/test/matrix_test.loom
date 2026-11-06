@@ -2,14 +2,15 @@
 // panels, offsets, and one/four active subgroups. The scalar F64 oracle
 // computes the exact dyadic result. Native matrix arithmetic retains the
 // established 2^-12 absolute bound, below the 2^-10 precision-case lattice.
-// Precision cases retain small terms after a large tile and F16 midpoints.
+// Trials cover zero and nonzero incoming accumulators. Precision cases retain
+// small terms after a large tile and F16 midpoints.
 // Storage guards and input preservation are checked independently and exactly.
 
 target.decl @matrix_execution
 
 amdgpu.target<gfx11-generic> @tensor_matrix_rdna3
 
-template.decl @tensor.matrix.f16_16x16.product_to_f32(%reduction_size: index, %left_columns: index, %left_layout: encoding<layout>, %left: buffer, %right_rows: index, %right_columns: index, %right: buffer, %right_origin: offset, %right_row: index, %right_column: index, %output_columns: index, %output: buffer, %output_column: index)
+template.decl @tensor.matrix.f16_16x16.accumulate_f32(%accumulator_elements: index, %reduction_size: index, %left_columns: index, %left_layout: encoding<layout>, %left: buffer, %right_rows: index, %right_columns: index, %right: buffer, %right_origin: offset, %right_row: index, %right_column: index, %initial: vector<[%accumulator_elements]xf32>) -> (vector<[%accumulator_elements]xf32>)
 
 template.decl pure @matrix.test.dimensions(%configuration: index) -> (index, index, index, index, index, index)
 
@@ -52,12 +53,21 @@ kernel.def @matrix_product() {
   %width = target.subgroup.size : index
   %threads = index.mul %subgroups, %width : index
   kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%active_subgroups: index, %reduction: index, %row_stride: index, %column_stride: index, %right_row: index, %column: index, %left: buffer, %right: buffer, %output: buffer) {
+} launch(%active_subgroups: index, %reduction: index, %row_stride: index, %column_stride: index, %right_row: index, %column: index, %control: buffer, %left: buffer, %right: buffer, %output: buffer) {
+  %metadata_origin = index.constant 0 : offset
+  %metadata = buffer.view %control[%metadata_origin] : buffer -> view<2xi32>
+  %seed_word = view.load %metadata[1] : view<2xi32> -> i32
+  %seed = scalar.sitofp %seed_word : i32 to f32
+  %initial_scale = scalar.constant 0.375 : f32
+  %initial = scalar.mulf %seed, %initial_scale : f32
   %left_columns = index.constant 80 : index
   %right_rows = index.constant 96 : index
   %columns = index.constant 96 : index
   %origin = index.constant 32 : offset
   %tile = index.constant 16 : index
+  %tile_elements = index.constant 256 : index
+  %width = target.subgroup.size : index
+  %accumulator_elements = index.div %tile_elements, %width : index
   %subgroup = kernel.subgroup.id : index
   %selected_column_value = index.madd %subgroup, %tile, %column : index
   %selected_column = index.assume %selected_column_value [range(%selected_column_value, 0, 80)] : index
@@ -65,14 +75,20 @@ kernel.def @matrix_product() {
   scf.if %active {
     %layout = encoding.layout.strided [%row_stride, %column_stride] : encoding<layout>
     %left_aligned, %right_aligned, %output_aligned = buffer.assume.alignment %left, %right, %output {minimum_alignment = 16} : buffer, buffer, buffer
-    template.apply<@tensor.matrix.f16_16x16.product_to_f32>(%reduction, %left_columns, %layout, %left_aligned, %right_rows, %columns, %right_aligned, %origin, %right_row, %selected_column, %columns, %output_aligned, %selected_column) : (index, index, encoding<layout>, buffer, index, index, buffer, offset, index, index, index, buffer, index)
+    %zero_origin = index.constant 0 : offset
+    %zero = index.constant 0 : index
+    %output_view = buffer.view %output_aligned[%zero_origin] : buffer -> view<16x96xf32>
+    %initial_values = vector.splat %initial : vector<[%accumulator_elements]xf32>
+    %initial_fragment = vector.fragment<init> %initial_values shape [%tile, %tile] : vector<[%accumulator_elements]xf32>
+    %product = template.apply<@tensor.matrix.f16_16x16.accumulate_f32>(%accumulator_elements, %reduction, %left_columns, %layout, %left_aligned, %right_rows, %columns, %right_aligned, %origin, %right_row, %selected_column, %initial_fragment) : (index, index, index, encoding<layout>, buffer, index, index, buffer, offset, index, index, vector<[%accumulator_elements]xf32>) -> (vector<[%accumulator_elements]xf32>)
+    vector.fragment.store<result> %product, %output_view[%zero, %selected_column] shape [%tile, %tile] : vector<[%accumulator_elements]xf32>, view<16x96xf32>
   }
   kernel.return
 }
 
 command.def target(@matrix_execution) @matrix_projection(%configuration: index) launch(%control: buffer, %left: buffer, %right: buffer, %output: buffer) {
   %reduction, %row_stride, %column_stride, %subgroups, %row, %column = template.apply<@matrix.test.dimensions>(%configuration) pure : (index) -> (index, index, index, index, index, index)
-  kernel.launch @matrix_product(%subgroups, %reduction, %row_stride, %column_stride, %row, %column, %left, %right, %output) : (index, index, index, index, index, index, buffer, buffer, buffer)
+  kernel.launch @matrix_product(%subgroups, %reduction, %row_stride, %column_stride, %row, %column, %control, %left, %right, %output) : (index, index, index, index, index, index, buffer, buffer, buffer, buffer)
   command.return
 }
 
@@ -93,7 +109,7 @@ func.def @matrix_fraction(%count: index, %storage: buffer) {
   func.return
 }
 
-func.def @matrix_precision_inputs(%configuration: index, %control: buffer, %left: buffer, %right: buffer) {
+func.def @matrix_precision_inputs(%configuration: index, %trial: index, %control: buffer, %left: buffer, %right: buffer) {
   %reduction, %row_stride, %column_stride, %subgroups, %right_row, %right_column = template.apply<@matrix.test.dimensions>(%configuration) pure : (index) -> (index, index, index, index, index, index)
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -103,9 +119,11 @@ func.def @matrix_precision_inputs(%configuration: index, %control: buffer, %left
   %c16 = index.constant 16 : index
   %origin = index.constant 0 : offset
   %right_origin = index.constant 32 : offset
-  %metadata = buffer.view %control[%origin] : buffer -> view<1xi32>
+  %metadata = buffer.view %control[%origin] : buffer -> view<2xi32>
   %configuration_word = index.cast %configuration : index to i32
-  view.store %configuration_word, %metadata[0] : i32, view<1xi32>
+  view.store %configuration_word, %metadata[0] : i32, view<2xi32>
+  %trial_word = index.cast %trial : index to i32
+  view.store %trial_word, %metadata[1] : i32, view<2xi32>
   %left_values = buffer.view %left[%origin] : buffer -> view<2048xf16>
   %right_values = buffer.view %right[%right_origin] : buffer -> view<96x96xf16>
   %precision = index.cmp uge, %configuration, %c4 : index
@@ -152,8 +170,8 @@ func.def @matrix_precision_inputs(%configuration: index, %control: buffer, %left
 
 func.def @matrix_reference(%control: buffer, %left: buffer, %right: buffer, %output: buffer) {
   %metadata_origin = index.constant 0 : offset
-  %metadata = buffer.view %control[%metadata_origin] : buffer -> view<1xi32>
-  %configuration_word = view.load %metadata[0] : view<1xi32> -> i32
+  %metadata = buffer.view %control[%metadata_origin] : buffer -> view<2xi32>
+  %configuration_word = view.load %metadata[0] : view<2xi32> -> i32
   %configuration_value = index.cast %configuration_word : i32 to index
   %configuration = index.assume %configuration_value [range(%configuration_value, 0, 5)] : index
   %reduction, %row_stride, %column_stride, %subgroups, %right_row, %column_origin = template.apply<@matrix.test.dimensions>(%configuration) pure : (index) -> (index, index, index, index, index, index)
@@ -166,7 +184,10 @@ func.def @matrix_reference(%control: buffer, %left: buffer, %right: buffer, %out
   %left_values = buffer.view %left[%origin] : buffer -> view<2048xf16>
   %right_values = buffer.view %right[%right_origin] : buffer -> view<96x96xf16>
   %output_values = buffer.view %output[%origin] : buffer -> view<16x96xf32>
-  %initial = scalar.constant 0.0 : f64
+  %seed_word = view.load %metadata[1] : view<2xi32> -> i32
+  %seed = scalar.sitofp %seed_word : i32 to f64
+  %initial_scale = scalar.constant 0.375 : f64
+  %initial = scalar.mulf %seed, %initial_scale : f64
   scf.for %row = [%c0 to %c16 step %c1] {
     scf.for %column = [%c0 to %columns step %c1] {
       %selected_column = index.add %column_origin, %column : index
@@ -193,7 +214,7 @@ check.scenario public @matrix_products configure[6](%configuration: index, %conf
   %left_count = check.literal value(2048) : index
   %right_count = check.literal value(9240) : index
   check.trial[2](%trial: index, %entropy: check.entropy) {
-    %control = check.generate.fill value(0) : tensor<1xi32>
+    %control = check.generate.fill value(0) : tensor<2xi32>
     %left_seed = check.entropy.read %entropy[0] : check.entropy -> i64
     %right_seed = check.entropy.read %entropy[1] : check.entropy -> i64
     %left_words = check.generate.random.uniform seed(%left_seed) range(-31 to 31) : tensor<2048xi16>
@@ -202,16 +223,16 @@ check.scenario public @matrix_products configure[6](%configuration: index, %conf
     check.generate<@matrix_fraction>(%right_count, %right_words) : (index, tensor<9240xi16>) -> ()
     %left = check.tensor.view %left_words offset(0) : tensor<2048xi16> -> tensor<2048xf16>
     %right = check.tensor.view %right_words offset(0) : tensor<9240xi16> -> tensor<9240xf16>
-    check.generate<@matrix_precision_inputs>(%configuration, %control, %left, %right) : (index, tensor<1xi32>, tensor<2048xf16>, tensor<9240xf16>) -> ()
+    check.generate<@matrix_precision_inputs>(%configuration, %trial, %control, %left, %right) : (index, index, tensor<2xi32>, tensor<2048xf16>, tensor<9240xf16>) -> ()
     %storage = check.generate.fill value(-99.0) : tensor<1544xf32>
     %output = check.tensor.view %storage offset(16) : tensor<1544xf32> -> tensor<16x96xf32>
     %prefix = check.tensor.view %storage offset(0) : tensor<1544xf32> -> tensor<4xf32>
     %suffix = check.tensor.view %storage offset(6160) : tensor<1544xf32> -> tensor<4xf32>
-    check.compare<@matrix_projection, @matrix_reference>[%configuration](%control, %left, %right, %output) : [index](tensor<1xi32>, tensor<2048xf16>, tensor<9240xf16>, tensor<16x96xf32>) -> () {
+    check.compare<@matrix_projection, @matrix_reference>[%configuration](%control, %left, %right, %output) : [index](tensor<2xi32>, tensor<2048xf16>, tensor<9240xf16>, tensor<16x96xf32>) -> () {
       check.expect.approximate actual(%storage) expected(%storage) atol(0.000244140625) rtol(0.0) nan(different) : tensor<1544xf32>, tensor<1544xf32>
       check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
       check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
-      check.expect.bitwise actual(%control) expected(%control) : tensor<1xi32>
+      check.expect.bitwise actual(%control) expected(%control) : tensor<2xi32>
       check.expect.bitwise actual(%left) expected(%left) : tensor<2048xf16>
       check.expect.bitwise actual(%right) expected(%right) : tensor<9240xf16>
     }
