@@ -4,6 +4,8 @@
 // four native 16x16 F16 matrix fragments across each 64-row cache block.
 // Scores cross LDS so each wave owns four query rows for online softmax. F16
 // probabilities then cross LDS for four sequential 64-channel P*V tiles.
+// Native F32 products and the unnormalized numerator retain their range until
+// final normalization; Q, K, V, and probability panels remain F16.
 // K and V retain the production token-major persistent cache layout.
 // The shared body receives logical and physical extents explicitly; only
 // concrete wrappers resolve the model's cache-capacity configuration.
@@ -18,7 +20,7 @@ template.decl @qwen38.attention.wmma(%logical_capacity: index, %query_tile: inde
 
 template.decl @tensor.matrix.f16_16x16x16.operand_elements() -> (index)
 
-template.decl @tensor.matrix.f16_16x16.product_to_f16(%reduction_size: index, %left_columns: index, %left_layout: encoding<layout>, %left: buffer, %right_rows: index, %right_columns: index, %right: buffer, %right_origin: offset, %right_row: index, %right_column: index, %output_columns: index, %output: buffer, %output_column: index)
+template.decl @tensor.matrix.f16_16x16.product_to_f32(%reduction_size: index, %left_columns: index, %left_layout: encoding<layout>, %left: buffer, %right_rows: index, %right_columns: index, %right: buffer, %right_origin: offset, %right_row: index, %right_column: index, %output_columns: index, %output: buffer, %output_column: index)
 
 template.def<@qwen38.attention.wmma> device @qwen38_attention_wmma(%logical_capacity: index, %query_tile: index, %query_head: index, %workitem: index, %subgroup: index, %lane: index, %control: buffer, %query: buffer, %gate: buffer, %key_cache: buffer, %value_cache: buffer, %output: buffer, %control_origin: offset, %token_begin: index, %key_cache_origin: offset, %value_cache_origin: offset, %map: buffer, %map_origin: offset, %pool_capacity: index) {
   %operand_elements = template.apply<@tensor.matrix.f16_16x16x16.operand_elements>() : () -> (index)
@@ -40,16 +42,16 @@ template.def<@qwen38.attention.wmma> device @qwen38_attention_wmma(%logical_capa
   %query_stage_bytes = index.constant 8448 : offset
   %score_stage_bytes = index.constant 6144 : offset
   %probability_stage_bytes = index.constant 3072 : offset
-  %product_stage_bytes = index.constant 2048 : offset
+  %product_stage_bytes = index.constant 4096 : offset
   %tail_key_value_stage_bytes = index.constant 8192 : offset
   %c0_f16 = scalar.constant 0.0 : f16
   %c1_f32 = scalar.constant 1.0 : f32
   %attention_scale = scalar.constant 0.0625 : f32
   %negative_large = scalar.constant -1e+30 : f32
-  %output_zero0 = vector.splatf 0.0 : vector<4xf16>
-  %output_zero1 = vector.splatf 0.0 : vector<4xf16>
-  %output_zero2 = vector.splatf 0.0 : vector<4xf16>
-  %output_zero3 = vector.splatf 0.0 : vector<4xf16>
+  %output_zero0 = vector.splatf 0.0 : vector<4xf32>
+  %output_zero1 = vector.splatf 0.0 : vector<4xf32>
+  %output_zero2 = vector.splatf 0.0 : vector<4xf32>
+  %output_zero3 = vector.splatf 0.0 : vector<4xf32>
   %c0_f32x4 = vector.splatf 0.0 : vector<4xf32>
   %negative_f32x4 = vector.splatf -1e+30 : vector<4xf32>
   %m = index.constant 16 : index
@@ -122,7 +124,7 @@ template.def<@qwen38.attention.wmma> device @qwen38_attention_wmma(%logical_capa
   %query_transposed_view = buffer.view %query_stage[%c0_offset] : buffer -> view<256x16xf16, %query_transposed_layout>
   %score_stage_view = buffer.view %score_stage[%c0_offset] : buffer -> view<64x24xf32>
   %probability_stage_view = buffer.view %probability_stage[%c0_offset] : buffer -> view<16x64xf16, %probability_transposed_layout>
-  %product_stage_view = buffer.view %product_stage[%c0_offset] : buffer -> view<16x64xf16>
+  %product_stage_view = buffer.view %product_stage[%c0_offset] : buffer -> view<16x64xf32>
   %tail_key_value_stage_view = buffer.view %tail_key_value_stage[%c0_offset] : buffer -> view<16x256xf16>
 
   // Scale and truncate Q once before the cache traversal.
@@ -146,7 +148,7 @@ template.def<@qwen38.attention.wmma> device @qwen38_attention_wmma(%logical_capa
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
-  %full_max, %full_sum, %full_output0, %full_output1, %full_output2, %full_output3 = scf.for %key_origin = [%c0 to %full_context_count step %c64](%current_max = %negative_f32x4 : vector<4xf32>, %current_sum = %c0_f32x4 : vector<4xf32>, %current_output0 = %output_zero0 : vector<4xf16>, %current_output1 = %output_zero1 : vector<4xf16>, %current_output2 = %output_zero2 : vector<4xf16>, %current_output3 = %output_zero3 : vector<4xf16>) -> (vector<4xf32>, vector<4xf32>, vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>) {
+  %full_max, %full_sum, %full_output0, %full_output1, %full_output2, %full_output3 = scf.for %key_origin = [%c0 to %full_context_count step %c64](%current_max = %negative_f32x4 : vector<4xf32>, %current_sum = %c0_f32x4 : vector<4xf32>, %current_output0 = %output_zero0 : vector<4xf32>, %current_output1 = %output_zero1 : vector<4xf32>, %current_output2 = %output_zero2 : vector<4xf32>, %current_output3 = %output_zero3 : vector<4xf32>) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
     %physical_key_origin = func.call @qwen38_kv_position(%logical_capacity, %map, %map_origin, %key_origin, %pool_capacity) : (index, buffer, offset, index, index) -> (index)
     %score_key_origin0 = index.add %physical_key_origin, %subgroup_score_column : index
     %last_full_key_tile_start = index.sub %physical_capacity, %c15 : index
@@ -200,47 +202,46 @@ template.def<@qwen38.attention.wmma> device @qwen38_attention_wmma(%logical_capa
     view.store %probability3, %probability_stage_view[%query_row3, %lane] : f16, view<16x64xf16, %probability_transposed_layout>
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
-    %old_scale_f16 = vector.fptrunc %old_scale : vector<4xf32> to vector<4xf16>
-    %old_scale0_scalar = vector.extract %old_scale_f16[0] : vector<4xf16> -> f16
-    %old_scale1_scalar = vector.extract %old_scale_f16[1] : vector<4xf16> -> f16
-    %old_scale2_scalar = vector.extract %old_scale_f16[2] : vector<4xf16> -> f16
-    %old_scale3_scalar = vector.extract %old_scale_f16[3] : vector<4xf16> -> f16
-    %old_scale0 = vector.splat %old_scale0_scalar : vector<4xf16>
-    %old_scale1 = vector.splat %old_scale1_scalar : vector<4xf16>
-    %old_scale2 = vector.splat %old_scale2_scalar : vector<4xf16>
-    %old_scale3 = vector.splat %old_scale3_scalar : vector<4xf16>
-    %scaled_current_output0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output0, %old_scale0 : vector<4xf16>
-    %scaled_current_output1 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output1, %old_scale1 : vector<4xf16>
-    %scaled_current_output2 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output2, %old_scale2 : vector<4xf16>
-    %scaled_current_output3 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output3, %old_scale3 : vector<4xf16>
-    %next_output0, %next_output1, %next_output2, %next_output3 = scf.for %output_tile = [%c0 to %c4 step %c1](%tile_output0 = %scaled_current_output0 : vector<4xf16>, %tile_output1 = %scaled_current_output1 : vector<4xf16>, %tile_output2 = %scaled_current_output2 : vector<4xf16>, %tile_output3 = %scaled_current_output3 : vector<4xf16>) -> (vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>) unroll {
+    %old_scale0_scalar = vector.extract %old_scale[0] : vector<4xf32> -> f32
+    %old_scale1_scalar = vector.extract %old_scale[1] : vector<4xf32> -> f32
+    %old_scale2_scalar = vector.extract %old_scale[2] : vector<4xf32> -> f32
+    %old_scale3_scalar = vector.extract %old_scale[3] : vector<4xf32> -> f32
+    %old_scale0 = vector.splat %old_scale0_scalar : vector<4xf32>
+    %old_scale1 = vector.splat %old_scale1_scalar : vector<4xf32>
+    %old_scale2 = vector.splat %old_scale2_scalar : vector<4xf32>
+    %old_scale3 = vector.splat %old_scale3_scalar : vector<4xf32>
+    %scaled_current_output0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output0, %old_scale0 : vector<4xf32>
+    %scaled_current_output1 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output1, %old_scale1 : vector<4xf32>
+    %scaled_current_output2 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output2, %old_scale2 : vector<4xf32>
+    %scaled_current_output3 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output3, %old_scale3 : vector<4xf32>
+    %next_output0, %next_output1, %next_output2, %next_output3 = scf.for %output_tile = [%c0 to %c4 step %c1](%tile_output0 = %scaled_current_output0 : vector<4xf32>, %tile_output1 = %scaled_current_output1 : vector<4xf32>, %tile_output2 = %scaled_current_output2 : vector<4xf32>, %tile_output3 = %scaled_current_output3 : vector<4xf32>) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) unroll {
       %output_tile_channel = index.mul %output_tile, %c64 : index
       %value_channel0 = index.add %key_value_head_base, %output_tile_channel : index
       %value_channel = index.add %value_channel0, %subgroup_product_channel : index
-      template.apply<@tensor.matrix.f16_16x16.product_to_f16>(%c64, %c64, %probability_transposed_layout, %probability_stage, %physical_capacity, %c1024, %value_aligned, %value_cache_origin, %physical_key_origin, %value_channel, %c64, %product_stage, %subgroup_product_channel) : (index, index, encoding<layout>, buffer, index, index, buffer, offset, index, index, index, buffer, index)
+      template.apply<@tensor.matrix.f16_16x16.product_to_f32>(%c64, %c64, %probability_transposed_layout, %probability_stage, %physical_capacity, %c1024, %value_aligned, %value_cache_origin, %physical_key_origin, %value_channel, %c64, %product_stage, %subgroup_product_channel) : (index, index, encoding<layout>, buffer, index, index, buffer, offset, index, index, index, buffer, index)
       kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
       %owns_output_tile = index.cmp eq, %lane_output_tile, %output_tile : index
-      %updated_output0, %updated_output1, %updated_output2, %updated_output3 = scf.if %owns_output_tile -> (vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>) {
-        %block_output0 = vector.load %product_stage_view[%query_row0, %lane_product_channel] : view<16x64xf16> -> vector<4xf16>
-        %block_output1 = vector.load %product_stage_view[%query_row1, %lane_product_channel] : view<16x64xf16> -> vector<4xf16>
-        %block_output2 = vector.load %product_stage_view[%query_row2, %lane_product_channel] : view<16x64xf16> -> vector<4xf16>
-        %block_output3 = vector.load %product_stage_view[%query_row3, %lane_product_channel] : view<16x64xf16> -> vector<4xf16>
-        %updated_tile_output0 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output0, %block_output0 : vector<4xf16>
-        %updated_tile_output1 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output1, %block_output1 : vector<4xf16>
-        %updated_tile_output2 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output2, %block_output2 : vector<4xf16>
-        %updated_tile_output3 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output3, %block_output3 : vector<4xf16>
-        scf.yield %updated_tile_output0, %updated_tile_output1, %updated_tile_output2, %updated_tile_output3 : vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>
+      %updated_output0, %updated_output1, %updated_output2, %updated_output3 = scf.if %owns_output_tile -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+        %block_output0 = vector.load %product_stage_view[%query_row0, %lane_product_channel] : view<16x64xf32> -> vector<4xf32>
+        %block_output1 = vector.load %product_stage_view[%query_row1, %lane_product_channel] : view<16x64xf32> -> vector<4xf32>
+        %block_output2 = vector.load %product_stage_view[%query_row2, %lane_product_channel] : view<16x64xf32> -> vector<4xf32>
+        %block_output3 = vector.load %product_stage_view[%query_row3, %lane_product_channel] : view<16x64xf32> -> vector<4xf32>
+        %updated_tile_output0 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output0, %block_output0 : vector<4xf32>
+        %updated_tile_output1 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output1, %block_output1 : vector<4xf32>
+        %updated_tile_output2 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output2, %block_output2 : vector<4xf32>
+        %updated_tile_output3 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output3, %block_output3 : vector<4xf32>
+        scf.yield %updated_tile_output0, %updated_tile_output1, %updated_tile_output2, %updated_tile_output3 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
       } else {
-        scf.yield %tile_output0, %tile_output1, %tile_output2, %tile_output3 : vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>
+        scf.yield %tile_output0, %tile_output1, %tile_output2, %tile_output3 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
       }
       kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-      scf.yield %updated_output0, %updated_output1, %updated_output2, %updated_output3 : vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>
+      scf.yield %updated_output0, %updated_output1, %updated_output2, %updated_output3 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
     }
-    scf.yield %next_max, %next_sum, %next_output0, %next_output1, %next_output2, %next_output3 : vector<4xf32>, vector<4xf32>, vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>
+    scf.yield %next_max, %next_sum, %next_output0, %next_output1, %next_output2, %next_output3 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
   }
 
   %tail_score_wave = index.cmp eq, %subgroup, %c0 : index
-  %final_max, %final_sum, %final_output0, %final_output1, %final_output2, %final_output3 = scf.for %tail_key_origin = [%full_context_count to %context_count step %c16](%current_max = %full_max : vector<4xf32>, %current_sum = %full_sum : vector<4xf32>, %current_output0 = %full_output0 : vector<4xf16>, %current_output1 = %full_output1 : vector<4xf16>, %current_output2 = %full_output2 : vector<4xf16>, %current_output3 = %full_output3 : vector<4xf16>) -> (vector<4xf32>, vector<4xf32>, vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>) {
+  %final_max, %final_sum, %final_output0, %final_output1, %final_output2, %final_output3 = scf.for %tail_key_origin = [%full_context_count to %context_count step %c16](%current_max = %full_max : vector<4xf32>, %current_sum = %full_sum : vector<4xf32>, %current_output0 = %full_output0 : vector<4xf32>, %current_output1 = %full_output1 : vector<4xf32>, %current_output2 = %full_output2 : vector<4xf32>, %current_output3 = %full_output3 : vector<4xf32>) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
     %physical_tail_origin = func.call @qwen38_kv_position(%logical_capacity, %map, %map_origin, %tail_key_origin, %pool_capacity) : (index, buffer, offset, index, index) -> (index)
     %tail_remaining = index.sub %context_count, %tail_key_origin : index
     %tail_key_count = index.min %tail_remaining, %c16 : index
@@ -334,42 +335,41 @@ template.def<@qwen38.attention.wmma> device @qwen38_attention_wmma(%logical_capa
     }
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
-    %old_scale_f16 = vector.fptrunc %old_scale : vector<4xf32> to vector<4xf16>
-    %old_scale0_scalar = vector.extract %old_scale_f16[0] : vector<4xf16> -> f16
-    %old_scale1_scalar = vector.extract %old_scale_f16[1] : vector<4xf16> -> f16
-    %old_scale2_scalar = vector.extract %old_scale_f16[2] : vector<4xf16> -> f16
-    %old_scale3_scalar = vector.extract %old_scale_f16[3] : vector<4xf16> -> f16
-    %old_scale0 = vector.splat %old_scale0_scalar : vector<4xf16>
-    %old_scale1 = vector.splat %old_scale1_scalar : vector<4xf16>
-    %old_scale2 = vector.splat %old_scale2_scalar : vector<4xf16>
-    %old_scale3 = vector.splat %old_scale3_scalar : vector<4xf16>
-    %scaled_current_output0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output0, %old_scale0 : vector<4xf16>
-    %scaled_current_output1 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output1, %old_scale1 : vector<4xf16>
-    %scaled_current_output2 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output2, %old_scale2 : vector<4xf16>
-    %scaled_current_output3 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output3, %old_scale3 : vector<4xf16>
-    %next_output0, %next_output1, %next_output2, %next_output3 = scf.for %output_tile = [%c0 to %c4 step %c1](%tile_output0 = %scaled_current_output0 : vector<4xf16>, %tile_output1 = %scaled_current_output1 : vector<4xf16>, %tile_output2 = %scaled_current_output2 : vector<4xf16>, %tile_output3 = %scaled_current_output3 : vector<4xf16>) -> (vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>) unroll {
+    %old_scale0_scalar = vector.extract %old_scale[0] : vector<4xf32> -> f32
+    %old_scale1_scalar = vector.extract %old_scale[1] : vector<4xf32> -> f32
+    %old_scale2_scalar = vector.extract %old_scale[2] : vector<4xf32> -> f32
+    %old_scale3_scalar = vector.extract %old_scale[3] : vector<4xf32> -> f32
+    %old_scale0 = vector.splat %old_scale0_scalar : vector<4xf32>
+    %old_scale1 = vector.splat %old_scale1_scalar : vector<4xf32>
+    %old_scale2 = vector.splat %old_scale2_scalar : vector<4xf32>
+    %old_scale3 = vector.splat %old_scale3_scalar : vector<4xf32>
+    %scaled_current_output0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output0, %old_scale0 : vector<4xf32>
+    %scaled_current_output1 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output1, %old_scale1 : vector<4xf32>
+    %scaled_current_output2 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output2, %old_scale2 : vector<4xf32>
+    %scaled_current_output3 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_output3, %old_scale3 : vector<4xf32>
+    %next_output0, %next_output1, %next_output2, %next_output3 = scf.for %output_tile = [%c0 to %c4 step %c1](%tile_output0 = %scaled_current_output0 : vector<4xf32>, %tile_output1 = %scaled_current_output1 : vector<4xf32>, %tile_output2 = %scaled_current_output2 : vector<4xf32>, %tile_output3 = %scaled_current_output3 : vector<4xf32>) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) unroll {
       %output_tile_channel = index.mul %output_tile, %c64 : index
       %value_channel = index.add %output_tile_channel, %subgroup_product_channel : index
-      template.apply<@tensor.matrix.f16_16x16.product_to_f16>(%c16, %c64, %probability_transposed_layout, %probability_stage, %c16, %c256, %tail_key_value_stage, %c0_offset, %c0, %value_channel, %c64, %product_stage, %subgroup_product_channel) : (index, index, encoding<layout>, buffer, index, index, buffer, offset, index, index, index, buffer, index)
+      template.apply<@tensor.matrix.f16_16x16.product_to_f32>(%c16, %c64, %probability_transposed_layout, %probability_stage, %c16, %c256, %tail_key_value_stage, %c0_offset, %c0, %value_channel, %c64, %product_stage, %subgroup_product_channel) : (index, index, encoding<layout>, buffer, index, index, buffer, offset, index, index, index, buffer, index)
       kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
       %owns_output_tile = index.cmp eq, %lane_output_tile, %output_tile : index
-      %updated_output0, %updated_output1, %updated_output2, %updated_output3 = scf.if %owns_output_tile -> (vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>) {
-        %block_output0 = vector.load %product_stage_view[%query_row0, %lane_product_channel] : view<16x64xf16> -> vector<4xf16>
-        %block_output1 = vector.load %product_stage_view[%query_row1, %lane_product_channel] : view<16x64xf16> -> vector<4xf16>
-        %block_output2 = vector.load %product_stage_view[%query_row2, %lane_product_channel] : view<16x64xf16> -> vector<4xf16>
-        %block_output3 = vector.load %product_stage_view[%query_row3, %lane_product_channel] : view<16x64xf16> -> vector<4xf16>
-        %updated_tile_output0 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output0, %block_output0 : vector<4xf16>
-        %updated_tile_output1 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output1, %block_output1 : vector<4xf16>
-        %updated_tile_output2 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output2, %block_output2 : vector<4xf16>
-        %updated_tile_output3 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output3, %block_output3 : vector<4xf16>
-        scf.yield %updated_tile_output0, %updated_tile_output1, %updated_tile_output2, %updated_tile_output3 : vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>
+      %updated_output0, %updated_output1, %updated_output2, %updated_output3 = scf.if %owns_output_tile -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+        %block_output0 = vector.load %product_stage_view[%query_row0, %lane_product_channel] : view<16x64xf32> -> vector<4xf32>
+        %block_output1 = vector.load %product_stage_view[%query_row1, %lane_product_channel] : view<16x64xf32> -> vector<4xf32>
+        %block_output2 = vector.load %product_stage_view[%query_row2, %lane_product_channel] : view<16x64xf32> -> vector<4xf32>
+        %block_output3 = vector.load %product_stage_view[%query_row3, %lane_product_channel] : view<16x64xf32> -> vector<4xf32>
+        %updated_tile_output0 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output0, %block_output0 : vector<4xf32>
+        %updated_tile_output1 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output1, %block_output1 : vector<4xf32>
+        %updated_tile_output2 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output2, %block_output2 : vector<4xf32>
+        %updated_tile_output3 = vector.addf<reassoc|nnan|ninf|nsz> %tile_output3, %block_output3 : vector<4xf32>
+        scf.yield %updated_tile_output0, %updated_tile_output1, %updated_tile_output2, %updated_tile_output3 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
       } else {
-        scf.yield %tile_output0, %tile_output1, %tile_output2, %tile_output3 : vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>
+        scf.yield %tile_output0, %tile_output1, %tile_output2, %tile_output3 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
       }
       kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-      scf.yield %updated_output0, %updated_output1, %updated_output2, %updated_output3 : vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>
+      scf.yield %updated_output0, %updated_output1, %updated_output2, %updated_output3 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
     }
-    scf.yield %next_max, %next_sum, %next_output0, %next_output1, %next_output2, %next_output3 : vector<4xf32>, vector<4xf32>, vector<4xf16>, vector<4xf16>, vector<4xf16>, vector<4xf16>
+    scf.yield %next_max, %next_sum, %next_output0, %next_output1, %next_output2, %next_output3 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
   }
 
   %sum0_scalar = vector.extract %final_sum[0] : vector<4xf32> -> f32
@@ -386,22 +386,14 @@ template.def<@qwen38.attention.wmma> device @qwen38_attention_wmma(%logical_capa
   %inverse_sum1_f32 = scalar.divf<nnan|ninf|nsz|arcp> %c1_f32, %safe_sum1 : f32
   %inverse_sum2_f32 = scalar.divf<nnan|ninf|nsz|arcp> %c1_f32, %safe_sum2 : f32
   %inverse_sum3_f32 = scalar.divf<nnan|ninf|nsz|arcp> %c1_f32, %safe_sum3 : f32
-  %inverse_sum0_f16 = scalar.fptrunc %inverse_sum0_f32 : f32 to f16
-  %inverse_sum1_f16 = scalar.fptrunc %inverse_sum1_f32 : f32 to f16
-  %inverse_sum2_f16 = scalar.fptrunc %inverse_sum2_f32 : f32 to f16
-  %inverse_sum3_f16 = scalar.fptrunc %inverse_sum3_f32 : f32 to f16
-  %inverse_sum0 = vector.splat %inverse_sum0_f16 : vector<4xf16>
-  %inverse_sum1 = vector.splat %inverse_sum1_f16 : vector<4xf16>
-  %inverse_sum2 = vector.splat %inverse_sum2_f16 : vector<4xf16>
-  %inverse_sum3 = vector.splat %inverse_sum3_f16 : vector<4xf16>
-  %normalized0_f16 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %final_output0, %inverse_sum0 : vector<4xf16>
-  %normalized1_f16 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %final_output1, %inverse_sum1 : vector<4xf16>
-  %normalized2_f16 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %final_output2, %inverse_sum2 : vector<4xf16>
-  %normalized3_f16 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %final_output3, %inverse_sum3 : vector<4xf16>
-  %normalized0 = vector.extf %normalized0_f16 : vector<4xf16> to vector<4xf32>
-  %normalized1 = vector.extf %normalized1_f16 : vector<4xf16> to vector<4xf32>
-  %normalized2 = vector.extf %normalized2_f16 : vector<4xf16> to vector<4xf32>
-  %normalized3 = vector.extf %normalized3_f16 : vector<4xf16> to vector<4xf32>
+  %inverse_sum0 = vector.splat %inverse_sum0_f32 : vector<4xf32>
+  %inverse_sum1 = vector.splat %inverse_sum1_f32 : vector<4xf32>
+  %inverse_sum2 = vector.splat %inverse_sum2_f32 : vector<4xf32>
+  %inverse_sum3 = vector.splat %inverse_sum3_f32 : vector<4xf32>
+  %normalized0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %final_output0, %inverse_sum0 : vector<4xf32>
+  %normalized1 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %final_output1, %inverse_sum1 : vector<4xf32>
+  %normalized2 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %final_output2, %inverse_sum2 : vector<4xf32>
+  %normalized3 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %final_output3, %inverse_sum3 : vector<4xf32>
   %output_channel = index.add %query_head_base, %lane_output_channel : index
   scf.if %query_valid0 {
     %bounded_query_token = index.assume %query_token0 [lt(%query_token0, %token_count)] : index
