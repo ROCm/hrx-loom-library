@@ -19,6 +19,19 @@ input immutability are checked independently. The split projection also checks
 each published K interval independently before checking the reduced output,
 including the shorter final partition and disabled launches.
 
+Attention precision scenarios call the public prefill command and the split
+command followed by its real reducer. A fixture-specific F64 reference uses
+separable value rows to check every output without reproducing the matrix
+algorithm. Exact inputs distinguish full-block rounding, finite-output
+overflow, changing maxima, cancellation, causal tails, and channel ownership
+under the existing 0.001 absolute plus 0.001 relative bound. Guards and input
+immutability remain bitwise checks. Paged scenarios separately check physical
+page permutations, inactive spans, partial-state publication, and merging.
+Prefill, contiguous split, and paged-state scenarios execute on AMDGPU and
+Vulkan. Paired-query split scenarios execute on AMDGPU; their Vulkan path
+requires mixed-width aliases of one Workgroup allocation. Subgroup width
+changes ownership inside the production kernels, not the expected outputs.
+
 Test overviews explain reference independence and numerical acceptance;
 scenarios and BUILD declarations own workload and target coverage. Large
 vocabulary and full-width performance workloads remain explicit stress tests,

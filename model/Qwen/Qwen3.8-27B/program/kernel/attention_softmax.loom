@@ -1,0 +1,76 @@
+// Four query rows share one subgroup. Cache rows are striped across its lanes;
+// each lane retains its score packets until the maximum is known, so every
+// score is read once. Callers publish scores before entry and synchronize
+// probability readers after return. Both panels use a 24-element row stride:
+// scores are [cache row, query row], probabilities are their F16 transpose.
+// The tile has 16 or 64 rows, valid_rows <= tile_rows, and query_row is one of
+// 0, 4, 8, or 12. Positions are nonnegative I32 indices into the live history.
+template.decl @qwen38.attention.softmax_tile(%tile_rows: index, %valid_rows: index, %key_origin: index, %query_row: index, %lane: index, %query_positions: vector<4xi32>, %query_valid: vector<4xi1>, %current_max: vector<4xf32>, %current_sum: vector<4xf32>, %scores: buffer, %probabilities: buffer) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>)
+
+template.def<@qwen38.attention.softmax_tile> device @qwen38_attention_softmax_tile(%tile_rows: index, %valid_rows: index, %key_origin: index, %query_row: index, %lane: index, %query_positions: vector<4xi32>, %query_valid: vector<4xi1>, %current_max: vector<4xf32>, %current_sum: vector<4xf32>, %scores: buffer, %probabilities: buffer) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %origin = index.constant 0 : offset
+  %width = target.subgroup.size : index
+  %padding = index.sub %width, %c1 : index
+  %rounded_rows = index.add %tile_rows, %padding : index
+  %packets = index.div %rounded_rows, %width : index
+  %negative = vector.splatf -1e+30 : vector<4xf32>
+  %empty_sum = vector.splatf 0.0 : vector<4xf32>
+  %empty_scores = vector.splatf -1e+30 : vector<[%packets]x4xf32>
+  %empty_masks = vector.splati 0 : vector<[%packets]x4xi1>
+  %score_view = buffer.view %scores[%origin] : buffer -> view<64x24xf32>
+  %probability_view = buffer.view %probabilities[%origin] : buffer -> view<64x24xf16>
+  %score_bank, %valid_bank = scf.for %packet = [%c0 to %packets step %c1](%old_scores = %empty_scores : vector<[%packets]x4xf32>, %old_masks = %empty_masks : vector<[%packets]x4xi1>) -> (vector<[%packets]x4xf32>, vector<[%packets]x4xi1>) unroll {
+    %row = index.madd %packet, %width, %lane : index
+    %live = index.cmp ult, %row, %valid_rows : index
+    %key = index.add %key_origin, %row : index
+    %key_word = index.cast %key : index to i32
+    %keys = vector.splat %key_word : vector<4xi32>
+    %causal = vector.cmpi ule, %keys, %query_positions : vector<4xi32> -> vector<4xi1>
+    %live_rows = vector.splat %live : vector<4xi1>
+    %live_queries = vector.andi %query_valid, %live_rows : vector<4xi1>
+    %valid = vector.andi %causal, %live_queries : vector<4xi1>
+    %raw = scf.if %live -> (vector<4xf32>) {
+      %bounded_row = index.assume %row [range(%row, 0, 63)] : index
+      %value = vector.load %score_view[%bounded_row, %query_row] : view<64x24xf32> -> vector<4xf32>
+      scf.yield %value : vector<4xf32>
+    } else {
+      scf.yield %negative : vector<4xf32>
+    }
+    %masked = vector.select %valid, %raw, %negative : vector<4xf32>
+    %next_scores = vector.insert %masked into %old_scores[%packet] : vector<4xf32>, vector<[%packets]x4xf32>
+    %next_masks = vector.insert %valid into %old_masks[%packet] : vector<4xi1>, vector<[%packets]x4xi1>
+    scf.yield %next_scores, %next_masks : vector<[%packets]x4xf32>, vector<[%packets]x4xi1>
+  }
+  %first_scores = vector.extract %score_bank[0] : vector<[%packets]x4xf32> -> vector<4xf32>
+  %local_max = scf.for %packet = [%c1 to %packets step %c1](%maximum = %first_scores : vector<4xf32>) -> (vector<4xf32>) unroll {
+    %values = vector.extract %score_bank[%packet] : vector<[%packets]x4xf32> -> vector<4xf32>
+    %next = vector.maxnumf %maximum, %values : vector<4xf32>
+    scf.yield %next : vector<4xf32>
+  }
+  %block_max = kernel.subgroup.reduce<maxnumf> %local_max : vector<4xf32>
+  %next_max = vector.maxnumf %current_max, %block_max : vector<4xf32>
+  %local_sum = scf.for %packet = [%c0 to %packets step %c1](%sum = %empty_sum : vector<4xf32>) -> (vector<4xf32>) unroll {
+    %values = vector.extract %score_bank[%packet] : vector<[%packets]x4xf32> -> vector<4xf32>
+    %valid = vector.extract %valid_bank[%packet] : vector<[%packets]x4xi1> -> vector<4xi1>
+    %delta = vector.subf<reassoc|nnan|nsz> %values, %next_max : vector<4xf32>
+    %raw_probability = vector.expf<afn> %delta : vector<4xf32>
+    %probability = vector.select %valid, %raw_probability, %empty_sum : vector<4xf32>
+    %half = vector.fptrunc %probability : vector<4xf32> to vector<4xf16>
+    %row = index.madd %packet, %width, %lane : index
+    %in_tile = index.cmp ult, %row, %tile_rows : index
+    scf.if %in_tile {
+      %bounded_row = index.assume %row [range(%row, 0, 63)] : index
+      vector.store %half, %probability_view[%bounded_row, %query_row] : vector<4xf16>, view<64x24xf16>
+    }
+    %next = vector.addf<reassoc|nnan|ninf|nsz> %sum, %probability : vector<4xf32>
+    scf.yield %next : vector<4xf32>
+  }
+  %block_sum = kernel.subgroup.reduce<addf> %local_sum : vector<4xf32>
+  %old_delta = vector.subf<reassoc|nnan|ninf|nsz> %current_max, %next_max : vector<4xf32>
+  %old_scale = vector.expf<afn> %old_delta : vector<4xf32>
+  %scaled_sum = vector.mulf<reassoc|nnan|ninf|nsz|contract> %current_sum, %old_scale : vector<4xf32>
+  %next_sum = vector.addf<reassoc|nnan|ninf|nsz> %scaled_sum, %block_sum : vector<4xf32>
+  template.return %next_max, %next_sum, %old_scale : vector<4xf32>, vector<4xf32>, vector<4xf32>
+}

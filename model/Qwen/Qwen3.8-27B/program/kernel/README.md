@@ -29,7 +29,18 @@ body; command selection retains the tuned split preference. The matrix motif
 owns native operand layouts, so these entries inherit the execution target.
 
 Attention separates preparation, cache publication, history partitions, and
-merge. Gated DeltaNet retains causal state within each span. Capture and
+merge. Four subgroups share each 16-query by 64-cache-row panel. Their actual
+width determines the staging stride, fragment carriers, score packets, and
+output channels per lane; the entries inherit the execution target. The
+softmax tile retains each lane's score packets across its maximum and sum
+reductions and publishes probabilities in the shared transposed layout.
+Contiguous, paged, and split attention use that same ownership contract.
+Q/K/V and probabilities remain F16, while native products and online
+numerators stay F32 through normalization or partial-state publication. The
+paired-query split path retains its native accumulator fragments across
+history tiles; its merge consumes the same F32 partial-state layout.
+
+Gated DeltaNet retains causal state within each span. Capture and
 accepted-prefix replay keep rejected proposals from advancing committed history.
 The output head and predictors preserve request-owned policy and accepted carry.
 
