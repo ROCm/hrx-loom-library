@@ -13,7 +13,7 @@
 
 #include <loomcxx/predicate.h>
 
-[[loom::symbol("qwen3_embedding.fill_weight_column"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.fill_weight_column"), loom::inline]]
 static void qwen3_embedding_fill_weight_column(loomt::buffer<unsigned> input0,
                                                WeightStream incoming0,
                                                loomt::offset base,
@@ -36,7 +36,7 @@ static void qwen3_embedding_fill_weight_column(loomt::buffer<unsigned> input0,
   return;
 }
 
-[[loom::symbol("qwen3_embedding.fill_attention_column"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.fill_attention_column"), loom::inline]]
 static void qwen3_embedding_fill_attention_column(
     loomt::buffer<std::bfloat16_t> state, loomt::buffer<unsigned> metadata,
     WeightStream source0, loomt::offset column_offset) {
@@ -143,7 +143,7 @@ static void qwen3_embedding_fill_attention_column(
   return;
 }
 
-[[loom::symbol("copy_pair"), loom::force_inline]]
+[[loom::symbol("copy_pair"), loom::inline]]
 static loomt::read<loomt::tile<loomt::shape<4624>, unsigned>>
 copy_pair(loomt::read<loomt::tile<loomt::shape<4624>, unsigned>> source,
           WeightStream a, WeightStream b) {
@@ -155,7 +155,7 @@ copy_pair(loomt::read<loomt::tile<loomt::shape<4624>, unsigned>> source,
   return fanout.first;
 }
 
-[[loom::symbol("copy_four"), loom::force_inline]]
+[[loom::symbol("copy_four"), loom::inline]]
 static loomt::read<loomt::tile<loomt::shape<4624>, unsigned>>
 copy_four(loomt::read<loomt::tile<loomt::shape<4624>, unsigned>> source,
           WeightStream a, WeightStream b, WeightStream c, WeightStream d) {

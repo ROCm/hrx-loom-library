@@ -9,7 +9,7 @@
 
 #include "array_resources.h"
 
-[[loom::symbol("qwen3_embedding.query_key_ingress_root"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.query_key_ingress_root"), loom::inline]]
 void qwen3_embedding_query_key_ingress_root(
     Bytes sequence_storage, loomt::offset origin, Bytes local_storage,
     loomt::offset result_offset, Bytes peer_storage, Bytes gather_storage,
@@ -22,7 +22,7 @@ void qwen3_embedding_query_key_ingress_root(
     loomt::index layer, loomt::index dense_group);
 
 [[loom::symbol("qwen3_embedding.query_key_ingress_root.attention"),
-  loom::force_inline]]
+  loom::inline]]
 void qwen3_embedding_query_key_ingress_root_attention(
     Bytes sequence_storage, loomt::offset origin, Bytes local_storage,
     loomt::offset result_offset, Bytes peer_storage, Bytes gather_storage,
@@ -34,7 +34,7 @@ void qwen3_embedding_query_key_ingress_root_attention(
     FeatureStream result_stream, BarrierStream phase_complete,
     loomt::index layer);
 
-[[loom::symbol("qwen3_embedding.query_key_egress"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.query_key_egress"), loom::inline]]
 void qwen3_embedding_query_key_egress(
     Bytes sequence_storage, loomt::offset origin, Bytes local_storage,
     loomt::offset result_offset, Bytes peer_storage,
@@ -52,7 +52,7 @@ void qwen3_embedding_query_key_egress(
     loomt::offset output_initial, loomt::index layer, loomt::index dense_group);
 
 [[loom::symbol("qwen3_embedding.query_key_egress.attention"),
-  loom::force_inline]]
+  loom::inline]]
 void qwen3_embedding_query_key_egress_attention(
     Bytes sequence_storage, loomt::offset origin, Bytes local_storage,
     loomt::offset result_offset, Bytes peer_storage,
@@ -69,7 +69,7 @@ void qwen3_embedding_query_key_egress_attention(
     loomt::offset mlp_initial, loomt::offset residual_initial,
     loomt::offset output_initial, loomt::index layer);
 
-[[loom::symbol("qwen3_embedding.probability_value"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.probability_value"), loom::inline]]
 void qwen3_embedding_probability_value(
     bool normalize_peer_rows, Bytes dimension_storage, loomt::offset origin,
     Bytes local_storage, loomt::offset result_offset, Bytes peer_storage,
@@ -83,7 +83,7 @@ void qwen3_embedding_probability_value(
     loomt::index skip_column, loomt::index layer, loomt::index dense_group);
 
 [[loom::symbol("qwen3_embedding.probability_value.attention"),
-  loom::force_inline]]
+  loom::inline]]
 void qwen3_embedding_probability_value_attention(
     bool normalize_peer_rows, Bytes dimension_storage, loomt::offset origin,
     Bytes local_storage, loomt::offset result_offset, Bytes peer_storage,
@@ -96,7 +96,7 @@ void qwen3_embedding_probability_value_attention(
     loomt::index dimension_row_base, loomt::index row_column,
     loomt::index skip_column, loomt::index layer);
 
-[[loom::symbol("qwen3_embedding.query_key_epilogue"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.query_key_epilogue"), loom::inline]]
 void qwen3_embedding_query_key_epilogue(
     Bytes sequence_storage, loomt::offset origin, Bytes dimension_storage,
     Bytes local_storage, loomt::offset result_offset, Bytes peer_storage,
@@ -110,7 +110,7 @@ void qwen3_embedding_query_key_epilogue(
     loomt::index skip_column, loomt::index layer, loomt::index dense_group);
 
 [[loom::symbol("qwen3_embedding.query_key_epilogue.attention"),
-  loom::force_inline]]
+  loom::inline]]
 void qwen3_embedding_query_key_epilogue_attention(
     Bytes sequence_storage, loomt::offset origin, Bytes dimension_storage,
     Bytes local_storage, loomt::offset result_offset, Bytes peer_storage,
@@ -124,7 +124,7 @@ void qwen3_embedding_query_key_epilogue_attention(
     loomt::index skip_column, loomt::index layer);
 
 [[loom::symbol("qwen3_embedding.probability_value_ingress"),
-  loom::force_inline]]
+  loom::inline]]
 void qwen3_embedding_probability_value_ingress(
     Bytes dimension_storage, Bytes local_storage, loomt::offset origin,
     loomt::offset result_offset, Bytes peer_storage, Bytes gather_storage,
@@ -148,7 +148,7 @@ void qwen3_embedding_probability_value_ingress(
     loomt::index layer, loomt::index dense_group);
 
 [[loom::symbol("qwen3_embedding.probability_value_ingress.attention"),
-  loom::force_inline]]
+  loom::inline]]
 void qwen3_embedding_probability_value_ingress_attention(
     Bytes dimension_storage, Bytes local_storage, loomt::offset origin,
     loomt::offset result_offset, Bytes peer_storage, Bytes gather_storage,
@@ -171,7 +171,7 @@ void qwen3_embedding_probability_value_ingress_attention(
     loomt::offset residual_initial, loomt::offset output_initial,
     loomt::index layer);
 
-[[loom::symbol("qwen3_embedding.probability_value_egress"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.probability_value_egress"), loom::inline]]
 void qwen3_embedding_probability_value_egress(
     Bytes dimension_storage, Bytes local_storage, loomt::offset origin,
     loomt::offset result_offset, Bytes peer_storage,
@@ -190,7 +190,7 @@ void qwen3_embedding_probability_value_egress(
     loomt::index layer, loomt::index dense_group);
 
 [[loom::symbol("qwen3_embedding.probability_value_egress.attention"),
-  loom::force_inline]]
+  loom::inline]]
 void qwen3_embedding_probability_value_egress_attention(
     Bytes local_storage, loomt::offset origin, loomt::offset result_offset,
     Bytes peer_storage, ActivationStream activation_stream, loomt::index zero,
@@ -207,7 +207,7 @@ void qwen3_embedding_probability_value_egress_attention(
     loomt::offset mlp_initial, loomt::offset residual_initial,
     loomt::offset output_initial, loomt::index layer);
 
-[[loom::symbol("qwen3_embedding.query_key_ingress"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.query_key_ingress"), loom::inline]]
 void qwen3_embedding_query_key_ingress(
     Bytes sequence_storage, loomt::offset origin, Bytes local_storage,
     loomt::offset result_offset, Bytes peer_storage, Bytes gather_storage,
@@ -220,7 +220,7 @@ void qwen3_embedding_query_key_ingress(
     FeatureStream result_stream, loomt::index layer, loomt::index dense_group);
 
 [[loom::symbol("qwen3_embedding.query_key_ingress.attention"),
-  loom::force_inline]]
+  loom::inline]]
 void qwen3_embedding_query_key_ingress_attention(
     Bytes sequence_storage, loomt::offset origin, Bytes local_storage,
     loomt::offset result_offset, Bytes peer_storage, Bytes gather_storage,
@@ -233,7 +233,7 @@ void qwen3_embedding_query_key_ingress_attention(
     FeatureStream result_stream, loomt::index layer);
 
 [[loom::symbol("qwen3_embedding.query_key_egress_terminal"),
-  loom::force_inline]]
+  loom::inline]]
 void qwen3_embedding_query_key_egress_terminal(
     Bytes sequence_storage, loomt::offset origin, Bytes local_storage,
     loomt::offset result_offset, Bytes peer_storage,
@@ -245,7 +245,7 @@ void qwen3_embedding_query_key_egress_terminal(
     loomt::index layer, loomt::index dense_group);
 
 [[loom::symbol("qwen3_embedding.query_key_egress_terminal.attention"),
-  loom::force_inline]]
+  loom::inline]]
 void qwen3_embedding_query_key_egress_terminal_attention(
     Bytes sequence_storage, loomt::offset origin, Bytes local_storage,
     loomt::offset result_offset, Bytes peer_storage,
@@ -256,12 +256,12 @@ void qwen3_embedding_query_key_egress_terminal_attention(
     FeatureStream probability_stream, FeatureStream result_stream,
     loomt::index layer);
 
-[[loom::symbol("qwen3_embedding.replay_weights16"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.replay_weights16"), loom::inline]]
 void qwen3_embedding_replay_weights16(WeightStream source, WeightStream row0,
                                       WeightStream row1, WeightStream row2,
                                       WeightStream row3, loomt::index panels);
 
-[[loom::symbol("qwen3_embedding.replay_weights24"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.replay_weights24"), loom::inline]]
 void qwen3_embedding_replay_weights24(WeightStream source, WeightStream row0,
                                       WeightStream row1, WeightStream row2,
                                       WeightStream row3, loomt::index panels);

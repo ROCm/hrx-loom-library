@@ -41,82 +41,82 @@ struct qwen3_embedding_dot128_result {
   Float32x64 value3;
 };
 
-[[loom::symbol("qwen3_embedding.silu_product"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.silu_product"), loom::inline]]
 static Float32x16 qwen3_embedding_silu_product(BFloat16x16 left, BFloat16x16 right);
 
-[[loom::symbol("qwen3_embedding.prepare_silu_lookup"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.prepare_silu_lookup"), loom::inline]]
 void qwen3_embedding_prepare_silu_lookup(loom::type::view<loom::type::shape<4096>, std::bfloat16_t> input, loom::type::view<loom::type::shape<8192>, std::bfloat16_t> output_ab, loom::type::view<loom::type::shape<8192>, std::bfloat16_t> output_cd);
 
-[[loom::symbol("qwen3_embedding.identity"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.identity"), loom::inline]]
 void qwen3_embedding_identity(loom::type::view<loom::type::shape<8, 8>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.copy_output"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.copy_output"), loom::inline]]
 void qwen3_embedding_copy_output(loom::type::view<loom::type::shape<4096>, std::bfloat16_t> input, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.block_right"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.block_right"), loom::inline]]
 void qwen3_embedding_block_right(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.block_left"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.block_left"), loom::inline]]
 void qwen3_embedding_block_left(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.three_products"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.three_products"), loom::inline]]
 void qwen3_embedding_three_products(loom::type::buffer<float> storage, loom::type::view<loom::type::shape<8, 8>, float> temporary, loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.exp"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.exp"), loom::inline]]
 static Float32x16 qwen3_embedding_exp(Float32x16 input);
 
-[[loom::symbol("qwen3_embedding.scale"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.scale"), loom::inline]]
 static BFloat16x16 qwen3_embedding_scale(BFloat16x16 input, float factor);
 
-[[loom::symbol("qwen3_embedding.softmax"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.softmax"), loom::inline]]
 void qwen3_embedding_softmax(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> matrix, loom::type::view<loom::type::shape<128>, float> scores, loom::type::view<loom::type::shape<128>, unsigned> sequences, loom::type::index query_base);
 
-[[loom::symbol("qwen3_embedding.normalize_dense_head"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.normalize_dense_head"), loom::inline]]
 static void qwen3_embedding_normalize_dense_head(loom::type::index length, loom::type::view<loom::type::shape<128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<128>, std::bfloat16_t> scale, loom::type::view<loom::type::shape<128>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.rotate"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.rotate"), loom::inline]]
 static void qwen3_embedding_rotate(loom::type::view<loom::type::shape<2, 64>, std::bfloat16_t> rope, loom::type::view<loom::type::shape<128>, std::bfloat16_t> output_head);
 
 [[loom::symbol("qwen3_embedding.dense_accumulate")]]
 void qwen3_embedding_dense_accumulate(loom::type::view<loom::type::shape<16, 2, 576>, unsigned char> weights, loom::type::view<loom::type::shape<2, 4, 576>, unsigned char> activations, loom::type::view<loom::type::shape<16, 4, 64>, float> primary, loom::type::view<loom::type::shape<16, 4, 64>, float> secondary, bool use_secondary, bool first);
 
-[[loom::symbol("qwen3_embedding.dense_rows"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.dense_rows"), loom::inline]]
 void qwen3_embedding_dense_rows(loom::type::view<loom::type::shape<16, 4, 64>, float> input, loom::type::view<loom::type::shape<16, 4, 64>, float> secondary, bool first, loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.dense_heads"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.dense_heads"), loom::inline]]
 void qwen3_embedding_dense_heads(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<128>, std::bfloat16_t> scale, loom::type::view<loom::type::shape<32, 2, 64>, std::bfloat16_t> rope);
 
-[[loom::symbol("qwen3_embedding.dense_transpose_values"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.dense_transpose_values"), loom::inline]]
 void qwen3_embedding_dense_transpose_values(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<128, 32>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.normalize_shared"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.normalize_shared"), loom::inline]]
 void qwen3_embedding_normalize_shared(loom::type::index length, loom::type::view<loom::type::shape<1024>, std::bfloat16_t> input, loom::type::view<loom::type::shape<1024>, std::bfloat16_t> scale, loom::type::view<loom::type::shape<1024>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.block_four_rows"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.block_four_rows"), loom::inline]]
 void qwen3_embedding_block_four_rows(loom::type::view<loom::type::shape<4, 1024>, std::bfloat16_t> input, loom::type::view<loom::type::shape<128, 4, 8>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.three_products_blocked"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.three_products_blocked"), loom::inline]]
 void qwen3_embedding_three_products_blocked(loom::type::buffer<float> storage, loom::type::view<loom::type::shape<8, 8>, float> temporary, loom::type::view<loom::type::shape<16, 4, 64>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.swiglu_dense"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.swiglu_dense"), loom::inline]]
 void qwen3_embedding_swiglu_dense(loom::type::view<loom::type::shape<4096>, float> gate, loom::type::view<loom::type::shape<4096>, float> up, loom::type::buffer<unsigned char> table_ab, loom::type::buffer<unsigned char> table_cd, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.dense_residual"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.dense_residual"), loom::inline]]
 void qwen3_embedding_dense_residual(loom::type::view<loom::type::shape<4096>, std::bfloat16_t> input, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> skip);
 
-[[loom::symbol("qwen3_embedding.retain_residual_panel"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.retain_residual_panel"), loom::inline]]
 void qwen3_embedding_retain_residual_panel(loom::type::view<loom::type::shape<4096>, std::bfloat16_t> input, loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> output, loom::type::index record, loom::type::index feature);
 
-[[loom::symbol("qwen3_embedding.block_dense_result"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.block_dense_result"), loom::inline]]
 void qwen3_embedding_block_dense_result(loom::type::view<loom::type::shape<16, 4, 64>, std::bfloat16_t> input, loom::type::view<loom::type::shape<16, 4, 64>, std::bfloat16_t> output);
 
-[[loom::symbol("qwen3_embedding.dot128"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.dot128"), loom::inline]]
 qwen3_embedding_dot128_result qwen3_embedding_dot128(loom::type::buffer<unsigned char> weights, loom::type::offset weight_offset, loom::type::buffer<unsigned char> activations, loom::type::offset activation_offset, Float32x64 initial0, Float32x64 initial1, Float32x64 initial2, Float32x64 initial3);
 
-[[loom::symbol("qwen3_embedding.silu_lookup"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.silu_lookup"), loom::inline]]
 static BFloat16x16 qwen3_embedding_silu_lookup(loom::type::buffer<unsigned char> table_ab, loom::type::buffer<unsigned char> table_cd, UInt32x16 indices);
 
-[[loom::symbol("qwen3_embedding.silu_product"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.silu_product"), loom::inline]]
 static Float32x16 qwen3_embedding_silu_product(BFloat16x16 left, BFloat16x16 right) {
   BFloat16x16 inactive_lanes = BFloat16x16{};
   Float32x16 initial = Float32x16{};
@@ -126,7 +126,7 @@ static Float32x16 qwen3_embedding_silu_product(BFloat16x16 left, BFloat16x16 rig
   return product;
 }
 
-[[loom::symbol("qwen3_embedding.prepare_silu_lookup"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.prepare_silu_lookup"), loom::inline]]
 void qwen3_embedding_prepare_silu_lookup(loom::type::view<loom::type::shape<4096>, std::bfloat16_t> input, loom::type::view<loom::type::shape<8192>, std::bfloat16_t> output_ab, loom::type::view<loom::type::shape<8192>, std::bfloat16_t> output_cd) {
   for (int block = 0; block < 256; ++block) {
     loom::type::index relative = loom::index::cast(block) * loom::type::index{16};
@@ -140,7 +140,7 @@ void qwen3_embedding_prepare_silu_lookup(loom::type::view<loom::type::shape<4096
   return;
 }
 
-[[loom::symbol("qwen3_embedding.identity"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.identity"), loom::inline]]
 void qwen3_embedding_identity(loom::type::view<loom::type::shape<8, 8>, std::bfloat16_t> output) {
   BFloat16x8x8 c0 = loom::vector::splat<BFloat16x8x8>({}, std::bfloat16_t{});
   loom::vector::store(c0, output, {0, 0});
@@ -150,7 +150,7 @@ void qwen3_embedding_identity(loom::type::view<loom::type::shape<8, 8>, std::bfl
   return;
 }
 
-[[loom::symbol("qwen3_embedding.copy_output"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.copy_output"), loom::inline]]
 void qwen3_embedding_copy_output(loom::type::view<loom::type::shape<4096>, std::bfloat16_t> input, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> output) {
   for (int position = 0; position < 4096; position += 32) {
     BFloat16x32 values = loom::vector::load<BFloat16x32>(input, {position});
@@ -159,7 +159,7 @@ void qwen3_embedding_copy_output(loom::type::view<loom::type::shape<4096>, std::
   return;
 }
 
-[[loom::symbol("qwen3_embedding.block_right"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.block_right"), loom::inline]]
 void qwen3_embedding_block_right(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> output) {
   for (int reduction = 0; reduction < 16; ++reduction) {
     loom::type::index column = loom::index::cast(reduction) * loom::type::index{8};
@@ -180,7 +180,7 @@ void qwen3_embedding_block_right(loom::type::view<loom::type::shape<32, 128>, st
   return;
 }
 
-[[loom::symbol("qwen3_embedding.block_left"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.block_left"), loom::inline]]
 void qwen3_embedding_block_left(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> output) {
   for (int reduction = 0; reduction < 16; ++reduction) {
     loom::type::index column = loom::index::cast(reduction) * loom::type::index{8};
@@ -201,7 +201,7 @@ void qwen3_embedding_block_left(loom::type::view<loom::type::shape<32, 128>, std
   return;
 }
 
-[[loom::symbol("qwen3_embedding.three_products"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.three_products"), loom::inline]]
 void qwen3_embedding_three_products(loom::type::buffer<float> storage, loom::type::view<loom::type::shape<8, 8>, float> temporary, loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> output) {
   auto partials = loom::buffer::view<4, 64>(storage, loom::type::offset{9344}, {});
   Float32x64 c0 = Float32x64{};
@@ -289,7 +289,7 @@ void qwen3_embedding_three_products(loom::type::buffer<float> storage, loom::typ
   return;
 }
 
-[[loom::symbol("qwen3_embedding.exp"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.exp"), loom::inline]]
 static Float32x16 qwen3_embedding_exp(Float32x16 input) {
   Float32x16 floor = -86.9f;
   [[loom::fastmath("nnan", "nsz")]] Float32x16 bounded = loom::vector::maxnumf(input, floor);
@@ -368,7 +368,7 @@ static Float32x16 qwen3_embedding_exp(Float32x16 input) {
   return rounded;
 }
 
-[[loom::symbol("qwen3_embedding.scale"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.scale"), loom::inline]]
 static BFloat16x16 qwen3_embedding_scale(BFloat16x16 input, float factor) {
   Float32x16 factor_vector = factor;
   BFloat16x16 high = loom::convert<BFloat16x16, loom::conversion::subnormal::daz>(factor_vector);
@@ -389,7 +389,7 @@ static BFloat16x16 qwen3_embedding_scale(BFloat16x16 input, float factor) {
   return result;
 }
 
-[[loom::symbol("qwen3_embedding.softmax"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.softmax"), loom::inline]]
 void qwen3_embedding_softmax(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> matrix, loom::type::view<loom::type::shape<128>, float> scores, loom::type::view<loom::type::shape<128>, unsigned> sequences, loom::type::index query_base) {
   Float32x16 c0_vector_16_f32 = Float32x16{};
   Float32x16 infinities = __builtin_bit_cast(float, 0xff800000u);
@@ -443,7 +443,7 @@ void qwen3_embedding_softmax(loom::type::view<loom::type::shape<32, 128>, std::b
   return;
 }
 
-[[loom::symbol("qwen3_embedding.normalize_dense_head"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.normalize_dense_head"), loom::inline]]
 static void qwen3_embedding_normalize_dense_head(loom::type::index length, loom::type::view<loom::type::shape<128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<128>, std::bfloat16_t> scale, loom::type::view<loom::type::shape<128>, std::bfloat16_t> output) {
   bool is_head = length == loom::type::index{128};
   BFloat16x16 head_inverse = static_cast<std::bfloat16_t>(0.0078125f);
@@ -500,7 +500,7 @@ static void qwen3_embedding_normalize_dense_head(loom::type::index length, loom:
   return;
 }
 
-[[loom::symbol("qwen3_embedding.rotate"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.rotate"), loom::inline]]
 static void qwen3_embedding_rotate(loom::type::view<loom::type::shape<2, 64>, std::bfloat16_t> rope, loom::type::view<loom::type::shape<128>, std::bfloat16_t> output_head) {
   Float32x16 c0 = Float32x16{};
   BFloat16x16 narrow_zero = BFloat16x16{};
@@ -576,7 +576,7 @@ struct Accumulators {
 // Each weight block contributes to four independent token accumulators.
 // Whole-panel loads let the compiler retain the FIFO stream across blocks.
 template <unsigned Weight>
-[[loom::force_inline]] static Accumulators contract_record(
+[[loom::inline]] static Accumulators contract_record(
     WeightPanel weights, ActivationPanel activations, Accumulators current,
     Schema schema) {
   auto tile = loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}};
@@ -645,7 +645,7 @@ void qwen3_embedding_dense_accumulate(loom::type::view<loom::type::shape<16, 2, 
   }
 }
 
-[[loom::symbol("qwen3_embedding.dense_rows"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.dense_rows"), loom::inline]]
 void qwen3_embedding_dense_rows(loom::type::view<loom::type::shape<16, 4, 64>, float> input, loom::type::view<loom::type::shape<16, 4, 64>, float> secondary, bool first, loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> output) {
   for (int panel = 0; panel < 16; ++panel) {
     loom::type::index feature_base = loom::index::cast(panel) * loom::type::index{8};
@@ -689,7 +689,7 @@ void qwen3_embedding_dense_rows(loom::type::view<loom::type::shape<16, 4, 64>, f
   return;
 }
 
-[[loom::symbol("qwen3_embedding.dense_heads"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.dense_heads"), loom::inline]]
 void qwen3_embedding_dense_heads(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<128>, std::bfloat16_t> scale, loom::type::view<loom::type::shape<32, 2, 64>, std::bfloat16_t> rope) {
   for (int row = 0; row < 32; ++row) {
     auto input_span = loom::view::subview<1, 128>(input, {row, 0}, {});
@@ -702,7 +702,7 @@ void qwen3_embedding_dense_heads(loom::type::view<loom::type::shape<32, 128>, st
   return;
 }
 
-[[loom::symbol("qwen3_embedding.dense_transpose_values"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.dense_transpose_values"), loom::inline]]
 void qwen3_embedding_dense_transpose_values(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<128, 32>, std::bfloat16_t> output) {
   for (int feature_block = 0; feature_block < 16; ++feature_block) {
     loom::type::index feature_base = loom::index::cast(feature_block) * loom::type::index{8};
@@ -762,7 +762,7 @@ void qwen3_embedding_dense_transpose_values(loom::type::view<loom::type::shape<3
   return;
 }
 
-[[loom::symbol("qwen3_embedding.normalize_shared"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.normalize_shared"), loom::inline]]
 void qwen3_embedding_normalize_shared(loom::type::index length, loom::type::view<loom::type::shape<1024>, std::bfloat16_t> input, loom::type::view<loom::type::shape<1024>, std::bfloat16_t> scale, loom::type::view<loom::type::shape<1024>, std::bfloat16_t> output) {
   bool is_head = length == loom::type::index{128};
   BFloat16x16 head_inverse = static_cast<std::bfloat16_t>(0.0078125f);
@@ -825,7 +825,7 @@ void qwen3_embedding_normalize_shared(loom::type::index length, loom::type::view
   return;
 }
 
-[[loom::symbol("qwen3_embedding.block_four_rows"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.block_four_rows"), loom::inline]]
 void qwen3_embedding_block_four_rows(loom::type::view<loom::type::shape<4, 1024>, std::bfloat16_t> input, loom::type::view<loom::type::shape<128, 4, 8>, std::bfloat16_t> output) {
   for (int group = 0; group < 128; ++group) {
     loom::type::index feature = loom::index::cast(group) * loom::type::index{8};
@@ -837,7 +837,7 @@ void qwen3_embedding_block_four_rows(loom::type::view<loom::type::shape<4, 1024>
   return;
 }
 
-[[loom::symbol("qwen3_embedding.three_products_blocked"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.three_products_blocked"), loom::inline]]
 void qwen3_embedding_three_products_blocked(loom::type::buffer<float> storage, loom::type::view<loom::type::shape<8, 8>, float> temporary, loom::type::view<loom::type::shape<16, 4, 64>, std::bfloat16_t> output) {
   auto partials = loom::buffer::view<4, 64>(storage, loom::type::offset{9344}, {});
   Float32x64 c0 = Float32x64{};
@@ -903,7 +903,7 @@ void qwen3_embedding_three_products_blocked(loom::type::buffer<float> storage, l
   return;
 }
 
-[[loom::symbol("qwen3_embedding.swiglu_dense"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.swiglu_dense"), loom::inline]]
 void qwen3_embedding_swiglu_dense(loom::type::view<loom::type::shape<4096>, float> gate, loom::type::view<loom::type::shape<4096>, float> up, loom::type::buffer<unsigned char> table_ab, loom::type::buffer<unsigned char> table_cd, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> output) {
   UInt32x16 c0 = UInt32x16{};
   UInt32x16 c1 = 1u;
@@ -957,7 +957,7 @@ void qwen3_embedding_swiglu_dense(loom::type::view<loom::type::shape<4096>, floa
   return;
 }
 
-[[loom::symbol("qwen3_embedding.dense_residual"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.dense_residual"), loom::inline]]
 void qwen3_embedding_dense_residual(loom::type::view<loom::type::shape<4096>, std::bfloat16_t> input, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> skip) {
   for (int position = 0; position < 4096; position += 16) {
     BFloat16x16 left = loom::vector::load<BFloat16x16>(input, {position});
@@ -971,7 +971,7 @@ void qwen3_embedding_dense_residual(loom::type::view<loom::type::shape<4096>, st
   return;
 }
 
-[[loom::symbol("qwen3_embedding.retain_residual_panel"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.retain_residual_panel"), loom::inline]]
 void qwen3_embedding_retain_residual_panel(loom::type::view<loom::type::shape<4096>, std::bfloat16_t> input, loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> output, loom::type::index record, loom::type::index feature) {
   loom::type::index output_base = record * loom::type::index{4};
   for (int row = 0; row < 4; ++row) {
@@ -987,7 +987,7 @@ void qwen3_embedding_retain_residual_panel(loom::type::view<loom::type::shape<40
   return;
 }
 
-[[loom::symbol("qwen3_embedding.block_dense_result"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.block_dense_result"), loom::inline]]
 void qwen3_embedding_block_dense_result(loom::type::view<loom::type::shape<16, 4, 64>, std::bfloat16_t> input, loom::type::view<loom::type::shape<16, 4, 64>, std::bfloat16_t> output) {
   for (int panel = 0; panel < 16; ++panel) {
     for (int block = 0; block < 4; ++block) {
@@ -1001,7 +1001,7 @@ void qwen3_embedding_block_dense_result(loom::type::view<loom::type::shape<16, 4
   return;
 }
 
-[[loom::force_inline]]
+[[loom::inline]]
 static qwen3_embedding_dot128_result qwen3_embedding_native_dot(loom::type::buffer<unsigned char> weights, loom::type::offset weight_offset, loom::type::buffer<unsigned char> activations, loom::type::offset activation_offset, Float32x64 initial0, Float32x64 initial1, Float32x64 initial2, Float32x64 initial3, int reduction_halves) {
   return loom::low::assembly<Aie2pCore, qwen3_embedding_dot128_result>(R"loom(
 (%weights: reg<aie2p.ep>, %weight_offset: reg<aie2p.er>, %activations: reg<aie2p.ep>, %activation_offset: reg<aie2p.er>, %initial0: reg<aie2p.mbms x4>, %initial1: reg<aie2p.mbms x4>, %initial2: reg<aie2p.mbms x4>, %initial3: reg<aie2p.mbms x4>, %reduction_halves: reg<aie2p.er>) -> (reg<aie2p.mbms x4>, reg<aie2p.mbms x4>, reg<aie2p.mbms x4>, reg<aie2p.mbms x4>) {
@@ -1112,17 +1112,17 @@ static qwen3_embedding_dot128_result qwen3_embedding_native_dot(loom::type::buff
   )loom", weights, weight_offset, activations, activation_offset, initial0, initial1, initial2, initial3, reduction_halves);
 }
 
-[[loom::symbol("qwen3_embedding.dot128"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.dot128"), loom::inline]]
 qwen3_embedding_dot128_result qwen3_embedding_dot128(loom::type::buffer<unsigned char> weights, loom::type::offset weight_offset, loom::type::buffer<unsigned char> activations, loom::type::offset activation_offset, Float32x64 initial0, Float32x64 initial1, Float32x64 initial2, Float32x64 initial3) {
   return qwen3_embedding_native_dot(weights, weight_offset, activations, activation_offset, initial0, initial1, initial2, initial3, 2);
 }
 
-[[loom::symbol("qwen3_embedding.dot64"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.dot64"), loom::inline]]
 qwen3_embedding_dot128_result qwen3_embedding_dot64(loom::type::buffer<unsigned char> weights, loom::type::offset weight_offset, loom::type::buffer<unsigned char> activations, loom::type::offset activation_offset, Float32x64 initial0, Float32x64 initial1, Float32x64 initial2, Float32x64 initial3) {
   return qwen3_embedding_native_dot(weights, weight_offset, activations, activation_offset, initial0, initial1, initial2, initial3, 1);
 }
 
-[[loom::symbol("qwen3_embedding.silu_lookup"), loom::force_inline]]
+[[loom::symbol("qwen3_embedding.silu_lookup"), loom::inline]]
 static BFloat16x16 qwen3_embedding_silu_lookup(loom::type::buffer<unsigned char> table_ab, loom::type::buffer<unsigned char> table_cd, UInt32x16 indices) {
   return loom::low::assembly<Aie2pCore, BFloat16x16>(R"loom(
 (%table_ab: reg<aie2p.ep>, %table_cd: reg<aie2p.ep>, %indices: reg<aie2p.vec256 x2>) -> (reg<aie2p.vec256 x2>) {
@@ -1151,7 +1151,7 @@ static BFloat16x16 qwen3_embedding_silu_lookup(loom::type::buffer<unsigned char>
   )loom", table_ab, table_cd, indices);
 }
 
-[[loom::symbol("bfp16ebs8.pack_bf16_aie2p"), loom::force_inline]]
+[[loom::symbol("bfp16ebs8.pack_bf16_aie2p"), loom::inline]]
 void pack_bf16_blocks(loom::type::buffer<unsigned char> storage, loom::type::offset input, loom::type::offset output, int count);
 
 // The dense phase consumes one 32x128 BF16 activation panel. All projection

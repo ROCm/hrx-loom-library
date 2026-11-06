@@ -55,20 +55,20 @@ struct QueryOutputResources {
 
 // Every phase starts fresh FIFO credits over the retained memory-tile records.
 template <unsigned Records>
-[[loom::force_inline]] static WeightStream bind_weight_ingress(Bytes storage) {
+[[loom::inline]] static WeightStream bind_weight_ingress(Bytes storage) {
   auto slots = loom::buffer::view<Records, 4624>(
       loom::buffer::cast<unsigned>(storage), {});
   return loom::channel::bind<loom::channel::discipline::fifo>(
       slots, loomt::index{Records});
 }
 
-[[loom::force_inline]] static CoreStorage allocate_core(loomt::pool memory) {
+[[loom::inline]] static CoreStorage allocate_core(loomt::pool memory) {
   auto *storage = loom::buffer::alloca<loom::memory_space::workgroup, 64>(
       loomt::offset{64448}, memory);
   return {.memory = memory, .storage = storage};
 }
 
-[[loom::force_inline]] static CoreStreams
+[[loom::inline]] static CoreStreams
 bind_core_streams(unsigned char *storage) {
   auto weight_slots =
       loom::buffer::view<1, 4624>(reinterpret_cast<unsigned *>(storage), {});
@@ -83,7 +83,7 @@ bind_core_streams(unsigned char *storage) {
   return {.weights = weights, .activations = activations};
 }
 
-[[loom::force_inline]] static BarrierResources
+[[loom::inline]] static BarrierResources
 make_barriers(loomt::pool memory) {
   auto *arrival_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(loomt::offset{64},
@@ -102,7 +102,7 @@ make_barriers(loomt::pool memory) {
   return {.arrival = arrival, .departure = departure};
 }
 
-[[loom::force_inline]] static FeatureStream
+[[loom::inline]] static FeatureStream
 make_feature_stream(unsigned char *storage) {
   auto slots = loom::buffer::view<1, 4096>(
       reinterpret_cast<std::bfloat16_t *>(
@@ -112,7 +112,7 @@ make_feature_stream(unsigned char *storage) {
                                                               loomt::index{1});
 }
 
-[[loom::force_inline]] static QueryOutputResources
+[[loom::inline]] static QueryOutputResources
 make_query_output(unsigned char *storage) {
   auto slots = loom::buffer::view<2, 4096>(
       reinterpret_cast<std::bfloat16_t *>(
