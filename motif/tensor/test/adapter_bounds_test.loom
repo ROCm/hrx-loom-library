@@ -46,7 +46,16 @@ func.def @adapter_matrix_bounds(%geometry: index, %input: buffer, %down: buffer,
   %rows, %inputs, %outputs, %banks, %stride, %row_stride, %column_stride, %exact = template.apply<@adapter_shape>(%geometry) : (index) -> (index, index, index, index, index, index, index, i1)
   %header = buffer.view %selections[%origin] : buffer -> view<1xi32>
   %count_word = view.load %header[0] : view<1xi32> -> i32
-  %count = index.cast %count_word : i32 to index
+  %count_value = index.cast %count_word : i32 to index
+  %selection_bytes = buffer.length %selections
+  %selection_payload = index.sub %selection_bytes, %payload : offset
+  %selection_length = index.cast %selection_payload : offset to index
+  %selection_stride = index.constant 16 : index
+  %selection_capacity = index.div %selection_length, %selection_stride : index
+  %count = index.assume %count_value [range(%count_value, 0, %selection_capacity)] : index
+  %up_bytes = buffer.length %up
+  %word_bytes = index.constant 2 : offset
+  %last_up_word = index.sub %up_bytes, %word_bytes : offset
   %offset_layout = encoding.layout.strided [2] : encoding<layout>
   %strength_layout = encoding.layout.strided [4] : encoding<layout>
   %offsets = buffer.view %selections[%payload] : buffer -> view<[%count]xi64, %offset_layout>
@@ -100,8 +109,11 @@ func.def @adapter_matrix_bounds(%geometry: index, %input: buffer, %down: buffer,
     }
     scf.yield %row_bound : f64
   }
-  %output_elements = index.mul %rows, %outputs : index
-  %bases = buffer.view %base[%payload] : buffer -> view<[%output_elements]xi16>
+  %base_bytes = buffer.length %base
+  %base_payload = index.sub %base_bytes, %payload : offset
+  %base_length = index.cast %base_payload : offset to index
+  %base_count = index.div %base_length, %c2 : index
+  %bases = buffer.view %base[%payload] : buffer -> view<[%base_count]xi16>
   %output_bound = scf.for %row = [%c0 to %rows step %c1](%row_bound = %c0_f64 : f64) -> (f64) {
     %reference_row = index.rem %row, %row_period : index
     %channel_bound = scf.for %channel = [%c0 to %reference_columns step %c1](%channel_bound = %row_bound : f64) -> (f64) {
@@ -110,12 +122,17 @@ func.def @adapter_matrix_bounds(%geometry: index, %input: buffer, %down: buffer,
         %nonnegative = scalar.assume %address [range(%address, 0, 9223372036854775807)] : i64
         %relative = index.cast %nonnegative : i64 to offset
         %bank_origin = index.add %relative, %payload : offset
-        %weights = buffer.view %up[%bank_origin] : buffer -> view<[%outputs]x32xi16>
+        %channel_offset = index.mul %channel, %rank : index
         %next_nominal, %next_lower, %next_upper, %next_norm = scf.for %element = [%c0 to %rank step %c1](%center_sum = %nominal : f64, %lower_sum = %lower : f64, %upper_sum = %upper : f64, %norm_sum = %norm : f64) -> (f64, f64, f64, f64) {
           %center = view.load %intervals[%ordinal, %reference_row, %element, 0] : view<[%count]x[%reference_rows]x32x3xf64> -> f64
           %low = view.load %intervals[%ordinal, %reference_row, %element, 1] : view<[%count]x[%reference_rows]x32x3xf64> -> f64
           %high = view.load %intervals[%ordinal, %reference_row, %element, 2] : view<[%count]x[%reference_rows]x32x3xf64> -> f64
-          %weight_word = view.load %weights[%channel, %element] : view<[%outputs]x32xi16> -> i16
+          %weight_position = index.add %channel_offset, %element : index
+          %weight_offset = index.scale %weight_position, %word_bytes : index, offset -> offset
+          %weight_origin_value = index.add %bank_origin, %weight_offset : offset
+          %weight_origin = index.assume %weight_origin_value [ge(%weight_origin_value, 0), le(%weight_origin_value, %last_up_word)] : offset
+          %weight_view = buffer.view %up[%weight_origin] : buffer -> view<1xi16>
+          %weight_word = view.load %weight_view[0] : view<1xi16> -> i16
           %weight_value = func.call @reference_bf16_value(%weight_word) : (i16) -> (f32)
           %weight = scalar.extf %weight_value : f32 to f64
           %nominal_product = scalar.mulf %center, %weight : f64
@@ -137,8 +154,9 @@ func.def @adapter_matrix_bounds(%geometry: index, %input: buffer, %down: buffer,
         scf.yield %next_nominal, %next_lower, %next_upper, %next_norm : f64, f64, f64, f64
       }
       %row_offset = index.mul %row, %row_stride : index
-      %position = index.madd %channel, %column_stride, %row_offset : index
-      %base_word = view.load %bases[%position] : view<[%output_elements]xi16> -> i16
+      %position_value = index.madd %channel, %column_stride, %row_offset : index
+      %position = index.assume %position_value [ge(%position_value, 0), lt(%position_value, %base_count)] : index
+      %base_word = view.load %bases[%position] : view<[%base_count]xi16> -> i16
       %base_value = func.call @reference_bf16_value(%base_word) : (i16) -> (f32)
       %error = scalar.mulf %norm, %contraction_error : f64
       %lower_sum = scalar.subf %lower, %error : f64

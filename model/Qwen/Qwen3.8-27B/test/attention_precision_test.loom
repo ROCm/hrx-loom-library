@@ -1,0 +1,275 @@
+// Independent F64 final-output checks for contiguous and partitioned matrix
+// attention. Small exact inputs distinguish product precision, online-sum
+// range, causal tails, cancellation, rescaling, and channel ownership under
+// the existing 0.001 absolute/relative model bound. No scalar GPU reference
+// or checkpoint is needed; guards and input preservation remain exact.
+
+target.decl @qwen38_execution
+
+config.decl @qwen38.attention.decode_split_count : %value: index where [range(%value, 1, 64)]
+
+command.decl @qwen38_dispatch_attention_decode_split_partial(%token_count: index, %token_ordinal: index, %control_position_index: index) launch(%control: buffer, %query: buffer, %key: buffer, %value: buffer, %partials: buffer)
+
+kernel.decl @qwen38_attention_decode_split_reduce() launch(%token_count: index, %token_ordinal: index, %gate: buffer, %partials: buffer, %output: buffer)
+
+// Exercise the same partial publication and merge as a single-token decode.
+command.def target(@qwen38_execution) @attention_split() launch(%control: buffer, %query: buffer, %gate: buffer, %key: buffer, %value: buffer, %output: buffer) {
+  %c1 = index.constant 1 : index
+  %c0 = index.constant 0 : index
+  %split_count = config.get @qwen38.attention.decode_split_count : index
+  %split_bytes = index.constant 24768 : offset
+  %partial_bytes = index.scale %split_count, %split_bytes : index, offset -> offset
+  %partials = buffer.alloca<global> align(256) %partial_bytes : buffer
+  command.launch @qwen38_dispatch_attention_decode_split_partial[%c1, %c0, %c1](%control, %query, %key, %value, %partials) : [index, index, index](buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @qwen38_attention_decode_split_reduce(%c1, %c0, %gate, %partials, %output) : (index, index, buffer, buffer, buffer)
+  command.return
+}
+
+command.decl @qwen38_dispatch_attention_prefill_f16(%capacity: index) launch(%control: buffer, %query: buffer, %gate: buffer, %key: buffer, %value: buffer, %output: buffer)
+
+// Eight small histories separate channel ownership, matrix rounding, causal
+// tails, cancellation, changing softmax maxima, and finite output range.
+func.def @attention_family_initialize(%configuration: index, %control: buffer, %query: buffer, %key: buffer, %value: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  %c17 = index.constant 17 : index
+  %c24 = index.constant 24 : index
+  %c62 = index.constant 62 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %c112 = index.constant 112 : index
+  %c127 = index.constant 127 : index
+  %c128 = index.constant 128 : index
+  %rows = index.constant 145 : index
+  %head_width = index.constant 256 : index
+  %channels = index.constant 1024 : index
+  %tail = index.cmp eq, %configuration, %c1 : index
+  %first = index.cmp eq, %configuration, %c2 : index
+  %many0 = index.cmp uge, %configuration, %c3 : index
+  %many1 = index.cmp ule, %configuration, %c5 : index
+  %many = scalar.andi %many0, %many1 : i1
+  %tokens = scf.select %many, %c17, %c1 : index
+  %later = index.cmp uge, %configuration, %c4 : index
+  %range = index.cmp eq, %configuration, %c6 : index
+  %last = index.cmp eq, %configuration, %c7 : index
+  %position0 = scf.select %tail, %c62, %c63 : index
+  %position1 = scf.select %first, %c0, %position0 : index
+  %position2 = scf.select %later, %c112, %position1 : index
+  %position3 = scf.select %range, %c127, %position2 : index
+  %position = scf.select %last, %c128, %position3 : index
+  %metadata = buffer.view %control[%origin] : buffer -> view<2xi32>
+  %token_word = index.cast %tokens : index to i32
+  %position_word = index.cast %position : index to i32
+  view.store %token_word, %metadata[0] : i32, view<2xi32>
+  view.store %position_word, %metadata[1] : i32, view<2xi32>
+  %queries = buffer.view %query[%origin] : buffer -> view<17x6144xf32>
+  %keys = buffer.view %key[%origin] : buffer -> view<145x1024xf16>
+  %values = buffer.view %value[%origin] : buffer -> view<145x1024xf16>
+  %rescale = index.cmp eq, %configuration, %c5 : index
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c1_f32 = scalar.constant 1.0 : f32
+  %negative_unit = scalar.constant -1.0 : f32
+  %half = scalar.constant 0.5 : f32
+  %channel_step = scalar.constant 0.0009765625 : f32
+  %large = scalar.constant 512.0 : f32
+  %amplitude_scale = scf.select %range, %large, %c1_f32 : f32
+  %query_scale = scalar.constant 16.0 : f32
+  %query_negative = scalar.constant -16.0 : f32
+  scf.for %token = [%c0 to %c17 step %c1] {
+    %parity = index.rem %token, %c2 : index
+    %even = index.cmp eq, %parity, %c0 : index
+    %signed_query = scf.select %even, %query_scale, %query_negative : f32
+    %query_value = scf.select %rescale, %signed_query, %c0_f32 : f32
+    scf.for %head = [%c0 to %c24 step %c1] {
+      %channel = index.mul %head, %head_width : index
+      view.store %query_value, %queries[%token, %channel] : f32, view<17x6144xf32>
+    }
+  }
+  %c0_f16 = scalar.constant 0.0 : f16
+  %key_positive = scalar.constant 4.0 : f16
+  %key_negative = scalar.constant -4.0 : f16
+  %cancellation0 = index.cmp uge, %configuration, %c2 : index
+  %not_range = index.cmp ne, %configuration, %c6 : index
+  %cancellation = scalar.andi %cancellation0, %not_range : i1
+  scf.for %row = [%c0 to %rows step %c1] {
+    %block = index.div %row, %c64 : index
+    %middle = index.cmp eq, %block, %c1 : index
+    %end = index.cmp eq, %block, %c2 : index
+    %key0 = scf.select %middle, %key_positive, %c0_f16 : f16
+    %key_value = scf.select %end, %key_negative, %key0 : f16
+    scf.for %head = [%c0 to %c4 step %c1] {
+      %channel = index.mul %head, %head_width : index
+      view.store %key_value, %keys[%row, %channel] : f16, view<145x1024xf16>
+    }
+    %phase = index.rem %row, %c4 : index
+    %parity = index.rem %phase, %c2 : index
+    %negative = index.cmp eq, %parity, %c1 : index
+    %small = index.cmp uge, %phase, %c2 : index
+    %sign = scf.select %negative, %negative_unit, %c1_f32 : f32
+    %magnitude = scf.select %small, %half, %c1_f32 : f32
+    %alternating = scalar.mulf %sign, %magnitude : f32
+    %block_sign0 = scf.select %middle, %negative_unit, %c1_f32 : f32
+    %block_sign = scf.select %end, %half, %block_sign0 : f32
+    %varying = scf.select %rescale, %block_sign, %alternating : f32
+    %factor = scf.select %cancellation, %varying, %c1_f32 : f32
+    %scaled_factor = scalar.mulf %factor, %amplitude_scale : f32
+    scf.for %channel = [%c0 to %channels step %c1] {
+      %word = index.cast %channel : index to i32
+      %number = scalar.uitofp %word : i32 to f32
+      %fraction = scalar.mulf %number, %channel_step : f32
+      %amplitude = scalar.addf %c1_f32, %fraction : f32
+      %wide_value = scalar.mulf %amplitude, %scaled_factor : f32
+      %half_value = scalar.fptrunc %wide_value : f32 to f16
+      view.store %half_value, %values[%row, %channel] : f16, view<145x1024xf16>
+    }
+  }
+  func.return
+}
+
+// The fixture's value matrix is separable: each row scales every channel by
+// the same exact power of two. Compute its weighted row mean in F64 once per
+// query/head, then apply each distinct channel amplitude. The sparse Q/K dot
+// product has one nonzero component, so no production matrix code is reused.
+func.def @attention_family_reference(%control: buffer, %query: buffer, %gate: buffer, %key: buffer, %value: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c6 = index.constant 6 : index
+  %heads = index.constant 24 : index
+  %width = index.constant 256 : index
+  %metadata = buffer.view %control[%origin] : buffer -> view<2xi32>
+  %token_word = view.load %metadata[0] : view<2xi32> -> i32
+  %position_word = view.load %metadata[1] : view<2xi32> -> i32
+  %tokens0 = index.cast %token_word : i32 to index
+  %tokens = index.assume %tokens0 [range(%tokens0, 1, 17)] : index
+  %position0 = index.cast %position_word : i32 to index
+  %position = index.assume %position0 [range(%position0, 0, 128)] : index
+  %queries = buffer.view %query[%origin] : buffer -> view<17x6144xf32>
+  %gates = buffer.view %gate[%origin] : buffer -> view<17x6144xf32>
+  %keys = buffer.view %key[%origin] : buffer -> view<145x1024xf16>
+  %values = buffer.view %value[%origin] : buffer -> view<145x1024xf16>
+  %results = buffer.view %output[%origin] : buffer -> view<17x6144xf32>
+  %c0_f64 = scalar.constant 0.0 : f64
+  %scale = scalar.constant 0.0625 : f64
+  scf.for %token = [%c0 to %tokens step %c1] {
+    %last = index.add %position, %token : index
+    %count = index.add %last, %c1 : index
+    scf.for %head = [%c0 to %heads step %c1] {
+      %query_base = index.mul %head, %width : index
+      %kv_head = index.div %head, %c6 : index
+      %kv_base = index.mul %kv_head, %width : index
+      %query_value = view.load %queries[%token, %query_base] : view<17x6144xf32> -> f32
+      %wide_query = scalar.extf %query_value : f32 to f64
+      %scaled_query = scalar.mulf %wide_query, %scale : f64
+      %numerator, %denominator = scf.for %row = [%c0 to %count step %c1](%sum = %c0_f64 : f64, %mass = %c0_f64 : f64) -> (f64, f64) {
+        %key_value = view.load %keys[%row, %kv_base] : view<145x1024xf16> -> f16
+        %wide_key = scalar.extf %key_value : f16 to f64
+        %score = scalar.mulf %scaled_query, %wide_key : f64
+        %weight = scalar.expf %score : f64
+        %value_element = view.load %values[%row, %kv_base] : view<145x1024xf16> -> f16
+        %wide_value = scalar.extf %value_element : f16 to f64
+        %weighted = scalar.mulf %weight, %wide_value : f64
+        %next_sum = scalar.addf %sum, %weighted : f64
+        %next_mass = scalar.addf %mass, %weight : f64
+        scf.yield %next_sum, %next_mass : f64, f64
+      }
+      %first_value = view.load %values[0, %kv_base] : view<145x1024xf16> -> f16
+      %first_wide = scalar.extf %first_value : f16 to f64
+      %normalizer = scalar.mulf %denominator, %first_wide : f64
+      %factor = scalar.divf %numerator, %normalizer : f64
+      scf.for %channel = [%c0 to %width step %c1] {
+        %input_channel = index.add %kv_base, %channel : index
+        %output_channel = index.add %query_base, %channel : index
+        %first = view.load %values[0, %input_channel] : view<145x1024xf16> -> f16
+        %wide_first = scalar.extf %first : f16 to f64
+        %gate_value = view.load %gates[%token, %output_channel] : view<17x6144xf32> -> f32
+        %wide_gate = scalar.extf %gate_value : f32 to f64
+        %mean = scalar.mulf %factor, %wide_first : f64
+        %gated = scalar.mulf %mean, %wide_gate : f64
+        %result = scalar.fptrunc %gated : f64 to f32
+        view.store %result, %results[%token, %output_channel] : f32, view<17x6144xf32>
+      }
+    }
+  }
+  func.return
+}
+
+check.scenario public @attention_family configure[8](%configuration: index, %configuration_entropy: check.entropy) {
+  %capacity = check.literal value(17) : index
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %control = check.generate.fill value(0) : tensor<2xi32>
+    %query = check.generate.fill value(0.0) : tensor<17x6144xf32>
+    %gate = check.generate.iota offset(0.25) step(0.0625) period(5) : tensor<17x6144xf32>
+    %key = check.generate.fill value(0.0) : tensor<145x1024xf16>
+    %value = check.generate.fill value(0.0) : tensor<145x1024xf16>
+    check.generate<@attention_family_initialize>(%configuration, %control, %query, %key, %value) : (index, tensor<2xi32>, tensor<17x6144xf32>, tensor<145x1024xf16>, tensor<145x1024xf16>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<104456xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<104456xf32> -> tensor<17x6144xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<104456xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(417808) : tensor<104456xf32> -> tensor<4xf32>
+    check.compare<@qwen38_dispatch_attention_prefill_f16, @attention_family_reference>[%capacity](%control, %query, %gate, %key, %value, %output) : [index](tensor<2xi32>, tensor<17x6144xf32>, tensor<17x6144xf32>, tensor<145x1024xf16>, tensor<145x1024xf16>, tensor<17x6144xf32>) -> () {
+      check.expect.approximate actual(%storage) expected(%storage) atol(0.001) rtol(0.001) nan(different) : tensor<104456xf32>, tensor<104456xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%control) expected(%control) : tensor<2xi32>
+      check.expect.bitwise actual(%query) expected(%query) : tensor<17x6144xf32>
+      check.expect.bitwise actual(%gate) expected(%gate) : tensor<17x6144xf32>
+      check.expect.bitwise actual(%key) expected(%key) : tensor<145x1024xf16>
+      check.expect.bitwise actual(%value) expected(%value) : tensor<145x1024xf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@attention_family> @attention_family_workload
+
+// Select full/tail pages, changing maxima, finite range, and signed tails.
+// Split decode uses one query; the prefill initializer still seeds all guards.
+func.def @attention_split_initialize(%configuration: index, %control: buffer, %query: buffer, %key: buffer, %value: buffer) {
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %early = index.cmp ult, %configuration, %c2 : index
+  %later = index.add %configuration, %c3 : index
+  %selected = scf.select %early, %configuration, %later : index
+  func.call @attention_family_initialize(%selected, %control, %query, %key, %value) : (index, buffer, buffer, buffer, buffer)
+  %origin = index.constant 0 : offset
+  %c1 = scalar.constant 1 : i32
+  %metadata = buffer.view %control[%origin] : buffer -> view<2xi32>
+  view.store %c1, %metadata[0] : i32, view<2xi32>
+  func.return
+}
+
+check.scenario public @attention_split_family configure[5](%configuration: index, %configuration_entropy: check.entropy) {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %control = check.generate.fill value(0) : tensor<2xi32>
+    %query = check.generate.fill value(0.0) : tensor<17x6144xf32>
+    %gate = check.generate.iota offset(0.25) step(0.0625) period(5) : tensor<17x6144xf32>
+    %key = check.generate.fill value(0.0) : tensor<145x1024xf16>
+    %value = check.generate.fill value(0.0) : tensor<145x1024xf16>
+    check.generate<@attention_split_initialize>(%configuration, %control, %query, %key, %value) : (index, tensor<2xi32>, tensor<17x6144xf32>, tensor<145x1024xf16>, tensor<145x1024xf16>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<104456xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<104456xf32> -> tensor<17x6144xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<104456xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(417808) : tensor<104456xf32> -> tensor<4xf32>
+    check.compare<@attention_split, @attention_family_reference>(%control, %query, %gate, %key, %value, %output) : (tensor<2xi32>, tensor<17x6144xf32>, tensor<17x6144xf32>, tensor<145x1024xf16>, tensor<145x1024xf16>, tensor<17x6144xf32>) -> () {
+      check.expect.approximate actual(%storage) expected(%storage) atol(0.001) rtol(0.001) nan(different) : tensor<104456xf32>, tensor<104456xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%control) expected(%control) : tensor<2xi32>
+      check.expect.bitwise actual(%query) expected(%query) : tensor<17x6144xf32>
+      check.expect.bitwise actual(%gate) expected(%gate) : tensor<17x6144xf32>
+      check.expect.bitwise actual(%key) expected(%key) : tensor<145x1024xf16>
+      check.expect.bitwise actual(%value) expected(%value) : tensor<145x1024xf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@attention_split_family> @attention_split_family_workload
