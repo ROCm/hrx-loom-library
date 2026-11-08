@@ -47,7 +47,8 @@ combines the standalone overview with card facts.
 The [program documentation](program/README.md) explains the fixed 32-core
 placement, shared-row ownership, and numerical boundaries. The public roots are
 `embedding_prepare_v1`, `embedding_prepare_request_v1`,
-`embedding_prepare_batch_v1`, and `embedding_run_v1`. Parameters load through
+`embedding_prepare_batch_v1`, `embedding_collect_batch_v1`, and
+`embedding_run_v1`. Parameters load through
 the `model` index scope and the tokenizer through the `text` identifier.
 
 ## Run learned regressions
