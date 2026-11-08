@@ -4,9 +4,12 @@
 // SiLU is checked with the direct signed logistic expression, including the
 // unused lookup slots. Rotary rows are checked against repeated complex
 // rotations at the ideal binary64 frequency, independently of the initializer's
-// rounded per-position angles. The absolute bound covers BF16 rounding plus
-// the F32 frequency/angle round points. An exact sample pins the one BF16
-// value that differs from evaluating the ideal binary64 expression directly.
+// rounded per-position angles. The short-prefix bound covers BF16 rounding plus
+// the F32 frequency/angle round points. Across 32768 positions, the largest
+// frequency drift is below 0.001407, angle rounding below 0.000977, and final
+// rounding below 0.001954; their sum is below the full-context 0.0045 bound.
+// An exact sample pins the BF16 value that differs from evaluating the ideal
+// binary64 expression directly.
 
 func.decl @qwen3_embedding.prepare_math() -> (buffer)
 
@@ -56,13 +59,12 @@ func.def @silu_mismatches(%data: buffer) -> (i32) {
   func.return %mismatches : i32
 }
 
-func.def @rotary_error(%data: buffer) -> (f64) {
+func.def @rotary_error(%data: buffer, %positions: index) -> (f64) where [range(%positions, 1, 32768)] {
   %origin = index.constant 8192 : offset
-  %values = buffer.view %data[%origin] : buffer -> view<256x128xbf16>
+  %values = buffer.view %data[%origin] : buffer -> view<32768x128xbf16>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %channels = index.constant 64 : index
-  %positions = index.constant 256 : index
   %base = scalar.constant 1000000.0 : f64
   %width = scalar.constant -64.0 : f64
   %c0_f64 = scalar.constant 0.0 : f64
@@ -76,8 +78,8 @@ func.def @rotary_error(%data: buffer) -> (f64) {
     %step_sine = scalar.sinf %frequency : f64
     %sine_channel = index.add %channel, %channels : index
     %unused_cosine, %unused_sine, %error = scf.for %position = [%c0 to %positions step %c1](%cosine = %c1_f64 : f64, %sine = %c0_f64 : f64, %error = %prior : f64) -> (f64, f64, f64) {
-      %stored_cosine = view.load %values[%position, %channel] : view<256x128xbf16> -> bf16
-      %stored_sine = view.load %values[%position, %sine_channel] : view<256x128xbf16> -> bf16
+      %stored_cosine = view.load %values[%position, %channel] : view<32768x128xbf16> -> bf16
+      %stored_sine = view.load %values[%position, %sine_channel] : view<32768x128xbf16> -> bf16
       %actual_cosine = scalar.extf %stored_cosine : bf16 to f64
       %actual_sine = scalar.extf %stored_sine : bf16 to f64
       %delta_cosine = scalar.subf %actual_cosine, %cosine : f64
@@ -99,12 +101,11 @@ func.def @rotary_error(%data: buffer) -> (f64) {
   func.return %maximum : f64
 }
 
-func.def @rounded_cosine(%data: buffer) -> (i16) {
+func.def @rounded_cosine(%data: buffer) -> (bf16) {
   %origin = index.constant 8192 : offset
-  %values = buffer.view %data[%origin] : buffer -> view<256x128xbf16>
-  %value = view.load %values[64, 7] : view<256x128xbf16> -> bf16
-  %bits = scalar.bitcast %value : bf16 to i16
-  func.return %bits : i16
+  %values = buffer.view %data[%origin] : buffer -> view<32768x128xbf16>
+  %value = view.load %values[64, 7] : view<32768x128xbf16> -> bf16
+  func.return %value : bf16
 }
 
 check.case @mathematical_initialization {
@@ -112,11 +113,15 @@ check.case @mathematical_initialization {
   %mismatches = func.call @silu_mismatches(%data) : (buffer) -> (i32)
   %expected = check.literal value(0) : i32
   check.expect.equal actual(%mismatches) expected(%expected) : i32
-  %error = func.call @rotary_error(%data) : (buffer) -> (f64)
+  %short_positions = check.literal value(256) : index
+  %error = func.call @rotary_error(%data, %short_positions) : (buffer, index) -> (f64)
   %exact = check.literal value(0.0) : f64
   check.expect.approximate actual(%error) expected(%exact) atol(0.002) rtol(0.0) nan(different) : f64, f64
-  %rounded = func.call @rounded_cosine(%data) : (buffer) -> (i16)
-  %cosine_bits = check.literal value(15463) : i16
-  check.expect.equal actual(%rounded) expected(%cosine_bits) : i16
+  %full_positions = check.literal value(32768) : index
+  %full_error = func.call @rotary_error(%data, %full_positions) : (buffer, index) -> (f64)
+  check.expect.approximate actual(%full_error) expected(%exact) atol(0.0044999999999999997) rtol(0.0) nan(different) : f64, f64
+  %rounded = func.call @rounded_cosine(%data) : (buffer) -> (bf16)
+  %cosine = check.literal value(0.01409912109375) : bf16
+  check.expect.equal actual(%rounded) expected(%cosine) : bf16
   check.return
 }
