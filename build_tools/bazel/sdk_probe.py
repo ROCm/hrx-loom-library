@@ -18,6 +18,7 @@ NATIVE_TOOLS = (
     "loom-benchmark",
     "loom-compile",
     "loom-format",
+    "loom-import-cxx",
     "loom-link",
     "loom-serve",
     "loom-test",
