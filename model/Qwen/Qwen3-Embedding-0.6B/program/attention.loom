@@ -1,14 +1,24 @@
 // Copyright 2026 AMD ROCm™ Software
 // SPDX-License-Identifier: MIT
 
-// Resident compensated-BF16 attention for a 256-slot cohort. Each query/value
-// pair retains one 128-query panel and visits four 64-token K/V windows. The
-// channel protocol owns operand credits; paired workers exchange probabilities
-// and result tiles. Sequence IDs mask cross-request attention. Online maxima
-// and sums use BF16 storage; F32 output accumulators span K/V windows.
+func.def inline @qwen3_embedding.write_attention_checkpoint(%values: view<128xbf16>, %output: buffer, %checkpoint_base: offset, %panel_offset: offset, %panel_wave: index) {
+  %checkpoint_bytes = index.constant 256 : offset
+  %half_offset = index.scale %panel_wave, %checkpoint_bytes : index, offset -> offset
+  %base = index.add %checkpoint_base, %panel_offset : offset
+  %address = index.add %base, %half_offset : offset
+  %external = buffer.view %output[%address] : buffer -> view<128xbf16>
+  %copy = kernel.async.copy %values to %external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<128xbf16> to view<128xbf16> -> kernel.async.token
+  %group = kernel.async.group %copy : kernel.async.token -> kernel.async.group
+  kernel.async.wait %group {newer_groups = 0} : kernel.async.group
+  func.return
+}
+
+// Each paired worker processes 32 queries against retained 64-key records.
+// F32 sums and context survive every key block and finite window; completed
+// attention is narrowed to BF16 only after normalization. Sequence identities
+// and positions preserve causal isolation across requests and panel boundaries.
 // Dense-block packing and the callable arithmetic leaves share tile storage
 // with the dense phases, whose completion precedes attention entry.
-
 aie2p.target<core> @qwen3_embedding.packed_core
 
 func.decl inline @qwen3_embedding.identity(%output: view<8x8xbf16>)
@@ -73,14 +83,30 @@ func.decl inline @bfp16ebs8.pack_bf16_aie2p(%storage: buffer, %input: offset, %o
 
 func.decl inline @bfp16ebs8.pack_bf16_residual_aie2p(%storage: buffer, %input: offset, %output: offset, %identity: offset, %count: i32)
 
-// Softmax uses the native approximate exponential; the complete embedding is
-// qualified against the publisher's F32 output, including cross-window reuse.
+// Samples half a base-two interval apart reduce the native exponential's
+// interpolation bias. An unchanged maximum must preserve all earlier keys:
+// return exactly one at zero without changing the approximation elsewhere.
+// Prepared differences exclude NaNs; masked lanes retain negative infinity.
 func.def inline @qwen3_embedding.attention_exp(%input: vector<16xf32>) -> (vector<16xf32>) {
-  %result = vector.expf<afn> %input : vector<16xf32>
+  %half_log_two = vector.splatf 0.34657359027997264 : vector<16xf32>
+  %shifted = vector.addf<nnan|nsz> %input, %half_log_two : vector<16xf32>
+  %first = vector.expf<nnan|afn> %input : vector<16xf32>
+  %second = vector.expf<nnan|afn> %shifted : vector<16xf32>
+  %first_narrow = vector.fptrunc<daz> %first : vector<16xf32> to vector<16xbf16>
+  %second_narrow = vector.fptrunc<daz> %second : vector<16xf32> to vector<16xbf16>
+  %parts = vector.interleave<0> %first_narrow, %second_narrow : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %first_scale = vector.splatf 0.484375 : vector<16xbf16>
+  %second_scale = vector.splatf 0.34375 : vector<16xbf16>
+  %scales = vector.interleave<0> %first_scale, %second_scale : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %initial_product = vector.splatf 0.0 : vector<16xf32>
+  %product = vector.dot2f %parts, %scales, %initial_product : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+  %unchanged = vector.cmpf oeq, %input, %initial_product : vector<16xf32> -> vector<16xi1>
+  %identity = vector.splatf 1.0 : vector<16xf32>
+  %result = vector.select %unchanged, %identity, %product : vector<16xf32>
   func.return %result : vector<16xf32>
 }
 
-func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurrence_prepare_row(%workspace: buffer, %query: index) where [range(%query, 0, 63)] {
+func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurrence_prepare_row(%workspace: buffer, %query: index, %query_base: index, %key_base: index) -> (f32) where [range(%query, 0, 31)] {
   // The array supplies its 64-byte-aligned tile workspace.
   %storage = buffer.assume.alignment %workspace {minimum_alignment = 64} : buffer
 
@@ -89,11 +115,11 @@ func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurren
   %running_sum_offset = index.constant 19200 : offset
   %old_scale_offset = index.constant 19328 : offset
   %inverse_sum_offset = index.constant 19456 : offset
-  %matrix = buffer.view %storage[%matrix_offset] : buffer -> view<64x64xbf16>
-  %running_maxima = buffer.view %storage[%running_maximum_offset] : buffer -> view<64xbf16>
-  %running_sums = buffer.view %storage[%running_sum_offset] : buffer -> view<64xbf16>
-  %old_scales = buffer.view %storage[%old_scale_offset] : buffer -> view<64xbf16>
-  %inverse_sums = buffer.view %storage[%inverse_sum_offset] : buffer -> view<64xbf16>
+  %matrix = buffer.view %storage[%matrix_offset] : buffer -> view<32x64xbf16>
+  %running_maxima = buffer.view %storage[%running_maximum_offset] : buffer -> view<32xbf16>
+  %running_sums = buffer.view %storage[%running_sum_offset] : buffer -> view<32xf32>
+  %old_scales = buffer.view %storage[%old_scale_offset] : buffer -> view<32xbf16>
+  %inverse_sums = buffer.view %storage[%inverse_sum_offset] : buffer -> view<32xbf16>
   %c0_0_2 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c16 = index.constant 16 : index
@@ -103,27 +129,21 @@ func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurren
   %integer_zero = scalar.constant 0 : i32
   %integer_one = scalar.constant 1 : i32
   %factor = scalar.constant 0.088388347648318433 : f32
-  %negative_infinity = scalar.constant -inf : f32
+  %negative_infinity = scalar.constant -inf : bf16
   %c0_vector = vector.splatf 0.0 : vector<16xf32>
   %narrow_zeros = vector.splatf 0.0 : vector<16xbf16>
   %c1_vector = vector.splatf 1.0 : vector<16xf32>
   %infinities = vector.splatf -inf : vector<16xf32>
   %lanes = vector.iota %integer_zero step %integer_one : vector<16xi32>
 
-  %maxima = scf.for %position = [%c0_0_2 to %c64 step %c16](%maximum = %infinities : vector<16xf32>) -> (vector<16xf32>) {
-    %input = vector.load %matrix[%query, %position] : view<64x64xbf16> -> vector<16xbf16>
-    %wide = vector.extf<daz> %input : vector<16xbf16> to vector<16xf32>
-    %next = vector.maxnumf<nnan|nsz> %maximum, %wide : vector<16xf32>
-    scf.yield %next : vector<16xf32>
-  }
-  %block_maximum = vector.reduce<maxnumf, reassoc|nnan|nsz> %maxima, %negative_infinity : vector<16xf32>, f32
-  %old_maximum_narrow = view.load %running_maxima[%query] : view<64xbf16> -> bf16
+  %maxima = func.call @qwen3_embedding.recurrence_mask_row(%workspace, %query_base, %key_base, %query) : (buffer, index, index, index) -> (vector<16xbf16>)
+  %block_maximum_narrow = vector.reduce<maxnumf, reassoc|nnan|nsz> %maxima, %negative_infinity : vector<16xbf16>, bf16
+  %block_maximum = scalar.extf<daz> %block_maximum_narrow : bf16 to f32
+  %old_maximum_narrow = view.load %running_maxima[%query] : view<32xbf16> -> bf16
   %old_maximum = scalar.extf<daz> %old_maximum_narrow : bf16 to f32
   %old_maximum_values = vector.splat %old_maximum : vector<16xf32>
-  %old_sum_narrow = view.load %running_sums[%query] : view<64xbf16> -> bf16
-  %old_sum = scalar.extf<daz> %old_sum_narrow : bf16 to f32
+  %old_sum = view.load %running_sums[%query] : view<32xf32> -> f32
   %old_sum_values = vector.splat %old_sum : vector<16xf32>
-  %old_sum_narrow_values = vector.splat %old_sum_narrow : vector<16xbf16>
   %block_maximum_values = vector.splat %block_maximum : vector<16xf32>
   %block_present = vector.cmpf ogt, %block_maximum_values, %infinities : vector<16xf32> -> vector<16xi1>
   %empty_maximum = vector.select %block_present, %block_maximum_values, %c0_vector : vector<16xf32>
@@ -136,15 +156,15 @@ func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurren
   vector.store %old_delta, %scratch[0] : vector<16xf32>, view<80xf32>
   %next_maximum_narrow_values = vector.fptrunc<daz> %next_maximum_values : vector<16xf32> to vector<16xbf16>
   %next_maximum_narrow = vector.extract %next_maximum_narrow_values[0] : vector<16xbf16> -> bf16
-  view.store %next_maximum_narrow, %running_maxima[%query] : bf16, view<64xbf16>
+  view.store %next_maximum_narrow, %running_maxima[%query] : bf16, view<32xbf16>
   scf.for %position = [%c0_0_2 to %c64 step %c16] {
-    %input = vector.load %matrix[%query, %position] : view<64x64xbf16> -> vector<16xbf16>
+    %input = vector.load %matrix[%query, %position] : view<32x64xbf16> -> vector<16xbf16>
     %wide = vector.extf<daz> %input : vector<16xbf16> to vector<16xf32>
     %shifted = vector.subf<nnan|nsz> %wide, %next_maximum_values : vector<16xf32>
     %output_position = index.add %position, %c16 : index
     vector.store %shifted, %scratch[%output_position] : vector<16xf32>, view<80xf32>
   }
-  func.return
+  func.return %old_sum : f32
 }
 
 func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurrence_exp_row(%workspace: buffer) {
@@ -155,15 +175,19 @@ func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurren
   %step = index.constant 16 : index
   %scratch_offset = index.constant 19968 : offset
   %scratch = buffer.view %storage[%scratch_offset] : buffer -> view<80xf32>
+  %rounded = buffer.view %storage[%scratch_offset] : buffer -> view<80xbf16>
+  // Ascending packets compact into already-consumed input bytes. The next
+  // packet's F32 input remains untouched until its load completes.
   scf.for %position = [%begin to %end step %step] {
     %input = vector.load %scratch[%position] : view<80xf32> -> vector<16xf32>
     %exponent = func.call @qwen3_embedding.attention_exp(%input) : (vector<16xf32>) -> (vector<16xf32>)
-    vector.store %exponent, %scratch[%position] : vector<16xf32>, view<80xf32>
+    %narrow = vector.fptrunc<daz> %exponent : vector<16xf32> to vector<16xbf16>
+    vector.store %narrow, %rounded[%position] : vector<16xbf16>, view<80xbf16>
   }
   func.return
 }
 
-func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurrence_finish_row(%workspace: buffer, %query: index) where [range(%query, 0, 63)] {
+func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurrence_finish_row(%workspace: buffer, %query: index, %old_sum: f32) where [range(%query, 0, 31)] {
   // The array supplies its 64-byte-aligned tile workspace.
   %storage = buffer.assume.alignment %workspace {minimum_alignment = 64} : buffer
   %begin = index.constant 0 : index
@@ -174,33 +198,28 @@ func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurren
   %scale_offset = index.constant 19328 : offset
   %inverse_offset = index.constant 19456 : offset
   %scratch_offset = index.constant 19968 : offset
-  %matrix = buffer.view %storage[%matrix_offset] : buffer -> view<64x64xbf16>
-  %running_sums = buffer.view %storage[%sum_offset] : buffer -> view<64xbf16>
-  %scales = buffer.view %storage[%scale_offset] : buffer -> view<64xbf16>
-  %inverses = buffer.view %storage[%inverse_offset] : buffer -> view<64xbf16>
-  %scratch = buffer.view %storage[%scratch_offset] : buffer -> view<80xf32>
+  %matrix = buffer.view %storage[%matrix_offset] : buffer -> view<32x64xbf16>
+  %running_sums = buffer.view %storage[%sum_offset] : buffer -> view<32xf32>
+  %scales = buffer.view %storage[%scale_offset] : buffer -> view<32xbf16>
+  %inverses = buffer.view %storage[%inverse_offset] : buffer -> view<32xbf16>
+  %scratch = buffer.view %storage[%scratch_offset] : buffer -> view<80xbf16>
   %c0_vector = vector.splatf 0.0 : vector<16xf32>
   %narrow_zeros = vector.splatf 0.0 : vector<16xbf16>
   %c1_vector = vector.splatf 1.0 : vector<16xf32>
   %c0_value = scalar.constant 0.0 : f32
   %c1_value = scalar.constant 1.0 : f32
-  %old_sum = view.load %running_sums[%query] : view<64xbf16> -> bf16
-  %old_sum_values = vector.splat %old_sum : vector<16xbf16>
-  %old_sum_wide = vector.extf<daz> %old_sum_values : vector<16xbf16> to vector<16xf32>
+  %old_sum_wide = vector.splat %old_sum : vector<16xf32>
   %old_present = vector.cmpf ogt, %old_sum_wide, %c0_vector : vector<16xf32> -> vector<16xi1>
-  %candidate_scale = vector.load %scratch[0] : view<80xf32> -> vector<16xf32>
-  %scale = vector.select %old_present, %candidate_scale, %c0_vector : vector<16xf32>
-  %scale_values = vector.fptrunc<daz> %scale : vector<16xf32> to vector<16xbf16>
+  %candidate_scale = vector.load %scratch[0] : view<80xbf16> -> vector<16xbf16>
+  %scale_values = vector.select %old_present, %candidate_scale, %narrow_zeros : vector<16xbf16>
   %scale_value = vector.extract %scale_values[0] : vector<16xbf16> -> bf16
-  view.store %scale_value, %scales[%query] : bf16, view<64xbf16>
-  %old_sum_pairs = vector.interleave<0> %old_sum_values, %narrow_zeros : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %scale_pairs = vector.interleave<0> %scale_values, %narrow_zeros : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %rescaled_sum = vector.dot2f %old_sum_pairs, %scale_pairs, %c0_vector : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+  view.store %scale_value, %scales[%query] : bf16, view<32xbf16>
+  %rescaled_sum = func.call @attention_scale16(%old_sum_wide, %scale_values) : (vector<16xf32>, vector<16xbf16>) -> (vector<16xf32>)
   %sums = scf.for %position = [%begin to %end step %step](%sum = %c0_vector : vector<16xf32>) -> (vector<16xf32>) {
     %source_position = index.add %position, %step : index
-    %exponent = vector.load %scratch[%source_position] : view<80xf32> -> vector<16xf32>
-    %narrow = vector.fptrunc<daz> %exponent : vector<16xf32> to vector<16xbf16>
-    vector.store %narrow, %matrix[%query, %position] : vector<16xbf16>, view<64x64xbf16>
+    %narrow = vector.load %scratch[%source_position] : view<80xbf16> -> vector<16xbf16>
+    %exponent = vector.extf<daz> %narrow : vector<16xbf16> to vector<16xf32>
+    vector.store %narrow, %matrix[%query, %position] : vector<16xbf16>, view<32x64xbf16>
     %next = vector.addf<reassoc|nnan|ninf|nsz> %sum, %exponent : vector<16xf32>
     scf.yield %next : vector<16xf32>
   }
@@ -210,18 +229,15 @@ func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurren
   %sum_present = vector.cmpf ogt, %next_sum, %c0_vector : vector<16xf32> -> vector<16xi1>
   %denominators = vector.select %sum_present, %next_sum, %c1_vector : vector<16xf32>
   %denominator = vector.extract %denominators[0] : vector<16xf32> -> f32
-  %inverse = scalar.divf<arcp> %c1_value, %denominator : f32
-  %inverse_values = vector.insert %inverse into %denominators[0] : f32, vector<16xf32>
-  %inverse_narrow_values = vector.fptrunc<daz> %inverse_values : vector<16xf32> to vector<16xbf16>
-  %inverse_narrow = vector.extract %inverse_narrow_values[0] : vector<16xbf16> -> bf16
-  %sum_narrow_values = vector.fptrunc<daz> %next_sum : vector<16xf32> to vector<16xbf16>
-  %sum_narrow = vector.extract %sum_narrow_values[0] : vector<16xbf16> -> bf16
-  view.store %sum_narrow, %running_sums[%query] : bf16, view<64xbf16>
-  view.store %inverse_narrow, %inverses[%query] : bf16, view<64xbf16>
+  %inverse = scalar.divf<nnan|arcp> %c1_value, %denominator : f32
+  %inverse_narrow = scalar.fptrunc<daz> %inverse : f32 to bf16
+  %sum_value = vector.extract %next_sum[0] : vector<16xf32> -> f32
+  view.store %sum_value, %running_sums[%query] : f32, view<32xf32>
+  view.store %inverse_narrow, %inverses[%query] : bf16, view<32xbf16>
   func.return
 }
 
-func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_score64(%workspace: buffer, %left_high: offset, %left_low: offset, %output_offset: offset, %output_row_base: index) where [range(%output_row_base, 0, 32)] {
+func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_score64(%workspace: buffer, %left_high: offset, %left_low: offset, %output_offset: offset, %output_row_base: index) where [range(%output_row_base, 0, 0)] {
   // The array supplies its 64-byte-aligned tile workspace.
   %storage = buffer.assume.alignment %workspace {minimum_alignment = 64} : buffer
   %begin = index.constant 0 : index
@@ -248,7 +264,7 @@ func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_s
     %partial_tile2 = view.bitcast %partial_span2 : view<1x64xf32> -> view<8x8xf32>
     %partial_span3 = view.subview %partials[3, 0] : view<4x64xf32> -> view<1x64xf32>
     %partial_tile3 = view.bitcast %partial_span3 : view<1x64xf32> -> view<8x8xf32>
-    %product_count = index.constant 2 : index
+    %product_count = index.constant 3 : index
     %second_product = index.constant 2 : index
     %product0, %product1, %product2, %product3 = scf.for %product_phase = [%begin to %product_count step %c1](%accumulator0 = %initial : vector<64xf32>, %accumulator1 = %initial : vector<64xf32>, %accumulator2 = %initial : vector<64xf32>, %accumulator3 = %initial : vector<64xf32>) -> (vector<64xf32>, vector<64xf32>, vector<64xf32>, vector<64xf32>) {
       %left_residual_product = index.cmp eq, %product_phase, %second_product : index
@@ -272,28 +288,16 @@ func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_s
       %narrow = vector.bitcast %flat : vector<64xbf16> to vector<8x8xbf16>
       %transposed = vector.transpose<[1, 0]> %narrow : vector<8x8xbf16> -> vector<8x8xbf16>
       %output_tile = view.subview %output[%output_result_base, %column] : view<64x64xbf16, #encoding.layout.strided<strides=[64, 1]>> -> view<8x8xbf16, #encoding.layout.strided<strides=[64, 1]>>
-      %values0 = vector.extract %transposed[0] : vector<8x8xbf16> -> vector<8xbf16>
-      vector.store %values0, %output_tile[0, 0] : vector<8xbf16>, view<8x8xbf16, #encoding.layout.strided<strides=[64, 1]>>
-      %values1 = vector.extract %transposed[1] : vector<8x8xbf16> -> vector<8xbf16>
-      vector.store %values1, %output_tile[1, 0] : vector<8xbf16>, view<8x8xbf16, #encoding.layout.strided<strides=[64, 1]>>
-      %values2 = vector.extract %transposed[2] : vector<8x8xbf16> -> vector<8xbf16>
-      vector.store %values2, %output_tile[2, 0] : vector<8xbf16>, view<8x8xbf16, #encoding.layout.strided<strides=[64, 1]>>
-      %values3 = vector.extract %transposed[3] : vector<8x8xbf16> -> vector<8xbf16>
-      vector.store %values3, %output_tile[3, 0] : vector<8xbf16>, view<8x8xbf16, #encoding.layout.strided<strides=[64, 1]>>
-      %values4 = vector.extract %transposed[4] : vector<8x8xbf16> -> vector<8xbf16>
-      vector.store %values4, %output_tile[4, 0] : vector<8xbf16>, view<8x8xbf16, #encoding.layout.strided<strides=[64, 1]>>
-      %values5 = vector.extract %transposed[5] : vector<8x8xbf16> -> vector<8xbf16>
-      vector.store %values5, %output_tile[5, 0] : vector<8xbf16>, view<8x8xbf16, #encoding.layout.strided<strides=[64, 1]>>
-      %values6 = vector.extract %transposed[6] : vector<8x8xbf16> -> vector<8xbf16>
-      vector.store %values6, %output_tile[6, 0] : vector<8xbf16>, view<8x8xbf16, #encoding.layout.strided<strides=[64, 1]>>
-      %values7 = vector.extract %transposed[7] : vector<8x8xbf16> -> vector<8xbf16>
-      vector.store %values7, %output_tile[7, 0] : vector<8xbf16>, view<8x8xbf16, #encoding.layout.strided<strides=[64, 1]>>
+      scf.for %output_row = [%begin to %c8 step %c1] {
+        %values = vector.extract %transposed[%output_row] : vector<8x8xbf16> -> vector<8xbf16>
+        vector.store %values, %output_tile[%output_row, 0] : vector<8xbf16>, view<8x8xbf16, #encoding.layout.strided<strides=[64, 1]>>
+      }
     }
   }
   func.return
 }
 
-func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_value_half(%workspace: buffer, %half: index, %previous: i1) where [range(%half, 0, 1)] {
+func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_value(%workspace: buffer, %previous: i1) {
   // The array supplies its 64-byte-aligned tile workspace.
   %storage = buffer.assume.alignment %workspace {minimum_alignment = 64} : buffer
   %c0 = index.constant 0 : index
@@ -318,70 +322,28 @@ func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_v
   %pack_count = scalar.constant 32 : i32
   %probabilities = buffer.view %storage[%probability_offset] : buffer -> view<64x64xbf16>
   %blocked = buffer.view %storage[%blocked_offset] : buffer -> view<2048xbf16>
-  %row_base = index.mul %half, %c32 : index
+  %row_base = index.constant 0 : index
   scf.for %reduction = [%c0 to %c8 step %c1] {
     %column = index.mul %reduction, %c8 : index
     scf.for %block = [%c0 to %c4 step %c1] {
       %tile = index.madd %reduction, %c4, %block : index
       %tile_base = index.mul %tile, %c64 : index
       %block_row = index.madd %block, %c8, %row_base : index
-      %lane0 = index.constant 0 : index
-      %row0 = index.add %block_row, %lane0 : index
-      %values0 = vector.load %probabilities[%row0, %column] : view<64x64xbf16> -> vector<8xbf16>
-      %lane1 = index.constant 1 : index
-      %row1 = index.add %block_row, %lane1 : index
-      %values1 = vector.load %probabilities[%row1, %column] : view<64x64xbf16> -> vector<8xbf16>
-      %lane2 = index.constant 2 : index
-      %row2 = index.add %block_row, %lane2 : index
-      %values2 = vector.load %probabilities[%row2, %column] : view<64x64xbf16> -> vector<8xbf16>
-      %lane3 = index.constant 3 : index
-      %row3 = index.add %block_row, %lane3 : index
-      %values3 = vector.load %probabilities[%row3, %column] : view<64x64xbf16> -> vector<8xbf16>
-      %lane4 = index.constant 4 : index
-      %row4 = index.add %block_row, %lane4 : index
-      %values4 = vector.load %probabilities[%row4, %column] : view<64x64xbf16> -> vector<8xbf16>
-      %lane5 = index.constant 5 : index
-      %row5 = index.add %block_row, %lane5 : index
-      %values5 = vector.load %probabilities[%row5, %column] : view<64x64xbf16> -> vector<8xbf16>
-      %lane6 = index.constant 6 : index
-      %row6 = index.add %block_row, %lane6 : index
-      %values6 = vector.load %probabilities[%row6, %column] : view<64x64xbf16> -> vector<8xbf16>
-      %lane7 = index.constant 7 : index
-      %row7 = index.add %block_row, %lane7 : index
-      %values7 = vector.load %probabilities[%row7, %column] : view<64x64xbf16> -> vector<8xbf16>
-      %probability_join8_0 = vector.concat<0> %values0, %values1 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
-      %probability_join8_2 = vector.concat<0> %values2, %values3 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
-      %probability_join8_4 = vector.concat<0> %values4, %values5 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
-      %probability_join8_6 = vector.concat<0> %values6, %values7 : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
-      %probability_join16_0 = vector.concat<0> %probability_join8_0, %probability_join8_2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-      %probability_join16_2 = vector.concat<0> %probability_join8_4, %probability_join8_6 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-      %probability_join32_0 = vector.concat<0> %probability_join16_0, %probability_join16_2 : vector<32xbf16>, vector<32xbf16> -> vector<64xbf16>
-      vector.store %probability_join32_0, %blocked[%tile_base] : vector<64xbf16>, view<2048xbf16>
+      scf.for %row = [%c0 to %c8 step %c1] {
+        %source_row = index.add %block_row, %row : index
+        %destination = index.madd %row, %c8, %tile_base : index
+        %values = vector.load %probabilities[%source_row, %column] : view<64x64xbf16> -> vector<8xbf16>
+        vector.store %values, %blocked[%destination] : vector<8xbf16>, view<2048xbf16>
+      }
     }
   }
   func.call @bfp16ebs8.pack_bf16_aie2p(%storage, %blocked_offset, %probability_high, %pack_count) : (buffer, offset, offset, i32)
   func.call @bfp16ebs8.pack_bf16_residual_aie2p(%storage, %blocked_offset, %probability_low, %identity_offset, %pack_count) : (buffer, offset, offset, offset, i32)
-  %context_relative = index.scale %half, %half_bytes : index, offset -> offset
-  %context_offset = index.add %context_initial, %context_relative : offset
-  %context = buffer.view %storage[%context_offset] : buffer -> view<16x4x8x8xbf16>
-  %scales = buffer.view %storage[%scale_offset] : buffer -> view<64xbf16>
-  %scale_context = view.bitcast %context : view<16x4x8x8xbf16> -> view<16x4x64xbf16>
-  %c0_vector = vector.splatf 0.0 : vector<8xf32>
-  %narrow_zeros = vector.splatf 0.0 : vector<8xbf16>
-  scf.if %previous {
-    scf.for %block = [%c0 to %c4 step %c1] {
-      %scale_row = index.madd %block, %c8, %row_base : index
-      %scale = vector.load %scales[%scale_row] : view<64xbf16> -> vector<8xbf16>
-      %scale_pairs = vector.interleave<0> %scale, %narrow_zeros : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
-      scf.for %panel = [%c0 to %c16 step %c1] {
-        %tile_values = vector.load %scale_context[%panel, %block, 0] : view<16x4x64xbf16> -> vector<64xbf16>
-        %scaled_tile = func.call @attention_scale_tile(%tile_values, %scale) : (vector<64xbf16>, vector<8xbf16>) -> (vector<64xbf16>)
-        vector.store %scaled_tile, %scale_context[%panel, %block, 0] : vector<64xbf16>, view<16x4x64xbf16>
-      }
-    }
-  }
+  %context_offset = index.constant 27008 : offset
+  %context = buffer.view %storage[%context_offset] : buffer -> view<16x4x8x8xf32>
+  %scales = buffer.view %storage[%scale_offset] : buffer -> view<32xbf16>
   %partials = buffer.view %storage[%partial_offset] : buffer -> view<4x64xf32>
-  %context_flat = view.bitcast %context : view<16x4x8x8xbf16> -> view<16x4x64xbf16>
+  %context_flat = view.bitcast %context : view<16x4x8x8xf32> -> view<16x4x64xf32>
   %wide_zeros = vector.splatf 0.0 : vector<64xf32>
   %initial = vector.fragment<init> %wide_zeros shape [%c8, %c8] : vector<64xf32>
 
@@ -411,61 +373,72 @@ func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_v
     vector.fragment.store<result> %product2, %tile2[0, 0] shape [%c8, %c8] : vector<64xf32>, view<8x8xf32>
     vector.fragment.store<result> %product3, %tile3[0, 0] shape [%c8, %c8] : vector<64xf32>, view<8x8xf32>
     scf.for %block = [%c0 to %c4 step %c1] {
-      %product = vector.load %partials[%block, 0] : view<4x64xf32> -> vector<64xf32>
-      %combined = scf.if %previous -> (vector<64xf32>) {
-        %old = vector.load %context_flat[%panel, %block, 0] : view<16x4x64xbf16> -> vector<64xbf16>
-        %wide = vector.extf<daz> %old : vector<64xbf16> to vector<64xf32>
-        %sum = vector.addf<nnan|ninf|nsz> %product, %wide : vector<64xf32>
-        scf.yield %sum : vector<64xf32>
-      } else {
-        scf.yield %product : vector<64xf32>
+      scf.for %packet = [%c0 to %c64 step %c16] {
+        %product = vector.load %partials[%block, %packet] : view<4x64xf32> -> vector<16xf32>
+        %combined = scf.if %previous -> (vector<16xf32>) {
+          %old = vector.load %context_flat[%panel, %block, %packet] : view<16x4x64xf32> -> vector<16xf32>
+          %scale_row = index.madd %block, %c8, %row_base : index
+          %scale = vector.load %scales[%scale_row] : view<32xbf16> -> vector<8xbf16>
+          %scale_packet = vector.concat<0> %scale, %scale : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
+          %scaled = func.call @attention_scale16(%old, %scale_packet) : (vector<16xf32>, vector<16xbf16>) -> (vector<16xf32>)
+          %sum = vector.addf<nnan|ninf|nsz> %product, %scaled : vector<16xf32>
+          scf.yield %sum : vector<16xf32>
+        } else {
+          scf.yield %product : vector<16xf32>
+        }
+        vector.store %combined, %context_flat[%panel, %block, %packet] : vector<16xf32>, view<16x4x64xf32>
       }
-      %result = vector.fptrunc<daz> %combined : vector<64xf32> to vector<64xbf16>
-      vector.store %result, %context_flat[%panel, %block, 0] : vector<64xbf16>, view<16x4x64xbf16>
     }
   }
   func.return
 }
 
-func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_value_result(%workspace: buffer, %half: index, %destination: view<4096xbf16>) where [range(%half, 0, 1)] {
-  // The array supplies its 64-byte-aligned tile workspace.
+func.def noinline @qwen3_embedding.online_value_result(%workspace: buffer, %half: index, %destination: view<4096xbf16>, %normalize: i1) where [range(%half, 0, 1)] {
   %storage = buffer.assume.alignment %workspace {minimum_alignment = 64} : buffer
-  %c0 = index.constant 0 : index
-  %c1 = index.constant 1 : index
-  %c4 = index.constant 4 : index
-  %c8 = index.constant 8 : index
-  %c16 = index.constant 16 : index
-  %c32 = index.constant 32 : index
-  %context_initial = index.constant 27008 : offset
-  %half_bytes = index.constant 8192 : offset
-  %inverse_offset = index.constant 62976 : offset
-  %relative = index.scale %half, %half_bytes : index, offset -> offset
-  %offset = index.add %context_initial, %relative : offset
-  %context = buffer.view %storage[%offset] : buffer -> view<16x4x8x8xbf16>
-  %output = view.bitcast %destination : view<4096xbf16> -> view<16x4x8x8xbf16>
-  %inverses = buffer.view %storage[%inverse_offset] : buffer -> view<64xbf16>
-  %row_base = index.mul %half, %c32 : index
-  %scale_context = view.bitcast %context : view<16x4x8x8xbf16> -> view<16x4x64xbf16>
-  %scale_output = view.bitcast %output : view<16x4x8x8xbf16> -> view<16x4x64xbf16>
-  %c0_vector = vector.splatf 0.0 : vector<8xf32>
-  %narrow_zeros = vector.splatf 0.0 : vector<8xbf16>
-  scf.for %block = [%c0 to %c4 step %c1] {
-    %row = index.madd %block, %c8, %row_base : index
-    %scale = vector.load %inverses[%row] : view<64xbf16> -> vector<8xbf16>
-    %scale_pairs = vector.interleave<0> %scale, %narrow_zeros : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
-    scf.for %panel = [%c0 to %c16 step %c1] {
-      %tile_values = vector.load %scale_context[%panel, %block, 0] : view<16x4x64xbf16> -> vector<64xbf16>
-      %scaled_tile = func.call @attention_scale_tile(%tile_values, %scale) : (vector<64xbf16>, vector<8xbf16>) -> (vector<64xbf16>)
-      %scaled_matrix = vector.bitcast %scaled_tile : vector<64xbf16> to vector<8x8xbf16>
-      %transposed_matrix = vector.transpose<[1, 0]> %scaled_matrix : vector<8x8xbf16> -> vector<8x8xbf16>
-      %transposed_tile = vector.bitcast %transposed_matrix : vector<8x8xbf16> to vector<64xbf16>
-      vector.store %transposed_tile, %scale_output[%panel, %block, 0] : vector<64xbf16>, view<16x4x64xbf16>
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %block_count = index.constant 4 : index
+  %rows_per_block = index.constant 8 : index
+  %packet_width = index.constant 16 : index
+  %panel_elements = index.constant 64 : index
+  %context_offset = index.constant 27008 : offset
+  scf.if %normalize {
+    %first = index.cmp eq, %half, %begin : index
+    scf.if %first {
+      %context = buffer.view %storage[%context_offset] : buffer -> view<16x4x64xf32>
+      %inverse_offset = index.constant 62976 : offset
+      %inverses = buffer.view %storage[%inverse_offset] : buffer -> view<32xbf16>
+      %output = view.bitcast %destination : view<4096xbf16> -> view<16x4x64xbf16>
+      scf.for %block = [%begin to %block_count step %step] {
+        %row = index.mul %block, %rows_per_block : index
+        %scale = vector.load %inverses[%row] : view<32xbf16> -> vector<8xbf16>
+        scf.for %panel = [%begin to %packet_width step %step] {
+          %scale_packet = vector.concat<0> %scale, %scale : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
+          scf.for %packet = [%begin to %panel_elements step %packet_width] {
+            %input = vector.load %context[%panel, %block, %packet] : view<16x4x64xf32> -> vector<16xf32>
+            %scaled = func.call @attention_scale16(%input, %scale_packet) : (vector<16xf32>, vector<16xbf16>) -> (vector<16xf32>)
+            %part = vector.fptrunc<daz> %scaled : vector<16xf32> to vector<16xbf16>
+            vector.store %part, %output[%panel, %block, %packet] : vector<16xbf16>, view<16x4x64xbf16>
+          }
+          %narrow = vector.load %output[%panel, %block, 0] : view<16x4x64xbf16> -> vector<64xbf16>
+          %matrix = vector.bitcast %narrow : vector<64xbf16> to vector<8x8xbf16>
+          %transposed = vector.transpose<[1, 0]> %matrix : vector<8x8xbf16> -> vector<8x8xbf16>
+          %values = vector.bitcast %transposed : vector<8x8xbf16> to vector<64xbf16>
+          vector.store %values, %output[%panel, %block, 0] : vector<64xbf16>, view<16x4x64xbf16>
+        }
+      }
     }
+  } else {
+    %half_bytes = index.constant 8192 : offset
+    %relative = index.scale %half, %half_bytes : index, offset -> offset
+    %address = index.add %context_offset, %relative : offset
+    %bits = buffer.view %storage[%address] : buffer -> view<4096xbf16>
+    func.call @qwen3_embedding.copy_output(%bits, %destination) : (view<4096xbf16>, view<4096xbf16>)
   }
   func.return
 }
 
-func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_mask64(%workspace: buffer, %query_base: index, %key_base: index) {
+func.def inline target(@qwen3_embedding.packed_core) @qwen3_embedding.recurrence_mask_row(%workspace: buffer, %query_base: index, %key_base: index, %query: index) -> (vector<16xbf16>) where [range(%query, 0, 31)] {
   // The array supplies its 64-byte-aligned tile workspace.
   %storage = buffer.assume.alignment %workspace {minimum_alignment = 64} : buffer
   %matrix_offset = index.constant 0 : offset
@@ -475,13 +448,13 @@ func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_m
   %inverse_sum_offset = index.constant 19456 : offset
   %query_sequence_offset = index.constant 18816 : offset
   %key_sequence_offset = index.constant 19584 : offset
-  %matrix = buffer.view %storage[%matrix_offset] : buffer -> view<64x64xbf16>
-  %query_sequences = buffer.view %storage[%query_sequence_offset] : buffer -> view<64xi32>
+  %matrix = buffer.view %storage[%matrix_offset] : buffer -> view<32x64xbf16>
+  %query_sequences = buffer.view %storage[%query_sequence_offset] : buffer -> view<32xi32>
   %key_sequences = buffer.view %storage[%key_sequence_offset] : buffer -> view<64xi32>
-  %running_maxima = buffer.view %storage[%running_maximum_offset] : buffer -> view<64xbf16>
-  %running_sums = buffer.view %storage[%running_sum_offset] : buffer -> view<64xbf16>
-  %old_scales = buffer.view %storage[%old_scale_offset] : buffer -> view<64xbf16>
-  %inverse_sums = buffer.view %storage[%inverse_sum_offset] : buffer -> view<64xbf16>
+  %running_maxima = buffer.view %storage[%running_maximum_offset] : buffer -> view<32xbf16>
+  %running_sums = buffer.view %storage[%running_sum_offset] : buffer -> view<32xf32>
+  %old_scales = buffer.view %storage[%old_scale_offset] : buffer -> view<32xbf16>
+  %inverse_sums = buffer.view %storage[%inverse_sum_offset] : buffer -> view<32xbf16>
   %c0_value = index.constant 0 : index
   %c1_value = index.constant 1 : index
   %c16_index = index.constant 16 : index
@@ -495,95 +468,76 @@ func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_m
   %c0_vector = vector.splatf 0.0 : vector<16xf32>
   %narrow_zeros = vector.splatf 0.0 : vector<16xbf16>
   %c1_vector = vector.splatf 1.0 : vector<16xf32>
-  %infinities = vector.splatf -inf : vector<16xf32>
+  %infinities = vector.splatf -inf : vector<16xbf16>
   %lanes = vector.iota %integer_zero step %integer_one : vector<16xi32>
-  scf.for %query = [%c0_value to %c64_index step %c1_value] {
-    %absolute_query = index.add %query_base, %query : index
-    %query_sequence = view.load %query_sequences[%query] : view<64xi32> -> i32
-    %valid = scalar.cmpi sge, %query_sequence, %integer_zero : i32
-    %valid_lanes = vector.splat %valid : vector<16xi1>
-    %query_sequence_lanes = vector.splat %query_sequence : vector<16xi32>
-    %query_integer = index.cast %absolute_query : index to i32
-    %query_indices = vector.splat %query_integer : vector<16xi32>
-    %maxima = scf.for %position = [%c0_value to %c64_index step %c16_index](%maximum = %infinities : vector<16xf32>) -> (vector<16xf32>) {
-      %input = vector.load %matrix[%query, %position] : view<64x64xbf16> -> vector<16xbf16>
-      %factor_vector = vector.splat %factor : vector<16xf32>
-      %high = vector.fptrunc<daz> %factor_vector : vector<16xf32> to vector<16xbf16>
-      %high_f32 = vector.extf<daz> %high : vector<16xbf16> to vector<16xf32>
-      %remainder = vector.subf %factor_vector, %high_f32 : vector<16xf32>
-      %middle = vector.fptrunc<daz> %remainder : vector<16xf32> to vector<16xbf16>
-      %middle_f32 = vector.extf<daz> %middle : vector<16xbf16> to vector<16xf32>
-      %tail_f32 = vector.subf %remainder, %middle_f32 : vector<16xf32>
-      %tail = vector.fptrunc<daz> %tail_f32 : vector<16xf32> to vector<16xbf16>
-      %c0_value = vector.splatf 0.0 : vector<16xf32>
-      %narrow_zero = vector.splatf 0.0 : vector<16xbf16>
-      %factor_pair = vector.interleave<0> %high, %middle : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-      %tail_pair = vector.interleave<0> %tail, %narrow_zero : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-      %repeated = vector.interleave<0> %input, %input : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-      %leading = vector.dot2f %repeated, %factor_pair, %c0_value : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
-      %product = vector.dot2f %repeated, %tail_pair, %leading : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
-      %result = vector.fptrunc<daz> %product : vector<16xf32> to vector<16xbf16>
-      %wide = vector.extf<daz> %result : vector<16xbf16> to vector<16xf32>
-      %key_sequence_lanes = vector.load %key_sequences[%position] : view<64xi32> -> vector<16xi32>
-      %same = vector.cmpi eq, %key_sequence_lanes, %query_sequence_lanes : vector<16xi32> -> vector<16xi1>
-      %relative_position = index.add %key_base, %position : index
-      %position_integer = index.cast %relative_position : index to i32
-      %positions = vector.splat %position_integer : vector<16xi32>
-      %keys = vector.addi %positions, %lanes : vector<16xi32>
-      %causal = vector.cmpi ule, %keys, %query_indices : vector<16xi32> -> vector<16xi1>
-      %same_causal = vector.andi %same, %causal : vector<16xi1>
-      %visible = vector.andi %same_causal, %valid_lanes : vector<16xi1>
-      %masked = vector.select %visible, %wide, %infinities : vector<16xf32>
-      %narrow = vector.fptrunc<daz> %masked : vector<16xf32> to vector<16xbf16>
-      vector.store %narrow, %matrix[%query, %position] : vector<16xbf16>, view<64x64xbf16>
-      %next = vector.maxnumf<nnan|nsz> %maximum, %masked : vector<16xf32>
-      scf.yield %next : vector<16xf32>
-    }
+  %query_end = index.constant 32 : index
+  %absolute_query = index.add %query_base, %query : index
+  %query_sequence = view.load %query_sequences[%query] : view<32xi32> -> i32
+  %valid = scalar.cmpi sge, %query_sequence, %integer_zero : i32
+  %valid_lanes = vector.splat %valid : vector<16xi1>
+  %query_sequence_lanes = vector.splat %query_sequence : vector<16xi32>
+  %query_integer = index.cast %absolute_query : index to i32
+  %query_indices = vector.splat %query_integer : vector<16xi32>
+  %maxima = scf.for %position = [%c0_value to %c64_index step %c16_index](%maximum = %infinities : vector<16xbf16>) -> (vector<16xbf16>) {
+    %input = vector.load %matrix[%query, %position] : view<32x64xbf16> -> vector<16xbf16>
+    %factor_vector = vector.splat %factor : vector<16xf32>
+    %high = vector.fptrunc<daz> %factor_vector : vector<16xf32> to vector<16xbf16>
+    %high_f32 = vector.extf<daz> %high : vector<16xbf16> to vector<16xf32>
+    %remainder = vector.subf %factor_vector, %high_f32 : vector<16xf32>
+    %middle = vector.fptrunc<daz> %remainder : vector<16xf32> to vector<16xbf16>
+    %middle_f32 = vector.extf<daz> %middle : vector<16xbf16> to vector<16xf32>
+    %tail_f32 = vector.subf %remainder, %middle_f32 : vector<16xf32>
+    %tail = vector.fptrunc<daz> %tail_f32 : vector<16xf32> to vector<16xbf16>
+    %c0_value = vector.splatf 0.0 : vector<16xf32>
+    %narrow_zero = vector.splatf 0.0 : vector<16xbf16>
+    %factor_pair = vector.interleave<0> %high, %middle : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+    %tail_pair = vector.interleave<0> %tail, %narrow_zero : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+    %repeated = vector.interleave<0> %input, %input : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+    %leading = vector.dot2f %repeated, %factor_pair, %c0_value : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+    %product = vector.dot2f %repeated, %tail_pair, %leading : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+    %result = vector.fptrunc<daz> %product : vector<16xf32> to vector<16xbf16>
+    %key_sequence_lanes = vector.load %key_sequences[%position] : view<64xi32> -> vector<16xi32>
+    %same = vector.cmpi eq, %key_sequence_lanes, %query_sequence_lanes : vector<16xi32> -> vector<16xi1>
+    %relative_position = index.add %key_base, %position : index
+    %position_integer = index.cast %relative_position : index to i32
+    %positions = vector.splat %position_integer : vector<16xi32>
+    %keys = vector.addi %positions, %lanes : vector<16xi32>
+    %causal = vector.cmpi ule, %keys, %query_indices : vector<16xi32> -> vector<16xi1>
+    %same_causal = vector.andi %same, %causal : vector<16xi1>
+    %visible = vector.andi %same_causal, %valid_lanes : vector<16xi1>
+    %masked = vector.select %visible, %result, %infinities : vector<16xbf16>
+    vector.store %masked, %matrix[%query, %position] : vector<16xbf16>, view<32x64xbf16>
+    %next = vector.maxnumf<nnan|nsz> %maximum, %masked : vector<16xbf16>
+    scf.yield %next : vector<16xbf16>
   }
-  func.return
+  func.return %maxima : vector<16xbf16>
 }
 
-func.def inline @qwen3_embedding.online_recurrence64(%storage: buffer) {
+func.def inline target(@qwen3_embedding.packed_core) @qwen3_embedding.online_recurrence64(%storage: buffer, %query_base: index, %key_base: index) {
   %begin = index.constant 0 : index
-  %end = index.constant 64 : index
+  %end = index.constant 32 : index
   %step = index.constant 1 : index
   scf.for %query = [%begin to %end step %step] {
-    func.call @qwen3_embedding.recurrence_prepare_row(%storage, %query) : (buffer, index)
+    %old_sum = func.call @qwen3_embedding.recurrence_prepare_row(%storage, %query, %query_base, %key_base) : (buffer, index, index, index) -> (f32)
     func.call @qwen3_embedding.recurrence_exp_row(%storage) : (buffer)
-    func.call @qwen3_embedding.recurrence_finish_row(%storage, %query) : (buffer, index)
+    func.call @qwen3_embedding.recurrence_finish_row(%storage, %query, %old_sum) : (buffer, index, f32)
   }
   func.return
 }
 
-func.def inline @attention_scale_tile(%input: vector<64xbf16>, %scale: vector<8xbf16>) -> (vector<64xbf16>) {
-  %tile = vector.bitcast %input : vector<64xbf16> to vector<4x16xbf16>
-  %c0_vector = vector.splatf 0.0 : vector<16xf32>
-  %narrow_zeros = vector.splatf 0.0 : vector<16xbf16>
-  %scales = vector.concat<0> %scale, %scale : vector<8xbf16>, vector<8xbf16> -> vector<16xbf16>
-  %scale_pairs = vector.interleave<0> %scales, %narrow_zeros : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %row0 = vector.extract %tile[0] : vector<4x16xbf16> -> vector<16xbf16>
-  %pairs0 = vector.interleave<0> %row0, %row0 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %product0 = vector.dot2f %pairs0, %scale_pairs, %c0_vector : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
-  %result0 = vector.fptrunc<daz> %product0 : vector<16xf32> to vector<16xbf16>
-  %row1 = vector.extract %tile[1] : vector<4x16xbf16> -> vector<16xbf16>
-  %pairs1 = vector.interleave<0> %row1, %row1 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %product1 = vector.dot2f %pairs1, %scale_pairs, %c0_vector : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
-  %result1 = vector.fptrunc<daz> %product1 : vector<16xf32> to vector<16xbf16>
-  %row2 = vector.extract %tile[2] : vector<4x16xbf16> -> vector<16xbf16>
-  %pairs2 = vector.interleave<0> %row2, %row2 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %product2 = vector.dot2f %pairs2, %scale_pairs, %c0_vector : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
-  %result2 = vector.fptrunc<daz> %product2 : vector<16xf32> to vector<16xbf16>
-  %row3 = vector.extract %tile[3] : vector<4x16xbf16> -> vector<16xbf16>
-  %pairs3 = vector.interleave<0> %row3, %row3 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %product3 = vector.dot2f %pairs3, %scale_pairs, %c0_vector : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
-  %result3 = vector.fptrunc<daz> %product3 : vector<16xf32> to vector<16xbf16>
-  %low = vector.concat<0> %result0, %result1 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %high = vector.concat<0> %result2, %result3 : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
-  %result = vector.concat<0> %low, %high : vector<32xbf16>, vector<32xbf16> -> vector<64xbf16>
-  func.return %result : vector<64xbf16>
+func.def inline @attention_scale16(%input: vector<16xf32>, %scale: vector<16xbf16>) -> (vector<16xf32>) {
+  %high = vector.fptrunc<daz> %input : vector<16xf32> to vector<16xbf16>
+  %high_wide = vector.extf<daz> %high : vector<16xbf16> to vector<16xf32>
+  %remainder = vector.subf<nnan|ninf|nsz> %input, %high_wide : vector<16xf32>
+  %low = vector.fptrunc<daz> %remainder : vector<16xf32> to vector<16xbf16>
+  %parts = vector.interleave<0> %high, %low : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %scales = vector.interleave<0> %scale, %scale : vector<16xbf16>, vector<16xbf16> -> vector<32xbf16>
+  %initial_product = vector.splatf 0.0 : vector<16xf32>
+  %product = vector.dot2f %parts, %scales, %initial_product : vector<32xbf16>, vector<32xbf16>, vector<16xf32>
+  func.return %product : vector<16xf32>
 }
 
-func.def public inline @qwen3_embedding.attention_query(%storage: buffer, %input: channel<tile<4624xi32>>, %probabilities: channel<tile<4096xbf16>>, %results: channel<tile<4096xbf16>>, %output: buffer, %output_base: offset, %panel_stride: offset, %emit_output: i1) {
+func.def public inline @qwen3_embedding.attention_query(%storage: buffer, %input: channel<tile<4624xi32>>, %probabilities: channel<tile<4096xbf16>>, %results: channel<tile<4096xbf16>>, %output: buffer, %output_base: offset, %panel_stride: offset, %emit_output: i1, %wave_begin: index, %first_panel: index, %key_begin: index, %key_end: index, %checkpoint_base: offset) {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
@@ -593,8 +547,6 @@ func.def public inline @qwen3_embedding.attention_query(%storage: buffer, %input
   %origin = index.constant 0 : offset
   %query_high = index.constant 27008 : offset
   %query_low = index.constant 36288 : offset
-  %query_high_second = index.constant 31616 : offset
-  %query_low_second = index.constant 40896 : offset
   %key_high = index.constant 45696 : offset
   %key_low = index.constant 54976 : offset
   %query_sequence_offset = index.constant 18816 : offset
@@ -606,79 +558,141 @@ func.def public inline @qwen3_embedding.attention_query(%storage: buffer, %input
   %identity_offset = index.constant 19840 : offset
   %half_bytes = index.constant 8192 : offset
   %wave_bytes = index.constant 16384 : offset
-  %pack_count = scalar.constant 128 : i32
+  %pack_count = scalar.constant 64 : i32
+  %key_pack_count = scalar.constant 128 : i32
   %metadata_word = index.constant 4096 : index
   %identity = buffer.view %storage[%identity_offset] : buffer -> view<8x8xbf16>
   func.call @qwen3_embedding.identity(%identity) : (view<8x8xbf16>)
-  %query_sequences = buffer.view %storage[%query_sequence_offset] : buffer -> view<64xi32>
+  %query_sequences = buffer.view %storage[%query_sequence_offset] : buffer -> view<32xi32>
   %key_sequences = buffer.view %storage[%key_sequence_offset] : buffer -> view<64xi32>
-  %maxima = buffer.view %storage[%maximum_offset] : buffer -> view<64xbf16>
-  %sums = buffer.view %storage[%sum_offset] : buffer -> view<64xbf16>
-  %scales = buffer.view %storage[%scale_offset] : buffer -> view<64xbf16>
-  %inverses = buffer.view %storage[%inverse_offset] : buffer -> view<64xbf16>
+  %maxima = buffer.view %storage[%maximum_offset] : buffer -> view<32xbf16>
+  %sums = buffer.view %storage[%sum_offset] : buffer -> view<32xf32>
+  %scales = buffer.view %storage[%scale_offset] : buffer -> view<32xbf16>
+  %inverses = buffer.view %storage[%inverse_offset] : buffer -> view<32xbf16>
   %score_values = buffer.view %storage[%origin] : buffer -> view<4096xbf16>
-  %c0_vector = vector.splatf 0.0 : vector<64xbf16>
-  scf.for %wave = [%c0 to %c4 step %c1] {
-    %query_read, %query_payload = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-    %query_ids = vector.load %query_payload[%metadata_word] : view<4624xi32> -> vector<64xi32>
-    vector.store %query_ids, %query_sequences[0] : vector<64xi32>, view<64xi32>
-    func.call @bfp16ebs8.pack_bf16_aie2p(%storage, %origin, %query_high, %pack_count) : (buffer, offset, offset, i32)
-    channel.release %query_read : read<tile<4624xi32>>
-    vector.store %c0_vector, %maxima[0] : vector<64xbf16>, view<64xbf16>
-    vector.store %c0_vector, %sums[0] : vector<64xbf16>, view<64xbf16>
-    %key_count = index.add %wave, %c1 : index
-    %query_base = index.mul %wave, %c64 : index
-    scf.for %key = [%c0 to %key_count step %c1] {
-      %key_read, %key_payload = channel.acquire<mutable> %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
-      %key_ids = vector.load %key_payload[%metadata_word] : view<4624xi32> -> vector<64xi32>
-      vector.store %key_ids, %key_sequences[0] : vector<64xi32>, view<64xi32>
-      func.call @bfp16ebs8.pack_bf16_aie2p(%storage, %origin, %key_high, %pack_count) : (buffer, offset, offset, i32)
-      func.call @bfp16ebs8.pack_bf16_residual_aie2p(%storage, %origin, %key_low, %identity_offset, %pack_count) : (buffer, offset, offset, offset, i32)
-      func.call @qwen3_embedding.online_score64(%storage, %query_high, %query_low, %origin, %c0) : (buffer, offset, offset, offset, index)
-      func.call @qwen3_embedding.online_score64(%storage, %query_high_second, %query_low_second, %origin, %c32) : (buffer, offset, offset, offset, index)
-      %key_base = index.mul %key, %c64 : index
-      func.call @qwen3_embedding.online_mask64(%storage, %query_base, %key_base) : (buffer, index, index)
-      func.call @qwen3_embedding.online_recurrence64(%storage) : (buffer)
-      %probability_write, %probability_payload = channel.reserve %probabilities : channel<tile<4096xbf16>> -> (write<tile<4096xbf16>>, view<4096xbf16>)
-      func.call @qwen3_embedding.copy_output(%score_values, %probability_payload) : (view<4096xbf16>, view<4096xbf16>)
-      channel.publish %probability_write : write<tile<4096xbf16>>
-      %state_write, %state_payload = channel.reserve %probabilities : channel<tile<4096xbf16>> -> (write<tile<4096xbf16>>, view<4096xbf16>)
-      %scale_values = vector.load %scales[0] : view<64xbf16> -> vector<64xbf16>
-      %inverse_values = vector.load %inverses[0] : view<64xbf16> -> vector<64xbf16>
-      vector.store %scale_values, %state_payload[0] : vector<64xbf16>, view<4096xbf16>
-      vector.store %inverse_values, %state_payload[64] : vector<64xbf16>, view<4096xbf16>
-      channel.publish %state_write : write<tile<4096xbf16>>
-      channel.release %key_read : read<tile<4624xi32>, mutable>
-      %value_read, %unused_value = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-      %next_key = index.add %key, %c1 : index
-      %last_key = index.cmp eq, %next_key, %key_count : index
-      scf.if %last_key {
-        scf.if %emit_output {
-          %panel = index.div %wave, %c2 : index
-          %panel_wave = index.rem %wave, %c2 : index
-          %panel_relative = index.scale %panel, %panel_stride : index, offset -> offset
-          %wave_relative = index.scale %panel_wave, %wave_bytes : index, offset -> offset
-          %panel_base = index.add %output_base, %panel_relative : offset
-          %wave_base = index.add %panel_base, %wave_relative : offset
-          scf.for %half = [%c0 to %c2 step %c1] {
-            %result_read, %result_payload = channel.acquire %results : channel<tile<4096xbf16>> -> (read<tile<4096xbf16>>, view<4096xbf16>)
-            %half_relative = index.scale %half, %half_bytes : index, offset -> offset
-            %address = index.add %wave_base, %half_relative : offset
-            %external = buffer.view %output[%address] : buffer -> view<4096xbf16>
-            %copy = kernel.async.copy %result_payload to %external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<4096xbf16> to view<4096xbf16> -> kernel.async.token
-            %completion = kernel.async.group %copy : kernel.async.token -> kernel.async.group
-            kernel.async.wait %completion {newer_groups = 0} : kernel.async.group
-            channel.release %result_read : read<tile<4096xbf16>>
-          }
-        }
+  %c0_vector = vector.splatf 0.0 : vector<32xbf16>
+  %key_wave = index.div %wave_begin, %c2 : index
+  %wave_end = index.add %key_wave, %c1 : index
+  %final_window = index.cmp eq, %key_end, %wave_end : index
+  %restore = index.cmp ne, %key_begin, %c0 : index
+  %true = scalar.constant true : i1
+  %partial = scalar.xori %final_window, %true : i1
+  %query_read, %query_payload = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
+  %query_ids = vector.load %query_payload[%metadata_word] : view<4624xi32> -> vector<32xi32>
+  vector.store %query_ids, %query_sequences[0] : vector<32xi32>, view<32xi32>
+  func.call @bfp16ebs8.pack_bf16_aie2p(%storage, %origin, %query_high, %pack_count) : (buffer, offset, offset, i32)
+  func.call @qwen3_embedding.pack_attention_residual(%storage, %origin, %query_low, %identity_offset, %pack_count) : (buffer, offset, offset, offset, i32)
+  scf.if %restore {
+    %saved = view.bitcast %query_payload : view<4624xi32> -> view<9248xbf16>
+    %saved_maxima = vector.load %saved[8320] : view<9248xbf16> -> vector<32xbf16>
+    %saved_wide = view.bitcast %query_payload : view<4624xi32> -> view<4624xf32>
+    %saved_sums = vector.load %saved_wide[4192] : view<4624xf32> -> vector<32xf32>
+    vector.store %saved_maxima, %maxima[0] : vector<32xbf16>, view<32xbf16>
+    vector.store %saved_sums, %sums[0] : vector<32xf32>, view<32xf32>
+  } else {
+    vector.store %c0_vector, %maxima[0] : vector<32xbf16>, view<32xbf16>
+    %sum_zeros = vector.splatf 0.0 : vector<32xf32>
+    vector.store %sum_zeros, %sums[0] : vector<32xf32>, view<32xf32>
+  }
+  channel.release %query_read : read<tile<4624xi32>>
+  %context_read, %unused_context = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
+  channel.release %context_read : read<tile<4624xi32>>
+  %query_base = index.mul %wave_begin, %c32 : index
+  %window_size = index.constant 8 : index
+  %transport_end = index.add %key_begin, %window_size : index
+  // The final input borrow spans result publication because input and
+  // result records alias. Earlier iterations return it at the loop backedge.
+  %last_value, %following_key = scf.while(%key_index = %key_begin : index) -> (read<tile<4624xi32>>, index) {
+    %key = index.assume %key_index [range(%key_index, 0, 511)] : index
+    %key_read, %key_payload = channel.acquire<mutable> %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
+    %key_ids = vector.load %key_payload[%metadata_word] : view<4624xi32> -> vector<64xi32>
+    vector.store %key_ids, %key_sequences[0] : vector<64xi32>, view<64xi32>
+    func.call @bfp16ebs8.pack_bf16_aie2p(%storage, %origin, %key_high, %key_pack_count) : (buffer, offset, offset, i32)
+    func.call @qwen3_embedding.pack_attention_residual(%storage, %origin, %key_low, %identity_offset, %key_pack_count) : (buffer, offset, offset, offset, i32)
+    func.call @qwen3_embedding.online_score64(%storage, %query_high, %query_low, %origin, %c0) : (buffer, offset, offset, offset, index)
+    %key_base = index.mul %key, %c64 : index
+    func.call @qwen3_embedding.online_recurrence64(%storage, %query_base, %key_base) : (buffer, index, index)
+    %probability_write, %probability_payload = channel.reserve %probabilities : channel<tile<4096xbf16>> -> (write<tile<4096xbf16>>, view<4096xbf16>)
+    func.call @qwen3_embedding.copy_output(%score_values, %probability_payload) : (view<4096xbf16>, view<4096xbf16>)
+    channel.publish %probability_write : write<tile<4096xbf16>>
+    %state_write, %state_payload = channel.reserve %probabilities : channel<tile<4096xbf16>> -> (write<tile<4096xbf16>>, view<4096xbf16>)
+    %scale_values = vector.load %scales[0] : view<32xbf16> -> vector<32xbf16>
+    %inverse_values = vector.load %inverses[0] : view<32xbf16> -> vector<32xbf16>
+    vector.store %scale_values, %state_payload[0] : vector<32xbf16>, view<4096xbf16>
+    vector.store %inverse_values, %state_payload[64] : vector<32xbf16>, view<4096xbf16>
+    channel.publish %state_write : write<tile<4096xbf16>>
+    channel.release %key_read : read<tile<4624xi32>, mutable>
+    %value_read, %unused_value = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
+    %next_key = index.add %key, %c1 : index
+    %more_keys = index.cmp ult, %next_key, %key_end : index
+    scf.condition %more_keys, %value_read, %next_key : i1, read<tile<4624xi32>>, index
+  } do(%completed_value: read<tile<4624xi32>>, %next_key: index) {
+    channel.release %completed_value : read<tile<4624xi32>>
+    scf.yield %next_key : index
+  }
+  scf.if %emit_output {
+    %relative_panel = index.div %wave_begin, %c4 : index
+    %physical_panel = index.add %first_panel, %relative_panel : index
+    %panel = index.assume %physical_panel [range(%physical_panel, 0, 511)] : index
+    %panel_wave = index.rem %wave_begin, %c4 : index
+    %panel_relative = index.scale %panel, %panel_stride : index, offset -> offset
+    %final_wave_bytes = index.constant 8192 : offset
+    %output_origin = index.constant 1318912 : offset
+    %partial_origin = index.constant 2940928 : offset
+    %head_relative = index.sub %output_base, %output_origin : offset
+    %head_wide = index.add %head_relative, %head_relative : offset
+    %partial_base = index.add %partial_origin, %head_wide : offset
+    %selected_base = scf.select %partial, %partial_base, %output_base : offset
+    %selected_wave_bytes = scf.select %partial, %wave_bytes, %final_wave_bytes : offset
+    %wave_relative = index.scale %panel_wave, %selected_wave_bytes : index, offset -> offset
+    %panel_base = index.add %selected_base, %panel_relative : offset
+    %wave_base = index.add %panel_base, %wave_relative : offset
+    %last_result, %last_payload, %following_half = scf.while(%half_index = %c0 : index) -> (read<tile<4096xbf16>, mutable>, view<4096xbf16>, index) {
+      %half = index.assume %half_index [range(%half_index, 0, 1)] : index
+      %result_read, %result_payload = channel.acquire<mutable> %results : channel<tile<4096xbf16>> -> (read<tile<4096xbf16>, mutable>, view<4096xbf16>)
+      %half_relative = index.scale %half, %half_bytes : index, offset -> offset
+      %address = index.add %wave_base, %half_relative : offset
+      %first_half = index.cmp eq, %half, %c0 : index
+      %write_half = scalar.ori %partial, %first_half : i1
+      scf.if %write_half {
+        %external = buffer.view %output[%address] : buffer -> view<4096xbf16>
+        %copy = kernel.async.copy %result_payload to %external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<4096xbf16> to view<4096xbf16> -> kernel.async.token
+        %completion = kernel.async.group %copy : kernel.async.token -> kernel.async.group
+        kernel.async.wait %completion {newer_groups = 0} : kernel.async.group
       }
-      channel.release %value_read : read<tile<4624xi32>>
+      %next_half = index.add %half, %c1 : index
+      %more_halves = index.cmp ult, %next_half, %c2 : index
+      scf.condition %more_halves, %result_read, %result_payload, %next_half : i1, read<tile<4096xbf16>, mutable>, view<4096xbf16>, index
+    } do(%completed_result: read<tile<4096xbf16>, mutable>, %completed_payload: view<4096xbf16>, %next_half: index) {
+      channel.release %completed_result : read<tile<4096xbf16>, mutable>
+      scf.yield %next_half : index
     }
+    // Both context halves are complete. The last borrowed slot can now
+    // carry the checkpoint until its DMA finishes and the credit returns.
+    scf.if %partial {
+      %saved_maxima = vector.load %maxima[0] : view<32xbf16> -> vector<32xbf16>
+      %saved_sums = vector.load %sums[0] : view<32xf32> -> vector<32xf32>
+      vector.store %saved_maxima, %last_payload[0] : vector<32xbf16>, view<4096xbf16>
+      %last_wide = view.bitcast %last_payload : view<4096xbf16> -> view<2048xf32>
+      vector.store %saved_sums, %last_wide[32] : vector<32xf32>, view<2048xf32>
+      %checkpoint = view.subview %last_payload[0] : view<4096xbf16> -> view<128xbf16>
+      func.call @qwen3_embedding.write_attention_checkpoint(%checkpoint, %output, %checkpoint_base, %panel_relative, %panel_wave) : (view<128xbf16>, buffer, offset, offset, index)
+    }
+    channel.release %last_result : read<tile<4096xbf16>, mutable>
+  }
+  channel.release %last_value : read<tile<4624xi32>>
+  // The finite distributor always sends eight K/V pairs. Padding follows
+  // all live keys and the completed output copies, preserving aliased slots.
+  %padding_keys = index.sub %transport_end, %key_end : index
+  %padding_records = index.mul %padding_keys, %c2 : index
+  scf.for %record = [%c0 to %padding_records step %c1] {
+    %discard, %unused = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
+    channel.release %discard : read<tile<4624xi32>>
   }
   func.return
 }
 
-func.def public inline @qwen3_embedding.attention_value(%storage: buffer, %input: channel<tile<4624xi32>>, %probabilities: channel<tile<4096xbf16>>, %results: channel<tile<4096xbf16>>, %output: buffer, %output_base: offset, %panel_stride: offset, %emit_output: i1) {
+func.def public inline @qwen3_embedding.attention_value(%storage: buffer, %query_storage: buffer, %input: channel<tile<4624xi32>>, %probabilities: channel<tile<4096xbf16>>, %results: channel<tile<4096xbf16>>, %output: buffer, %output_base: offset, %panel_stride: offset, %emit_output: i1, %wave_begin: index, %first_panel: index, %key_begin: index, %key_end: index, %checkpoint_base: offset) {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
@@ -693,71 +707,123 @@ func.def public inline @qwen3_embedding.attention_value(%storage: buffer, %input
   %identity = buffer.view %storage[%identity_offset] : buffer -> view<8x8xbf16>
   func.call @qwen3_embedding.identity(%identity) : (view<8x8xbf16>)
   %probability_local = buffer.view %storage[%probability_offset] : buffer -> view<4096xbf16>
-  %scales = buffer.view %storage[%scale_offset] : buffer -> view<64xbf16>
-  %inverses = buffer.view %storage[%inverse_offset] : buffer -> view<64xbf16>
-  %maximum_offset = index.constant 63104 : offset
-  %sum_offset = index.constant 63232 : offset
-  %maxima = buffer.view %storage[%maximum_offset] : buffer -> view<64xbf16>
-  %sums = buffer.view %storage[%sum_offset] : buffer -> view<64xbf16>
-  %c0_vector = vector.splatf 0.0 : vector<64xbf16>
-  scf.for %wave = [%c0 to %c4 step %c1] {
-    %query_read, %unused_query = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-    channel.release %query_read : read<tile<4624xi32>>
-    %key_count = index.add %wave, %c1 : index
-    scf.for %key = [%c0 to %key_count step %c1] {
-      %key_read, %unused_key = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-      %probability_read, %probability_payload = channel.acquire %probabilities : channel<tile<4096xbf16>> -> (read<tile<4096xbf16>>, view<4096xbf16>)
-      func.call @qwen3_embedding.copy_output(%probability_payload, %probability_local) : (view<4096xbf16>, view<4096xbf16>)
-      channel.release %probability_read : read<tile<4096xbf16>>
-      %state_read, %state_payload = channel.acquire %probabilities : channel<tile<4096xbf16>> -> (read<tile<4096xbf16>>, view<4096xbf16>)
-      %scale_values = vector.load %state_payload[0] : view<4096xbf16> -> vector<64xbf16>
-      %inverse_values = vector.load %state_payload[64] : view<4096xbf16> -> vector<64xbf16>
-      vector.store %scale_values, %scales[0] : vector<64xbf16>, view<64xbf16>
-      vector.store %inverse_values, %inverses[0] : vector<64xbf16>, view<64xbf16>
-      channel.release %state_read : read<tile<4096xbf16>>
-      channel.release %key_read : read<tile<4624xi32>>
-      %value_read, %value_payload = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
-      func.call @bfp16ebs8.pack_bf16_aie2p(%storage, %origin, %value_high, %pack_count) : (buffer, offset, offset, i32)
-      %previous = index.cmp ne, %key, %c0 : index
-      %next_key = index.add %key, %c1 : index
-      %last_key = index.cmp eq, %next_key, %key_count : index
-      scf.if %last_key {
-        scf.for %half = [%c0 to %c2 step %c1] {
-          func.call @qwen3_embedding.online_value_half(%storage, %half, %previous) : (buffer, index, i1)
-        }
-        scf.for %half = [%c0 to %c2 step %c1] {
-          %result_write, %result_payload = channel.reserve %results : channel<tile<4096xbf16>> -> (write<tile<4096xbf16>>, view<4096xbf16>)
-          func.call @qwen3_embedding.online_value_result(%storage, %half, %result_payload) : (buffer, index, view<4096xbf16>)
-          channel.publish %result_write : write<tile<4096xbf16>>
-          scf.if %emit_output {
-            %read, %payload = channel.acquire %results : channel<tile<4096xbf16>> -> (read<tile<4096xbf16>>, view<4096xbf16>)
-            %panel = index.div %wave, %c2 : index
-            %panel_wave = index.rem %wave, %c2 : index
-            %panel_offset = index.scale %panel, %panel_stride : index, offset -> offset
-            %wave_bytes = index.constant 16384 : offset
-            %half_bytes = index.constant 8192 : offset
-            %wave_offset = index.scale %panel_wave, %wave_bytes : index, offset -> offset
-            %half_offset = index.scale %half, %half_bytes : index, offset -> offset
-            %panel_base = index.add %output_base, %panel_offset : offset
-            %wave_base = index.add %panel_base, %wave_offset : offset
-            %address = index.add %wave_base, %half_offset : offset
-            %external = buffer.view %output[%address] : buffer -> view<4096xbf16>
-            %copy = kernel.async.copy %payload to %external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<4096xbf16> to view<4096xbf16> -> kernel.async.token
-            %completion = kernel.async.group %copy : kernel.async.token -> kernel.async.group
-            kernel.async.wait %completion {newer_groups = 0} : kernel.async.group
-            channel.release %read : read<tile<4096xbf16>>
-          }
-        }
-        channel.release %value_read : read<tile<4624xi32>>
-      } else {
-        // Packed V and all PV workspace are private. Returning this credit
-        // lets the next K arrive while the current value product runs.
-        channel.release %value_read : read<tile<4624xi32>>
-        scf.for %half = [%c0 to %c2 step %c1] {
-          func.call @qwen3_embedding.online_value_half(%storage, %half, %previous) : (buffer, index, i1)
-        }
-      }
+  %scales = buffer.view %storage[%scale_offset] : buffer -> view<32xbf16>
+  %inverses = buffer.view %storage[%inverse_offset] : buffer -> view<32xbf16>
+  %key_wave = index.div %wave_begin, %c2 : index
+  %wave_end = index.add %key_wave, %c1 : index
+  %final_window = index.cmp eq, %key_end, %wave_end : index
+  %restore = index.cmp ne, %key_begin, %c0 : index
+  %true = scalar.constant true : i1
+  %partial = scalar.xori %final_window, %true : i1
+  %query_read, %unused_query = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
+  channel.release %query_read : read<tile<4624xi32>>
+  %context_read, %saved_context = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
+  scf.if %restore {
+    %context_offset = index.constant 27008 : offset
+    %context = buffer.view %storage[%context_offset] : buffer -> view<8192xbf16>
+    %saved = view.bitcast %saved_context : view<4624xi32> -> view<9248xbf16>
+    %context0 = view.subview %context[0] : view<8192xbf16> -> view<4096xbf16>
+    %context1 = view.subview %context[4096] : view<8192xbf16> -> view<4096xbf16>
+    %saved0 = view.subview %saved[0] : view<9248xbf16> -> view<4096xbf16>
+    %saved1 = view.subview %saved[4096] : view<9248xbf16> -> view<4096xbf16>
+    func.call @qwen3_embedding.shared_copy_output(%saved0, %context0) : (view<4096xbf16>, view<4096xbf16>)
+    func.call @qwen3_embedding.shared_copy_output(%saved1, %context1) : (view<4096xbf16>, view<4096xbf16>)
+  }
+  channel.release %context_read : read<tile<4624xi32>>
+  %window_size = index.constant 8 : index
+  %transport_end = index.add %key_begin, %window_size : index
+  // The final input borrow spans result publication because input and
+  // result records alias. Earlier iterations return it at the loop backedge.
+  %last_value, %last_value_payload, %following_key = scf.while(%key_index = %key_begin : index) -> (read<tile<4624xi32>, mutable>, view<4624xi32>, index) {
+    %key = index.assume %key_index [range(%key_index, 0, 511)] : index
+    %key_read, %unused_key = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
+    %probability_read, %probability_payload = channel.acquire %probabilities : channel<tile<4096xbf16>> -> (read<tile<4096xbf16>>, view<4096xbf16>)
+    func.call @qwen3_embedding.copy_output(%probability_payload, %probability_local) : (view<4096xbf16>, view<4096xbf16>)
+    channel.release %probability_read : read<tile<4096xbf16>>
+    %state_read, %state_payload = channel.acquire %probabilities : channel<tile<4096xbf16>> -> (read<tile<4096xbf16>>, view<4096xbf16>)
+    %scale_values = vector.load %state_payload[0] : view<4096xbf16> -> vector<32xbf16>
+    %inverse_values = vector.load %state_payload[64] : view<4096xbf16> -> vector<32xbf16>
+    vector.store %scale_values, %scales[0] : vector<32xbf16>, view<32xbf16>
+    vector.store %inverse_values, %inverses[0] : vector<32xbf16>, view<32xbf16>
+    channel.release %state_read : read<tile<4096xbf16>>
+    channel.release %key_read : read<tile<4624xi32>>
+    %value_read, %value_payload = channel.acquire<mutable> %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
+    func.call @bfp16ebs8.pack_bf16_aie2p(%storage, %origin, %value_high, %pack_count) : (buffer, offset, offset, i32)
+    %previous = index.cmp ne, %key, %c0 : index
+    func.call @qwen3_embedding.online_value(%storage, %previous) : (buffer, i1)
+    %next_key = index.add %key, %c1 : index
+    %more_keys = index.cmp ult, %next_key, %key_end : index
+    scf.condition %more_keys, %value_read, %value_payload, %next_key : i1, read<tile<4624xi32>, mutable>, view<4624xi32>, index
+  } do(%completed_value: read<tile<4624xi32>, mutable>, %completed_payload: view<4624xi32>, %next_key: index) {
+    channel.release %completed_value : read<tile<4624xi32>, mutable>
+    scf.yield %next_key : index
+  }
+  scf.if %emit_output {
+    // The packed operand and accumulated context are disjoint from the
+    // borrowed input. Retain that slot through every output DMA.
+    %last_value_bits = view.bitcast %last_value_payload : view<4624xi32> -> view<9248xbf16>
+    %result_wave = view.subview %last_value_bits[0] : view<9248xbf16> -> view<8192xbf16>
+    %relative_panel = index.div %wave_begin, %c4 : index
+    %physical_panel = index.add %first_panel, %relative_panel : index
+    %panel = index.assume %physical_panel [range(%physical_panel, 0, 511)] : index
+    %panel_wave = index.rem %wave_begin, %c4 : index
+    %panel_offset = index.scale %panel, %panel_stride : index, offset -> offset
+    %wave_bytes = index.constant 16384 : offset
+    %final_wave_bytes = index.constant 8192 : offset
+    %output_origin = index.constant 1318912 : offset
+    %partial_origin = index.constant 2940928 : offset
+    %head_relative = index.sub %output_base, %output_origin : offset
+    %head_wide = index.add %head_relative, %head_relative : offset
+    %partial_base = index.add %partial_origin, %head_wide : offset
+    %selected_base = scf.select %partial, %partial_base, %output_base : offset
+    %selected_wave_bytes = scf.select %partial, %wave_bytes, %final_wave_bytes : offset
+    %wave_offset = index.scale %panel_wave, %selected_wave_bytes : index, offset -> offset
+    %panel_base = index.add %selected_base, %panel_offset : offset
+    %wave_base = index.add %panel_base, %wave_offset : offset
+    %half_elements = index.constant 4096 : index
+    %half_bytes = index.constant 8192 : offset
+    %result_halves = scf.select %partial, %c2, %c1 : index
+    scf.for %half = [%c0 to %result_halves step %c1] {
+      %half_begin = index.mul %half, %half_elements : index
+      %result_payload = view.subview %result_wave[%half_begin] : view<8192xbf16> -> view<4096xbf16>
+      func.call @qwen3_embedding.online_value_result(%storage, %half, %result_payload, %final_window) : (buffer, index, view<4096xbf16>, i1)
+      %half_relative = index.scale %half, %half_bytes : index, offset -> offset
+      %address = index.add %wave_base, %half_relative : offset
+      %external = buffer.view %output[%address] : buffer -> view<4096xbf16>
+      %copy = kernel.async.copy %result_payload to %external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<4096xbf16> to view<4096xbf16> -> kernel.async.token
+      %completion = kernel.async.group %copy : kernel.async.token -> kernel.async.group
+      kernel.async.wait %completion {newer_groups = 0} : kernel.async.group
     }
+    scf.if %partial {
+      // The last probability record publishes the final recurrence.
+      // The query does no more live-key math before the phase join.
+      %query_maximum_offset = index.constant 19072 : offset
+      %query_sum_offset = index.constant 19200 : offset
+      %query_maxima = buffer.view %query_storage[%query_maximum_offset] : buffer -> view<32xbf16>
+      %query_sums = buffer.view %query_storage[%query_sum_offset] : buffer -> view<32xf32>
+      %saved_maxima = vector.load %query_maxima[0] : view<32xbf16> -> vector<32xbf16>
+      %saved_sums = vector.load %query_sums[0] : view<32xf32> -> vector<32xf32>
+      %checkpoint = view.subview %result_wave[0] : view<8192xbf16> -> view<128xbf16>
+      vector.store %saved_maxima, %checkpoint[0] : vector<32xbf16>, view<128xbf16>
+      %checkpoint_wide = view.bitcast %checkpoint : view<128xbf16> -> view<64xf32>
+      vector.store %saved_sums, %checkpoint_wide[32] : vector<32xf32>, view<64xf32>
+      func.call @qwen3_embedding.write_attention_checkpoint(%checkpoint, %output, %checkpoint_base, %panel_offset, %panel_wave) : (view<128xbf16>, buffer, offset, offset, index)
+    }
+  } else {
+    scf.for %half = [%c0 to %c2 step %c1] {
+      %result_write, %result_payload = channel.reserve %results : channel<tile<4096xbf16>> -> (write<tile<4096xbf16>>, view<4096xbf16>)
+      func.call @qwen3_embedding.online_value_result(%storage, %half, %result_payload, %final_window) : (buffer, index, view<4096xbf16>, i1)
+      channel.publish %result_write : write<tile<4096xbf16>>
+    }
+  }
+  channel.release %last_value : read<tile<4624xi32>, mutable>
+  // The finite distributor always sends eight K/V pairs. Padding follows
+  // all live keys and the completed output copies, preserving aliased slots.
+  %padding_keys = index.sub %transport_end, %key_end : index
+  %padding_records = index.mul %padding_keys, %c2 : index
+  scf.for %record = [%c0 to %padding_records step %c1] {
+    %discard, %unused = channel.acquire %input : channel<tile<4624xi32>> -> (read<tile<4624xi32>>, view<4624xi32>)
+    channel.release %discard : read<tile<4624xi32>>
   }
   func.return
 }
@@ -866,7 +932,7 @@ func.def public inline target(@qwen3_embedding.packed_core) @qwen3_embedding.sha
   func.return
 }
 
-func.def public inline target(@qwen3_embedding.packed_core) @qwen3_embedding.shared_normalize_shared(%rows: view<1024xbf16>, %scale: view<1024xbf16>) {
+func.def public noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.shared_normalize_shared(%rows: view<1024xbf16>, %scale: view<1024xbf16>) {
   %width = index.constant 1024 : index
   func.call @qwen3_embedding.normalize_shared(%width, %rows, %scale, %rows) : (index, view<1024xbf16>, view<1024xbf16>, view<1024xbf16>)
   func.return
@@ -889,5 +955,10 @@ func.def public inline target(@qwen3_embedding.packed_core) @qwen3_embedding.sha
   %up = buffer.view %up_storage[%slot] : buffer -> view<4096xf32>
   %output = buffer.view %gate_storage[%slot] : buffer -> view<4096xbf16>
   func.call @qwen3_embedding.swiglu_dense(%gate, %up, %table_ab, %table_cd, %output) : (view<4096xf32>, view<4096xf32>, buffer, buffer, view<4096xbf16>)
+  func.return
+}
+
+func.def noinline target(@qwen3_embedding.packed_core) @qwen3_embedding.pack_attention_residual(%storage: buffer, %input: offset, %output: offset, %identity: offset, %count: i32) {
+  func.call @bfp16ebs8.pack_bf16_residual_aie2p(%storage, %input, %output, %identity, %count) : (buffer, offset, offset, offset, i32)
   func.return
 }

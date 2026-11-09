@@ -16,9 +16,11 @@ request replays check execution-state reuse separately from accuracy.
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import math
 import os
+import socket
 import struct
 import tempfile
 import urllib.error
@@ -27,8 +29,15 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from loom_serve_testing.http_harness import control, running_server, wait_status
+from loom_serve_testing.http_harness import (
+    control,
+    running_server,
+    wait_counters,
+    wait_status,
+)
 from loom_serve_testing.model_staging import stage_model
+
+from reference_inputs import pattern_tokens
 
 
 def check(endpoint: str, model: str, reference: dict, publisher: bytes) -> dict:
@@ -130,12 +139,10 @@ def check(endpoint: str, model: str, reference: dict, publisher: bytes) -> dict:
         )
         < acceptance["prefix_absolute_error"]
     )
-    # A complete cohort exercises both token panels and all sequence identities.
-    full_cohort, usage = embed([[1]] * 32)
-    assert len(full_cohort) == 32 and all(
-        row == full_cohort[0] for row in full_cohort
-    )
-    assert usage["prompt_tokens"] == usage["total_tokens"] == 32
+    # More than the old row cap remains an ordinary logical request.
+    full_cohort, usage = embed([[1]] * 33)
+    assert len(full_cohort) == 33 and all(row == full_cohort[0] for row in full_cohort)
+    assert usage["prompt_tokens"] == usage["total_tokens"] == 33
     # Different placements partition attention reductions differently. Each
     # result must satisfy the publisher bound; identical placements must replay
     # exactly after other requests have reused the resident program.
@@ -152,10 +159,93 @@ def check(endpoint: str, model: str, reference: dict, publisher: bytes) -> dict:
         for vector in (long_single[0], mixed[1], reversed_mixed[0])
     ]
     assert usage["prompt_tokens"] == usage["total_tokens"] == 136
+    long_case, context_case = reference["flexible_cases"]
+    long_ids = pattern_tokens(long_case)
+    context_ids = pattern_tokens(context_case)
+    extended, usage = embed(long_ids)
+    extended_cosine = check_publisher(extended[0], long_case["reference_index"])
+    assert usage["prompt_tokens"] == usage["total_tokens"] == 513
+    prefix, _ = embed(long_ids, dimensions=257)
+    norm = math.sqrt(sum(value * value for value in extended[0][:257]))
+    assert (
+        max(
+            abs(actual - expected / norm)
+            for actual, expected in zip(prefix[0], extended[0][:257])
+        )
+        < acceptance["prefix_absolute_error"]
+    )
+
+    long_text = "The library is open on Saturday. " * 80
+    long_text_ids = request(
+        "/tokenize", {"model": model, "content": long_text, "add_special": True}
+    )["tokens"]
+    assert len(long_text_ids) > 256
+    text_vector, text_usage = embed(long_text)
+    explicit_vector, explicit_usage = embed(long_text_ids)
+    assert text_vector == explicit_vector and text_usage == explicit_usage
+
+    # The full-context row fills one cohort. Its independently owned output
+    # survives scratch reuse by the following mixed-length cohort. A late
+    # short request must complete while the longer request is still active.
+    address = urlsplit(endpoint)
+    before = wait_counters(address, lambda _: True)
+    logical_inputs = [context_ids, long_ids, tokens[1]]
+    with ThreadPoolExecutor(max_workers=1) as clients:
+        logical = clients.submit(embed, logical_inputs)
+        advanced = wait_counters(
+            address,
+            lambda c: (
+                c["batches"] >= before["batches"] + 2 or c["failed"] != before["failed"]
+            ),
+        )
+        assert advanced["failed"] == before["failed"], advanced
+        peer, _ = embed(tokens[1])
+        assert peer == [batched[1]]
+        peer_done = wait_counters(
+            address, lambda c: c["completed"] > before["completed"]
+        )
+        assert peer_done["completed"] == before["completed"] + 1, peer_done
+        logical_vectors, logical_usage = logical.result()
+    assert len(logical_vectors) == len(logical_inputs)
+    logical_cosines = [
+        check_publisher(vector, index)
+        for vector, index in zip(
+            logical_vectors,
+            [context_case["reference_index"], long_case["reference_index"], 1],
+        )
+    ]
+    useful = sum(map(len, logical_inputs))
+    assert logical_usage["prompt_tokens"] == logical_usage["total_tokens"] == useful
+    after = wait_counters(address, lambda c: c["completed"] == before["completed"] + 2)
+    assert after["failed"] == before["failed"], after
+
+    # Cancellation retires accepted native work before returning its interval.
+    connection = http.client.HTTPConnection(address.hostname, address.port)
+    connection.request(
+        "POST",
+        "/v1/embeddings",
+        body=json.dumps({"model": model, "input": [context_ids, context_ids]}),
+        headers={"Content-Type": "application/json"},
+    )
+    advanced = wait_counters(
+        address,
+        lambda c: (
+            c["batches"] >= after["batches"] + 2 or c["failed"] != after["failed"]
+        ),
+    )
+    assert advanced["failed"] == after["failed"], advanced
+    connection.sock.setsockopt(
+        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+    )
+    connection.close()
+    cancelled = wait_counters(
+        address, lambda c: c["cancelled"] == after["cancelled"] + 1
+    )
+    assert cancelled["failed"] == after["failed"], cancelled
+    recovered, _ = embed(long_ids)
+    assert recovered == extended
     for body in (
-        {"input": [1] * 257},
-        {"input": [[1]] * 33},
-        {"input": [[1] * 129, [2] * 121]},
+        {"input": [1] * 32769},
         {"input": [151669]},
         {"input": [-1]},
         {"input": [1], "dimensions": 1025},
@@ -168,7 +258,13 @@ def check(endpoint: str, model: str, reference: dict, publisher: bytes) -> dict:
         "cohort_replay": True,
         "concurrent_replay": True,
         "prefix_dimensions": 64,
-        "invalid_requests_rejected": 6,
+        "extended_prefix_dimensions": 257,
+        "extended_publisher_cosine": extended_cosine,
+        "logical_publisher_cosines": logical_cosines,
+        "logical_input_tokens": useful,
+        "late_peer_finished_first": True,
+        "cancelled_continuation_reused": True,
+        "invalid_requests_rejected": 4,
     }
 
 

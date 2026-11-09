@@ -28,7 +28,7 @@ func.decl inline @qwen3_embedding.shared_dense_residual(%input: view<4096xbf16>,
 
 func.decl inline @qwen3_embedding.shared_dense_rows(%input: view<16x4x64xf32>, %output: view<32x128xbf16>)
 
-func.decl inline @qwen3_embedding.shared_normalize_shared(%rows: view<1024xbf16>, %scale: view<1024xbf16>)
+func.decl noinline @qwen3_embedding.shared_normalize_shared(%rows: view<1024xbf16>, %scale: view<1024xbf16>)
 
 func.decl inline @qwen3_embedding.shared_prepare_silu_lookup(%input: view<4096xbf16>, %output_ab: view<8192xbf16>, %output_cd: view<8192xbf16>)
 
@@ -37,10 +37,6 @@ func.decl inline @qwen3_embedding.shared_retain_residual_panel(%input: view<4096
 func.decl inline @qwen3_embedding.shared_swiglu_dense(%gate_storage: buffer, %up_storage: buffer, %slot: offset, %swap_tables: i1)
 
 func.decl inline @qwen3_embedding.block_attention_keys(%input: view<32x128xbf16>, %output: view<4096xbf16>)
-
-func.decl inline @qwen3_embedding.attention_query(%storage: buffer, %input: channel<tile<4624xi32>>, %probabilities: channel<tile<4096xbf16>>, %results: channel<tile<4096xbf16>>, %output: buffer, %output_base: offset, %panel_stride: offset, %emit_output: i1)
-
-func.decl inline @qwen3_embedding.attention_value(%storage: buffer, %input: channel<tile<4624xi32>>, %probabilities: channel<tile<4096xbf16>>, %results: channel<tile<4096xbf16>>, %output: buffer, %output_base: offset, %panel_stride: offset, %emit_output: i1)
 
 func.decl inline @qwen3_embedding.copy_output(%input: view<4096xbf16>, %output: view<4096xbf16>)
 
@@ -87,7 +83,7 @@ func.decl inline @qwen3_embedding.three_products_blocked(%storage: buffer, %temp
 // Computes attention values and dense epilogues. The placed strand supplies
 // whether this worker owns its ingress peer's shared-row normalization. All
 // workers participate in the same arrival/departure barriers around that phase.
-func.def public inline @qwen3_embedding.probability_value(%normalize_peer_rows: i1, %dimension_storage: buffer, %origin: offset, %local_storage: buffer, %result_offset: offset, %peer_storage: buffer, %activation_stream: channel<tile<2048xi32>>, %zero: index, %one: index, %incoming_arrival: channel<tile<16xi32>>, %outgoing_arrival: channel<tile<16xi32>>, %incoming_departure: channel<tile<16xi32>>, %outgoing_departure: channel<tile<16xi32>>, %projection_stream: channel<tile<4096xbf16>>, %weight_stream: channel<tile<4624xi32>>, %activation_offset: offset, %probability_stream: channel<tile<4096xbf16>>, %result_stream: channel<tile<4096xbf16>>, %column_offset: index, %dimension_row_base: index, %row_column: index, %skip_column: index, %layer: index, %dense_group: index) {
+func.def public inline @qwen3_embedding.probability_value(%normalize_peer_rows: i1, %dimension_storage: buffer, %origin: offset, %local_storage: buffer, %result_offset: offset, %peer_storage: buffer, %activation_stream: channel<tile<2048xi32>>, %zero: index, %one: index, %incoming_arrival: channel<tile<16xi32>>, %outgoing_arrival: channel<tile<16xi32>>, %incoming_departure: channel<tile<16xi32>>, %outgoing_departure: channel<tile<16xi32>>, %projection_stream: channel<tile<4096xbf16>>, %weight_stream: channel<tile<4624xi32>>, %activation_offset: offset, %probability_stream: channel<tile<4096xbf16>>, %result_stream: channel<tile<4096xbf16>>, %column_offset: index, %dimension_row_base: index, %row_column: index, %skip_column: index, %layer: index, %dense_group: index, %panel_index: index) {
   %dimensions = buffer.view %dimension_storage[%origin] : buffer -> view<2x4xi32>
   %c2 = index.constant 2 : index
   %c4 = index.constant 4 : index
@@ -116,7 +112,6 @@ func.def public inline @qwen3_embedding.probability_value(%normalize_peer_rows: 
   %raw_matrix = buffer.view %local_storage[%origin] : buffer -> view<32x128xbf16>
   %blocked = buffer.view %local_storage[%result_offset] : buffer -> view<4096xbf16>
 
-  %last_chunk = index.constant 7 : index
   %dense_input_stride = index.constant 32768 : offset
   %dense_packed_offset = index.constant 27008 : offset
   %dense_result_offset = index.constant 48064 : offset
@@ -132,7 +127,7 @@ func.def public inline @qwen3_embedding.probability_value(%normalize_peer_rows: 
   %dense_rope_bits = buffer.view %local_storage[%dense_rope_offset] : buffer -> view<4096xbf16>
   %dense_rope = buffer.view %local_storage[%dense_rope_offset] : buffer -> view<32x2x64xbf16>
   %scale_words = index.constant 256 : index
-  %episode_state_stride = index.constant 2924544 : offset
+  %episode_state_stride = index.constant 3989504 : offset
   %c3 = index.constant 3 : index
   %c6 = index.constant 6 : index
   %c7 = index.constant 7 : index
@@ -150,724 +145,282 @@ func.def public inline @qwen3_embedding.probability_value(%normalize_peer_rows: 
   %learned_layer = index.cmp ult, %layer, %learned_layers : index
   %active_groups = scf.select %final_layer, %one, %c7 : index
 
-  %panels = index.constant 2 : index
-  scf.for %episode = [%zero to %panels step %one] {
-    %episode_input_offset = index.scale %episode, %episode_input_stride : index, offset -> offset
-    %episode_state_offset = index.scale %episode, %episode_state_stride : index, offset -> offset
-    %episode_output_offset = index.scale %episode, %episode_output_stride : index, offset -> offset
-    %reload_metadata = index.cmp eq, %dense_group, %zero : index
-    scf.if %reload_metadata {
-      %metadata_read, %metadata_incoming = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
-      %metadata_bf16 = view.bitcast %metadata_incoming : view<2048xi32> -> view<4096xbf16>
-      %dimension_metadata_rows = view.bitcast %metadata_incoming : view<2048xi32> -> view<128x16xi32>
+  %episode_input_offset = index.scale %panel_index, %episode_input_stride : index, offset -> offset
+  %episode_state_offset = index.scale %panel_index, %episode_state_stride : index, offset -> offset
+  %episode_output_offset = index.scale %panel_index, %episode_output_stride : index, offset -> offset
+  %reload_metadata = index.cmp eq, %dense_group, %zero : index
+  scf.if %reload_metadata {
+    %metadata_read, %metadata_incoming = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
+    %metadata_bf16 = view.bitcast %metadata_incoming : view<2048xi32> -> view<4096xbf16>
+    %dimension_metadata_rows = view.bitcast %metadata_incoming : view<2048xi32> -> view<128x16xi32>
 
-      scf.for %dimension_member = [%zero to %c2 step %one] {
-        %dimension_member_relative = index.mul %dimension_member, %c32 : index
-        %dimension_member_base = index.add %dimension_row_base, %dimension_member_relative : index
-        scf.for %dimension_token = [%zero to %c4 step %one] {
-          %dimension_row = index.add %dimension_member_base, %dimension_token : index
-          %dimension_count = view.load %dimension_metadata_rows[%dimension_row, 3] : view<128x16xi32> -> i32
-          view.store %dimension_count, %dimensions[%dimension_member, %dimension_token] : i32, view<2x4xi32>
-        }
+    scf.for %dimension_member = [%zero to %c2 step %one] {
+      %dimension_member_relative = index.mul %dimension_member, %c32 : index
+      %dimension_member_base = index.add %dimension_row_base, %dimension_member_relative : index
+      scf.for %dimension_token = [%zero to %c4 step %one] {
+        %dimension_row = index.add %dimension_member_base, %dimension_token : index
+        %dimension_count = view.load %dimension_metadata_rows[%dimension_row, 3] : view<128x16xi32> -> i32
+        view.store %dimension_count, %dimensions[%dimension_member, %dimension_token] : i32, view<2x4xi32>
       }
-      channel.release %metadata_read : read<tile<2048xi32>>
     }
-    %query_key_group = index.cmp eq, %dense_group, %zero : index
-    %head_group = index.cmp ult, %dense_group, %c2 : index
-    %output_group = index.cmp eq, %dense_group, %c2 : index
-    %down_group = index.cmp eq, %dense_group, %c6 : index
-    %residual_group = scalar.ori %output_group, %down_group : i1
-    %gate_or_later = index.cmp uge, %dense_group, %c3 : index
-    %before_down = index.cmp ult, %dense_group, %c6 : index
-    %mlp_group = scalar.andi %gate_or_later, %before_down : i1
-    %post_norm_group = index.cmp eq, %dense_group, %c3 : index
-    %normalize_rows = scalar.ori %query_key_group, %post_norm_group : i1
-    %gather_initial = scalar.andi %initial_layer, %query_key_group : i1
-    %wide_chunks = scf.select %down_group, %c24, %c16 : index
-    %dense_chunks = scf.select %residual_group, %wide_chunks, %c8 : index
-    %dense_roles = scf.select %residual_group, %one, %c2 : index
-    %last_dense_role = index.sub %dense_roles, %one : index
-    %last_chunk = index.sub %dense_chunks, %one : index
-    scf.if %normalize_rows {
-      %row_raw = buffer.view %peer_storage[%dense_result_offset] : buffer -> view<4096xbf16>
-      %row_width = index.constant 1024 : index
-      %row_bytes = index.constant 2048 : offset
-      %row_slot_base = index.constant 31680 : offset
-      %row_slot_stride = index.constant 16384 : offset
-      %row_scale = buffer.view %local_storage[%row_slot_base] : buffer -> view<1024xbf16>
-
-      %row_gamma_read, %row_gamma_record = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
-      %row_gamma_values = view.bitcast %row_gamma_record : view<2048xi32> -> view<4096xbf16>
-      channel.release %row_gamma_read : read<tile<2048xi32>>
-      scf.for %row_record = [%zero to %c8 step %one] {
-        %row_input_read, %row_input_record = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
-        %row_input_values = view.bitcast %row_input_record : view<2048xi32> -> view<4096xbf16>
-        %owns_rows = index.cmp eq, %row_record, %row_column : index
-        scf.if %owns_rows {
-          func.call @qwen3_embedding.shared_copy_output(%row_input_values, %row_raw) : (view<4096xbf16>, view<4096xbf16>)
-        }
-        channel.release %row_input_read : read<tile<2048xi32>>
-      }
-      func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
-      scf.if %normalize_peer_rows {
-        scf.for %row_member = [%zero to %c2 step %one] {
-          %slot_relative = index.scale %row_member, %row_slot_stride : index, offset -> offset
-          %slot = index.add %row_slot_base, %slot_relative : offset
-          %member_rows = buffer.view %peer_storage[%slot] : buffer -> view<4x1024xbf16>
-          scf.for %row_token = [%zero to %c4 step %one] {
-            %token_relative = index.scale %row_token, %row_bytes : index, offset -> offset
-            %token_offset = index.add %slot, %token_relative : offset
-            %row_values = buffer.view %peer_storage[%token_offset] : buffer -> view<1024xbf16>
-            func.call @qwen3_embedding.shared_normalize_shared(%row_values, %row_scale) : (view<1024xbf16>, view<1024xbf16>)
-          }
-        }
-      }
-      func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
-      %row_records = scf.select %final_layer, %c4, %c2 : index
-      scf.for %output_record = [%zero to %row_records step %one] {
-        %row_write, %row_destination = channel.reserve %projection_stream : channel<tile<4096xbf16>> -> (write<tile<4096xbf16>>, view<4096xbf16>)
-        scf.if %final_layer {
-          %output_member = index.div %output_record, %c2 : index
-          %output_half = index.rem %output_record, %c2 : index
-          %output_token_base = index.mul %output_half, %c2 : index
-          %output_slot_relative = index.scale %output_member, %row_slot_stride : index, offset -> offset
-          %output_slot = index.add %row_slot_base, %output_slot_relative : offset
-          %output_rows = buffer.view %peer_storage[%output_slot] : buffer -> view<4x1024xbf16>
-          %output_values = view.bitcast %row_destination : view<4096xbf16> -> view<2x1024xf32>
-          scf.for %output_token = [%zero to %c2 step %one] {
-            %source_token = index.add %output_token_base, %output_token : index
-            %source_row = view.subview %output_rows[%source_token, 0] : view<4x1024xbf16> -> view<1x1024xbf16>
-            %source_values = view.bitcast %source_row : view<1x1024xbf16> -> view<1024xbf16>
-            %target_row = view.subview %output_values[%output_token, 0] : view<2x1024xf32> -> view<1x1024xf32>
-            %target_values = view.bitcast %target_row : view<1x1024xf32> -> view<1024xf32>
-            %dimension_count = view.load %dimensions[%output_member, %source_token] : view<2x4xi32> -> i32
-            %prefix_width = index.constant 1024 : index
-            %prefix_floor = scalar.constant 9.9999999999999992e-25 : f32
-            %prefix_source = view.refine %source_values : view<1024xbf16> -> view<[%prefix_width]xbf16>
-            %prefix_target = view.refine %target_values : view<1024xf32> -> view<[%prefix_width]xf32>
-            template.apply<@normalization.l2_prefix_bf16>(%prefix_width, %dimension_count, %prefix_floor, %prefix_source, %prefix_target) : (index, i32, f32, view<[%prefix_width]xbf16>, view<[%prefix_width]xf32>)
-          }
-        } else {
-          %slot_relative = index.scale %output_record, %row_slot_stride : index, offset -> offset
-          %slot = index.add %row_slot_base, %slot_relative : offset
-          %member_rows = buffer.view %peer_storage[%slot] : buffer -> view<4x1024xbf16>
-          %row_blocked = view.bitcast %row_destination : view<4096xbf16> -> view<128x4x8xbf16>
-          func.call @qwen3_embedding.shared_block_four_rows(%member_rows, %row_blocked) : (view<4x1024xbf16>, view<128x4x8xbf16>)
-        }
-        channel.publish %row_write : write<tile<4096xbf16>>
-      }
-      func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
-    }
-    scf.if %learned_layer {
-      %group_last_read, %completed_chunks = scf.while(%chunk_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
-        // Projection groups contain 8, 16, or 24 chunks, with one or two roles.
-        %dense_chunk = index.assume %chunk_index [range(%chunk_index, 0, 23)] : index
-        %dense_input_read, %dense_input_view = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
-        %dense_input_values = view.bitcast %dense_input_view : view<2048xi32> -> view<4096xbf16>
-        func.call @qwen3_embedding.pack_dense_activations(%local_storage, %activation_offset) : (buffer, offset)
-        channel.release %dense_input_read : read<tile<2048xi32>>
-        %chunk_last_read, %completed_roles = scf.while(%role_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
-          %dense_role = index.assume %role_index [range(%role_index, 0, 1)] : index
-          %weight_read, %weight_values = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
-          %first_dense_projection = index.cmp eq, %dense_role, %zero : index
-          %projection_storage = scf.if %first_dense_projection -> (buffer) {
-            scf.yield %peer_storage : buffer
-          } else {
-            scf.yield %local_storage : buffer
-          }
-          %first_dense_chunk = index.cmp eq, %dense_chunk, %zero : index
-          %dense_weights_offset = index.constant 0 : offset
-          %dense_activations_offset = index.constant 27008 : offset
-          %dense_operand_storage, %dense_output_storage = buffer.assume.alignment %local_storage, %projection_storage {minimum_alignment = 64} : buffer, buffer
-          %dense_weights = buffer.view %dense_operand_storage[%dense_weights_offset] : buffer -> view<16x2x576xi8>
-          %dense_packed_activations = buffer.view %dense_operand_storage[%dense_activations_offset] : buffer -> view<2x4x576xi8>
-          %dense_accumulators = buffer.view %dense_output_storage[%dense_result_offset] : buffer -> view<16x4x64xf32>
-          %dense_use_secondary = scalar.constant 0 : i1
-          func.call @qwen3_embedding.dense_accumulate(%dense_weights, %dense_packed_activations, %dense_accumulators, %dense_accumulators, %dense_use_secondary, %first_dense_chunk) : (view<16x2x576xi8>, view<2x4x576xi8>, view<16x4x64xf32>, view<16x4x64xf32>, i1, i1)
-          %next_role = index.add %dense_role, %one : index
-          %more_roles = index.cmp ult, %next_role, %dense_roles : index
-          scf.condition %more_roles, %weight_read, %next_role : i1, read<tile<4624xi32>, mutable>, index
-        } do(%completed_weight: read<tile<4624xi32>, mutable>, %following_role: index) {
-          channel.release %completed_weight : read<tile<4624xi32>, mutable>
-          scf.yield %following_role : index
-        }
-        %next_chunk = index.add %dense_chunk, %one : index
-        %more_chunks = index.cmp ult, %next_chunk, %dense_chunks : index
-        scf.condition %more_chunks, %chunk_last_read, %next_chunk : i1, read<tile<4624xi32>, mutable>, index
-      } do(%completed_chunk: read<tile<4624xi32>, mutable>, %following_chunk: index) {
-        channel.release %completed_chunk : read<tile<4624xi32>, mutable>
-        scf.yield %following_chunk : index
-      }
-      %head_records = scf.select %head_group, %c2, %one : index
-      %preparation_records = scf.select %residual_group, %c8, %head_records : index
-      scf.for %record = [%zero to %preparation_records step %one] {
-        %first_record = index.cmp eq, %record, %zero : index
-        %preparation_read, %preparation_incoming = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
-        %preparation_values = view.bitcast %preparation_incoming : view<2048xi32> -> view<4096xbf16>
-        scf.if %head_group {
-          scf.if %first_record {
-            scf.for %word = [%zero to %scale_words step %vector_step] {
-              %value = vector.load %preparation_values[%word] : view<4096xbf16> -> vector<32xbf16>
-              vector.store %value, %dense_scales[%word] : vector<32xbf16>, view<256xbf16>
-            }
-          } else {
-            func.call @qwen3_embedding.shared_copy_output(%preparation_values, %dense_rope_bits) : (view<4096xbf16>, view<4096xbf16>)
-          }
-        } else {
-          scf.if %residual_group {
-
-            %skip_rows = view.bitcast %dense_secondary_bits : view<4096xbf16> -> view<32x128xbf16>
-            func.call @qwen3_embedding.shared_retain_residual_panel(%preparation_values, %skip_rows, %record, %skip_column) : (view<4096xbf16>, view<32x128xbf16>, index, index)
-          } else {
-            func.call @qwen3_embedding.shared_copy_output(%preparation_values, %raw) : (view<4096xbf16>, view<4096xbf16>)
-          }
-        }
-        channel.release %preparation_read : read<tile<2048xi32>>
-      }
-      func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
-      scf.if %mlp_group {
-        %lookup_source = buffer.view %local_storage[%origin] : buffer -> view<4096xbf16>
-        %lookup_ab = buffer.view %peer_storage[%origin] : buffer -> view<8192xbf16>
-        %lookup_cd = buffer.view %local_storage[%origin] : buffer -> view<8192xbf16>
-        func.call @qwen3_embedding.shared_prepare_silu_lookup(%lookup_source, %lookup_ab, %lookup_cd) : (view<4096xbf16>, view<8192xbf16>, view<8192xbf16>)
-      }
-      %epilogue_roles = scf.select %head_group, %c2, %one : index
-      %epilogue_members = index.mul %epilogue_roles, %c2 : index
-      scf.for %projection_member = [%zero to %epilogue_members step %one] {
-        %projection_role = index.div %projection_member, %c2 : index
-        %head_member = index.rem %projection_member, %c2 : index
-
-        %first_projection = index.cmp eq, %projection_role, %zero : index
-        %normalize_projection = scalar.ori %first_projection, %query_key_group : i1
-        %head_normalization = scalar.andi %head_group, %normalize_projection : i1
-
-        %head_slot_stride = index.constant 16384 : offset
-        %head_slot_base = index.constant 31680 : offset
-        %head_slot_relative = index.scale %head_member, %head_slot_stride : index, offset -> offset
-        %head_slot = index.add %head_slot_base, %head_slot_relative : offset
-        %head_primary = buffer.view %peer_storage[%head_slot] : buffer -> view<16x4x64xf32>
-        %head_secondary = buffer.view %local_storage[%head_slot] : buffer -> view<16x4x64xf32>
-        %head_primary_flat = buffer.view %peer_storage[%head_slot] : buffer -> view<4096xf32>
-        %head_secondary_flat = buffer.view %local_storage[%head_slot] : buffer -> view<4096xf32>
-        %head_primary_narrow = buffer.view %peer_storage[%head_slot] : buffer -> view<4096xbf16>
-        %head_primary_blocks = buffer.view %peer_storage[%head_slot] : buffer -> view<16x4x64xbf16>
-        %head_skip = buffer.view %local_storage[%head_slot] : buffer -> view<4096xbf16>
-        scf.if %mlp_group {
-          %swap_silu_tables = scalar.constant false : i1
-          func.call @qwen3_embedding.shared_swiglu_dense(%peer_storage, %local_storage, %head_slot, %swap_silu_tables) : (buffer, buffer, offset, i1)
-        } else {
-          %selected_dense_rows = scf.select %first_projection, %head_primary, %head_secondary : view<16x4x64xf32>
-          func.call @qwen3_embedding.shared_dense_rows(%selected_dense_rows, %raw_matrix) : (view<16x4x64xf32>, view<32x128xbf16>)
-          scf.if %head_normalization {
-            %first_head_member = index.cmp eq, %head_member, %zero : index
-            %member_storage = scf.select %first_head_member, %peer_storage, %local_storage : buffer
-            %member_rope = buffer.view %member_storage[%dense_rope_offset] : buffer -> view<32x2x64xbf16>
-            %scale_relative = index.scale %projection_role, %dense_scale_stride : index, offset -> offset
-            %scale_offset = index.add %dense_scale_offset, %scale_relative : offset
-            %head_scale = buffer.view %local_storage[%scale_offset] : buffer -> view<128xbf16>
-            func.call @qwen3_embedding.shared_dense_heads(%raw_matrix, %head_scale, %member_rope) : (view<32x128xbf16>, view<128xbf16>, view<32x2x64xbf16>)
-          }
-          scf.if %residual_group {
-            func.call @qwen3_embedding.shared_dense_residual(%raw, %head_skip) : (view<4096xbf16>, view<4096xbf16>)
-          }
-        }
-        %head_write, %head_destination = channel.reserve %projection_stream : channel<tile<4096xbf16>> -> (write<tile<4096xbf16>>, view<4096xbf16>)
-        scf.if %mlp_group {
-          %head_destination_blocks = view.bitcast %head_destination : view<4096xbf16> -> view<16x4x64xbf16>
-          func.call @qwen3_embedding.shared_block_dense_result(%head_primary_blocks, %head_destination_blocks) : (view<16x4x64xbf16>, view<16x4x64xbf16>)
-        } else {
-          scf.if %normalize_projection {
-            scf.if %head_group {
-              scf.if %first_projection {
-                func.call @qwen3_embedding.shared_block_left(%raw_matrix, %head_destination) : (view<32x128xbf16>, view<4096xbf16>)
-              } else {
-                func.call @qwen3_embedding.shared_block_attention_keys(%raw_matrix, %head_destination) : (view<32x128xbf16>, view<4096xbf16>)
-              }
-            } else {
-              func.call @qwen3_embedding.shared_copy_output(%raw, %head_destination) : (view<4096xbf16>, view<4096xbf16>)
-            }
-          } else {
-            %head_transposed = view.bitcast %head_destination : view<4096xbf16> -> view<16x4x64xbf16>
-            func.call @qwen3_embedding.shared_dense_block_values(%raw_matrix, %head_transposed) : (view<32x128xbf16>, view<16x4x64xbf16>)
-          }
-        }
-        channel.publish %head_write : write<tile<4096xbf16>>
-
-        %last_head_member = index.cmp eq, %head_member, %one : index
-        scf.if %last_head_member {
-
-          %next_episode = index.add %episode, %one : index
-          %next_projection = index.add %projection_role, %one : index
-          %later_episode = index.cmp ult, %next_episode, %panels : index
-          %later_projection = index.cmp ult, %next_projection, %epilogue_roles : index
-          %internal_join = scalar.ori %later_episode, %later_projection : i1
-          scf.if %internal_join {
-            func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
-            func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
-            func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
-            func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
-          }
-        }
-      }
-
-      channel.release %group_last_read : read<tile<4624xi32>, mutable>
-    }
+    channel.release %metadata_read : read<tile<2048xi32>>
   }
-  func.return
-}
+  %query_key_group = index.cmp eq, %dense_group, %zero : index
+  %head_group = index.cmp ult, %dense_group, %c2 : index
+  %output_group = index.cmp eq, %dense_group, %c2 : index
+  %down_group = index.cmp eq, %dense_group, %c6 : index
+  %residual_group = scalar.ori %output_group, %down_group : i1
+  %gate_or_later = index.cmp uge, %dense_group, %c3 : index
+  %before_down = index.cmp ult, %dense_group, %c6 : index
+  %mlp_group = scalar.andi %gate_or_later, %before_down : i1
+  %post_norm_group = index.cmp eq, %dense_group, %c3 : index
+  %normalize_rows = scalar.ori %query_key_group, %post_norm_group : i1
+  %gather_initial = scalar.andi %initial_layer, %query_key_group : i1
+  %wide_chunks = scf.select %down_group, %c24, %c16 : index
+  %dense_chunks = scf.select %residual_group, %wide_chunks, %c8 : index
+  %dense_roles = scf.select %residual_group, %one, %c2 : index
+  %last_dense_role = index.sub %dense_roles, %one : index
+  scf.if %normalize_rows {
+    %row_raw = buffer.view %peer_storage[%dense_result_offset] : buffer -> view<4096xbf16>
+    %row_width = index.constant 1024 : index
+    %row_bytes = index.constant 2048 : offset
+    %row_slot_base = index.constant 31680 : offset
+    %row_slot_stride = index.constant 16384 : offset
+    %row_scale = buffer.view %local_storage[%row_slot_base] : buffer -> view<1024xbf16>
 
-func.def public inline @qwen3_embedding.probability_value.attention(%normalize_peer_rows: i1, %dimension_storage: buffer, %origin: offset, %local_storage: buffer, %result_offset: offset, %peer_storage: buffer, %activation_stream: channel<tile<2048xi32>>, %zero: index, %one: index, %incoming_arrival: channel<tile<16xi32>>, %outgoing_arrival: channel<tile<16xi32>>, %incoming_departure: channel<tile<16xi32>>, %outgoing_departure: channel<tile<16xi32>>, %projection_stream: channel<tile<4096xbf16>>, %weight_stream: channel<tile<4624xi32>>, %activation_offset: offset, %probability_stream: channel<tile<4096xbf16>>, %result_stream: channel<tile<4096xbf16>>, %column_offset: index, %dimension_row_base: index, %row_column: index, %skip_column: index, %layer: index) {
-  %dimensions = buffer.view %dimension_storage[%origin] : buffer -> view<2x4xi32>
-  %c2 = index.constant 2 : index
-  %c4 = index.constant 4 : index
-  %c8 = index.constant 8 : index
-  %c32 = index.constant 32 : index
-  %capacity = index.constant 128 : index
-  %chunk_words = index.constant 512 : index
-  %vector_step = index.constant 32 : index
-  %record_stride = index.constant 8192 : offset
-  %episode_input_stride = index.constant 8192 : offset
-  %episode_output_stride = index.constant 524288 : offset
-
-  %identity_offset = index.constant 27008 : offset
-  %temporary_offset = index.constant 10368 : offset
-  %scores_offset = index.constant 9344 : offset
-  %packed_low = index.constant 4672 : offset
-  %right_high = index.constant 27136 : offset
-  %right_low = index.constant 45632 : offset
-  %right_stride = index.constant 1152 : offset
-  %right_count = scalar.constant 16 : i32
-  %left_count = scalar.constant 64 : i32
-  %identity = buffer.view %local_storage[%identity_offset] : buffer -> view<8x8xbf16>
-  %temporary = buffer.view %local_storage[%temporary_offset] : buffer -> view<8x8xf32>
-  %scores = buffer.view %local_storage[%scores_offset] : buffer -> view<128xf32>
-  %raw = buffer.view %local_storage[%origin] : buffer -> view<4096xbf16>
-  %raw_matrix = buffer.view %local_storage[%origin] : buffer -> view<32x128xbf16>
-  %blocked = buffer.view %local_storage[%result_offset] : buffer -> view<4096xbf16>
-
-  %last_chunk = index.constant 7 : index
-  %dense_input_stride = index.constant 32768 : offset
-  %dense_packed_offset = index.constant 27008 : offset
-  %dense_result_offset = index.constant 48064 : offset
-  %dense_primary = buffer.view %peer_storage[%dense_result_offset] : buffer -> view<16x4x64xf32>
-  %dense_secondary = buffer.view %local_storage[%dense_result_offset] : buffer -> view<16x4x64xf32>
-  %dense_primary_bits = buffer.view %peer_storage[%dense_result_offset] : buffer -> view<4096xbf16>
-  %dense_secondary_bits = buffer.view %local_storage[%dense_result_offset] : buffer -> view<4096xbf16>
-  %dense_blocked_values = buffer.view %local_storage[%dense_result_offset] : buffer -> view<16x4x64xbf16>
-  %dense_scale_offset = index.constant 8192 : offset
-  %dense_scale_stride = index.constant 256 : offset
-  %dense_rope_offset = index.constant 8704 : offset
-  %dense_scales = buffer.view %local_storage[%dense_scale_offset] : buffer -> view<256xbf16>
-  %dense_rope_bits = buffer.view %local_storage[%dense_rope_offset] : buffer -> view<4096xbf16>
-  %dense_rope = buffer.view %local_storage[%dense_rope_offset] : buffer -> view<32x2x64xbf16>
-  %scale_words = index.constant 256 : index
-  %episode_state_stride = index.constant 2924544 : offset
-  %c3 = index.constant 3 : index
-  %c6 = index.constant 6 : index
-  %c7 = index.constant 7 : index
-  %c16 = index.constant 16 : index
-  %c24 = index.constant 24 : index
-  %layers = index.constant 29 : index
-  %learned_layers = index.constant 28 : index
-
-  %initial_layer = index.cmp eq, %layer, %zero : index
-  %constant_base = index.constant 497172480 : offset
-  %constant_stride = index.constant 8192 : offset
-  %constant_relative = index.scale %layer, %constant_stride : index, offset -> offset
-  %constant_offset = index.add %constant_base, %constant_relative : offset
-  %final_layer = index.cmp eq, %layer, %learned_layers : index
-  %learned_layer = index.cmp ult, %layer, %learned_layers : index
-  %active_groups = scf.select %final_layer, %one, %c7 : index
-
-  %attention_emits = scalar.constant false : i1
-  func.call @qwen3_embedding.attention_value(%local_storage, %weight_stream, %probability_stream, %result_stream, %local_storage, %origin, %episode_state_stride, %attention_emits) : (buffer, channel<tile<4624xi32>>, channel<tile<4096xbf16>>, channel<tile<4096xbf16>>, buffer, offset, offset, i1)
-
-  func.return
-}
-
-// Owns value products, dense epilogues, and global writes for its query/key peer.
-func.def public inline @qwen3_embedding.probability_value_egress(%dimension_storage: buffer, %local_storage: buffer, %origin: offset, %result_offset: offset, %peer_storage: buffer, %activation_stream: channel<tile<2048xi32>>, %zero: index, %one: index, %incoming_arrival: channel<tile<16xi32>>, %outgoing_arrival: channel<tile<16xi32>>, %incoming_departure: channel<tile<16xi32>>, %outgoing_departure: channel<tile<16xi32>>, %normalization_stream: channel<tile<4096xbf16>>, %output: buffer, %state: buffer, %weight_stream: channel<tile<4624xi32>>, %activation_offset: offset, %projection_stream: channel<tile<4096xbf16>>, %probability_stream: channel<tile<4096xbf16>>, %result_stream: channel<tile<4096xbf16>>, %column_offset: index, %row_column: index, %finish_initial: offset, %normalized_initial: offset, %skip_column: index, %query_initial: offset, %key_initial: offset, %value_initial: offset, %mlp_initial: offset, %residual_initial: offset, %output_initial: offset, %layer: index, %dense_group: index) {
-  %dimensions = buffer.view %dimension_storage[%origin] : buffer -> view<2x4xi32>
-  %c2 = index.constant 2 : index
-  %c4 = index.constant 4 : index
-  %c8 = index.constant 8 : index
-  %c32 = index.constant 32 : index
-  %capacity = index.constant 128 : index
-  %chunk_words = index.constant 512 : index
-  %vector_step = index.constant 32 : index
-  %record_stride = index.constant 8192 : offset
-  %episode_input_stride = index.constant 8192 : offset
-  %episode_output_stride = index.constant 524288 : offset
-
-  %identity_offset = index.constant 27008 : offset
-  %temporary_offset = index.constant 10368 : offset
-  %scores_offset = index.constant 9344 : offset
-  %packed_low = index.constant 4672 : offset
-  %right_high = index.constant 27136 : offset
-  %right_low = index.constant 45632 : offset
-  %right_stride = index.constant 1152 : offset
-  %right_count = scalar.constant 16 : i32
-  %left_count = scalar.constant 64 : i32
-  %identity = buffer.view %local_storage[%identity_offset] : buffer -> view<8x8xbf16>
-  %temporary = buffer.view %local_storage[%temporary_offset] : buffer -> view<8x8xf32>
-  %scores = buffer.view %local_storage[%scores_offset] : buffer -> view<128xf32>
-  %raw = buffer.view %local_storage[%origin] : buffer -> view<4096xbf16>
-  %raw_matrix = buffer.view %local_storage[%origin] : buffer -> view<32x128xbf16>
-  %blocked = buffer.view %local_storage[%result_offset] : buffer -> view<4096xbf16>
-
-  %last_chunk = index.constant 7 : index
-  %dense_input_stride = index.constant 32768 : offset
-  %dense_packed_offset = index.constant 27008 : offset
-  %dense_result_offset = index.constant 48064 : offset
-  %dense_primary = buffer.view %local_storage[%dense_result_offset] : buffer -> view<16x4x64xf32>
-  %dense_secondary = buffer.view %peer_storage[%dense_result_offset] : buffer -> view<16x4x64xf32>
-  %dense_primary_bits = buffer.view %local_storage[%dense_result_offset] : buffer -> view<4096xbf16>
-  %dense_secondary_bits = buffer.view %peer_storage[%dense_result_offset] : buffer -> view<4096xbf16>
-  %dense_blocked_values = buffer.view %peer_storage[%dense_result_offset] : buffer -> view<16x4x64xbf16>
-  %dense_scale_offset = index.constant 8192 : offset
-  %dense_scale_stride = index.constant 256 : offset
-  %dense_rope_offset = index.constant 8704 : offset
-  %dense_scales = buffer.view %local_storage[%dense_scale_offset] : buffer -> view<256xbf16>
-  %dense_rope_bits = buffer.view %local_storage[%dense_rope_offset] : buffer -> view<4096xbf16>
-  %dense_rope = buffer.view %local_storage[%dense_rope_offset] : buffer -> view<32x2x64xbf16>
-  %scale_words = index.constant 256 : index
-  %episode_state_stride = index.constant 2924544 : offset
-  %c3 = index.constant 3 : index
-  %c6 = index.constant 6 : index
-  %c7 = index.constant 7 : index
-  %c16 = index.constant 16 : index
-  %c24 = index.constant 24 : index
-  %layers = index.constant 29 : index
-  %learned_layers = index.constant 28 : index
-
-  %initial_layer = index.cmp eq, %layer, %zero : index
-  %constant_base = index.constant 497172480 : offset
-  %constant_stride = index.constant 8192 : offset
-  %constant_relative = index.scale %layer, %constant_stride : index, offset -> offset
-  %constant_offset = index.add %constant_base, %constant_relative : offset
-  %final_layer = index.cmp eq, %layer, %learned_layers : index
-  %learned_layer = index.cmp ult, %layer, %learned_layers : index
-  %active_groups = scf.select %final_layer, %one, %c7 : index
-
-  %panels = index.constant 2 : index
-  scf.for %episode = [%zero to %panels step %one] {
-    %episode_input_offset = index.scale %episode, %episode_input_stride : index, offset -> offset
-    %episode_state_offset = index.scale %episode, %episode_state_stride : index, offset -> offset
-    %episode_output_offset = index.scale %episode, %episode_output_stride : index, offset -> offset
-    %reload_metadata = index.cmp eq, %dense_group, %zero : index
-    scf.if %reload_metadata {
-      %metadata_read, %metadata_incoming = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
-      %metadata_bf16 = view.bitcast %metadata_incoming : view<2048xi32> -> view<4096xbf16>
-      channel.release %metadata_read : read<tile<2048xi32>>
+    %row_gamma_read, %row_gamma_record = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
+    %row_gamma_values = view.bitcast %row_gamma_record : view<2048xi32> -> view<4096xbf16>
+    channel.release %row_gamma_read : read<tile<2048xi32>>
+    scf.for %row_record = [%zero to %c8 step %one] {
+      %row_input_read, %row_input_record = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
+      %row_input_values = view.bitcast %row_input_record : view<2048xi32> -> view<4096xbf16>
+      %owns_rows = index.cmp eq, %row_record, %row_column : index
+      scf.if %owns_rows {
+        func.call @qwen3_embedding.shared_copy_output(%row_input_values, %row_raw) : (view<4096xbf16>, view<4096xbf16>)
+      }
+      channel.release %row_input_read : read<tile<2048xi32>>
     }
-    %query_key_group = index.cmp eq, %dense_group, %zero : index
-    %head_group = index.cmp ult, %dense_group, %c2 : index
-    %output_group = index.cmp eq, %dense_group, %c2 : index
-    %down_group = index.cmp eq, %dense_group, %c6 : index
-    %residual_group = scalar.ori %output_group, %down_group : i1
-    %gate_or_later = index.cmp uge, %dense_group, %c3 : index
-    %before_down = index.cmp ult, %dense_group, %c6 : index
-    %mlp_group = scalar.andi %gate_or_later, %before_down : i1
-    %post_norm_group = index.cmp eq, %dense_group, %c3 : index
-    %normalize_rows = scalar.ori %query_key_group, %post_norm_group : i1
-    %gather_initial = scalar.andi %initial_layer, %query_key_group : i1
-    %wide_chunks = scf.select %down_group, %c24, %c16 : index
-    %dense_chunks = scf.select %residual_group, %wide_chunks, %c8 : index
-    %dense_roles = scf.select %residual_group, %one, %c2 : index
-    %last_dense_role = index.sub %dense_roles, %one : index
-    %last_chunk = index.sub %dense_chunks, %one : index
-    scf.if %normalize_rows {
-      %row_raw = buffer.view %local_storage[%dense_result_offset] : buffer -> view<4096xbf16>
-      %row_width = index.constant 1024 : index
-      %row_bytes = index.constant 2048 : offset
-      %row_slot_base = index.constant 31680 : offset
-      %row_slot_stride = index.constant 16384 : offset
-      %row_scale = buffer.view %peer_storage[%row_slot_base] : buffer -> view<1024xbf16>
-
-      %row_gamma_read, %row_gamma_record = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
-      %row_gamma_values = view.bitcast %row_gamma_record : view<2048xi32> -> view<4096xbf16>
-      %input_gamma_word = index.constant 256 : index
-      %post_gamma_word = index.constant 1280 : index
-      %gamma_word = scf.select %query_key_group, %input_gamma_word, %post_gamma_word : index
-      %row_gamma_selected = view.subview %row_gamma_values[%gamma_word] : view<4096xbf16> -> view<1024xbf16>
-      scf.for %word = [%zero to %row_width step %vector_step] {
-        %value = vector.load %row_gamma_selected[%word] : view<1024xbf16> -> vector<32xbf16>
-        vector.store %value, %row_scale[%word] : vector<32xbf16>, view<1024xbf16>
-      }
-      channel.release %row_gamma_read : read<tile<2048xi32>>
-      scf.for %row_record = [%zero to %c8 step %one] {
-        %row_input_read, %row_input_record = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
-        %row_input_values = view.bitcast %row_input_record : view<2048xi32> -> view<4096xbf16>
-        %owns_rows = index.cmp eq, %row_record, %row_column : index
-        scf.if %owns_rows {
-          func.call @qwen3_embedding.shared_copy_output(%row_input_values, %row_raw) : (view<4096xbf16>, view<4096xbf16>)
-        }
-        channel.release %row_input_read : read<tile<2048xi32>>
-      }
-      func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
+    scf.if %normalize_peer_rows {
       scf.for %row_member = [%zero to %c2 step %one] {
         %slot_relative = index.scale %row_member, %row_slot_stride : index, offset -> offset
         %slot = index.add %row_slot_base, %slot_relative : offset
-        %member_rows = buffer.view %local_storage[%slot] : buffer -> view<4x1024xbf16>
+        %member_rows = buffer.view %peer_storage[%slot] : buffer -> view<4x1024xbf16>
         scf.for %row_token = [%zero to %c4 step %one] {
           %token_relative = index.scale %row_token, %row_bytes : index, offset -> offset
           %token_offset = index.add %slot, %token_relative : offset
-          %row_values = buffer.view %local_storage[%token_offset] : buffer -> view<1024xbf16>
+          %row_values = buffer.view %peer_storage[%token_offset] : buffer -> view<1024xbf16>
           func.call @qwen3_embedding.shared_normalize_shared(%row_values, %row_scale) : (view<1024xbf16>, view<1024xbf16>)
         }
       }
-      func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
-      %row_records = scf.select %final_layer, %c4, %c2 : index
-      scf.for %output_record = [%zero to %row_records step %one] {
-        %row_read, %row_source = channel.acquire<mutable> %normalization_stream : channel<tile<4096xbf16>> -> (read<tile<4096xbf16>, mutable>, view<4096xbf16>)
-        scf.if %learned_layer {
-          %slot_relative = index.scale %output_record, %row_slot_stride : index, offset -> offset
-          %slot = index.add %row_slot_base, %slot_relative : offset
-          %member_rows = buffer.view %local_storage[%slot] : buffer -> view<4x1024xbf16>
-          %row_blocked = view.bitcast %row_source : view<4096xbf16> -> view<128x4x8xbf16>
-          func.call @qwen3_embedding.shared_block_four_rows(%member_rows, %row_blocked) : (view<4x1024xbf16>, view<128x4x8xbf16>)
-        }
-        scf.if %final_layer {
-          %output_member = index.div %output_record, %c2 : index
-          %output_half = index.rem %output_record, %c2 : index
-          %output_token_base = index.mul %output_half, %c2 : index
-          %output_slot_relative = index.scale %output_member, %row_slot_stride : index, offset -> offset
-          %output_slot = index.add %row_slot_base, %output_slot_relative : offset
-          %output_rows = buffer.view %local_storage[%output_slot] : buffer -> view<4x1024xbf16>
-          %output_values = view.bitcast %row_source : view<4096xbf16> -> view<2x1024xf32>
-          scf.for %output_token = [%zero to %c2 step %one] {
-            %source_token = index.add %output_token_base, %output_token : index
-            %source_row = view.subview %output_rows[%source_token, 0] : view<4x1024xbf16> -> view<1x1024xbf16>
-            %source_values = view.bitcast %source_row : view<1x1024xbf16> -> view<1024xbf16>
-            %target_row = view.subview %output_values[%output_token, 0] : view<2x1024xf32> -> view<1x1024xf32>
-            %target_values = view.bitcast %target_row : view<1x1024xf32> -> view<1024xf32>
-            %dimension_count = view.load %dimensions[%output_member, %source_token] : view<2x4xi32> -> i32
-            %prefix_width = index.constant 1024 : index
-            %prefix_floor = scalar.constant 9.9999999999999992e-25 : f32
-            %prefix_source = view.refine %source_values : view<1024xbf16> -> view<[%prefix_width]xbf16>
-            %prefix_target = view.refine %target_values : view<1024xf32> -> view<[%prefix_width]xf32>
-            template.apply<@normalization.l2_prefix_bf16>(%prefix_width, %dimension_count, %prefix_floor, %prefix_source, %prefix_target) : (index, i32, f32, view<[%prefix_width]xbf16>, view<[%prefix_width]xf32>)
-          }
-
-          %finish_member = index.div %output_record, %c2 : index
-          %finish_half = index.rem %output_record, %c2 : index
-          %finish_half_bytes = index.scale %finish_half, %record_stride : index, offset -> offset
-          %finish_member_stride = index.constant 131072 : offset
-          %finish_member_bytes = index.scale %finish_member, %finish_member_stride : index, offset -> offset
-
-          %finish_base = index.add %finish_initial, %finish_member_bytes : offset
-          %finish_relative = index.add %finish_base, %finish_half_bytes : offset
-          %finish_address = index.add %finish_relative, %episode_output_offset : offset
-          %finish_external = buffer.view %output[%finish_address] : buffer -> view<4096xbf16>
-          %finish_copy = kernel.async.copy %row_source to %finish_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<4096xbf16> to view<4096xbf16> -> kernel.async.token
-          %finish_group = kernel.async.group %finish_copy : kernel.async.token -> kernel.async.group
-          kernel.async.wait %finish_group {newer_groups = 0} : kernel.async.group
-        } else {
-
-          %normalized_relative = index.scale %output_record, %record_stride : index, offset -> offset
-          %normalized_base = index.add %normalized_initial, %episode_state_offset : offset
-          %normalized_address = index.add %normalized_base, %normalized_relative : offset
-          %normalized_external = buffer.view %state[%normalized_address] : buffer -> view<8x16x32xbf16, #encoding.layout.strided<strides=[16384, 256, 1]>>
-          %normalized_local = view.bitcast %row_source : view<4096xbf16> -> view<8x16x32xbf16>
-          %normalized_copy = kernel.async.copy %normalized_local to %normalized_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<8x16x32xbf16> to view<8x16x32xbf16, #encoding.layout.strided<strides=[16384, 256, 1]>> -> kernel.async.token
-          %normalized_group = kernel.async.group %normalized_copy : kernel.async.token -> kernel.async.group
-          kernel.async.wait %normalized_group {newer_groups = 0} : kernel.async.group
-        }
-        channel.release %row_read : read<tile<4096xbf16>, mutable>
-      }
-      func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
     }
-    scf.if %learned_layer {
-      %group_last_read, %completed_chunks = scf.while(%chunk_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
-        // Projection groups contain 8, 16, or 24 chunks, with one or two roles.
-        %dense_chunk = index.assume %chunk_index [range(%chunk_index, 0, 23)] : index
-        %dense_input_read, %dense_input_view = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
-        %dense_input_values = view.bitcast %dense_input_view : view<2048xi32> -> view<4096xbf16>
-        func.call @qwen3_embedding.pack_dense_activations(%local_storage, %activation_offset) : (buffer, offset)
-        channel.release %dense_input_read : read<tile<2048xi32>>
-        %chunk_last_read, %completed_roles = scf.while(%role_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
-          %dense_role = index.assume %role_index [range(%role_index, 0, 1)] : index
-          %weight_read, %weight_values = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
-          %first_dense_projection = index.cmp eq, %dense_role, %zero : index
-          %projection_storage = scf.if %first_dense_projection -> (buffer) {
-            scf.yield %local_storage : buffer
-          } else {
-            scf.yield %peer_storage : buffer
-          }
-          %first_dense_chunk = index.cmp eq, %dense_chunk, %zero : index
-          %dense_weights_offset = index.constant 0 : offset
-          %dense_activations_offset = index.constant 27008 : offset
-          %dense_operand_storage, %dense_output_storage = buffer.assume.alignment %local_storage, %projection_storage {minimum_alignment = 64} : buffer, buffer
-          %dense_weights = buffer.view %dense_operand_storage[%dense_weights_offset] : buffer -> view<16x2x576xi8>
-          %dense_packed_activations = buffer.view %dense_operand_storage[%dense_activations_offset] : buffer -> view<2x4x576xi8>
-          %dense_accumulators = buffer.view %dense_output_storage[%dense_result_offset] : buffer -> view<16x4x64xf32>
-          %dense_use_secondary = scalar.constant 0 : i1
-          func.call @qwen3_embedding.dense_accumulate(%dense_weights, %dense_packed_activations, %dense_accumulators, %dense_accumulators, %dense_use_secondary, %first_dense_chunk) : (view<16x2x576xi8>, view<2x4x576xi8>, view<16x4x64xf32>, view<16x4x64xf32>, i1, i1)
-          %next_role = index.add %dense_role, %one : index
-          %more_roles = index.cmp ult, %next_role, %dense_roles : index
-          scf.condition %more_roles, %weight_read, %next_role : i1, read<tile<4624xi32>, mutable>, index
-        } do(%completed_weight: read<tile<4624xi32>, mutable>, %following_role: index) {
-          channel.release %completed_weight : read<tile<4624xi32>, mutable>
-          scf.yield %following_role : index
+    func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
+    %row_records = scf.select %final_layer, %c4, %c2 : index
+    scf.for %output_record = [%zero to %row_records step %one] {
+      %row_write, %row_destination = channel.reserve %projection_stream : channel<tile<4096xbf16>> -> (write<tile<4096xbf16>>, view<4096xbf16>)
+      scf.if %final_layer {
+        %output_member = index.div %output_record, %c2 : index
+        %output_half = index.rem %output_record, %c2 : index
+        %output_token_base = index.mul %output_half, %c2 : index
+        %output_slot_relative = index.scale %output_member, %row_slot_stride : index, offset -> offset
+        %output_slot = index.add %row_slot_base, %output_slot_relative : offset
+        %output_rows = buffer.view %peer_storage[%output_slot] : buffer -> view<4x1024xbf16>
+        %output_values = view.bitcast %row_destination : view<4096xbf16> -> view<2x1024xf32>
+        scf.for %output_token = [%zero to %c2 step %one] {
+          %source_token = index.add %output_token_base, %output_token : index
+          %source_row = view.subview %output_rows[%source_token, 0] : view<4x1024xbf16> -> view<1x1024xbf16>
+          %source_values = view.bitcast %source_row : view<1x1024xbf16> -> view<1024xbf16>
+          %target_row = view.subview %output_values[%output_token, 0] : view<2x1024xf32> -> view<1x1024xf32>
+          %target_values = view.bitcast %target_row : view<1x1024xf32> -> view<1024xf32>
+          %dimension_count = view.load %dimensions[%output_member, %source_token] : view<2x4xi32> -> i32
+          %prefix_width = index.constant 1024 : index
+          %prefix_floor = scalar.constant 9.9999999999999992e-25 : f32
+          %prefix_source = view.refine %source_values : view<1024xbf16> -> view<[%prefix_width]xbf16>
+          %prefix_target = view.refine %target_values : view<1024xf32> -> view<[%prefix_width]xf32>
+          template.apply<@normalization.l2_prefix_bf16>(%prefix_width, %dimension_count, %prefix_floor, %prefix_source, %prefix_target) : (index, i32, f32, view<[%prefix_width]xbf16>, view<[%prefix_width]xf32>)
         }
-        %next_chunk = index.add %dense_chunk, %one : index
-        %more_chunks = index.cmp ult, %next_chunk, %dense_chunks : index
-        scf.condition %more_chunks, %chunk_last_read, %next_chunk : i1, read<tile<4624xi32>, mutable>, index
-      } do(%completed_chunk: read<tile<4624xi32>, mutable>, %following_chunk: index) {
-        channel.release %completed_chunk : read<tile<4624xi32>, mutable>
-        scf.yield %following_chunk : index
+      } else {
+        %slot_relative = index.scale %output_record, %row_slot_stride : index, offset -> offset
+        %slot = index.add %row_slot_base, %slot_relative : offset
+        %member_rows = buffer.view %peer_storage[%slot] : buffer -> view<4x1024xbf16>
+        %row_blocked = view.bitcast %row_destination : view<4096xbf16> -> view<128x4x8xbf16>
+        func.call @qwen3_embedding.shared_block_four_rows(%member_rows, %row_blocked) : (view<4x1024xbf16>, view<128x4x8xbf16>)
       }
-      %head_records = scf.select %head_group, %c2, %one : index
-      %preparation_records = scf.select %residual_group, %c8, %head_records : index
-      scf.for %record = [%zero to %preparation_records step %one] {
-        %first_record = index.cmp eq, %record, %zero : index
-        %preparation_read, %preparation_incoming = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
-        %preparation_values = view.bitcast %preparation_incoming : view<2048xi32> -> view<4096xbf16>
-        scf.if %head_group {
-          scf.if %first_record {
-            scf.for %word = [%zero to %scale_words step %vector_step] {
-              %value = vector.load %preparation_values[%word] : view<4096xbf16> -> vector<32xbf16>
-              vector.store %value, %dense_scales[%word] : vector<32xbf16>, view<256xbf16>
-            }
-          } else {
-            func.call @qwen3_embedding.shared_copy_output(%preparation_values, %dense_rope_bits) : (view<4096xbf16>, view<4096xbf16>)
+      channel.publish %row_write : write<tile<4096xbf16>>
+    }
+    func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
+  }
+  scf.if %learned_layer {
+    %group_last_read, %completed_chunks = scf.while(%chunk_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
+      // Projection groups contain 8, 16, or 24 chunks, with one or two roles.
+      %dense_chunk = index.assume %chunk_index [range(%chunk_index, 0, 23)] : index
+      %dense_input_read, %dense_input_view = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
+      %dense_input_values = view.bitcast %dense_input_view : view<2048xi32> -> view<4096xbf16>
+      func.call @qwen3_embedding.pack_dense_activations(%local_storage, %activation_offset) : (buffer, offset)
+      channel.release %dense_input_read : read<tile<2048xi32>>
+      %chunk_last_read, %completed_roles = scf.while(%role_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
+        %dense_role = index.assume %role_index [range(%role_index, 0, 1)] : index
+        %weight_read, %weight_values = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
+        %first_dense_projection = index.cmp eq, %dense_role, %zero : index
+        %projection_storage = scf.if %first_dense_projection -> (buffer) {
+          scf.yield %peer_storage : buffer
+        } else {
+          scf.yield %local_storage : buffer
+        }
+        %first_dense_chunk = index.cmp eq, %dense_chunk, %zero : index
+        %dense_weights_offset = index.constant 0 : offset
+        %dense_activations_offset = index.constant 27008 : offset
+        %dense_operand_storage, %dense_output_storage = buffer.assume.alignment %local_storage, %projection_storage {minimum_alignment = 64} : buffer, buffer
+        %dense_weights = buffer.view %dense_operand_storage[%dense_weights_offset] : buffer -> view<16x2x576xi8>
+        %dense_packed_activations = buffer.view %dense_operand_storage[%dense_activations_offset] : buffer -> view<2x4x576xi8>
+        %dense_accumulators = buffer.view %dense_output_storage[%dense_result_offset] : buffer -> view<16x4x64xf32>
+        %dense_use_secondary = scalar.constant 0 : i1
+        func.call @qwen3_embedding.dense_accumulate(%dense_weights, %dense_packed_activations, %dense_accumulators, %dense_accumulators, %dense_use_secondary, %first_dense_chunk) : (view<16x2x576xi8>, view<2x4x576xi8>, view<16x4x64xf32>, view<16x4x64xf32>, i1, i1)
+        %next_role = index.add %dense_role, %one : index
+        %more_roles = index.cmp ult, %next_role, %dense_roles : index
+        scf.condition %more_roles, %weight_read, %next_role : i1, read<tile<4624xi32>, mutable>, index
+      } do(%completed_weight: read<tile<4624xi32>, mutable>, %following_role: index) {
+        channel.release %completed_weight : read<tile<4624xi32>, mutable>
+        scf.yield %following_role : index
+      }
+      %next_chunk = index.add %dense_chunk, %one : index
+      %more_chunks = index.cmp ult, %next_chunk, %dense_chunks : index
+      scf.condition %more_chunks, %chunk_last_read, %next_chunk : i1, read<tile<4624xi32>, mutable>, index
+    } do(%completed_chunk: read<tile<4624xi32>, mutable>, %following_chunk: index) {
+      channel.release %completed_chunk : read<tile<4624xi32>, mutable>
+      scf.yield %following_chunk : index
+    }
+    %head_records = scf.select %head_group, %c2, %one : index
+    %preparation_records = scf.select %residual_group, %c8, %head_records : index
+    scf.for %record = [%zero to %preparation_records step %one] {
+      %first_record = index.cmp eq, %record, %zero : index
+      %preparation_read, %preparation_incoming = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
+      %preparation_values = view.bitcast %preparation_incoming : view<2048xi32> -> view<4096xbf16>
+      scf.if %head_group {
+        scf.if %first_record {
+          scf.for %word = [%zero to %scale_words step %vector_step] {
+            %value = vector.load %preparation_values[%word] : view<4096xbf16> -> vector<32xbf16>
+            vector.store %value, %dense_scales[%word] : vector<32xbf16>, view<256xbf16>
           }
         } else {
-          scf.if %residual_group {
-
-            %skip_rows = view.bitcast %dense_secondary_bits : view<4096xbf16> -> view<32x128xbf16>
-            func.call @qwen3_embedding.shared_retain_residual_panel(%preparation_values, %skip_rows, %record, %skip_column) : (view<4096xbf16>, view<32x128xbf16>, index, index)
-          } else {
-            func.call @qwen3_embedding.shared_copy_output(%preparation_values, %raw) : (view<4096xbf16>, view<4096xbf16>)
-          }
+          func.call @qwen3_embedding.shared_copy_output(%preparation_values, %dense_rope_bits) : (view<4096xbf16>, view<4096xbf16>)
         }
-        channel.release %preparation_read : read<tile<2048xi32>>
+      } else {
+        scf.if %residual_group {
+
+          %skip_rows = view.bitcast %dense_secondary_bits : view<4096xbf16> -> view<32x128xbf16>
+          func.call @qwen3_embedding.shared_retain_residual_panel(%preparation_values, %skip_rows, %record, %skip_column) : (view<4096xbf16>, view<32x128xbf16>, index, index)
+        } else {
+          func.call @qwen3_embedding.shared_copy_output(%preparation_values, %raw) : (view<4096xbf16>, view<4096xbf16>)
+        }
       }
-      func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
-      func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
+      channel.release %preparation_read : read<tile<2048xi32>>
+    }
+    func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
+    scf.if %mlp_group {
+      %lookup_source = buffer.view %local_storage[%origin] : buffer -> view<4096xbf16>
+      %lookup_ab = buffer.view %peer_storage[%origin] : buffer -> view<8192xbf16>
+      %lookup_cd = buffer.view %local_storage[%origin] : buffer -> view<8192xbf16>
+      func.call @qwen3_embedding.shared_prepare_silu_lookup(%lookup_source, %lookup_ab, %lookup_cd) : (view<4096xbf16>, view<8192xbf16>, view<8192xbf16>)
+    }
+    %epilogue_roles = scf.select %head_group, %c2, %one : index
+    %epilogue_members = index.mul %epilogue_roles, %c2 : index
+    scf.for %projection_member = [%zero to %epilogue_members step %one] {
+      %projection_role = index.div %projection_member, %c2 : index
+      %head_member = index.rem %projection_member, %c2 : index
+
+      %first_projection = index.cmp eq, %projection_role, %zero : index
+      %normalize_projection = scalar.ori %first_projection, %query_key_group : i1
+      %head_normalization = scalar.andi %head_group, %normalize_projection : i1
+
+      %head_slot_stride = index.constant 16384 : offset
+      %head_slot_base = index.constant 31680 : offset
+      %head_slot_relative = index.scale %head_member, %head_slot_stride : index, offset -> offset
+      %head_slot = index.add %head_slot_base, %head_slot_relative : offset
+      %head_primary = buffer.view %peer_storage[%head_slot] : buffer -> view<16x4x64xf32>
+      %head_secondary = buffer.view %local_storage[%head_slot] : buffer -> view<16x4x64xf32>
+      %head_primary_flat = buffer.view %peer_storage[%head_slot] : buffer -> view<4096xf32>
+      %head_secondary_flat = buffer.view %local_storage[%head_slot] : buffer -> view<4096xf32>
+      %head_primary_narrow = buffer.view %peer_storage[%head_slot] : buffer -> view<4096xbf16>
+      %head_primary_blocks = buffer.view %peer_storage[%head_slot] : buffer -> view<16x4x64xbf16>
+      %head_skip = buffer.view %local_storage[%head_slot] : buffer -> view<4096xbf16>
       scf.if %mlp_group {
-        %lookup_source = buffer.view %local_storage[%origin] : buffer -> view<4096xbf16>
-        %lookup_ab = buffer.view %peer_storage[%origin] : buffer -> view<8192xbf16>
-        %lookup_cd = buffer.view %local_storage[%origin] : buffer -> view<8192xbf16>
-        func.call @qwen3_embedding.shared_prepare_silu_lookup(%lookup_source, %lookup_ab, %lookup_cd) : (view<4096xbf16>, view<8192xbf16>, view<8192xbf16>)
+        %swap_silu_tables = scalar.constant false : i1
+        func.call @qwen3_embedding.shared_swiglu_dense(%peer_storage, %local_storage, %head_slot, %swap_silu_tables) : (buffer, buffer, offset, i1)
+      } else {
+        %selected_dense_rows = scf.select %first_projection, %head_primary, %head_secondary : view<16x4x64xf32>
+        func.call @qwen3_embedding.shared_dense_rows(%selected_dense_rows, %raw_matrix) : (view<16x4x64xf32>, view<32x128xbf16>)
+        scf.if %head_normalization {
+          %first_head_member = index.cmp eq, %head_member, %zero : index
+          %member_storage = scf.select %first_head_member, %peer_storage, %local_storage : buffer
+          %member_rope = buffer.view %member_storage[%dense_rope_offset] : buffer -> view<32x2x64xbf16>
+          %scale_relative = index.scale %projection_role, %dense_scale_stride : index, offset -> offset
+          %scale_offset = index.add %dense_scale_offset, %scale_relative : offset
+          %head_scale = buffer.view %local_storage[%scale_offset] : buffer -> view<128xbf16>
+          func.call @qwen3_embedding.shared_dense_heads(%raw_matrix, %head_scale, %member_rope) : (view<32x128xbf16>, view<128xbf16>, view<32x2x64xbf16>)
+        }
+        scf.if %residual_group {
+          func.call @qwen3_embedding.shared_dense_residual(%raw, %head_skip) : (view<4096xbf16>, view<4096xbf16>)
+        }
       }
-      func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
-      %epilogue_roles = scf.select %head_group, %c2, %one : index
-      %epilogue_members = index.mul %epilogue_roles, %c2 : index
-      scf.for %projection_role = [%zero to %epilogue_roles step %one] {
-        %first_projection = index.cmp eq, %projection_role, %zero : index
-        %normalize_projection = scalar.ori %first_projection, %query_key_group : i1
-        %head_normalization = scalar.andi %head_group, %normalize_projection : i1
-        scf.for %member = [%zero to %c2 step %one] {
-          %head_read, %head_source = channel.acquire<mutable> %projection_stream : channel<tile<4096xbf16>> -> (read<tile<4096xbf16>, mutable>, view<4096xbf16>)
-          scf.if %residual_group {
-            %skip_member_stride = index.constant 16384 : offset
-            %skip_member_base = index.constant 31680 : offset
-            %skip_member_relative = index.scale %member, %skip_member_stride : index, offset -> offset
-            %skip_member_offset = index.add %skip_member_base, %skip_member_relative : offset
-            %skip_member = buffer.view %peer_storage[%skip_member_offset] : buffer -> view<4096xbf16>
-            func.call @qwen3_embedding.shared_dense_residual(%head_source, %skip_member) : (view<4096xbf16>, view<4096xbf16>)
-          }
+      %head_write, %head_destination = channel.reserve %projection_stream : channel<tile<4096xbf16>> -> (write<tile<4096xbf16>>, view<4096xbf16>)
+      scf.if %mlp_group {
+        %head_destination_blocks = view.bitcast %head_destination : view<4096xbf16> -> view<16x4x64xbf16>
+        func.call @qwen3_embedding.shared_block_dense_result(%head_primary_blocks, %head_destination_blocks) : (view<16x4x64xbf16>, view<16x4x64xbf16>)
+      } else {
+        scf.if %normalize_projection {
           scf.if %head_group {
-            scf.if %normalize_projection {
-
-              %query_stride = index.constant 131072 : offset
-              %query_relative = index.scale %dense_group, %query_stride : index, offset -> offset
-              %query_offset = index.add %query_initial, %query_relative : offset
-              %head_initial = scf.select %first_projection, %query_offset, %key_initial : offset
-              %head_row_stride = index.constant 8192 : offset
-              %head_relative = index.scale %member, %head_row_stride : index, offset -> offset
-              %head_base = index.add %head_initial, %episode_state_offset : offset
-              %head_address = index.add %head_base, %head_relative : offset
-              %head_external = buffer.view %state[%head_address] : buffer -> view<4096xbf16>
-              %head_copy = kernel.async.copy %head_source to %head_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<4096xbf16> to view<4096xbf16> -> kernel.async.token
-              %head_group = kernel.async.group %head_copy : kernel.async.token -> kernel.async.group
-              kernel.async.wait %head_group {newer_groups = 0} : kernel.async.group
+            scf.if %first_projection {
+              func.call @qwen3_embedding.shared_block_left(%raw_matrix, %head_destination) : (view<32x128xbf16>, view<4096xbf16>)
             } else {
-
-              %value_row_stride = index.constant 512 : offset
-              %value_relative = index.scale %member, %value_row_stride : index, offset -> offset
-              %value_base = index.add %value_initial, %episode_state_offset : offset
-              %value_address = index.add %value_base, %value_relative : offset
-              %value_external = buffer.view %state[%value_address] : buffer -> view<16x4x64xbf16, #encoding.layout.strided<strides=[1024, 64, 1]>>
-              %value_local = view.bitcast %head_source : view<4096xbf16> -> view<16x4x64xbf16>
-              %value_copy = kernel.async.copy %value_local to %value_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<16x4x64xbf16> to view<16x4x64xbf16, #encoding.layout.strided<strides=[1024, 64, 1]>> -> kernel.async.token
-              %value_group = kernel.async.group %value_copy : kernel.async.token -> kernel.async.group
-              kernel.async.wait %value_group {newer_groups = 0} : kernel.async.group
+              func.call @qwen3_embedding.shared_block_attention_keys(%raw_matrix, %head_destination) : (view<32x128xbf16>, view<4096xbf16>)
             }
           } else {
-            scf.if %mlp_group {
-              %mlp_panel_unbounded = index.sub %dense_group, %c3 : index
-              %mlp_panel = index.assume %mlp_panel_unbounded [range(%mlp_panel_unbounded, 0, 2)] : index
-              %mlp_panel_stride = index.constant 262144 : offset
-              %mlp_panel_relative = index.scale %mlp_panel, %mlp_panel_stride : index, offset -> offset
-
-              %mlp_base = index.add %mlp_initial, %episode_state_offset : offset
-              %mlp_panel_base = index.add %mlp_base, %mlp_panel_relative : offset
-              %mlp_row_relative = index.scale %member, %record_stride : index, offset -> offset
-              %mlp_address = index.add %mlp_panel_base, %mlp_row_relative : offset
-              %mlp_external = buffer.view %state[%mlp_address] : buffer -> view<4096xbf16>
-              %mlp_output_copy = kernel.async.copy %head_source to %mlp_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<4096xbf16> to view<4096xbf16> -> kernel.async.token
-              %mlp_output_completion = kernel.async.group %mlp_output_copy : kernel.async.token -> kernel.async.group
-              kernel.async.wait %mlp_output_completion {newer_groups = 0} : kernel.async.group
-            } else {
-              %residual_row_stride = index.constant 65536 : offset
-              %residual_row_relative = index.scale %member, %residual_row_stride : index, offset -> offset
-              %residual_local = view.bitcast %head_source : view<4096xbf16> -> view<32x128xbf16>
-
-              %residual_base = index.add %residual_initial, %episode_state_offset : offset
-              %residual_address = index.add %residual_base, %residual_row_relative : offset
-              %residual_external = buffer.view %state[%residual_address] : buffer -> view<32x128xbf16, #encoding.layout.strided<strides=[1024, 1]>>
-              %residual_output_copy = kernel.async.copy %residual_local to %residual_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<32x128xbf16> to view<32x128xbf16, #encoding.layout.strided<strides=[1024, 1]>> -> kernel.async.token
-              %residual_output_completion = kernel.async.group %residual_output_copy : kernel.async.token -> kernel.async.group
-              kernel.async.wait %residual_output_completion {newer_groups = 0} : kernel.async.group
-            }
+            func.call @qwen3_embedding.shared_copy_output(%raw, %head_destination) : (view<4096xbf16>, view<4096xbf16>)
           }
-          channel.release %head_read : read<tile<4096xbf16>, mutable>
+        } else {
+          %head_transposed = view.bitcast %head_destination : view<4096xbf16> -> view<16x4x64xbf16>
+          func.call @qwen3_embedding.shared_dense_block_values(%raw_matrix, %head_transposed) : (view<32x128xbf16>, view<16x4x64xbf16>)
         }
-        %next_episode = index.add %episode, %one : index
+      }
+      channel.publish %head_write : write<tile<4096xbf16>>
+
+      %last_head_member = index.cmp eq, %head_member, %one : index
+      scf.if %last_head_member {
+
         %next_projection = index.add %projection_role, %one : index
-        %later_episode = index.cmp ult, %next_episode, %panels : index
+
         %later_projection = index.cmp ult, %next_projection, %epilogue_roles : index
-        %internal_join = scalar.ori %later_episode, %later_projection : i1
-        scf.if %internal_join {
+
+        scf.if %later_projection {
           func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
           func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
           func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
           func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
         }
       }
-
-      channel.release %group_last_read : read<tile<4624xi32>, mutable>
     }
+
+    channel.release %group_last_read : read<tile<4624xi32>, mutable>
   }
   func.return
 }
 
-func.def public inline @qwen3_embedding.probability_value_egress.attention(%local_storage: buffer, %origin: offset, %result_offset: offset, %peer_storage: buffer, %activation_stream: channel<tile<2048xi32>>, %zero: index, %one: index, %incoming_arrival: channel<tile<16xi32>>, %outgoing_arrival: channel<tile<16xi32>>, %incoming_departure: channel<tile<16xi32>>, %outgoing_departure: channel<tile<16xi32>>, %normalization_stream: channel<tile<4096xbf16>>, %output: buffer, %state: buffer, %weight_stream: channel<tile<4624xi32>>, %activation_offset: offset, %projection_stream: channel<tile<4096xbf16>>, %probability_stream: channel<tile<4096xbf16>>, %result_stream: channel<tile<4096xbf16>>, %column_offset: index, %row_column: index, %finish_initial: offset, %normalized_initial: offset, %skip_column: index, %query_initial: offset, %key_initial: offset, %value_initial: offset, %mlp_initial: offset, %residual_initial: offset, %output_initial: offset, %layer: index) {
+// Owns value products, dense epilogues, and global writes for its query/key peer.
+func.def public inline @qwen3_embedding.probability_value_egress(%dimension_storage: buffer, %local_storage: buffer, %origin: offset, %result_offset: offset, %peer_storage: buffer, %activation_stream: channel<tile<2048xi32>>, %zero: index, %one: index, %incoming_arrival: channel<tile<16xi32>>, %outgoing_arrival: channel<tile<16xi32>>, %incoming_departure: channel<tile<16xi32>>, %outgoing_departure: channel<tile<16xi32>>, %normalization_stream: channel<tile<4096xbf16>>, %output: buffer, %state: buffer, %weight_stream: channel<tile<4624xi32>>, %activation_offset: offset, %projection_stream: channel<tile<4096xbf16>>, %probability_stream: channel<tile<4096xbf16>>, %result_stream: channel<tile<4096xbf16>>, %column_offset: index, %row_column: index, %finish_initial: offset, %normalized_initial: offset, %skip_column: index, %query_initial: offset, %key_initial: offset, %value_initial: offset, %mlp_initial: offset, %residual_initial: offset, %output_initial: offset, %layer: index, %dense_group: index, %panel_index: index) {
+  %dimensions = buffer.view %dimension_storage[%origin] : buffer -> view<2x4xi32>
   %c2 = index.constant 2 : index
   %c4 = index.constant 4 : index
   %c8 = index.constant 8 : index
@@ -895,7 +448,6 @@ func.def public inline @qwen3_embedding.probability_value_egress.attention(%loca
   %raw_matrix = buffer.view %local_storage[%origin] : buffer -> view<32x128xbf16>
   %blocked = buffer.view %local_storage[%result_offset] : buffer -> view<4096xbf16>
 
-  %last_chunk = index.constant 7 : index
   %dense_input_stride = index.constant 32768 : offset
   %dense_packed_offset = index.constant 27008 : offset
   %dense_result_offset = index.constant 48064 : offset
@@ -911,7 +463,7 @@ func.def public inline @qwen3_embedding.probability_value_egress.attention(%loca
   %dense_rope_bits = buffer.view %local_storage[%dense_rope_offset] : buffer -> view<4096xbf16>
   %dense_rope = buffer.view %local_storage[%dense_rope_offset] : buffer -> view<32x2x64xbf16>
   %scale_words = index.constant 256 : index
-  %episode_state_stride = index.constant 2924544 : offset
+  %episode_state_stride = index.constant 3989504 : offset
   %c3 = index.constant 3 : index
   %c6 = index.constant 6 : index
   %c7 = index.constant 7 : index
@@ -929,8 +481,304 @@ func.def public inline @qwen3_embedding.probability_value_egress.attention(%loca
   %learned_layer = index.cmp ult, %layer, %learned_layers : index
   %active_groups = scf.select %final_layer, %one, %c7 : index
 
-  %attention_emits = scalar.constant true : i1
-  func.call @qwen3_embedding.attention_value(%local_storage, %weight_stream, %probability_stream, %result_stream, %state, %output_initial, %episode_state_stride, %attention_emits) : (buffer, channel<tile<4624xi32>>, channel<tile<4096xbf16>>, channel<tile<4096xbf16>>, buffer, offset, offset, i1)
+  %episode_input_offset = index.scale %panel_index, %episode_input_stride : index, offset -> offset
+  %episode_state_offset = index.scale %panel_index, %episode_state_stride : index, offset -> offset
+  %episode_output_offset = index.scale %panel_index, %episode_output_stride : index, offset -> offset
+  %reload_metadata = index.cmp eq, %dense_group, %zero : index
+  scf.if %reload_metadata {
+    %metadata_read, %metadata_incoming = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
+    %metadata_bf16 = view.bitcast %metadata_incoming : view<2048xi32> -> view<4096xbf16>
+    channel.release %metadata_read : read<tile<2048xi32>>
+  }
+  %query_key_group = index.cmp eq, %dense_group, %zero : index
+  %head_group = index.cmp ult, %dense_group, %c2 : index
+  %output_group = index.cmp eq, %dense_group, %c2 : index
+  %down_group = index.cmp eq, %dense_group, %c6 : index
+  %residual_group = scalar.ori %output_group, %down_group : i1
+  %gate_or_later = index.cmp uge, %dense_group, %c3 : index
+  %before_down = index.cmp ult, %dense_group, %c6 : index
+  %mlp_group = scalar.andi %gate_or_later, %before_down : i1
+  %post_norm_group = index.cmp eq, %dense_group, %c3 : index
+  %normalize_rows = scalar.ori %query_key_group, %post_norm_group : i1
+  %gather_initial = scalar.andi %initial_layer, %query_key_group : i1
+  %wide_chunks = scf.select %down_group, %c24, %c16 : index
+  %dense_chunks = scf.select %residual_group, %wide_chunks, %c8 : index
+  %dense_roles = scf.select %residual_group, %one, %c2 : index
+  %last_dense_role = index.sub %dense_roles, %one : index
+  scf.if %normalize_rows {
+    %row_raw = buffer.view %local_storage[%dense_result_offset] : buffer -> view<4096xbf16>
+    %row_width = index.constant 1024 : index
+    %row_bytes = index.constant 2048 : offset
+    %row_slot_base = index.constant 31680 : offset
+    %row_slot_stride = index.constant 16384 : offset
+    %row_scale = buffer.view %peer_storage[%row_slot_base] : buffer -> view<1024xbf16>
 
+    %row_gamma_read, %row_gamma_record = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
+    %row_gamma_values = view.bitcast %row_gamma_record : view<2048xi32> -> view<4096xbf16>
+    %input_gamma_word = index.constant 256 : index
+    %post_gamma_word = index.constant 1280 : index
+    %gamma_word = scf.select %query_key_group, %input_gamma_word, %post_gamma_word : index
+    %row_gamma_selected = view.subview %row_gamma_values[%gamma_word] : view<4096xbf16> -> view<1024xbf16>
+    scf.for %word = [%zero to %row_width step %vector_step] {
+      %value = vector.load %row_gamma_selected[%word] : view<1024xbf16> -> vector<32xbf16>
+      vector.store %value, %row_scale[%word] : vector<32xbf16>, view<1024xbf16>
+    }
+    channel.release %row_gamma_read : read<tile<2048xi32>>
+    scf.for %row_record = [%zero to %c8 step %one] {
+      %row_input_read, %row_input_record = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
+      %row_input_values = view.bitcast %row_input_record : view<2048xi32> -> view<4096xbf16>
+      %owns_rows = index.cmp eq, %row_record, %row_column : index
+      scf.if %owns_rows {
+        func.call @qwen3_embedding.shared_copy_output(%row_input_values, %row_raw) : (view<4096xbf16>, view<4096xbf16>)
+      }
+      channel.release %row_input_read : read<tile<2048xi32>>
+    }
+    func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
+    scf.for %row_member = [%zero to %c2 step %one] {
+      %slot_relative = index.scale %row_member, %row_slot_stride : index, offset -> offset
+      %slot = index.add %row_slot_base, %slot_relative : offset
+      %member_rows = buffer.view %local_storage[%slot] : buffer -> view<4x1024xbf16>
+      scf.for %row_token = [%zero to %c4 step %one] {
+        %token_relative = index.scale %row_token, %row_bytes : index, offset -> offset
+        %token_offset = index.add %slot, %token_relative : offset
+        %row_values = buffer.view %local_storage[%token_offset] : buffer -> view<1024xbf16>
+        func.call @qwen3_embedding.shared_normalize_shared(%row_values, %row_scale) : (view<1024xbf16>, view<1024xbf16>)
+      }
+    }
+    func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
+    %row_records = scf.select %final_layer, %c4, %c2 : index
+    scf.for %output_record = [%zero to %row_records step %one] {
+      %row_read, %row_source = channel.acquire<mutable> %normalization_stream : channel<tile<4096xbf16>> -> (read<tile<4096xbf16>, mutable>, view<4096xbf16>)
+      scf.if %learned_layer {
+        %slot_relative = index.scale %output_record, %row_slot_stride : index, offset -> offset
+        %slot = index.add %row_slot_base, %slot_relative : offset
+        %member_rows = buffer.view %local_storage[%slot] : buffer -> view<4x1024xbf16>
+        %row_blocked = view.bitcast %row_source : view<4096xbf16> -> view<128x4x8xbf16>
+        func.call @qwen3_embedding.shared_block_four_rows(%member_rows, %row_blocked) : (view<4x1024xbf16>, view<128x4x8xbf16>)
+      }
+      scf.if %final_layer {
+        %output_member = index.div %output_record, %c2 : index
+        %output_half = index.rem %output_record, %c2 : index
+        %output_token_base = index.mul %output_half, %c2 : index
+        %output_slot_relative = index.scale %output_member, %row_slot_stride : index, offset -> offset
+        %output_slot = index.add %row_slot_base, %output_slot_relative : offset
+        %output_rows = buffer.view %local_storage[%output_slot] : buffer -> view<4x1024xbf16>
+        %output_values = view.bitcast %row_source : view<4096xbf16> -> view<2x1024xf32>
+        scf.for %output_token = [%zero to %c2 step %one] {
+          %source_token = index.add %output_token_base, %output_token : index
+          %source_row = view.subview %output_rows[%source_token, 0] : view<4x1024xbf16> -> view<1x1024xbf16>
+          %source_values = view.bitcast %source_row : view<1x1024xbf16> -> view<1024xbf16>
+          %target_row = view.subview %output_values[%output_token, 0] : view<2x1024xf32> -> view<1x1024xf32>
+          %target_values = view.bitcast %target_row : view<1x1024xf32> -> view<1024xf32>
+          %dimension_count = view.load %dimensions[%output_member, %source_token] : view<2x4xi32> -> i32
+          %prefix_width = index.constant 1024 : index
+          %prefix_floor = scalar.constant 9.9999999999999992e-25 : f32
+          %prefix_source = view.refine %source_values : view<1024xbf16> -> view<[%prefix_width]xbf16>
+          %prefix_target = view.refine %target_values : view<1024xf32> -> view<[%prefix_width]xf32>
+          template.apply<@normalization.l2_prefix_bf16>(%prefix_width, %dimension_count, %prefix_floor, %prefix_source, %prefix_target) : (index, i32, f32, view<[%prefix_width]xbf16>, view<[%prefix_width]xf32>)
+        }
+
+        %finish_member = index.div %output_record, %c2 : index
+        %finish_half = index.rem %output_record, %c2 : index
+        %finish_half_bytes = index.scale %finish_half, %record_stride : index, offset -> offset
+        %finish_member_stride = index.constant 131072 : offset
+        %finish_member_bytes = index.scale %finish_member, %finish_member_stride : index, offset -> offset
+
+        %finish_base = index.add %finish_initial, %finish_member_bytes : offset
+        %finish_relative = index.add %finish_base, %finish_half_bytes : offset
+        %finish_address = index.add %finish_relative, %episode_output_offset : offset
+        %finish_external = buffer.view %output[%finish_address] : buffer -> view<4096xbf16>
+        %finish_copy = kernel.async.copy %row_source to %finish_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<4096xbf16> to view<4096xbf16> -> kernel.async.token
+        %finish_group = kernel.async.group %finish_copy : kernel.async.token -> kernel.async.group
+        kernel.async.wait %finish_group {newer_groups = 0} : kernel.async.group
+      } else {
+
+        %normalized_relative = index.scale %output_record, %record_stride : index, offset -> offset
+        %normalized_base = index.add %normalized_initial, %episode_state_offset : offset
+        %normalized_address = index.add %normalized_base, %normalized_relative : offset
+        %normalized_external = buffer.view %state[%normalized_address] : buffer -> view<8x16x32xbf16, #encoding.layout.strided<strides=[16384, 256, 1]>>
+        %normalized_local = view.bitcast %row_source : view<4096xbf16> -> view<8x16x32xbf16>
+        %normalized_copy = kernel.async.copy %normalized_local to %normalized_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<8x16x32xbf16> to view<8x16x32xbf16, #encoding.layout.strided<strides=[16384, 256, 1]>> -> kernel.async.token
+        %normalized_group = kernel.async.group %normalized_copy : kernel.async.token -> kernel.async.group
+        kernel.async.wait %normalized_group {newer_groups = 0} : kernel.async.group
+      }
+      channel.release %row_read : read<tile<4096xbf16>, mutable>
+    }
+    func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
+  }
+  scf.if %learned_layer {
+    %group_last_read, %completed_chunks = scf.while(%chunk_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
+      // Projection groups contain 8, 16, or 24 chunks, with one or two roles.
+      %dense_chunk = index.assume %chunk_index [range(%chunk_index, 0, 23)] : index
+      %dense_input_read, %dense_input_view = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
+      %dense_input_values = view.bitcast %dense_input_view : view<2048xi32> -> view<4096xbf16>
+      func.call @qwen3_embedding.pack_dense_activations(%local_storage, %activation_offset) : (buffer, offset)
+      channel.release %dense_input_read : read<tile<2048xi32>>
+      %chunk_last_read, %completed_roles = scf.while(%role_index = %zero : index) -> (read<tile<4624xi32>, mutable>, index) {
+        %dense_role = index.assume %role_index [range(%role_index, 0, 1)] : index
+        %weight_read, %weight_values = channel.acquire<mutable> %weight_stream : channel<tile<4624xi32>> -> (read<tile<4624xi32>, mutable>, view<4624xi32>)
+        %first_dense_projection = index.cmp eq, %dense_role, %zero : index
+        %projection_storage = scf.if %first_dense_projection -> (buffer) {
+          scf.yield %local_storage : buffer
+        } else {
+          scf.yield %peer_storage : buffer
+        }
+        %first_dense_chunk = index.cmp eq, %dense_chunk, %zero : index
+        %dense_weights_offset = index.constant 0 : offset
+        %dense_activations_offset = index.constant 27008 : offset
+        %dense_operand_storage, %dense_output_storage = buffer.assume.alignment %local_storage, %projection_storage {minimum_alignment = 64} : buffer, buffer
+        %dense_weights = buffer.view %dense_operand_storage[%dense_weights_offset] : buffer -> view<16x2x576xi8>
+        %dense_packed_activations = buffer.view %dense_operand_storage[%dense_activations_offset] : buffer -> view<2x4x576xi8>
+        %dense_accumulators = buffer.view %dense_output_storage[%dense_result_offset] : buffer -> view<16x4x64xf32>
+        %dense_use_secondary = scalar.constant 0 : i1
+        func.call @qwen3_embedding.dense_accumulate(%dense_weights, %dense_packed_activations, %dense_accumulators, %dense_accumulators, %dense_use_secondary, %first_dense_chunk) : (view<16x2x576xi8>, view<2x4x576xi8>, view<16x4x64xf32>, view<16x4x64xf32>, i1, i1)
+        %next_role = index.add %dense_role, %one : index
+        %more_roles = index.cmp ult, %next_role, %dense_roles : index
+        scf.condition %more_roles, %weight_read, %next_role : i1, read<tile<4624xi32>, mutable>, index
+      } do(%completed_weight: read<tile<4624xi32>, mutable>, %following_role: index) {
+        channel.release %completed_weight : read<tile<4624xi32>, mutable>
+        scf.yield %following_role : index
+      }
+      %next_chunk = index.add %dense_chunk, %one : index
+      %more_chunks = index.cmp ult, %next_chunk, %dense_chunks : index
+      scf.condition %more_chunks, %chunk_last_read, %next_chunk : i1, read<tile<4624xi32>, mutable>, index
+    } do(%completed_chunk: read<tile<4624xi32>, mutable>, %following_chunk: index) {
+      channel.release %completed_chunk : read<tile<4624xi32>, mutable>
+      scf.yield %following_chunk : index
+    }
+    %head_records = scf.select %head_group, %c2, %one : index
+    %preparation_records = scf.select %residual_group, %c8, %head_records : index
+    scf.for %record = [%zero to %preparation_records step %one] {
+      %first_record = index.cmp eq, %record, %zero : index
+      %preparation_read, %preparation_incoming = channel.acquire %activation_stream : channel<tile<2048xi32>> -> (read<tile<2048xi32>>, view<2048xi32>)
+      %preparation_values = view.bitcast %preparation_incoming : view<2048xi32> -> view<4096xbf16>
+      scf.if %head_group {
+        scf.if %first_record {
+          scf.for %word = [%zero to %scale_words step %vector_step] {
+            %value = vector.load %preparation_values[%word] : view<4096xbf16> -> vector<32xbf16>
+            vector.store %value, %dense_scales[%word] : vector<32xbf16>, view<256xbf16>
+          }
+        } else {
+          func.call @qwen3_embedding.shared_copy_output(%preparation_values, %dense_rope_bits) : (view<4096xbf16>, view<4096xbf16>)
+        }
+      } else {
+        scf.if %residual_group {
+
+          %skip_rows = view.bitcast %dense_secondary_bits : view<4096xbf16> -> view<32x128xbf16>
+          func.call @qwen3_embedding.shared_retain_residual_panel(%preparation_values, %skip_rows, %record, %skip_column) : (view<4096xbf16>, view<32x128xbf16>, index, index)
+        } else {
+          func.call @qwen3_embedding.shared_copy_output(%preparation_values, %raw) : (view<4096xbf16>, view<4096xbf16>)
+        }
+      }
+      channel.release %preparation_read : read<tile<2048xi32>>
+    }
+    func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
+    func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
+    scf.if %mlp_group {
+      %lookup_source = buffer.view %local_storage[%origin] : buffer -> view<4096xbf16>
+      %lookup_ab = buffer.view %peer_storage[%origin] : buffer -> view<8192xbf16>
+      %lookup_cd = buffer.view %local_storage[%origin] : buffer -> view<8192xbf16>
+      func.call @qwen3_embedding.shared_prepare_silu_lookup(%lookup_source, %lookup_ab, %lookup_cd) : (view<4096xbf16>, view<8192xbf16>, view<8192xbf16>)
+    }
+    func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
+    %epilogue_roles = scf.select %head_group, %c2, %one : index
+    %epilogue_members = index.mul %epilogue_roles, %c2 : index
+    scf.for %projection_role = [%zero to %epilogue_roles step %one] {
+      %first_projection = index.cmp eq, %projection_role, %zero : index
+      %normalize_projection = scalar.ori %first_projection, %query_key_group : i1
+      %head_normalization = scalar.andi %head_group, %normalize_projection : i1
+      scf.for %member = [%zero to %c2 step %one] {
+        %head_read, %head_source = channel.acquire<mutable> %projection_stream : channel<tile<4096xbf16>> -> (read<tile<4096xbf16>, mutable>, view<4096xbf16>)
+        scf.if %residual_group {
+          %skip_member_stride = index.constant 16384 : offset
+          %skip_member_base = index.constant 31680 : offset
+          %skip_member_relative = index.scale %member, %skip_member_stride : index, offset -> offset
+          %skip_member_offset = index.add %skip_member_base, %skip_member_relative : offset
+          %skip_member = buffer.view %peer_storage[%skip_member_offset] : buffer -> view<4096xbf16>
+          func.call @qwen3_embedding.shared_dense_residual(%head_source, %skip_member) : (view<4096xbf16>, view<4096xbf16>)
+        }
+        scf.if %head_group {
+          scf.if %normalize_projection {
+
+            %query_stride = index.constant 131072 : offset
+            %query_relative = index.scale %dense_group, %query_stride : index, offset -> offset
+            %query_offset = index.add %query_initial, %query_relative : offset
+            %head_initial = scf.select %first_projection, %query_offset, %key_initial : offset
+            %head_row_stride = index.constant 8192 : offset
+            %head_relative = index.scale %member, %head_row_stride : index, offset -> offset
+            %head_base = index.add %head_initial, %episode_state_offset : offset
+            %head_address = index.add %head_base, %head_relative : offset
+            %head_external = buffer.view %state[%head_address] : buffer -> view<4096xbf16>
+            %head_copy = kernel.async.copy %head_source to %head_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<4096xbf16> to view<4096xbf16> -> kernel.async.token
+            %head_group = kernel.async.group %head_copy : kernel.async.token -> kernel.async.group
+            kernel.async.wait %head_group {newer_groups = 0} : kernel.async.group
+          } else {
+
+            %value_row_stride = index.constant 512 : offset
+            %value_relative = index.scale %member, %value_row_stride : index, offset -> offset
+            %value_base = index.add %value_initial, %episode_state_offset : offset
+            %value_address = index.add %value_base, %value_relative : offset
+            %value_external = buffer.view %state[%value_address] : buffer -> view<16x4x64xbf16, #encoding.layout.strided<strides=[1024, 64, 1]>>
+            %value_local = view.bitcast %head_source : view<4096xbf16> -> view<16x4x64xbf16>
+            %value_copy = kernel.async.copy %value_local to %value_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<16x4x64xbf16> to view<16x4x64xbf16, #encoding.layout.strided<strides=[1024, 64, 1]>> -> kernel.async.token
+            %value_group = kernel.async.group %value_copy : kernel.async.token -> kernel.async.group
+            kernel.async.wait %value_group {newer_groups = 0} : kernel.async.group
+          }
+        } else {
+          scf.if %mlp_group {
+            %mlp_panel_unbounded = index.sub %dense_group, %c3 : index
+            %mlp_panel = index.assume %mlp_panel_unbounded [range(%mlp_panel_unbounded, 0, 2)] : index
+            %mlp_panel_stride = index.constant 262144 : offset
+            %mlp_panel_relative = index.scale %mlp_panel, %mlp_panel_stride : index, offset -> offset
+
+            %mlp_base = index.add %mlp_initial, %episode_state_offset : offset
+            %mlp_panel_base = index.add %mlp_base, %mlp_panel_relative : offset
+            %mlp_row_relative = index.scale %member, %record_stride : index, offset -> offset
+            %mlp_address = index.add %mlp_panel_base, %mlp_row_relative : offset
+            %mlp_external = buffer.view %state[%mlp_address] : buffer -> view<4096xbf16>
+            %mlp_output_copy = kernel.async.copy %head_source to %mlp_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<4096xbf16> to view<4096xbf16> -> kernel.async.token
+            %mlp_output_completion = kernel.async.group %mlp_output_copy : kernel.async.token -> kernel.async.group
+            kernel.async.wait %mlp_output_completion {newer_groups = 0} : kernel.async.group
+          } else {
+            %residual_row_stride = index.constant 65536 : offset
+            %residual_row_relative = index.scale %member, %residual_row_stride : index, offset -> offset
+            %residual_local = view.bitcast %head_source : view<4096xbf16> -> view<32x128xbf16>
+
+            %residual_base = index.add %residual_initial, %episode_state_offset : offset
+            %residual_address = index.add %residual_base, %residual_row_relative : offset
+            %residual_external = buffer.view %state[%residual_address] : buffer -> view<32x128xbf16, #encoding.layout.strided<strides=[1024, 1]>>
+            %residual_output_copy = kernel.async.copy %residual_local to %residual_external {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<32x128xbf16> to view<32x128xbf16, #encoding.layout.strided<strides=[1024, 1]>> -> kernel.async.token
+            %residual_output_completion = kernel.async.group %residual_output_copy : kernel.async.token -> kernel.async.group
+            kernel.async.wait %residual_output_completion {newer_groups = 0} : kernel.async.group
+          }
+        }
+        channel.release %head_read : read<tile<4096xbf16>, mutable>
+      }
+
+      %next_projection = index.add %projection_role, %one : index
+
+      %later_projection = index.cmp ult, %next_projection, %epilogue_roles : index
+
+      scf.if %later_projection {
+        func.call @qwen3_embedding.wait(%incoming_arrival) : (channel<tile<16xi32>>)
+        func.call @qwen3_embedding.signal(%outgoing_arrival) : (channel<tile<16xi32>>)
+        func.call @qwen3_embedding.wait(%incoming_departure) : (channel<tile<16xi32>>)
+        func.call @qwen3_embedding.signal(%outgoing_departure) : (channel<tile<16xi32>>)
+      }
+    }
+
+    channel.release %group_last_read : read<tile<4624xi32>, mutable>
+  }
   func.return
 }

@@ -31,6 +31,9 @@ import numpy as np
 import torch
 import transformers
 from transformers import AutoModel, AutoTokenizer
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+from reference_inputs import pattern_tokens
 
 
 def main() -> None:
@@ -77,6 +80,19 @@ def main() -> None:
         normalized = torch.nn.functional.normalize(output, p=2, dim=-1)[0]
         cohort_case["reference_index"] = len(vectors)
         vectors.append(normalized.numpy().astype("<f4"))
+        for case in reference["flexible_cases"]:
+            if case["attention"] == "sdpa_cpu_flash":
+                model.config._attn_implementation = "sdpa"
+            tokens = torch.tensor([pattern_tokens(case)], dtype=torch.int64)
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                output = model(
+                    input_ids=tokens,
+                    attention_mask=None,
+                    use_cache=False,
+                ).last_hidden_state[:, -1]
+            normalized = torch.nn.functional.normalize(output, p=2, dim=-1)[0]
+            case["reference_index"] = len(vectors)
+            vectors.append(normalized.numpy().astype("<f4"))
     payload = b"".join(vector.tobytes() for vector in vectors)
     provenance = reference["reference"]
     provenance.update(

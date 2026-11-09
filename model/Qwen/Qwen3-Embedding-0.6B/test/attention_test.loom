@@ -1,0 +1,128 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Uniform scores give every key unit weight. Across a full context of 512
+// 64-key blocks, an unchanged maximum must preserve all prior contributions.
+// The actual model's three recurrence leaves own masking, exponential
+// approximation, accumulation, and BF16 scratch. The reference is the exact
+// equal-score sum and reciprocal, independent of that implementation.
+func.decl noinline @qwen3_embedding.recurrence_prepare_row(%workspace: buffer, %query: index, %query_base: index, %key_base: index) -> (f32) where [range(%query, 0, 31)]
+
+func.decl noinline @qwen3_embedding.recurrence_exp_row(%workspace: buffer)
+
+func.decl noinline @qwen3_embedding.recurrence_finish_row(%workspace: buffer, %query: index, %old_sum: f32) where [range(%query, 0, 31)]
+
+func.def inline @recurrence_body(%workspace: buffer, %output: buffer) {
+  %storage = buffer.assume.alignment %workspace {minimum_alignment = 64} : buffer
+  %origin = index.constant 0 : offset
+  %query_sequence_offset = index.constant 18816 : offset
+  %maximum_offset = index.constant 19072 : offset
+  %sum_offset = index.constant 19200 : offset
+  %scale_offset = index.constant 19328 : offset
+  %inverse_offset = index.constant 19456 : offset
+  %key_sequence_offset = index.constant 19584 : offset
+  %query_sequences = buffer.view %storage[%query_sequence_offset] : buffer -> view<32xi32>
+  %key_sequences = buffer.view %storage[%key_sequence_offset] : buffer -> view<64xi32>
+  %matrix = buffer.view %storage[%origin] : buffer -> view<32x64xbf16>
+  %maxima = buffer.view %storage[%maximum_offset] : buffer -> view<32xbf16>
+  %sums = buffer.view %storage[%sum_offset] : buffer -> view<32xf32>
+  %scales = buffer.view %storage[%scale_offset] : buffer -> view<32xbf16>
+  %inverses = buffer.view %storage[%inverse_offset] : buffer -> view<32xbf16>
+  %result = buffer.view %output[%origin] : buffer -> view<4xf32>
+  %integer_zero = vector.splati 0 : vector<32xi32>
+  vector.store %integer_zero, %query_sequences[0] : vector<32xi32>, view<32xi32>
+  vector.store %integer_zero, %key_sequences[0] : vector<32xi32>, view<64xi32>
+  vector.store %integer_zero, %key_sequences[32] : vector<32xi32>, view<64xi32>
+  %empty_scores = vector.splatf 0.0 : vector<32xbf16>
+  vector.store %empty_scores, %matrix[0, 0] : vector<32xbf16>, view<32x64xbf16>
+  vector.store %empty_scores, %matrix[0, 32] : vector<32xbf16>, view<32x64xbf16>
+  vector.store %empty_scores, %maxima[0] : vector<32xbf16>, view<32xbf16>
+  %initial_sum = scalar.constant 0.0 : f32
+  view.store %initial_sum, %sums[0] : f32, view<32xf32>
+  %begin = index.constant 0 : index
+  %query_base = index.constant 32767 : index
+  %end_block = index.constant 512 : index
+  %block_step = index.constant 1 : index
+  %key_width = index.constant 64 : index
+  scf.for %block = [%begin to %end_block step %block_step] {
+    %key_base = index.mul %block, %key_width : index
+    vector.store %empty_scores, %matrix[0, 0] : vector<32xbf16>, view<32x64xbf16>
+    vector.store %empty_scores, %matrix[0, 32] : vector<32xbf16>, view<32x64xbf16>
+    %old_sum = func.call @qwen3_embedding.recurrence_prepare_row(%storage, %begin, %query_base, %key_base) : (buffer, index, index, index) -> (f32)
+    func.call @qwen3_embedding.recurrence_exp_row(%storage) : (buffer)
+    func.call @qwen3_embedding.recurrence_finish_row(%storage, %begin, %old_sum) : (buffer, index, f32)
+    view.store %old_sum, %result[3] : f32, view<4xf32>
+  }
+  %sum = view.load %sums[0] : view<32xf32> -> f32
+  %scale = view.load %scales[0] : view<32xbf16> -> bf16
+  %inverse = view.load %inverses[0] : view<32xbf16> -> bf16
+  %scale_wide = scalar.extf %scale : bf16 to f32
+  %inverse_wide = scalar.extf %inverse : bf16 to f32
+  view.store %sum, %result[0] : f32, view<4xf32>
+  view.store %scale_wide, %result[1] : f32, view<4xf32>
+  view.store %inverse_wide, %result[2] : f32, view<4xf32>
+  func.return
+}
+
+func.def @recurrence_reference(%storage: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %result = buffer.view %output[%origin] : buffer -> view<4xf32>
+  %sum = scalar.constant 32768.0 : f32
+  %scale = scalar.constant 1.0 : f32
+  %inverse = scalar.constant 3.0517578125e-05 : f32
+  %old_sum = scalar.constant 32704.0 : f32
+  view.store %sum, %result[0] : f32, view<4xf32>
+  view.store %scale, %result[1] : f32, view<4xf32>
+  view.store %inverse, %result[2] : f32, view<4xf32>
+  view.store %old_sum, %result[3] : f32, view<4xf32>
+  func.return
+}
+
+check.scenario @unchanged_maximum_retains_prior_keys {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %storage = check.generate.fill value(0.0) : tensor<5120xf32>
+    %output = check.generate.fill value(-100.0) : tensor<4xf32>
+    check.compare<@recurrence, @recurrence_reference>(%storage, %output) : (tensor<5120xf32>, tensor<4xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<4xf32>
+    }
+  }
+  check.return
+}
+
+aie2p.target<array> @recurrence_array
+
+pipeline.def<kernel> public retain target(@recurrence_array) @recurrence() run(%input_arg: buffer, %output_arg: buffer) {
+  %input, %output = buffer.assume.alignment %input_arg, %output_arg {minimum_alignment = 64} : buffer, buffer
+  %memory = pipeline.memory<workgroup>[0, 3] : pool
+  %origin = index.constant 0 : offset
+  %input_bytes = index.constant 20480 : offset
+  %output_bytes = index.constant 320 : offset
+  %storage = buffer.alloca<workgroup> pool(%memory) align(64) %input_bytes : buffer
+  %result = buffer.alloca<workgroup> pool(%memory) align(64) %output_bytes : buffer
+  %capacity = index.constant 1 : index
+  %input_slots = buffer.view %storage[%origin] : buffer -> view<1x5120xf32>
+  %incoming = channel.bind<fifo> %input_slots, %capacity : view<1x5120xf32>, index -> channel<tile<5120xf32>>
+  %output_slots = buffer.view %result[%origin] : buffer -> view<1x4xf32>
+  %outgoing = channel.bind<fifo> %output_slots, %capacity : view<1x4xf32>, index -> channel<tile<4xf32>>
+  pipeline.strand workers([0, 2], [1, 1], [1, 1]) {
+    %input_view = buffer.view %input[%origin] : buffer -> view<5120xf32>
+    %input_write, %local_input = channel.reserve %incoming : channel<tile<5120xf32>> -> (write<tile<5120xf32>>, view<5120xf32>)
+    %copy_input = kernel.async.copy %input_view to %local_input {cache_scope = workgroup, cache_temporal = regular, direction = global_to_workgroup} : view<5120xf32> to view<5120xf32> -> kernel.async.token
+    %input_group = kernel.async.group %copy_input : kernel.async.token -> kernel.async.group
+    kernel.async.wait %input_group {newer_groups = 0} : kernel.async.group
+    channel.publish %input_write : write<tile<5120xf32>>
+    %output_read, %local_output = channel.acquire %outgoing : channel<tile<4xf32>> -> (read<tile<4xf32>>, view<4xf32>)
+    %output_view = buffer.view %output[%origin] : buffer -> view<4xf32>
+    %copy_output = kernel.async.copy %local_output to %output_view {cache_scope = workgroup, cache_temporal = regular, direction = workgroup_to_global} : view<4xf32> to view<4xf32> -> kernel.async.token
+    %output_group = kernel.async.group %copy_output : kernel.async.token -> kernel.async.group
+    kernel.async.wait %output_group {newer_groups = 0} : kernel.async.group
+    channel.release %output_read : read<tile<4xf32>>
+  }
+  pipeline.strand workers([0, 3], [1, 1], [1, 1]) {
+    %input_read, %unused_input = channel.acquire<mutable> %incoming : channel<tile<5120xf32>> -> (read<tile<5120xf32>, mutable>, view<5120xf32>)
+    %output_write, %unused_output = channel.reserve %outgoing : channel<tile<4xf32>> -> (write<tile<4xf32>>, view<4xf32>)
+    func.call @recurrence_body(%storage, %result) : (buffer, buffer)
+    channel.release %input_read : read<tile<5120xf32>, mutable>
+    channel.publish %output_write : write<tile<4xf32>>
+  }
+}

@@ -2,11 +2,290 @@
 // SPDX-License-Identifier: MIT
 
 // Eight-column by four-core-row Strix Halo composition. One resident program
-// executes all 28 layers, reusing each projection group across two token
-// panels. Root-owned SRAM and channels persist across joined dense/attention
+// executes all 28 layers, reusing each projection group across the request's
+// token panels. Root-owned SRAM and channels persist across joined dense/attention
 // phases.
 
 #include "array_phases.h"
+#include "attention_schedule.h"
+
+[[loom::pipeline]]
+static void activation_multicast(
+    [[loom::launch]] ActivationStream a0, ActivationStream a1,
+    ActivationStream a2, ActivationStream a3, ActivationStream a4,
+    ActivationStream a5, ActivationStream a6, ActivationStream a7,
+    ActivationStream a8, ActivationStream a9, ActivationStream a10,
+    ActivationStream a11, ActivationStream a12, ActivationStream a13,
+    ActivationStream a14, ActivationStream a15, ActivationStream a16,
+    ActivationStream a17, ActivationStream a18, ActivationStream a19,
+    ActivationStream a20, ActivationStream a21, ActivationStream a22,
+    ActivationStream a23, ActivationStream a24, ActivationStream a25,
+    ActivationStream a26, ActivationStream a27, ActivationStream a28,
+    ActivationStream a29, ActivationStream a30, ActivationStream a31,
+    loomt::index count) {
+  [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{2}},
+                 loomt::indices{loomt::index{1}, loomt::index{1}},
+                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
+    for (loomt::index record{0}; record < count;
+         record = record + loomt::index{1}) {
+      auto acquisition = loom::channel::acquire(a0);
+      auto fanout = loom::channel::fanout<7>(acquisition.read);
+      auto reservation = loom::channel::reserve(a4);
+      loom::channel::copy(fanout.first, reservation.write);
+      auto reservation_2 = loom::channel::reserve(a8);
+      loom::channel::copy(fanout.remaining.first, reservation_2.write);
+      auto reservation_3 = loom::channel::reserve(a12);
+      loom::channel::copy(fanout.remaining.remaining.first,
+                          reservation_3.write);
+      auto reservation_4 = loom::channel::reserve(a16);
+      loom::channel::copy(fanout.remaining.remaining.remaining.first,
+                          reservation_4.write);
+      auto reservation_5 = loom::channel::reserve(a20);
+      loom::channel::copy(fanout.remaining.remaining.remaining.remaining.first,
+                          reservation_5.write);
+      auto reservation_6 = loom::channel::reserve(a24);
+      loom::channel::copy(
+          fanout.remaining.remaining.remaining.remaining.remaining.first,
+          reservation_6.write);
+      auto reservation_7 = loom::channel::reserve(a28);
+      loom::channel::copy(
+          fanout.remaining.remaining.remaining.remaining.remaining.second,
+          reservation_7.write);
+    }
+  }
+  [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{3}},
+                 loomt::indices{loomt::index{1}, loomt::index{1}},
+                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
+    for (loomt::index record_1{0}; record_1 < count;
+         record_1 = record_1 + loomt::index{1}) {
+      auto acquisition_2 = loom::channel::acquire(a9);
+      auto fanout_2 = loom::channel::fanout<7>(acquisition_2.read);
+      auto reservation_8 = loom::channel::reserve(a1);
+      loom::channel::copy(fanout_2.first, reservation_8.write);
+      auto reservation_9 = loom::channel::reserve(a5);
+      loom::channel::copy(fanout_2.remaining.first, reservation_9.write);
+      auto reservation_10 = loom::channel::reserve(a13);
+      loom::channel::copy(fanout_2.remaining.remaining.first,
+                          reservation_10.write);
+      auto reservation_11 = loom::channel::reserve(a17);
+      loom::channel::copy(fanout_2.remaining.remaining.remaining.first,
+                          reservation_11.write);
+      auto reservation_12 = loom::channel::reserve(a21);
+      loom::channel::copy(
+          fanout_2.remaining.remaining.remaining.remaining.first,
+          reservation_12.write);
+      auto reservation_13 = loom::channel::reserve(a25);
+      loom::channel::copy(
+          fanout_2.remaining.remaining.remaining.remaining.remaining.first,
+          reservation_13.write);
+      auto reservation_14 = loom::channel::reserve(a29);
+      loom::channel::copy(
+          fanout_2.remaining.remaining.remaining.remaining.remaining.second,
+          reservation_14.write);
+    }
+  }
+  [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{4}},
+                 loomt::indices{loomt::index{1}, loomt::index{1}},
+                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
+    for (loomt::index record_2{0}; record_2 < count;
+         record_2 = record_2 + loomt::index{1}) {
+      auto acquisition_3 = loom::channel::acquire(a18);
+      auto fanout_3 = loom::channel::fanout<7>(acquisition_3.read);
+      auto reservation_15 = loom::channel::reserve(a2);
+      loom::channel::copy(fanout_3.first, reservation_15.write);
+      auto reservation_16 = loom::channel::reserve(a6);
+      loom::channel::copy(fanout_3.remaining.first, reservation_16.write);
+      auto reservation_17 = loom::channel::reserve(a10);
+      loom::channel::copy(fanout_3.remaining.remaining.first,
+                          reservation_17.write);
+      auto reservation_18 = loom::channel::reserve(a14);
+      loom::channel::copy(fanout_3.remaining.remaining.remaining.first,
+                          reservation_18.write);
+      auto reservation_19 = loom::channel::reserve(a22);
+      loom::channel::copy(
+          fanout_3.remaining.remaining.remaining.remaining.first,
+          reservation_19.write);
+      auto reservation_20 = loom::channel::reserve(a26);
+      loom::channel::copy(
+          fanout_3.remaining.remaining.remaining.remaining.remaining.first,
+          reservation_20.write);
+      auto reservation_21 = loom::channel::reserve(a30);
+      loom::channel::copy(
+          fanout_3.remaining.remaining.remaining.remaining.remaining.second,
+          reservation_21.write);
+    }
+  }
+  [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{5}},
+                 loomt::indices{loomt::index{1}, loomt::index{1}},
+                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
+    for (loomt::index record_3{0}; record_3 < count;
+         record_3 = record_3 + loomt::index{1}) {
+      auto acquisition_4 = loom::channel::acquire(a27);
+      auto fanout_4 = loom::channel::fanout<7>(acquisition_4.read);
+      auto reservation_22 = loom::channel::reserve(a3);
+      loom::channel::copy(fanout_4.first, reservation_22.write);
+      auto reservation_23 = loom::channel::reserve(a7);
+      loom::channel::copy(fanout_4.remaining.first, reservation_23.write);
+      auto reservation_24 = loom::channel::reserve(a11);
+      loom::channel::copy(fanout_4.remaining.remaining.first,
+                          reservation_24.write);
+      auto reservation_25 = loom::channel::reserve(a15);
+      loom::channel::copy(fanout_4.remaining.remaining.remaining.first,
+                          reservation_25.write);
+      auto reservation_26 = loom::channel::reserve(a19);
+      loom::channel::copy(
+          fanout_4.remaining.remaining.remaining.remaining.first,
+          reservation_26.write);
+      auto reservation_27 = loom::channel::reserve(a23);
+      loom::channel::copy(
+          fanout_4.remaining.remaining.remaining.remaining.remaining.first,
+          reservation_27.write);
+      auto reservation_28 = loom::channel::reserve(a31);
+      loom::channel::copy(
+          fanout_4.remaining.remaining.remaining.remaining.remaining.second,
+          reservation_28.write);
+    }
+  }
+}
+
+// The phase chooses one finite DMA graph. Its repeat count is fixed by the
+// projection kind; the request's panel loop remains in the enclosing schedule.
+[[loom::pipeline]]
+static void activation_phase_multicast(
+    [[loom::launch]] ActivationStream a0, ActivationStream a1,
+    ActivationStream a2, ActivationStream a3, ActivationStream a4,
+    ActivationStream a5, ActivationStream a6, ActivationStream a7,
+    ActivationStream a8, ActivationStream a9, ActivationStream a10,
+    ActivationStream a11, ActivationStream a12, ActivationStream a13,
+    ActivationStream a14, ActivationStream a15, ActivationStream a16,
+    ActivationStream a17, ActivationStream a18, ActivationStream a19,
+    ActivationStream a20, ActivationStream a21, ActivationStream a22,
+    ActivationStream a23, ActivationStream a24, ActivationStream a25,
+    ActivationStream a26, ActivationStream a27, ActivationStream a28,
+    ActivationStream a29, ActivationStream a30, ActivationStream a31,
+    loomt::index layer, loomt::index dense_group) {
+  [[loom::serial]] {
+    if (layer == loomt::index{28} || dense_group == loomt::index{1}) {
+      loom::pipeline::compose<activation_multicast>(
+          a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+          a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29,
+          a30, a31, loomt::index{10});
+    } else if (dense_group == loomt::index{0}) {
+      loom::pipeline::compose<activation_multicast>(
+          a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+          a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29,
+          a30, a31, loomt::index{20});
+    } else if (dense_group == loomt::index{2}) {
+      loom::pipeline::compose<activation_multicast>(
+          a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+          a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29,
+          a30, a31, loomt::index{24});
+    } else if (dense_group == loomt::index{3}) {
+      loom::pipeline::compose<activation_multicast>(
+          a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+          a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29,
+          a30, a31, loomt::index{18});
+    } else if (dense_group == loomt::index{6}) {
+      loom::pipeline::compose<activation_multicast>(
+          a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+          a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29,
+          a30, a31, loomt::index{32});
+    } else {
+      loom::pipeline::compose<activation_multicast>(
+          a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+          a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29,
+          a30, a31, loomt::index{9});
+    }
+  }
+}
+
+[[loom::pipeline, loom::symbol("request.receive")]]
+void request_receive([[loom::launch]] Bytes requests, FeatureStream records,
+                     Bytes header);
+[[loom::pipeline, loom::symbol("request.reply")]]
+void request_reply([[loom::launch]] Bytes replies, FeatureStream records,
+                   Bytes header);
+
+// One NPU worker owns the continuation. Other workers receive only the fields
+// of their next joined work unit through the existing collective channel.
+using WorkRecord = loomt::view<loomt::shape<16>, unsigned>;
+
+[[loom::noinline]]
+static void prepare_work(WorkRecord header, WorkRecord work) {
+  unsigned panels = loom::view::load(header, loomt::index{4});
+  unsigned cursor = loom::view::load(header, loomt::index{6});
+  unsigned remaining = loom::view::load(header, loomt::index{7});
+  bool cold = loom::view::load(header, loomt::index{8}) != 0;
+  unsigned first_panel = loom::view::load(header, loomt::index{9});
+  loom::assume(loom::predicate::range(first_panel, 0U, 511U));
+  loom::assume(loom::predicate::range(panels, 1U, 256U));
+  loom::assume(loom::predicate::range(remaining, 0U, 64U));
+  for (unsigned word = 0; word < 5; ++word) {
+    loom::view::store(0U, work, loom::index::cast(word));
+  }
+  loom::view::store(first_panel, work, loomt::index{5});
+  unsigned waves = panels * 4;
+  unsigned phase = cursor & 1023U;
+  if (remaining != 0 && phase < 225U) {
+    unsigned position = (cursor >> 10) & 1023U;
+    bool attention = (cursor & (1U << 26)) != 0;
+    if (attention) {
+      unsigned key_begin = ((cursor >> 20) & 63U) << 3;
+      loom::view::store(2U, work, loomt::index{0});
+      loom::view::store(position, work, loomt::index{1});
+      loom::view::store(key_begin, work, loomt::index{2});
+      loom::view::store(waves, work, loomt::index{3});
+      loom::view::store((cold || position == key_begin * 2) ? 1U : 0U, work,
+                        loomt::index{4});
+      if (position + 1 == waves) {
+        unsigned next_key = key_begin + 8;
+        cursor = next_key * 2 >= waves
+                     ? phase + 1
+                     : phase | (next_key << 11) | ((next_key >> 3) << 20) |
+                           (1U << 26);
+      } else {
+        cursor += 1U << 10;
+      }
+    } else {
+      unsigned group = phase & 7U;
+      if (group < 7) {
+        loom::view::store(1U, work, loomt::index{0});
+        loom::view::store(phase >> 3, work, loomt::index{1});
+        loom::view::store(group, work, loomt::index{2});
+        loom::view::store(first_panel + position, work, loomt::index{3});
+        loom::view::store((cold || position == 0) ? 1U : 0U, work,
+                          loomt::index{4});
+        cursor = position + 1 == panels
+                     ? (group == 1 ? phase | (1U << 26) : phase + 1)
+                     : cursor + (1U << 10);
+      } else {
+        loom::view::store(3U, work, loomt::index{0});
+        cursor = phase + 1;
+      }
+    }
+    // This cursor is private planned state until the joined work and reply
+    // publication finish. A host never observes it as completed progress early.
+    loom::view::store(cursor, header, loomt::index{6});
+    loom::view::store(remaining - 1, header, loomt::index{7});
+    loom::view::store(0U, header, loomt::index{8});
+  }
+}
+
+[[loom::pipeline]]
+static void request_next([[loom::launch]] FeatureStream records, Bytes header) {
+  [[loom::strand(loomt::indices{loomt::index{1}, loomt::index{2}},
+                 loomt::indices{loomt::index{1}, loomt::index{1}},
+                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
+    auto reservation = loom::channel::reserve(records);
+    auto words = loom::view::bitcast<loomt::view<loomt::shape<2048>, unsigned>>(
+        reservation.payload);
+    auto work = loom::view::subview<16>(words, {0}, {});
+    auto saved = loom::buffer::view<16>(loom::buffer::cast<unsigned>(header),
+                                        loomt::offset{0}, {});
+    prepare_work(saved, work);
+    loom::channel::publish(reservation.write);
+  }
+}
 
 [[loom::symbol("qwen3_embedding.array")]]
 extern const loom::target::declaration array_target;
@@ -19,7 +298,8 @@ void qwen3_embedding_cohort([[loom::launch]] Bytes projection0_arg,
                             Bytes projection5_arg, Bytes projection6_arg,
                             Bytes projection7_arg, Bytes constants_arg,
                             Bytes embedding_arg, Bytes activations_arg,
-                            Bytes output_arg, Bytes state_arg) {
+                            Bytes output_arg, Bytes state_arg,
+                            Bytes requests_arg, Bytes replies_arg) {
   auto projection0_unique = loom::buffer::assume::noalias(projection0_arg);
   auto projection1_unique = loom::buffer::assume::noalias(projection1_arg);
   auto projection2_unique = loom::buffer::assume::noalias(projection2_arg);
@@ -48,42 +328,42 @@ void qwen3_embedding_cohort([[loom::launch]] Bytes projection0_arg,
   auto state = loom::buffer::assume::alignment<64>(state_unique);
   auto memory_tile0 = loom::pipeline::memory<loom::memory_space::workgroup>(
       loomt::indices{loomt::index{0}, loomt::index{1}});
-  auto *weight_ingress0_storage =
+  auto* weight_ingress0_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{443904}, memory_tile0);
   auto memory_tile1 = loom::pipeline::memory<loom::memory_space::workgroup>(
       loomt::indices{loomt::index{1}, loomt::index{1}});
-  auto *weight_ingress1_storage =
+  auto* weight_ingress1_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{443904}, memory_tile1);
   auto memory_tile2 = loom::pipeline::memory<loom::memory_space::workgroup>(
       loomt::indices{loomt::index{2}, loomt::index{1}});
-  auto *weight_ingress2_storage =
+  auto* weight_ingress2_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{443904}, memory_tile2);
   auto memory_tile3 = loom::pipeline::memory<loom::memory_space::workgroup>(
       loomt::indices{loomt::index{3}, loomt::index{1}});
-  auto *weight_ingress3_storage =
+  auto* weight_ingress3_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{443904}, memory_tile3);
   auto memory_tile4 = loom::pipeline::memory<loom::memory_space::workgroup>(
       loomt::indices{loomt::index{4}, loomt::index{1}});
-  auto *weight_ingress4_storage =
+  auto* weight_ingress4_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{443904}, memory_tile4);
   auto memory_tile5 = loom::pipeline::memory<loom::memory_space::workgroup>(
       loomt::indices{loomt::index{5}, loomt::index{1}});
-  auto *weight_ingress5_storage =
+  auto* weight_ingress5_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{443904}, memory_tile5);
   auto memory_tile6 = loom::pipeline::memory<loom::memory_space::workgroup>(
       loomt::indices{loomt::index{6}, loomt::index{1}});
-  auto *weight_ingress6_storage =
+  auto* weight_ingress6_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{443904}, memory_tile6);
   auto memory_tile7 = loom::pipeline::memory<loom::memory_space::workgroup>(
       loomt::indices{loomt::index{7}, loomt::index{1}});
-  auto *weight_ingress7_storage =
+  auto* weight_ingress7_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{443904}, memory_tile7);
   auto tile0 = loom::pipeline::memory<loom::memory_space::workgroup>(
@@ -262,67 +542,67 @@ void qwen3_embedding_cohort([[loom::launch]] Bytes projection0_arg,
   auto result28 = make_feature_stream(core28.storage);
   auto result30 = make_feature_stream(core30.storage);
   auto probability0 = make_feature_stream(core0.storage);
-  auto *sequence0_storage =
+  auto* sequence0_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile0);
   auto probability2 = make_feature_stream(core2.storage);
-  auto *sequence2_storage =
+  auto* sequence2_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile2);
   auto probability4 = make_feature_stream(core4.storage);
-  auto *sequence4_storage =
+  auto* sequence4_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile4);
   auto probability6 = make_feature_stream(core6.storage);
-  auto *sequence6_storage =
+  auto* sequence6_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile6);
   auto probability8 = make_feature_stream(core8.storage);
-  auto *sequence8_storage =
+  auto* sequence8_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile8);
   auto probability10 = make_feature_stream(core10.storage);
-  auto *sequence10_storage =
+  auto* sequence10_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile10);
   auto probability12 = make_feature_stream(core12.storage);
-  auto *sequence12_storage =
+  auto* sequence12_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile12);
   auto probability14 = make_feature_stream(core14.storage);
-  auto *sequence14_storage =
+  auto* sequence14_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile14);
   auto probability16 = make_feature_stream(core16.storage);
-  auto *sequence16_storage =
+  auto* sequence16_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile16);
   auto probability18 = make_feature_stream(core18.storage);
-  auto *sequence18_storage =
+  auto* sequence18_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile18);
   auto probability20 = make_feature_stream(core20.storage);
-  auto *sequence20_storage =
+  auto* sequence20_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile20);
   auto probability22 = make_feature_stream(core22.storage);
-  auto *sequence22_storage =
+  auto* sequence22_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile22);
   auto probability24 = make_feature_stream(core24.storage);
-  auto *sequence24_storage =
+  auto* sequence24_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile24);
   auto probability26 = make_feature_stream(core26.storage);
-  auto *sequence26_storage =
+  auto* sequence26_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile26);
   auto probability28 = make_feature_stream(core28.storage);
-  auto *sequence28_storage =
+  auto* sequence28_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile28);
   auto probability30 = make_feature_stream(core30.storage);
-  auto *sequence30_storage =
+  auto* sequence30_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 64>(
           loomt::offset{512}, tile30);
   auto query0 = make_query_output(core0.storage);
@@ -349,466 +629,348 @@ void qwen3_embedding_cohort([[loom::launch]] Bytes projection0_arg,
       query24.slots, loomt::index{2});
   auto normal_output26 = loom::channel::bind<loom::channel::discipline::fifo>(
       query26.slots, loomt::index{2});
-  auto *dimensions1_storage =
+  auto* dimensions1_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile1);
-  auto *dimensions3_storage =
+  auto* dimensions3_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile3);
-  auto *dimensions5_storage =
+  auto* dimensions5_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile5);
-  auto *dimensions7_storage =
+  auto* dimensions7_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile7);
-  auto *dimensions8_storage =
+  auto* dimensions8_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile8);
-  auto *dimensions10_storage =
+  auto* dimensions10_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile10);
-  auto *dimensions13_storage =
+  auto* dimensions13_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile13);
-  auto *dimensions15_storage =
+  auto* dimensions15_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile15);
-  auto *dimensions17_storage =
+  auto* dimensions17_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile17);
-  auto *dimensions19_storage =
+  auto* dimensions19_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile19);
-  auto *dimensions21_storage =
+  auto* dimensions21_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile21);
-  auto *dimensions23_storage =
+  auto* dimensions23_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile23);
-  auto *dimensions24_storage =
+  auto* dimensions24_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile24);
-  auto *dimensions26_storage =
+  auto* dimensions26_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile26);
-  auto *dimensions29_storage =
+  auto* dimensions29_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile29);
-  auto *dimensions31_storage =
+  auto* dimensions31_storage =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(loomt::offset{32},
                                                               tile31);
-  auto *gather_cache0 = loom::buffer::alloca<loom::memory_space::workgroup, 16>(
+  auto* gather_cache0 = loom::buffer::alloca<loom::memory_space::workgroup, 16>(
       loomt::offset{192}, tile0);
-  auto *gather_cache9 = loom::buffer::alloca<loom::memory_space::workgroup, 16>(
+  auto* gather_cache9 = loom::buffer::alloca<loom::memory_space::workgroup, 16>(
       loomt::offset{192}, tile9);
-  auto *gather_cache18 =
+  auto* gather_cache18 =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(
           loomt::offset{192}, tile18);
-  auto *gather_cache27 =
+  auto* gather_cache27 =
       loom::buffer::alloca<loom::memory_space::workgroup, 16>(
           loomt::offset{192}, tile27);
-  auto *phase_storage = loom::buffer::alloca<loom::memory_space::workgroup, 64>(
+  auto* phase_storage = loom::buffer::alloca<loom::memory_space::workgroup, 64>(
       loomt::offset{64}, tile1);
   auto phase_slots = loom::buffer::view<1, 16>(
-      reinterpret_cast<unsigned *>(
-          reinterpret_cast<unsigned char *>(phase_storage)),
+      reinterpret_cast<unsigned*>(
+          reinterpret_cast<unsigned char*>(phase_storage)),
       {});
   auto phase_complete = loom::channel::bind<loom::channel::discipline::fifo>(
       phase_slots, loomt::index{1});
-  [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record = 0; record < 6852; ++record) {
-      auto acquisition = loom::channel::acquire(streams0.activations);
-      auto fanout = loom::channel::fanout<7>(acquisition.read);
-      auto reservation = loom::channel::reserve(streams4.activations);
-      loom::channel::copy(fanout.first, reservation.write);
-      auto reservation_2 = loom::channel::reserve(streams8.activations);
-      loom::channel::copy(fanout.remaining.first, reservation_2.write);
-      auto reservation_3 = loom::channel::reserve(streams12.activations);
-      loom::channel::copy(fanout.remaining.remaining.first,
-                          reservation_3.write);
-      auto reservation_4 = loom::channel::reserve(streams16.activations);
-      loom::channel::copy(fanout.remaining.remaining.remaining.first,
-                          reservation_4.write);
-      auto reservation_5 = loom::channel::reserve(streams20.activations);
-      loom::channel::copy(fanout.remaining.remaining.remaining.remaining.first,
-                          reservation_5.write);
-      auto reservation_6 = loom::channel::reserve(streams24.activations);
-      loom::channel::copy(
-          fanout.remaining.remaining.remaining.remaining.remaining.first,
-          reservation_6.write);
-      auto reservation_7 = loom::channel::reserve(streams28.activations);
-      loom::channel::copy(
-          fanout.remaining.remaining.remaining.remaining.remaining.second,
-          reservation_7.write);
-    }
-  }
-  [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{3}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_1 = 0; record_1 < 6852; ++record_1) {
-      auto acquisition_2 = loom::channel::acquire(streams9.activations);
-      auto fanout_2 = loom::channel::fanout<7>(acquisition_2.read);
-      auto reservation_8 = loom::channel::reserve(streams1.activations);
-      loom::channel::copy(fanout_2.first, reservation_8.write);
-      auto reservation_9 = loom::channel::reserve(streams5.activations);
-      loom::channel::copy(fanout_2.remaining.first, reservation_9.write);
-      auto reservation_10 = loom::channel::reserve(streams13.activations);
-      loom::channel::copy(fanout_2.remaining.remaining.first,
-                          reservation_10.write);
-      auto reservation_11 = loom::channel::reserve(streams17.activations);
-      loom::channel::copy(fanout_2.remaining.remaining.remaining.first,
-                          reservation_11.write);
-      auto reservation_12 = loom::channel::reserve(streams21.activations);
-      loom::channel::copy(
-          fanout_2.remaining.remaining.remaining.remaining.first,
-          reservation_12.write);
-      auto reservation_13 = loom::channel::reserve(streams25.activations);
-      loom::channel::copy(
-          fanout_2.remaining.remaining.remaining.remaining.remaining.first,
-          reservation_13.write);
-      auto reservation_14 = loom::channel::reserve(streams29.activations);
-      loom::channel::copy(
-          fanout_2.remaining.remaining.remaining.remaining.remaining.second,
-          reservation_14.write);
-    }
-  }
-  [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{4}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_2 = 0; record_2 < 6852; ++record_2) {
-      auto acquisition_3 = loom::channel::acquire(streams18.activations);
-      auto fanout_3 = loom::channel::fanout<7>(acquisition_3.read);
-      auto reservation_15 = loom::channel::reserve(streams2.activations);
-      loom::channel::copy(fanout_3.first, reservation_15.write);
-      auto reservation_16 = loom::channel::reserve(streams6.activations);
-      loom::channel::copy(fanout_3.remaining.first, reservation_16.write);
-      auto reservation_17 = loom::channel::reserve(streams10.activations);
-      loom::channel::copy(fanout_3.remaining.remaining.first,
-                          reservation_17.write);
-      auto reservation_18 = loom::channel::reserve(streams14.activations);
-      loom::channel::copy(fanout_3.remaining.remaining.remaining.first,
-                          reservation_18.write);
-      auto reservation_19 = loom::channel::reserve(streams22.activations);
-      loom::channel::copy(
-          fanout_3.remaining.remaining.remaining.remaining.first,
-          reservation_19.write);
-      auto reservation_20 = loom::channel::reserve(streams26.activations);
-      loom::channel::copy(
-          fanout_3.remaining.remaining.remaining.remaining.remaining.first,
-          reservation_20.write);
-      auto reservation_21 = loom::channel::reserve(streams30.activations);
-      loom::channel::copy(
-          fanout_3.remaining.remaining.remaining.remaining.remaining.second,
-          reservation_21.write);
-    }
-  }
-  [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{5}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    for (int record_3 = 0; record_3 < 6852; ++record_3) {
-      auto acquisition_4 = loom::channel::acquire(streams27.activations);
-      auto fanout_4 = loom::channel::fanout<7>(acquisition_4.read);
-      auto reservation_22 = loom::channel::reserve(streams3.activations);
-      loom::channel::copy(fanout_4.first, reservation_22.write);
-      auto reservation_23 = loom::channel::reserve(streams7.activations);
-      loom::channel::copy(fanout_4.remaining.first, reservation_23.write);
-      auto reservation_24 = loom::channel::reserve(streams11.activations);
-      loom::channel::copy(fanout_4.remaining.remaining.first,
-                          reservation_24.write);
-      auto reservation_25 = loom::channel::reserve(streams15.activations);
-      loom::channel::copy(fanout_4.remaining.remaining.remaining.first,
-                          reservation_25.write);
-      auto reservation_26 = loom::channel::reserve(streams19.activations);
-      loom::channel::copy(
-          fanout_4.remaining.remaining.remaining.remaining.first,
-          reservation_26.write);
-      auto reservation_27 = loom::channel::reserve(streams23.activations);
-      loom::channel::copy(
-          fanout_4.remaining.remaining.remaining.remaining.remaining.first,
-          reservation_27.write);
-      auto reservation_28 = loom::channel::reserve(streams31.activations);
-      loom::channel::copy(
-          fanout_4.remaining.remaining.remaining.remaining.remaining.second,
-          reservation_28.write);
-    }
-  }
+  auto requests = loom::buffer::assume::alignment<64>(requests_arg);
+  auto replies = loom::buffer::assume::alignment<64>(replies_arg);
+  auto* header_storage =
+      loom::buffer::alloca<loom::memory_space::workgroup, 64>(loomt::offset{64},
+                                                              tile0);
+  auto header_buffer = loom::buffer::root(header_storage);
   [[loom::serial]] {
-    for (int schedule_position = 0; schedule_position < 225;
-         ++schedule_position) {
-      loomt::index layer =
-          loom::index::cast(schedule_position) / loomt::index{8};
-      loomt::index dense_group =
-          loom::index::cast(schedule_position) % loomt::index{8};
-      bool dense = loom::index::ult(dense_group, loomt::index{7});
-      if (dense) {
-        loom::pipeline::compose<qwen3_embedding_dense_group>(
-            loom::buffer::root(sequence0_storage),
-            loom::buffer::root(core0.storage),
-            loom::buffer::root(core1.storage),
-            loom::buffer::root(gather_cache0), activations,
-            streams0.activations, constants, embedding, state, barrier0.arrival,
-            barrier0.departure, query0.stream, output, streams0.weights,
-            probability0, result0, phase_complete,
-            loom::buffer::root(dimensions1_storage), streams1.activations,
-            barrier1.arrival, barrier1.departure, streams1.weights,
-            loom::buffer::root(sequence2_storage),
-            loom::buffer::root(core2.storage),
-            loom::buffer::root(core3.storage), streams2.activations,
-            barrier2.arrival, barrier2.departure, query2.stream,
-            streams2.weights, probability2, result2,
-            loom::buffer::root(dimensions3_storage), streams3.activations,
-            barrier3.arrival, barrier3.departure, streams3.weights,
-            loom::buffer::root(sequence4_storage),
-            loom::buffer::root(core4.storage),
-            loom::buffer::root(core5.storage), streams4.activations,
-            barrier4.arrival, barrier5.arrival, barrier5.departure,
-            barrier4.departure, query4.stream, streams4.weights, probability4,
-            result4, loom::buffer::root(dimensions5_storage),
-            streams5.activations, barrier6.arrival, barrier6.departure,
-            streams5.weights, loom::buffer::root(sequence6_storage),
-            loom::buffer::root(core6.storage),
-            loom::buffer::root(core7.storage), streams6.activations,
-            barrier7.arrival, barrier7.departure, query6.stream,
-            streams6.weights, probability6, result6,
-            loom::buffer::root(dimensions7_storage), streams7.activations,
-            streams7.weights, loom::buffer::root(sequence8_storage),
-            loom::buffer::root(dimensions8_storage),
-            loom::buffer::root(core8.storage),
-            loom::buffer::root(core9.storage), streams8.activations,
-            barrier8.arrival, barrier8.departure, normal_output8,
-            streams8.weights, query8.stream, probability8,
-            loom::buffer::root(gather_cache9), streams9.activations,
-            barrier9.arrival, barrier9.departure, streams9.weights, result8,
-            loom::buffer::root(sequence10_storage),
-            loom::buffer::root(dimensions10_storage),
-            loom::buffer::root(core10.storage),
-            loom::buffer::root(core11.storage), streams10.activations,
-            barrier10.arrival, barrier10.departure, normal_output10,
-            streams10.weights, probability10, streams11.activations,
-            barrier11.arrival, barrier11.departure, streams11.weights,
-            query10.stream, result10, loom::buffer::root(sequence12_storage),
-            loom::buffer::root(core12.storage),
-            loom::buffer::root(core13.storage), streams12.activations,
-            barrier12.arrival, barrier13.arrival, barrier13.departure,
-            barrier12.departure, query12.stream, streams12.weights,
-            probability12, result12, loom::buffer::root(dimensions13_storage),
-            streams13.activations, barrier14.arrival, barrier14.departure,
-            streams13.weights, loom::buffer::root(sequence14_storage),
-            loom::buffer::root(core14.storage),
-            loom::buffer::root(core15.storage), streams14.activations,
-            barrier15.arrival, barrier15.departure, query14.stream,
-            streams14.weights, probability14, result14,
-            loom::buffer::root(dimensions15_storage), streams15.activations,
-            streams15.weights, loom::buffer::root(sequence16_storage),
-            loom::buffer::root(core16.storage),
-            loom::buffer::root(core17.storage), streams16.activations,
-            barrier16.arrival, barrier16.departure, query16.stream,
-            streams16.weights, probability16, result16,
-            loom::buffer::root(dimensions17_storage), streams17.activations,
-            barrier17.arrival, barrier17.departure, streams17.weights,
-            loom::buffer::root(sequence18_storage),
-            loom::buffer::root(core18.storage),
-            loom::buffer::root(core19.storage),
-            loom::buffer::root(gather_cache18), streams18.activations,
-            barrier18.arrival, barrier18.departure, query18.stream,
-            streams18.weights, probability18, result18,
-            loom::buffer::root(dimensions19_storage), streams19.activations,
-            barrier19.arrival, barrier19.departure, streams19.weights,
-            loom::buffer::root(sequence20_storage),
-            loom::buffer::root(core20.storage),
-            loom::buffer::root(core21.storage), streams20.activations,
-            barrier20.arrival, barrier21.arrival, barrier21.departure,
-            barrier20.departure, query20.stream, streams20.weights,
-            probability20, result20, loom::buffer::root(dimensions21_storage),
-            streams21.activations, barrier22.arrival, barrier22.departure,
-            streams21.weights, loom::buffer::root(sequence22_storage),
-            loom::buffer::root(core22.storage),
-            loom::buffer::root(core23.storage), streams22.activations,
-            barrier23.arrival, barrier23.departure, query22.stream,
-            streams22.weights, probability22, result22,
-            loom::buffer::root(dimensions23_storage), streams23.activations,
-            streams23.weights, loom::buffer::root(sequence24_storage),
-            loom::buffer::root(dimensions24_storage),
-            loom::buffer::root(core24.storage),
-            loom::buffer::root(core25.storage), streams24.activations,
-            barrier24.arrival, barrier24.departure, normal_output24,
-            streams24.weights, probability24, streams25.activations,
-            barrier25.arrival, barrier25.departure, streams25.weights,
-            query24.stream, result24, loom::buffer::root(sequence26_storage),
-            loom::buffer::root(dimensions26_storage),
-            loom::buffer::root(core26.storage),
-            loom::buffer::root(core27.storage), streams26.activations,
-            barrier26.arrival, barrier26.departure, normal_output26,
-            streams26.weights, query26.stream, probability26,
-            loom::buffer::root(gather_cache27), streams27.activations,
-            barrier27.arrival, barrier27.departure, streams27.weights, result26,
-            loom::buffer::root(sequence28_storage),
-            loom::buffer::root(core28.storage),
-            loom::buffer::root(core29.storage), streams28.activations,
-            barrier29.arrival, barrier29.departure, query28.stream,
-            streams28.weights, probability28, result28,
-            loom::buffer::root(dimensions29_storage), streams29.activations,
-            barrier30.arrival, barrier30.departure, streams29.weights,
-            loom::buffer::root(sequence30_storage),
-            loom::buffer::root(core30.storage),
-            loom::buffer::root(core31.storage), streams30.activations,
-            barrier31.arrival, barrier31.departure, query30.stream,
-            streams30.weights, probability30, result30,
-            loom::buffer::root(dimensions31_storage), streams31.activations,
-            streams31.weights, projection0,
-            loom::buffer::root(weight_ingress0_storage), projection1,
-            loom::buffer::root(weight_ingress1_storage), projection2,
-            loom::buffer::root(weight_ingress2_storage), projection3,
-            loom::buffer::root(weight_ingress3_storage), projection4,
-            loom::buffer::root(weight_ingress4_storage), projection5,
-            loom::buffer::root(weight_ingress5_storage), projection6,
-            loom::buffer::root(weight_ingress6_storage), projection7,
-            loom::buffer::root(weight_ingress7_storage),
-            loom::buffer::root(weight_ingress0_storage),
-            loom::buffer::root(weight_ingress1_storage),
-            loom::buffer::root(weight_ingress2_storage),
-            loom::buffer::root(weight_ingress3_storage),
-            loom::buffer::root(weight_ingress4_storage),
-            loom::buffer::root(weight_ingress5_storage),
-            loom::buffer::root(weight_ingress6_storage),
-            loom::buffer::root(weight_ingress7_storage), layer, dense_group);
+    loom::pipeline::compose<request_receive>(requests, probability0,
+                                             header_buffer);
+    unsigned kind = 1;
+    do {
+      loom::pipeline::compose<request_next>(probability4, header_buffer);
+      auto acquisition = loom::channel::acquire(probability4);
+      auto work =
+          loom::view::bitcast<loomt::view<loomt::shape<2048>, const unsigned>>(
+              acquisition.payload);
+      kind = loom::view::load(work, loomt::index{0});
+      unsigned first = loom::view::load(work, loomt::index{1});
+      unsigned second = loom::view::load(work, loomt::index{2});
+      unsigned third = loom::view::load(work, loomt::index{3});
+      bool refill = loom::view::load(work, loomt::index{4}) != 0;
+      unsigned cohort_origin = loom::view::load(work, loomt::index{5});
+      loom::channel::release(acquisition.read);
+      loom::assume(loom::predicate::range(kind, 0U, 3U));
+      if (kind == 2) {
+        unsigned position = first;
+        unsigned key = second;
+        unsigned waves = third;
+        loom::assume(loom::predicate::range(position, 0U, 1023U));
+        loom::assume(loom::predicate::range(key, 0U, 504U));
+        loom::assume(loom::predicate::range(waves, 4U, 1024U));
+        loomt::index wave = loom::index::cast(position);
+        loomt::index key_begin = loom::index::cast(key);
+        loomt::index wave_count = loom::index::cast(waves);
+        loom::assume(loom::predicate::range(cohort_origin, 0U, 511U));
+        loomt::index first_panel = loom::index::cast(cohort_origin);
+        loomt::index fresh = refill ? loomt::index{0} : loomt::index{8};
+        [[loom::concurrent]] {
+          loom::pipeline::compose<attention_window_column>(
+              state, activations, loom::buffer::root(weight_ingress0_storage),
+              streams0.weights, streams1.weights, streams2.weights,
+              streams3.weights, wave, key_begin, fresh, wave_count, first_panel,
+              loom::buffer::root(core0.storage),
+              loom::buffer::root(core1.storage),
+              loom::buffer::root(core2.storage),
+              loom::buffer::root(core3.storage), probability0, probability2,
+              result0, result2, loomt::index{0}, true, loomt::index{4});
+          loom::pipeline::compose<attention_window_column>(
+              state, activations, loom::buffer::root(weight_ingress1_storage),
+              streams4.weights, streams5.weights, streams6.weights,
+              streams7.weights, wave, key_begin, fresh, wave_count, first_panel,
+              loom::buffer::root(core4.storage),
+              loom::buffer::root(core5.storage),
+              loom::buffer::root(core6.storage),
+              loom::buffer::root(core7.storage), probability4, probability6,
+              result4, result6, loomt::index{1}, true, loomt::index{4});
+          loom::pipeline::compose<attention_window_column>(
+              state, activations, loom::buffer::root(weight_ingress2_storage),
+              streams8.weights, streams9.weights, streams10.weights,
+              streams11.weights, wave, key_begin, fresh, wave_count,
+              first_panel, loom::buffer::root(core8.storage),
+              loom::buffer::root(core9.storage),
+              loom::buffer::root(core10.storage),
+              loom::buffer::root(core11.storage), probability8, probability10,
+              result8, result10, loomt::index{2}, false, loomt::index{5});
+          loom::pipeline::compose<attention_window_column>(
+              state, activations, loom::buffer::root(weight_ingress3_storage),
+              streams12.weights, streams13.weights, streams14.weights,
+              streams15.weights, wave, key_begin, fresh, wave_count,
+              first_panel, loom::buffer::root(core12.storage),
+              loom::buffer::root(core13.storage),
+              loom::buffer::root(core14.storage),
+              loom::buffer::root(core15.storage), probability12, probability14,
+              result12, result14, loomt::index{3}, true, loomt::index{2});
+          loom::pipeline::compose<attention_window_column>(
+              state, activations, loom::buffer::root(weight_ingress4_storage),
+              streams16.weights, streams17.weights, streams18.weights,
+              streams19.weights, wave, key_begin, fresh, wave_count,
+              first_panel, loom::buffer::root(core16.storage),
+              loom::buffer::root(core17.storage),
+              loom::buffer::root(core18.storage),
+              loom::buffer::root(core19.storage), probability16, probability18,
+              result16, result18, loomt::index{4}, true, loomt::index{2});
+          loom::pipeline::compose<attention_window_column>(
+              state, activations, loom::buffer::root(weight_ingress5_storage),
+              streams20.weights, streams21.weights, streams22.weights,
+              streams23.weights, wave, key_begin, fresh, wave_count,
+              first_panel, loom::buffer::root(core20.storage),
+              loom::buffer::root(core21.storage),
+              loom::buffer::root(core22.storage),
+              loom::buffer::root(core23.storage), probability20, probability22,
+              result20, result22, loomt::index{5}, true, loomt::index{2});
+          loom::pipeline::compose<attention_window_column>(
+              state, activations, loom::buffer::root(weight_ingress6_storage),
+              streams24.weights, streams25.weights, streams26.weights,
+              streams27.weights, wave, key_begin, fresh, wave_count,
+              first_panel, loom::buffer::root(core24.storage),
+              loom::buffer::root(core25.storage),
+              loom::buffer::root(core26.storage),
+              loom::buffer::root(core27.storage), probability24, probability26,
+              result24, result26, loomt::index{6}, false, loomt::index{3});
+          loom::pipeline::compose<attention_window_column>(
+              state, activations, loom::buffer::root(weight_ingress7_storage),
+              streams28.weights, streams29.weights, streams30.weights,
+              streams31.weights, wave, key_begin, fresh, wave_count,
+              first_panel, loom::buffer::root(core28.storage),
+              loom::buffer::root(core29.storage),
+              loom::buffer::root(core30.storage),
+              loom::buffer::root(core31.storage), probability28, probability30,
+              result28, result30, loomt::index{7}, true, loomt::index{2});
+        }
+      } else if (kind == 1) {
+        unsigned work_layer = first;
+        unsigned work_group = second;
+        unsigned position = third;
+        loom::assume(loom::predicate::range(position, 0U, 511U));
+        loom::assume(loom::predicate::range(work_layer, 0U, 28U));
+        loom::assume(loom::predicate::range(work_group, 0U, 6U));
+        loomt::index panel_index = loom::index::cast(position);
+        loomt::index layer = loom::index::cast(work_layer);
+        loomt::index dense_group = loom::index::cast(work_group);
+        bool reload_weights = refill;
+        [[loom::concurrent]] {
+          loom::pipeline::compose<activation_phase_multicast>(
+              streams0.activations, streams1.activations, streams2.activations,
+              streams3.activations, streams4.activations, streams5.activations,
+              streams6.activations, streams7.activations, streams8.activations,
+              streams9.activations, streams10.activations,
+              streams11.activations, streams12.activations,
+              streams13.activations, streams14.activations,
+              streams15.activations, streams16.activations,
+              streams17.activations, streams18.activations,
+              streams19.activations, streams20.activations,
+              streams21.activations, streams22.activations,
+              streams23.activations, streams24.activations,
+              streams25.activations, streams26.activations,
+              streams27.activations, streams28.activations,
+              streams29.activations, streams30.activations,
+              streams31.activations, layer, dense_group);
+
+          loom::pipeline::compose<qwen3_embedding_dense_group>(
+              loom::buffer::root(sequence0_storage),
+              loom::buffer::root(core0.storage),
+              loom::buffer::root(core1.storage),
+              loom::buffer::root(gather_cache0), activations,
+              streams0.activations, constants, embedding, state,
+              barrier0.arrival, barrier0.departure, query0.stream, output,
+              streams0.weights, probability0, result0, phase_complete,
+              loom::buffer::root(dimensions1_storage), streams1.activations,
+              barrier1.arrival, barrier1.departure, streams1.weights,
+              loom::buffer::root(sequence2_storage),
+              loom::buffer::root(core2.storage),
+              loom::buffer::root(core3.storage), streams2.activations,
+              barrier2.arrival, barrier2.departure, query2.stream,
+              streams2.weights, probability2, result2,
+              loom::buffer::root(dimensions3_storage), streams3.activations,
+              barrier3.arrival, barrier3.departure, streams3.weights,
+              loom::buffer::root(sequence4_storage),
+              loom::buffer::root(core4.storage),
+              loom::buffer::root(core5.storage), streams4.activations,
+              barrier4.arrival, barrier5.arrival, barrier5.departure,
+              barrier4.departure, query4.stream, streams4.weights, probability4,
+              result4, loom::buffer::root(dimensions5_storage),
+              streams5.activations, barrier6.arrival, barrier6.departure,
+              streams5.weights, loom::buffer::root(sequence6_storage),
+              loom::buffer::root(core6.storage),
+              loom::buffer::root(core7.storage), streams6.activations,
+              barrier7.arrival, barrier7.departure, query6.stream,
+              streams6.weights, probability6, result6,
+              loom::buffer::root(dimensions7_storage), streams7.activations,
+              streams7.weights, loom::buffer::root(sequence8_storage),
+              loom::buffer::root(dimensions8_storage),
+              loom::buffer::root(core8.storage),
+              loom::buffer::root(core9.storage), streams8.activations,
+              barrier8.arrival, barrier8.departure, normal_output8,
+              streams8.weights, query8.stream, probability8,
+              loom::buffer::root(gather_cache9), streams9.activations,
+              barrier9.arrival, barrier9.departure, streams9.weights, result8,
+              loom::buffer::root(sequence10_storage),
+              loom::buffer::root(dimensions10_storage),
+              loom::buffer::root(core10.storage),
+              loom::buffer::root(core11.storage), streams10.activations,
+              barrier10.arrival, barrier10.departure, normal_output10,
+              streams10.weights, probability10, streams11.activations,
+              barrier11.arrival, barrier11.departure, streams11.weights,
+              query10.stream, result10, loom::buffer::root(sequence12_storage),
+              loom::buffer::root(core12.storage),
+              loom::buffer::root(core13.storage), streams12.activations,
+              barrier12.arrival, barrier13.arrival, barrier13.departure,
+              barrier12.departure, query12.stream, streams12.weights,
+              probability12, result12, loom::buffer::root(dimensions13_storage),
+              streams13.activations, barrier14.arrival, barrier14.departure,
+              streams13.weights, loom::buffer::root(sequence14_storage),
+              loom::buffer::root(core14.storage),
+              loom::buffer::root(core15.storage), streams14.activations,
+              barrier15.arrival, barrier15.departure, query14.stream,
+              streams14.weights, probability14, result14,
+              loom::buffer::root(dimensions15_storage), streams15.activations,
+              streams15.weights, loom::buffer::root(sequence16_storage),
+              loom::buffer::root(core16.storage),
+              loom::buffer::root(core17.storage), streams16.activations,
+              barrier16.arrival, barrier16.departure, query16.stream,
+              streams16.weights, probability16, result16,
+              loom::buffer::root(dimensions17_storage), streams17.activations,
+              barrier17.arrival, barrier17.departure, streams17.weights,
+              loom::buffer::root(sequence18_storage),
+              loom::buffer::root(core18.storage),
+              loom::buffer::root(core19.storage),
+              loom::buffer::root(gather_cache18), streams18.activations,
+              barrier18.arrival, barrier18.departure, query18.stream,
+              streams18.weights, probability18, result18,
+              loom::buffer::root(dimensions19_storage), streams19.activations,
+              barrier19.arrival, barrier19.departure, streams19.weights,
+              loom::buffer::root(sequence20_storage),
+              loom::buffer::root(core20.storage),
+              loom::buffer::root(core21.storage), streams20.activations,
+              barrier20.arrival, barrier21.arrival, barrier21.departure,
+              barrier20.departure, query20.stream, streams20.weights,
+              probability20, result20, loom::buffer::root(dimensions21_storage),
+              streams21.activations, barrier22.arrival, barrier22.departure,
+              streams21.weights, loom::buffer::root(sequence22_storage),
+              loom::buffer::root(core22.storage),
+              loom::buffer::root(core23.storage), streams22.activations,
+              barrier23.arrival, barrier23.departure, query22.stream,
+              streams22.weights, probability22, result22,
+              loom::buffer::root(dimensions23_storage), streams23.activations,
+              streams23.weights, loom::buffer::root(sequence24_storage),
+              loom::buffer::root(dimensions24_storage),
+              loom::buffer::root(core24.storage),
+              loom::buffer::root(core25.storage), streams24.activations,
+              barrier24.arrival, barrier24.departure, normal_output24,
+              streams24.weights, probability24, streams25.activations,
+              barrier25.arrival, barrier25.departure, streams25.weights,
+              query24.stream, result24, loom::buffer::root(sequence26_storage),
+              loom::buffer::root(dimensions26_storage),
+              loom::buffer::root(core26.storage),
+              loom::buffer::root(core27.storage), streams26.activations,
+              barrier26.arrival, barrier26.departure, normal_output26,
+              streams26.weights, query26.stream, probability26,
+              loom::buffer::root(gather_cache27), streams27.activations,
+              barrier27.arrival, barrier27.departure, streams27.weights,
+              result26, loom::buffer::root(sequence28_storage),
+              loom::buffer::root(core28.storage),
+              loom::buffer::root(core29.storage), streams28.activations,
+              barrier29.arrival, barrier29.departure, query28.stream,
+              streams28.weights, probability28, result28,
+              loom::buffer::root(dimensions29_storage), streams29.activations,
+              barrier30.arrival, barrier30.departure, streams29.weights,
+              loom::buffer::root(sequence30_storage),
+              loom::buffer::root(core30.storage),
+              loom::buffer::root(core31.storage), streams30.activations,
+              barrier31.arrival, barrier31.departure, query30.stream,
+              streams30.weights, probability30, result30,
+              loom::buffer::root(dimensions31_storage), streams31.activations,
+              streams31.weights, projection0,
+              loom::buffer::root(weight_ingress0_storage), projection1,
+              loom::buffer::root(weight_ingress1_storage), projection2,
+              loom::buffer::root(weight_ingress2_storage), projection3,
+              loom::buffer::root(weight_ingress3_storage), projection4,
+              loom::buffer::root(weight_ingress4_storage), projection5,
+              loom::buffer::root(weight_ingress5_storage), projection6,
+              loom::buffer::root(weight_ingress6_storage), projection7,
+              loom::buffer::root(weight_ingress7_storage),
+              loom::buffer::root(weight_ingress0_storage),
+              loom::buffer::root(weight_ingress1_storage),
+              loom::buffer::root(weight_ingress2_storage),
+              loom::buffer::root(weight_ingress3_storage),
+              loom::buffer::root(weight_ingress4_storage),
+              loom::buffer::root(weight_ingress5_storage),
+              loom::buffer::root(weight_ingress6_storage),
+              loom::buffer::root(weight_ingress7_storage), layer, dense_group,
+              panel_index, reload_weights);
+        }
       }
-      bool attention = dense_group == loomt::index{1};
-      if (attention) {
-        loom::pipeline::compose<qwen3_embedding_attention_phase>(
-            loom::buffer::root(sequence0_storage),
-            loom::buffer::root(core0.storage),
-            loom::buffer::root(core1.storage),
-            loom::buffer::root(gather_cache0), activations,
-            streams0.activations, constants, embedding, state, barrier0.arrival,
-            barrier0.departure, query0.stream, output, streams0.weights,
-            probability0, result0, phase_complete,
-            loom::buffer::root(dimensions1_storage), streams1.activations,
-            barrier1.arrival, barrier1.departure, streams1.weights,
-            loom::buffer::root(sequence2_storage),
-            loom::buffer::root(core2.storage),
-            loom::buffer::root(core3.storage), streams2.activations,
-            barrier2.arrival, barrier2.departure, query2.stream,
-            streams2.weights, probability2, result2,
-            loom::buffer::root(dimensions3_storage), streams3.activations,
-            barrier3.arrival, barrier3.departure, streams3.weights,
-            loom::buffer::root(sequence4_storage),
-            loom::buffer::root(core4.storage),
-            loom::buffer::root(core5.storage), streams4.activations,
-            barrier4.arrival, barrier5.arrival, barrier5.departure,
-            barrier4.departure, query4.stream, streams4.weights, probability4,
-            result4, loom::buffer::root(dimensions5_storage),
-            streams5.activations, barrier6.arrival, barrier6.departure,
-            streams5.weights, loom::buffer::root(sequence6_storage),
-            loom::buffer::root(core6.storage),
-            loom::buffer::root(core7.storage), streams6.activations,
-            barrier7.arrival, barrier7.departure, query6.stream,
-            streams6.weights, probability6, result6,
-            loom::buffer::root(dimensions7_storage), streams7.activations,
-            streams7.weights, loom::buffer::root(sequence8_storage),
-            loom::buffer::root(dimensions8_storage),
-            loom::buffer::root(core8.storage),
-            loom::buffer::root(core9.storage), streams8.activations,
-            barrier8.arrival, barrier8.departure, normal_output8,
-            streams8.weights, query8.stream, probability8,
-            loom::buffer::root(gather_cache9), streams9.activations,
-            barrier9.arrival, barrier9.departure, streams9.weights, result8,
-            loom::buffer::root(sequence10_storage),
-            loom::buffer::root(dimensions10_storage),
-            loom::buffer::root(core10.storage),
-            loom::buffer::root(core11.storage), streams10.activations,
-            barrier10.arrival, barrier10.departure, normal_output10,
-            streams10.weights, probability10, streams11.activations,
-            barrier11.arrival, barrier11.departure, streams11.weights,
-            query10.stream, result10, loom::buffer::root(sequence12_storage),
-            loom::buffer::root(core12.storage),
-            loom::buffer::root(core13.storage), streams12.activations,
-            barrier12.arrival, barrier13.arrival, barrier13.departure,
-            barrier12.departure, query12.stream, streams12.weights,
-            probability12, result12, loom::buffer::root(dimensions13_storage),
-            streams13.activations, barrier14.arrival, barrier14.departure,
-            streams13.weights, loom::buffer::root(sequence14_storage),
-            loom::buffer::root(core14.storage),
-            loom::buffer::root(core15.storage), streams14.activations,
-            barrier15.arrival, barrier15.departure, query14.stream,
-            streams14.weights, probability14, result14,
-            loom::buffer::root(dimensions15_storage), streams15.activations,
-            streams15.weights, loom::buffer::root(sequence16_storage),
-            loom::buffer::root(core16.storage),
-            loom::buffer::root(core17.storage), streams16.activations,
-            barrier16.arrival, barrier16.departure, query16.stream,
-            streams16.weights, probability16, result16,
-            loom::buffer::root(dimensions17_storage), streams17.activations,
-            barrier17.arrival, barrier17.departure, streams17.weights,
-            loom::buffer::root(sequence18_storage),
-            loom::buffer::root(core18.storage),
-            loom::buffer::root(core19.storage),
-            loom::buffer::root(gather_cache18), streams18.activations,
-            barrier18.arrival, barrier18.departure, query18.stream,
-            streams18.weights, probability18, result18,
-            loom::buffer::root(dimensions19_storage), streams19.activations,
-            barrier19.arrival, barrier19.departure, streams19.weights,
-            loom::buffer::root(sequence20_storage),
-            loom::buffer::root(core20.storage),
-            loom::buffer::root(core21.storage), streams20.activations,
-            barrier20.arrival, barrier21.arrival, barrier21.departure,
-            barrier20.departure, query20.stream, streams20.weights,
-            probability20, result20, loom::buffer::root(dimensions21_storage),
-            streams21.activations, barrier22.arrival, barrier22.departure,
-            streams21.weights, loom::buffer::root(sequence22_storage),
-            loom::buffer::root(core22.storage),
-            loom::buffer::root(core23.storage), streams22.activations,
-            barrier23.arrival, barrier23.departure, query22.stream,
-            streams22.weights, probability22, result22,
-            loom::buffer::root(dimensions23_storage), streams23.activations,
-            streams23.weights, loom::buffer::root(sequence24_storage),
-            loom::buffer::root(dimensions24_storage),
-            loom::buffer::root(core24.storage),
-            loom::buffer::root(core25.storage), streams24.activations,
-            barrier24.arrival, barrier24.departure, normal_output24,
-            streams24.weights, probability24, streams25.activations,
-            barrier25.arrival, barrier25.departure, streams25.weights,
-            query24.stream, result24, loom::buffer::root(sequence26_storage),
-            loom::buffer::root(dimensions26_storage),
-            loom::buffer::root(core26.storage),
-            loom::buffer::root(core27.storage), streams26.activations,
-            barrier26.arrival, barrier26.departure, normal_output26,
-            streams26.weights, query26.stream, probability26,
-            loom::buffer::root(gather_cache27), streams27.activations,
-            barrier27.arrival, barrier27.departure, streams27.weights, result26,
-            loom::buffer::root(sequence28_storage),
-            loom::buffer::root(core28.storage),
-            loom::buffer::root(core29.storage), streams28.activations,
-            barrier29.arrival, barrier29.departure, query28.stream,
-            streams28.weights, probability28, result28,
-            loom::buffer::root(dimensions29_storage), streams29.activations,
-            barrier30.arrival, barrier30.departure, streams29.weights,
-            loom::buffer::root(sequence30_storage),
-            loom::buffer::root(core30.storage),
-            loom::buffer::root(core31.storage), streams30.activations,
-            barrier31.arrival, barrier31.departure, query30.stream,
-            streams30.weights, probability30, result30,
-            loom::buffer::root(dimensions31_storage), streams31.activations,
-            streams31.weights, projection0,
-            loom::buffer::root(weight_ingress0_storage), projection1,
-            loom::buffer::root(weight_ingress1_storage), projection2,
-            loom::buffer::root(weight_ingress2_storage), projection3,
-            loom::buffer::root(weight_ingress3_storage), projection4,
-            loom::buffer::root(weight_ingress4_storage), projection5,
-            loom::buffer::root(weight_ingress5_storage), projection6,
-            loom::buffer::root(weight_ingress6_storage), projection7,
-            loom::buffer::root(weight_ingress7_storage),
-            loom::buffer::root(weight_ingress0_storage),
-            loom::buffer::root(weight_ingress1_storage),
-            loom::buffer::root(weight_ingress2_storage),
-            loom::buffer::root(weight_ingress3_storage),
-            loom::buffer::root(weight_ingress4_storage),
-            loom::buffer::root(weight_ingress5_storage),
-            loom::buffer::root(weight_ingress6_storage),
-            loom::buffer::root(weight_ingress7_storage), layer);
-      }
-    }
+    } while (kind != 0);
+    loom::pipeline::compose<request_reply>(replies, probability4,
+                                           header_buffer);
   }
 }

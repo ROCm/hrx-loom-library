@@ -65,10 +65,11 @@ bazel test --config=asan --config=amdgpu \
 ```
 
 The repository's `amdgpu` build configuration enables the native AMD HAL,
-including XDNA. These explicit `manual` targets select an eight-column NPU
+including XDNA. These explicit `manual` stress targets select an eight-column NPU
 context and fixed resident backing. They check independent publisher vectors,
 exact native regressions, concurrent and reordered requests, tokenization, explicit token
-IDs, output encodings, normalized prefixes, cohort bounds, and joined shutdown.
+IDs, output encodings, normalized prefixes, full-context inputs, logical requests
+spanning cohorts, cancellation, storage reuse, and joined shutdown.
 The [test documentation](test/README.md) records the numerical acceptance and
 reference provenance.
 

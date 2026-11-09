@@ -61,11 +61,23 @@ installation with the same device and pool options.
 
 ## Input and cohort contract
 
-One execution cohort contains 256 token slots and at most thirty-two independent
-sequences. Each sequence consumes its token count rounded upward to eight
-slots. Eight 32-token inputs or thirty-two inputs of at most eight tokens therefore
-share one complete weight pass. A sequence longer than 256 tokens, or a request
-whose rounded sequences exceed the cohort, is rejected.
+Each sequence accepts between one and 32,768 tokens. A logical request may
+contain more sequences than fit in one execution cohort: the model processes
+successive cohorts and returns their embeddings in original input order.
+There is no model-specific limit on the number of rows in a logical request;
+the service's request-body and available-memory limits still apply.
+
+A cohort contains up to 256 panels of 128 token slots. Each sequence occupies
+its token count rounded upward to eight slots, and stays whole within its
+cohort. For example, a 32,768-token sequence fills one cohort; a second sequence
+continues in the next cohort. Short sequences share panels. The service retains
+completed embeddings while reusing the cohort's working storage.
+
+Native execution yields after bounded amounts of work. Another request can
+make progress between those epochs without recompiling the model or replacing
+its resident parameter and storage allocations. Concurrent cohorts receive
+disjoint ranges in a shared 512-panel arena; those ranges become reusable only
+after captured device work retires.
 
 Text tokenization includes the publisher's end token; explicit token IDs are
 used as supplied. For retrieval queries, the caller provides the intended task
@@ -77,23 +89,26 @@ Query: When is the library open?
 ```
 
 Documents use their ordinary text. Instruction tokens count against the same
-256-token limit. The `embedding` preset selects a 256-dimensional normalized
-prefix and a 32-request pending queue. Queue size does not enlarge a cohort.
+32,768-token limit. The `embedding` preset selects a 256-dimensional normalized
+prefix and a 32-request pending queue. Queue size counts service requests,
+independently of the number of input rows in each request.
 
 ## Storage and qualification
 
 The immutable device parameters account for the 808,069,120-byte memory estimate.
 Loading also uses 420 MiB of temporary conversion staging, retired after
-activation. The composition also declares 5,849,088 bytes of mutable state,
-16,384 bytes of control data, and a 1,048,576-byte output region. These counts do not include
-every allocator, compiler, or runtime cost and do not establish a complete
-transient-memory peak. A resident invocation still transfers intermediate data
-through global memory; it does not imply that every intermediate stays in NPU
-local memory.
+activation. The fixed arena declares 2,042,626,048 bytes of numerical state,
+4,194,304 bytes of token metadata, 268,435,456 bytes of vector storage, and
+128 bytes of control records. Cohort result capacity is 16,777,216 bytes;
+completed logical results also remain owned until the response is released.
+These counts exclude allocator, compiler, and other runtime costs and do not
+establish a complete transient-memory peak. Intermediate activations pass
+through global memory between native phases.
 
 Native service checks compare independent publisher embeddings and exact
 regression outputs, sequence isolation and ordering, concurrent requests,
-normalized prefixes, token usage, cohort rejection, and joined shutdown on the
+normalized prefixes, token usage, full-context and multi-cohort inputs,
+cancellation, storage reuse, and joined shutdown on the
 actual NPU. The source model's general capabilities
 and intended uses are documented in the
 [publisher's model card](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B).

@@ -1,7 +1,7 @@
 // Copyright 2026 AMD ROCm™ Software
 // SPDX-License-Identifier: MIT
 
-// Composable dense and attention phases. Child FIFO cursors restart on entry;
+// Composable dense phases. Child FIFO cursors restart on entry;
 // their backing allocations and the shared row channels belong to the root.
 // The serial caller joins all cores and DMA before reusing child-owned state.
 
@@ -17,7 +17,8 @@
 static void qwen3_embedding_fill_weight_column(loomt::buffer<unsigned> input0,
                                                WeightStream incoming0,
                                                loomt::offset base,
-                                               loomt::index count) {
+                                               loomt::index count,
+                                               bool refill) {
   for (loomt::index record = loomt::index{0}; record < count;
        record = record + loomt::index{1}) {
     loomt::offset relative = loom::index::scale(record, loomt::offset{18496});
@@ -25,218 +26,16 @@ static void qwen3_embedding_fill_weight_column(loomt::buffer<unsigned> input0,
     auto external0 = loom::buffer::view<4624>(
         loom::buffer::cast<const unsigned>(input0), offset, {});
     auto reservation = loom::channel::reserve(incoming0);
-    auto copy0 = loom::kernel::async::copy<
-        loom::kernel::async::direction::global_to_workgroup,
-        loom::cache::scope::workgroup, loom::cache::temporal::regular>(
-        external0, reservation.payload);
-    auto copy0_group = loom::kernel::async::group(copy0);
-    loom::kernel::async::wait<0>(copy0_group);
+    if (refill) {
+      auto copy0 = loom::kernel::async::copy<
+          loom::kernel::async::direction::global_to_workgroup,
+          loom::cache::scope::workgroup, loom::cache::temporal::regular>(
+          external0, reservation.payload);
+      auto copy0_group = loom::kernel::async::group(copy0);
+      loom::kernel::async::wait<0>(copy0_group);
+    }
     loom::channel::publish(reservation.write);
   }
-  return;
-}
-
-[[loom::symbol("qwen3_embedding.fill_attention_column"), loom::inline]]
-static void qwen3_embedding_fill_attention_column(
-    loomt::buffer<std::bfloat16_t> state, loomt::buffer<unsigned> metadata,
-    WeightStream source0, loomt::offset column_offset) {
-  for (int kind = 0; kind < 2; ++kind) {
-    loomt::offset kind_offset =
-        loom::index::scale(loom::index::cast(kind), loomt::offset{262144});
-    loomt::offset kind_base = loomt::offset{532480} + kind_offset;
-    for (int record = 0; record < 4; ++record) {
-      loomt::index episode = loom::index::cast(record) / loomt::index{2};
-      loomt::index half = loom::index::cast(record) % loomt::index{2};
-      loomt::offset episode_offset =
-          loom::index::scale(episode, loomt::offset{2924544});
-      loomt::offset half_offset =
-          loom::index::scale(half, loomt::offset{16384});
-      loomt::offset record_offset = episode_offset + half_offset;
-      loomt::offset metadata_relative =
-          loom::index::scale(loom::index::cast(record), loomt::offset{4096});
-      loomt::offset metadata_offset = loomt::offset{4} + metadata_relative;
-      loomt::offset record_base = kind_base + record_offset;
-      auto reservation = loom::channel::reserve(source0);
-      auto data_r0c0 = loom::view::subview<4096>(reservation.payload, {0}, {});
-      auto tiles_r0c0 = loom::view::bitcast<
-          loomt::view<loomt::shape<16, 512>, std::bfloat16_t>>(data_r0c0);
-      loomt::offset offset_r0c0 = record_base + column_offset;
-      auto external_r0c0 = loom::buffer::view<16, 512>(
-          loom::buffer::cast<const std::bfloat16_t>(state), offset_r0c0, {});
-      auto copy_r0c0 = loom::kernel::async::copy<
-          loom::kernel::async::direction::global_to_workgroup,
-          loom::cache::scope::workgroup, loom::cache::temporal::regular>(
-          external_r0c0, tiles_r0c0);
-      auto copy_r0c0_group = loom::kernel::async::group(copy_r0c0);
-      loom::kernel::async::wait<0>(copy_r0c0_group);
-      auto ids_r0c0 = loom::buffer::view<64>(
-          loom::buffer::cast<const unsigned>(metadata), metadata_offset, {},
-          loom::encoding::layout::strided(loomt::index{16}));
-      auto ids_destination_r0c0 =
-          loom::view::subview<64>(reservation.payload, {4096}, {});
-      auto ids_copy_r0c0 = loom::kernel::async::copy<
-          loom::kernel::async::direction::global_to_workgroup,
-          loom::cache::scope::workgroup, loom::cache::temporal::regular>(
-          ids_r0c0, ids_destination_r0c0);
-      auto ids_copy_r0c0_group = loom::kernel::async::group(ids_copy_r0c0);
-      loom::kernel::async::wait<0>(ids_copy_r0c0_group);
-      loom::channel::publish(reservation.write);
-    }
-  }
-  for (int record_1 = 0; record_1 < 4; ++record_1) {
-    loomt::index episode_1 = loom::index::cast(record_1) / loomt::index{2};
-    loomt::index half_1 = loom::index::cast(record_1) % loomt::index{2};
-    loomt::offset episode_offset_1 =
-        loom::index::scale(episode_1, loomt::offset{2924544});
-    loomt::offset half_offset_1 =
-        loom::index::scale(half_1, loomt::offset{16384});
-    loomt::offset record_offset_1 = episode_offset_1 + half_offset_1;
-    loomt::offset metadata_relative_1 =
-        loom::index::scale(loom::index::cast(record_1), loomt::offset{4096});
-    loomt::offset metadata_offset_1 = loomt::offset{4} + metadata_relative_1;
-    loomt::offset query_offset = loomt::offset{8192} + record_offset_1;
-    auto reservation_2 = loom::channel::reserve(source0);
-    auto data_r8c0 = loom::view::subview<4096>(reservation_2.payload, {0}, {});
-    auto tiles_r8c0 = loom::view::bitcast<
-        loomt::view<loomt::shape<16, 512>, std::bfloat16_t>>(data_r8c0);
-    loomt::offset offset_r8c0 = query_offset + column_offset;
-    auto external_r8c0 = loom::buffer::view<16, 512>(
-        loom::buffer::cast<const std::bfloat16_t>(state), offset_r8c0, {});
-    auto copy_r8c0 = loom::kernel::async::copy<
-        loom::kernel::async::direction::global_to_workgroup,
-        loom::cache::scope::workgroup, loom::cache::temporal::regular>(
-        external_r8c0, tiles_r8c0);
-    auto copy_r8c0_group = loom::kernel::async::group(copy_r8c0);
-    loom::kernel::async::wait<0>(copy_r8c0_group);
-    auto ids_r8c0 = loom::buffer::view<64>(
-        loom::buffer::cast<const unsigned>(metadata), metadata_offset_1, {},
-        loom::encoding::layout::strided(loomt::index{16}));
-    auto ids_destination_r8c0 =
-        loom::view::subview<64>(reservation_2.payload, {4096}, {});
-    auto ids_copy_r8c0 = loom::kernel::async::copy<
-        loom::kernel::async::direction::global_to_workgroup,
-        loom::cache::scope::workgroup, loom::cache::temporal::regular>(
-        ids_r8c0, ids_destination_r8c0);
-    auto ids_copy_r8c0_group = loom::kernel::async::group(ids_copy_r8c0);
-    loom::kernel::async::wait<0>(ids_copy_r8c0_group);
-    loom::channel::publish(reservation_2.write);
-    loomt::offset output_half_offset =
-        loom::index::scale(half_1, loomt::offset{1024});
-    loomt::offset output_record_offset = episode_offset_1 + output_half_offset;
-    loomt::offset output_offset = loomt::offset{270336} + output_record_offset;
-    auto reservation_3 = loom::channel::reserve(source0);
-    auto data_r9c0 = loom::view::subview<4096>(reservation_3.payload, {0}, {});
-    auto tiles_r9c0 = loom::view::bitcast<
-        loomt::view<loomt::shape<16, 512>, std::bfloat16_t>>(data_r9c0);
-    loomt::offset offset_r9c0 = output_offset + column_offset;
-    auto external_r9c0 = loom::buffer::view<16, 512>(
-        loom::buffer::cast<const std::bfloat16_t>(state), offset_r9c0, {},
-        loom::encoding::layout::strided(loomt::index{1024}, loomt::index{1}));
-    auto copy_r9c0 = loom::kernel::async::copy<
-        loom::kernel::async::direction::global_to_workgroup,
-        loom::cache::scope::workgroup, loom::cache::temporal::regular>(
-        external_r9c0, tiles_r9c0);
-    auto copy_r9c0_group = loom::kernel::async::group(copy_r9c0);
-    loom::kernel::async::wait<0>(copy_r9c0_group);
-    loom::channel::publish(reservation_3.write);
-  }
-  return;
-}
-
-[[loom::symbol("copy_pair"), loom::inline]]
-static loomt::read<loomt::tile<loomt::shape<4624>, unsigned>>
-copy_pair(loomt::read<loomt::tile<loomt::shape<4624>, unsigned>> source,
-          WeightStream a, WeightStream b) {
-  auto fanout = loom::channel::fanout<3>(source);
-  auto reservation = loom::channel::reserve(a);
-  loom::channel::copy(fanout.remaining.first, reservation.write);
-  auto reservation_2 = loom::channel::reserve(b);
-  loom::channel::copy(fanout.remaining.second, reservation_2.write);
-  return fanout.first;
-}
-
-[[loom::symbol("copy_four"), loom::inline]]
-static loomt::read<loomt::tile<loomt::shape<4624>, unsigned>>
-copy_four(loomt::read<loomt::tile<loomt::shape<4624>, unsigned>> source,
-          WeightStream a, WeightStream b, WeightStream c, WeightStream d) {
-  auto fanout = loom::channel::fanout<5>(source);
-  auto reservation = loom::channel::reserve(a);
-  loom::channel::copy(fanout.remaining.first, reservation.write);
-  auto reservation_2 = loom::channel::reserve(b);
-  loom::channel::copy(fanout.remaining.remaining.first, reservation_2.write);
-  auto reservation_3 = loom::channel::reserve(c);
-  loom::channel::copy(fanout.remaining.remaining.remaining.first,
-                      reservation_3.write);
-  auto reservation_4 = loom::channel::reserve(d);
-  loom::channel::copy(fanout.remaining.remaining.remaining.second,
-                      reservation_4.write);
-  return fanout.first;
-}
-
-[[loom::symbol("replay_attention_records")]]
-static void replay_attention_records(WeightStream source, WeightStream row0,
-                                     WeightStream row1, WeightStream row2,
-                                     WeightStream row3) {
-  auto acquisition = loom::channel::acquire(source);
-  auto acquisition_2 = loom::channel::acquire(source);
-  auto acquisition_3 = loom::channel::acquire(source);
-  auto acquisition_4 = loom::channel::acquire(source);
-  auto acquisition_5 = loom::channel::acquire(source);
-  auto acquisition_6 = loom::channel::acquire(source);
-  auto acquisition_7 = loom::channel::acquire(source);
-  auto acquisition_8 = loom::channel::acquire(source);
-  auto acquisition_9 = loom::channel::acquire(source);
-  auto acquisition_10 = loom::channel::acquire(source);
-  auto acquisition_11 = loom::channel::acquire(source);
-  auto acquisition_12 = loom::channel::acquire(source);
-  auto acquisition_13 = loom::channel::acquire(source);
-  auto acquisition_14 = loom::channel::acquire(source);
-  auto acquisition_15 = loom::channel::acquire(source);
-  auto acquisition_16 = loom::channel::acquire(source);
-  auto q0_r0 = copy_pair(acquisition.read, row0, row1);
-  auto q0_r4 = copy_pair(acquisition_5.read, row2, row3);
-  auto q0_r8 = copy_four(acquisition_9.read, row0, row1, row2, row3);
-  auto q0_r12 = copy_four(acquisition_10.read, row0, row1, row2, row3);
-  auto q1_r1 = copy_pair(acquisition_2.read, row0, row1);
-  auto q1_r5 = copy_pair(acquisition_6.read, row2, row3);
-  auto q1_r8 = copy_four(q0_r8, row0, row1, row2, row3);
-  auto q1_r12 = copy_four(q0_r12, row0, row1, row2, row3);
-  auto q1_r9 = copy_four(acquisition_11.read, row0, row1, row2, row3);
-  auto q1_r13 = copy_four(acquisition_12.read, row0, row1, row2, row3);
-  auto q2_r2 = copy_pair(acquisition_3.read, row0, row1);
-  auto q2_r6 = copy_pair(acquisition_7.read, row2, row3);
-  auto q2_r8 = copy_four(q1_r8, row0, row1, row2, row3);
-  auto q2_r12 = copy_four(q1_r12, row0, row1, row2, row3);
-  auto q2_r9 = copy_four(q1_r9, row0, row1, row2, row3);
-  auto q2_r13 = copy_four(q1_r13, row0, row1, row2, row3);
-  auto q2_r10 = copy_four(acquisition_13.read, row0, row1, row2, row3);
-  auto q2_r14 = copy_four(acquisition_14.read, row0, row1, row2, row3);
-  auto q3_r3 = copy_pair(acquisition_4.read, row0, row1);
-  auto q3_r7 = copy_pair(acquisition_8.read, row2, row3);
-  auto q3_r8 = copy_four(q2_r8, row0, row1, row2, row3);
-  auto q3_r12 = copy_four(q2_r12, row0, row1, row2, row3);
-  auto q3_r9 = copy_four(q2_r9, row0, row1, row2, row3);
-  auto q3_r13 = copy_four(q2_r13, row0, row1, row2, row3);
-  auto q3_r10 = copy_four(q2_r10, row0, row1, row2, row3);
-  auto q3_r14 = copy_four(q2_r14, row0, row1, row2, row3);
-  auto q3_r11 = copy_four(acquisition_15.read, row0, row1, row2, row3);
-  auto q3_r15 = copy_four(acquisition_16.read, row0, row1, row2, row3);
-  loom::channel::release(q0_r0);
-  loom::channel::release(q1_r1);
-  loom::channel::release(q2_r2);
-  loom::channel::release(q3_r3);
-  loom::channel::release(q0_r4);
-  loom::channel::release(q1_r5);
-  loom::channel::release(q2_r6);
-  loom::channel::release(q3_r7);
-  loom::channel::release(q3_r8);
-  loom::channel::release(q3_r9);
-  loom::channel::release(q3_r10);
-  loom::channel::release(q3_r11);
-  loom::channel::release(q3_r12);
-  loom::channel::release(q3_r13);
-  loom::channel::release(q3_r14);
-  loom::channel::release(q3_r15);
   return;
 }
 
@@ -493,7 +292,7 @@ static void qwen3_embedding_dense_group(
     Bytes weight_ingress3_24_storage, Bytes weight_ingress4_24_storage,
     Bytes weight_ingress5_24_storage, Bytes weight_ingress6_24_storage,
     Bytes weight_ingress7_24_storage, loomt::index layer,
-    loomt::index dense_group) {
+    loomt::index dense_group, loomt::index panel_index, bool reload_weights) {
   auto weight_ingress0_16 = bind_weight_ingress<16>(weight_ingress0_16_storage);
   auto weight_ingress1_16 = bind_weight_ingress<16>(weight_ingress1_16_storage);
   auto weight_ingress2_16 = bind_weight_ingress<16>(weight_ingress2_16_storage);
@@ -517,7 +316,7 @@ static void qwen3_embedding_dense_group(
       if (is_down) {
         loom::pipeline::compose<qwen3_embedding_distribute_weights24>(
             weight_ingress0_24, weights0, weights1, weights2, weights3,
-            loomt::index{2}, weight_ingress1_24, weights4, weights5, weights6,
+            loomt::index{1}, weight_ingress1_24, weights4, weights5, weights6,
             weights7, weight_ingress2_24, weights8, weights9, weights10,
             weights11, weight_ingress3_24, weights12, weights13, weights14,
             weights15, weight_ingress4_24, weights16, weights17, weights18,
@@ -528,7 +327,7 @@ static void qwen3_embedding_dense_group(
       } else {
         loom::pipeline::compose<qwen3_embedding_distribute_weights16>(
             weight_ingress0_16, weights0, weights1, weights2, weights3,
-            loomt::index{2}, weight_ingress1_16, weights4, weights5, weights6,
+            loomt::index{1}, weight_ingress1_16, weights4, weights5, weights6,
             weights7, weight_ingress2_16, weights8, weights9, weights10,
             weights11, weight_ingress3_16, weights12, weights13, weights14,
             weights15, weight_ingress4_16, weights16, weights17, weights18,
@@ -547,7 +346,7 @@ static void qwen3_embedding_dense_group(
         storage1, gather_cache0, activations, activations0, loomt::index{0},
         loomt::index{1}, constants, embedding, state, arrival0, departure0,
         query_output0, output, weights0, loomt::offset{18816}, probability0,
-        result0, phase_complete, layer, dense_group);
+        result0, phase_complete, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{3}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -558,7 +357,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival1, arrival0, departure0, departure1,
         query_output0, weights1, loomt::offset{18816}, probability0, result0,
         loomt::index{0}, loomt::index{0}, loomt::index{0}, loomt::index{0},
-        layer, dense_group);
+        layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{4}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -573,11 +372,11 @@ static void qwen3_embedding_dense_group(
       if (is_down) {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection0), weight_ingress0_24,
-            group_base, loomt::index{24});
+            group_base, loomt::index{24}, reload_weights);
       } else {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection0), weight_ingress0_16,
-            group_base, loomt::index{16});
+            group_base, loomt::index{16}, reload_weights);
       }
     }
     qwen3_embedding_query_key_egress(
@@ -588,7 +387,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{0}, loomt::offset{262144}, loomt::offset{1073152},
         loomt::index{0}, loomt::offset{548864}, loomt::offset{24576},
         loomt::offset{271360}, loomt::offset{1859584}, loomt::offset{2760704},
-        loomt::offset{1351680}, layer, dense_group);
+        loomt::offset{1351680}, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{5}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -599,7 +398,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival3, arrival2, departure2, departure3,
         query_output2, weights3, loomt::offset{18816}, probability2, result2,
         loomt::index{0}, loomt::index{64}, loomt::index{0}, loomt::index{0},
-        layer, dense_group);
+        layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{1}, loomt::index{2}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -614,11 +413,11 @@ static void qwen3_embedding_dense_group(
       if (is_down) {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection1), weight_ingress1_24,
-            group_base_1, loomt::index{24});
+            group_base_1, loomt::index{24}, reload_weights);
       } else {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection1), weight_ingress1_16,
-            group_base_1, loomt::index{16});
+            group_base_1, loomt::index{16}, reload_weights);
       }
     }
     qwen3_embedding_query_key_egress(
@@ -629,7 +428,8 @@ static void qwen3_embedding_dense_group(
         loomt::index{512}, loomt::index{1}, loomt::offset{16384},
         loomt::offset{1056832}, loomt::index{128}, loomt::offset{794624},
         loomt::offset{40960}, loomt::offset{303104}, loomt::offset{1875968},
-        loomt::offset{2629888}, loomt::offset{1384448}, layer, dense_group);
+        loomt::offset{2629888}, loomt::offset{1384448}, layer, dense_group,
+        panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{1}, loomt::index{3}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -640,7 +440,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival5, arrival6, departure6, departure5,
         query_output4, weights5, loomt::offset{18816}, probability4, result4,
         loomt::index{512}, loomt::index{4}, loomt::index{1}, loomt::index{128},
-        layer, dense_group);
+        layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{1}, loomt::index{4}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -653,7 +453,8 @@ static void qwen3_embedding_dense_group(
         loomt::index{512}, loomt::index{1}, loomt::offset{278528},
         loomt::offset{1073216}, loomt::index{128}, loomt::offset{811008},
         loomt::offset{57344}, loomt::offset{304128}, loomt::offset{1892352},
-        loomt::offset{2760960}, loomt::offset{1417216}, layer, dense_group);
+        loomt::offset{2760960}, loomt::offset{1417216}, layer, dense_group,
+        panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{1}, loomt::index{5}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -664,7 +465,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival7, arrival3, departure3, departure7,
         query_output6, weights7, loomt::offset{18816}, probability6, result6,
         loomt::index{512}, loomt::index{68}, loomt::index{1}, loomt::index{128},
-        layer, dense_group);
+        layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{2}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -675,7 +476,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival8, arrival4, departure4, departure8,
         normal_output8, weights8, loomt::offset{18816}, query_output8,
         probability8, loomt::index{1024}, loomt::index{8}, loomt::index{2},
-        loomt::index{256}, layer, dense_group);
+        loomt::index{256}, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{3}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -692,7 +493,7 @@ static void qwen3_embedding_dense_group(
         loomt::offset{2695168}, loomt::offset{2899968}, loomt::index{256},
         loomt::offset{565248}, loomt::offset{73728}, loomt::offset{335872},
         loomt::offset{1908736}, loomt::offset{2630144}, loomt::offset{1449984},
-        layer, dense_group);
+        layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{4}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -703,7 +504,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival10, arrival9, departure9, departure10,
         normal_output10, weights10, loomt::offset{18816}, query_output10,
         probability10, loomt::index{1024}, loomt::index{72}, loomt::index{2},
-        loomt::index{256}, layer, dense_group);
+        loomt::index{256}, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{5}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -718,11 +519,11 @@ static void qwen3_embedding_dense_group(
       if (is_down) {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection2), weight_ingress2_24,
-            group_base_2, loomt::index{24});
+            group_base_2, loomt::index{24}, reload_weights);
       } else {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection2), weight_ingress2_16,
-            group_base_2, loomt::index{16});
+            group_base_2, loomt::index{16}, reload_weights);
       }
     }
     qwen3_embedding_probability_value_egress(
@@ -733,7 +534,8 @@ static void qwen3_embedding_dense_group(
         result10, loomt::index{1024}, loomt::index{2}, loomt::offset{294912},
         loomt::offset{1073280}, loomt::index{256}, loomt::offset{581632},
         loomt::offset{90112}, loomt::offset{336896}, loomt::offset{1925120},
-        loomt::offset{2761216}, loomt::offset{1482752}, layer, dense_group);
+        loomt::offset{2761216}, loomt::offset{1482752}, layer, dense_group,
+        panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{3}, loomt::index{2}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -748,11 +550,11 @@ static void qwen3_embedding_dense_group(
       if (is_down) {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection3), weight_ingress3_24,
-            group_base_3, loomt::index{24});
+            group_base_3, loomt::index{24}, reload_weights);
       } else {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection3), weight_ingress3_16,
-            group_base_3, loomt::index{16});
+            group_base_3, loomt::index{16}, reload_weights);
       }
     }
     qwen3_embedding_query_key_egress(
@@ -763,7 +565,8 @@ static void qwen3_embedding_dense_group(
         loomt::index{1536}, loomt::index{3}, loomt::offset{49152},
         loomt::offset{1056960}, loomt::index{384}, loomt::offset{827392},
         loomt::offset{106496}, loomt::offset{368640}, loomt::offset{1941504},
-        loomt::offset{2630400}, loomt::offset{1515520}, layer, dense_group);
+        loomt::offset{2630400}, loomt::offset{1515520}, layer, dense_group,
+        panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{3}, loomt::index{3}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -774,7 +577,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival13, arrival14, departure14, departure13,
         query_output12, weights13, loomt::offset{18816}, probability12,
         result12, loomt::index{1536}, loomt::index{12}, loomt::index{3},
-        loomt::index{384}, layer, dense_group);
+        loomt::index{384}, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{3}, loomt::index{4}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -787,7 +590,8 @@ static void qwen3_embedding_dense_group(
         loomt::index{1536}, loomt::index{3}, loomt::offset{311296},
         loomt::offset{1073344}, loomt::index{384}, loomt::offset{843776},
         loomt::offset{122880}, loomt::offset{369664}, loomt::offset{1957888},
-        loomt::offset{2761472}, loomt::offset{1548288}, layer, dense_group);
+        loomt::offset{2761472}, loomt::offset{1548288}, layer, dense_group,
+        panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{3}, loomt::index{5}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -798,7 +602,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival15, arrival11, departure11, departure15,
         query_output14, weights15, loomt::offset{18816}, probability14,
         result14, loomt::index{1536}, loomt::index{76}, loomt::index{3},
-        loomt::index{384}, layer, dense_group);
+        loomt::index{384}, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{2}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -813,11 +617,11 @@ static void qwen3_embedding_dense_group(
       if (is_down) {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection4), weight_ingress4_24,
-            group_base_4, loomt::index{24});
+            group_base_4, loomt::index{24}, reload_weights);
       } else {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection4), weight_ingress4_16,
-            group_base_4, loomt::index{16});
+            group_base_4, loomt::index{16}, reload_weights);
       }
     }
     qwen3_embedding_query_key_egress(
@@ -828,7 +632,8 @@ static void qwen3_embedding_dense_group(
         loomt::index{2048}, loomt::index{4}, loomt::offset{65536},
         loomt::offset{1057024}, loomt::index{512}, loomt::offset{598016},
         loomt::offset{139264}, loomt::offset{401408}, loomt::offset{1974272},
-        loomt::offset{2630656}, loomt::offset{1581056}, layer, dense_group);
+        loomt::offset{2630656}, loomt::offset{1581056}, layer, dense_group,
+        panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{3}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -839,7 +644,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival17, arrival16, departure16, departure17,
         query_output16, weights17, loomt::offset{18816}, probability16,
         result16, loomt::index{2048}, loomt::index{16}, loomt::index{4},
-        loomt::index{512}, layer, dense_group);
+        loomt::index{512}, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{4}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -849,7 +654,8 @@ static void qwen3_embedding_dense_group(
         storage19, gather_cache18, activations, activations18, loomt::index{0},
         loomt::index{1}, constants, embedding, state, arrival18, arrival17,
         departure17, departure18, query_output18, output, weights18,
-        loomt::offset{18816}, probability18, result18, layer, dense_group);
+        loomt::offset{18816}, probability18, result18, layer, dense_group,
+        panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{5}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -860,7 +666,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival19, arrival18, departure18, departure19,
         query_output18, weights19, loomt::offset{18816}, probability18,
         result18, loomt::index{2048}, loomt::index{80}, loomt::index{4},
-        loomt::index{512}, layer, dense_group);
+        loomt::index{512}, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{5}, loomt::index{2}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -875,11 +681,11 @@ static void qwen3_embedding_dense_group(
       if (is_down) {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection5), weight_ingress5_24,
-            group_base_5, loomt::index{24});
+            group_base_5, loomt::index{24}, reload_weights);
       } else {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection5), weight_ingress5_16,
-            group_base_5, loomt::index{16});
+            group_base_5, loomt::index{16}, reload_weights);
       }
     }
     qwen3_embedding_query_key_egress(
@@ -890,7 +696,8 @@ static void qwen3_embedding_dense_group(
         loomt::index{2560}, loomt::index{5}, loomt::offset{81920},
         loomt::offset{1057088}, loomt::index{640}, loomt::offset{860160},
         loomt::offset{172032}, loomt::offset{434176}, loomt::offset{2007040},
-        loomt::offset{2630912}, loomt::offset{1646592}, layer, dense_group);
+        loomt::offset{2630912}, loomt::offset{1646592}, layer, dense_group,
+        panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{5}, loomt::index{3}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -901,7 +708,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival21, arrival22, departure22, departure21,
         query_output20, weights21, loomt::offset{18816}, probability20,
         result20, loomt::index{2560}, loomt::index{20}, loomt::index{5},
-        loomt::index{640}, layer, dense_group);
+        loomt::index{640}, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{5}, loomt::index{4}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -914,7 +721,8 @@ static void qwen3_embedding_dense_group(
         loomt::index{2560}, loomt::index{5}, loomt::offset{344064},
         loomt::offset{1073472}, loomt::index{640}, loomt::offset{876544},
         loomt::offset{188416}, loomt::offset{435200}, loomt::offset{2023424},
-        loomt::offset{2761984}, loomt::offset{1679360}, layer, dense_group);
+        loomt::offset{2761984}, loomt::offset{1679360}, layer, dense_group,
+        panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{5}, loomt::index{5}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -925,7 +733,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival23, arrival19, departure19, departure23,
         query_output22, weights23, loomt::offset{18816}, probability22,
         result22, loomt::index{2560}, loomt::index{84}, loomt::index{5},
-        loomt::index{640}, layer, dense_group);
+        loomt::index{640}, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{2}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -936,7 +744,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival24, arrival20, departure20, departure24,
         normal_output24, weights24, loomt::offset{18816}, query_output24,
         probability24, loomt::index{3072}, loomt::index{24}, loomt::index{6},
-        loomt::index{768}, layer, dense_group);
+        loomt::index{768}, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{3}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -951,11 +759,11 @@ static void qwen3_embedding_dense_group(
       if (is_down) {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection6), weight_ingress6_24,
-            group_base_6, loomt::index{24});
+            group_base_6, loomt::index{24}, reload_weights);
       } else {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection6), weight_ingress6_16,
-            group_base_6, loomt::index{16});
+            group_base_6, loomt::index{16}, reload_weights);
       }
     }
     qwen3_embedding_probability_value_egress(
@@ -966,7 +774,8 @@ static void qwen3_embedding_dense_group(
         result24, loomt::index{3072}, loomt::index{6}, loomt::offset{98304},
         loomt::offset{1057152}, loomt::index{768}, loomt::offset{630784},
         loomt::offset{204800}, loomt::offset{466944}, loomt::offset{2039808},
-        loomt::offset{2631168}, loomt::offset{1712128}, layer, dense_group);
+        loomt::offset{2631168}, loomt::offset{1712128}, layer, dense_group,
+        panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{4}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -977,7 +786,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival26, arrival25, departure25, departure26,
         normal_output26, weights26, loomt::offset{18816}, query_output26,
         probability26, loomt::index{3072}, loomt::index{88}, loomt::index{6},
-        loomt::index{768}, layer, dense_group);
+        loomt::index{768}, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{5}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -994,7 +803,7 @@ static void qwen3_embedding_dense_group(
         loomt::offset{2826240}, loomt::offset{2916352}, loomt::index{768},
         loomt::offset{647168}, loomt::offset{221184}, loomt::offset{467968},
         loomt::offset{2056192}, loomt::offset{2762240}, loomt::offset{1744896},
-        layer, dense_group);
+        layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{7}, loomt::index{2}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -1009,18 +818,19 @@ static void qwen3_embedding_dense_group(
       if (is_down) {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection7), weight_ingress7_24,
-            group_base_7, loomt::index{24});
+            group_base_7, loomt::index{24}, reload_weights);
       } else {
         qwen3_embedding_fill_weight_column(
             loom::buffer::cast<unsigned>(projection7), weight_ingress7_16,
-            group_base_7, loomt::index{16});
+            group_base_7, loomt::index{16}, reload_weights);
       }
     }
     qwen3_embedding_query_key_egress_terminal(
         sequence28_storage, loomt::offset{0}, storage28, loomt::offset{10624},
         storage29, activations28, loomt::index{0}, loomt::index{1}, arrival29,
         departure29, query_output28, output, state, weights28,
-        loomt::offset{18816}, probability28, result28, layer, dense_group);
+        loomt::offset{18816}, probability28, result28, layer, dense_group,
+        panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{7}, loomt::index{3}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -1031,7 +841,7 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival29, arrival30, departure30, departure29,
         query_output28, weights29, loomt::offset{18816}, probability28,
         result28, loomt::index{3584}, loomt::index{28}, loomt::index{7},
-        loomt::index{896}, layer, dense_group);
+        loomt::index{896}, layer, dense_group, panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{7}, loomt::index{4}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -1044,7 +854,8 @@ static void qwen3_embedding_dense_group(
         loomt::index{3584}, loomt::index{7}, loomt::offset{376832},
         loomt::offset{1073600}, loomt::index{896}, loomt::offset{909312},
         loomt::offset{253952}, loomt::offset{500736}, loomt::offset{2088960},
-        loomt::offset{2762496}, loomt::offset{1810432}, layer, dense_group);
+        loomt::offset{2762496}, loomt::offset{1810432}, layer, dense_group,
+        panel_index);
   }
   [[loom::strand(loomt::indices{loomt::index{7}, loomt::index{5}},
                  loomt::indices{loomt::index{1}, loomt::index{1}},
@@ -1055,605 +866,8 @@ static void qwen3_embedding_dense_group(
         loomt::index{1}, arrival31, arrival27, departure27, departure31,
         query_output30, weights31, loomt::offset{18816}, probability30,
         result30, loomt::index{3584}, loomt::index{92}, loomt::index{7},
-        loomt::index{896}, layer, dense_group);
+        loomt::index{896}, layer, dense_group, panel_index);
   }
 }
 
-[[loom::pipeline, loom::symbol("qwen3_embedding.attention_phase")]]
-static void qwen3_embedding_attention_phase(
-    [[loom::launch]] Bytes sequence0_storage, Bytes storage0, Bytes storage1,
-    Bytes gather_cache0, Bytes activations, ActivationStream activations0,
-    Bytes constants, Bytes embedding, Bytes state, BarrierStream arrival0,
-    BarrierStream departure0, FeatureStream query_output0, Bytes output,
-    WeightStream weights0, FeatureStream probability0, FeatureStream result0,
-    BarrierStream phase_complete, Bytes dimensions1_storage,
-    ActivationStream activations1, BarrierStream arrival1,
-    BarrierStream departure1, WeightStream weights1, Bytes sequence2_storage,
-    Bytes storage2, Bytes storage3, ActivationStream activations2,
-    BarrierStream arrival2, BarrierStream departure2,
-    FeatureStream query_output2, WeightStream weights2,
-    FeatureStream probability2, FeatureStream result2,
-    Bytes dimensions3_storage, ActivationStream activations3,
-    BarrierStream arrival3, BarrierStream departure3, WeightStream weights3,
-    Bytes sequence4_storage, Bytes storage4, Bytes storage5,
-    ActivationStream activations4, BarrierStream arrival4,
-    BarrierStream arrival5, BarrierStream departure5, BarrierStream departure4,
-    FeatureStream query_output4, WeightStream weights4,
-    FeatureStream probability4, FeatureStream result4,
-    Bytes dimensions5_storage, ActivationStream activations5,
-    BarrierStream arrival6, BarrierStream departure6, WeightStream weights5,
-    Bytes sequence6_storage, Bytes storage6, Bytes storage7,
-    ActivationStream activations6, BarrierStream arrival7,
-    BarrierStream departure7, FeatureStream query_output6,
-    WeightStream weights6, FeatureStream probability6, FeatureStream result6,
-    Bytes dimensions7_storage, ActivationStream activations7,
-    WeightStream weights7, Bytes sequence8_storage, Bytes dimensions8_storage,
-    Bytes storage8, Bytes storage9, ActivationStream activations8,
-    BarrierStream arrival8, BarrierStream departure8,
-    FeatureStream normal_output8, WeightStream weights8,
-    FeatureStream query_output8, FeatureStream probability8,
-    Bytes gather_cache9, ActivationStream activations9, BarrierStream arrival9,
-    BarrierStream departure9, WeightStream weights9, FeatureStream result8,
-    Bytes sequence10_storage, Bytes dimensions10_storage, Bytes storage10,
-    Bytes storage11, ActivationStream activations10, BarrierStream arrival10,
-    BarrierStream departure10, FeatureStream normal_output10,
-    WeightStream weights10, FeatureStream probability10,
-    ActivationStream activations11, BarrierStream arrival11,
-    BarrierStream departure11, WeightStream weights11,
-    FeatureStream query_output10, FeatureStream result10,
-    Bytes sequence12_storage, Bytes storage12, Bytes storage13,
-    ActivationStream activations12, BarrierStream arrival12,
-    BarrierStream arrival13, BarrierStream departure13,
-    BarrierStream departure12, FeatureStream query_output12,
-    WeightStream weights12, FeatureStream probability12, FeatureStream result12,
-    Bytes dimensions13_storage, ActivationStream activations13,
-    BarrierStream arrival14, BarrierStream departure14, WeightStream weights13,
-    Bytes sequence14_storage, Bytes storage14, Bytes storage15,
-    ActivationStream activations14, BarrierStream arrival15,
-    BarrierStream departure15, FeatureStream query_output14,
-    WeightStream weights14, FeatureStream probability14, FeatureStream result14,
-    Bytes dimensions15_storage, ActivationStream activations15,
-    WeightStream weights15, Bytes sequence16_storage, Bytes storage16,
-    Bytes storage17, ActivationStream activations16, BarrierStream arrival16,
-    BarrierStream departure16, FeatureStream query_output16,
-    WeightStream weights16, FeatureStream probability16, FeatureStream result16,
-    Bytes dimensions17_storage, ActivationStream activations17,
-    BarrierStream arrival17, BarrierStream departure17, WeightStream weights17,
-    Bytes sequence18_storage, Bytes storage18, Bytes storage19,
-    Bytes gather_cache18, ActivationStream activations18,
-    BarrierStream arrival18, BarrierStream departure18,
-    FeatureStream query_output18, WeightStream weights18,
-    FeatureStream probability18, FeatureStream result18,
-    Bytes dimensions19_storage, ActivationStream activations19,
-    BarrierStream arrival19, BarrierStream departure19, WeightStream weights19,
-    Bytes sequence20_storage, Bytes storage20, Bytes storage21,
-    ActivationStream activations20, BarrierStream arrival20,
-    BarrierStream arrival21, BarrierStream departure21,
-    BarrierStream departure20, FeatureStream query_output20,
-    WeightStream weights20, FeatureStream probability20, FeatureStream result20,
-    Bytes dimensions21_storage, ActivationStream activations21,
-    BarrierStream arrival22, BarrierStream departure22, WeightStream weights21,
-    Bytes sequence22_storage, Bytes storage22, Bytes storage23,
-    ActivationStream activations22, BarrierStream arrival23,
-    BarrierStream departure23, FeatureStream query_output22,
-    WeightStream weights22, FeatureStream probability22, FeatureStream result22,
-    Bytes dimensions23_storage, ActivationStream activations23,
-    WeightStream weights23, Bytes sequence24_storage,
-    Bytes dimensions24_storage, Bytes storage24, Bytes storage25,
-    ActivationStream activations24, BarrierStream arrival24,
-    BarrierStream departure24, FeatureStream normal_output24,
-    WeightStream weights24, FeatureStream probability24,
-    ActivationStream activations25, BarrierStream arrival25,
-    BarrierStream departure25, WeightStream weights25,
-    FeatureStream query_output24, FeatureStream result24,
-    Bytes sequence26_storage, Bytes dimensions26_storage, Bytes storage26,
-    Bytes storage27, ActivationStream activations26, BarrierStream arrival26,
-    BarrierStream departure26, FeatureStream normal_output26,
-    WeightStream weights26, FeatureStream query_output26,
-    FeatureStream probability26, Bytes gather_cache27,
-    ActivationStream activations27, BarrierStream arrival27,
-    BarrierStream departure27, WeightStream weights27, FeatureStream result26,
-    Bytes sequence28_storage, Bytes storage28, Bytes storage29,
-    ActivationStream activations28, BarrierStream arrival29,
-    BarrierStream departure29, FeatureStream query_output28,
-    WeightStream weights28, FeatureStream probability28, FeatureStream result28,
-    Bytes dimensions29_storage, ActivationStream activations29,
-    BarrierStream arrival30, BarrierStream departure30, WeightStream weights29,
-    Bytes sequence30_storage, Bytes storage30, Bytes storage31,
-    ActivationStream activations30, BarrierStream arrival31,
-    BarrierStream departure31, FeatureStream query_output30,
-    WeightStream weights30, FeatureStream probability30, FeatureStream result30,
-    Bytes dimensions31_storage, ActivationStream activations31,
-    WeightStream weights31, Bytes projection0, Bytes weight_ingress0_16_storage,
-    Bytes projection1, Bytes weight_ingress1_16_storage, Bytes projection2,
-    Bytes weight_ingress2_16_storage, Bytes projection3,
-    Bytes weight_ingress3_16_storage, Bytes projection4,
-    Bytes weight_ingress4_16_storage, Bytes projection5,
-    Bytes weight_ingress5_16_storage, Bytes projection6,
-    Bytes weight_ingress6_16_storage, Bytes projection7,
-    Bytes weight_ingress7_16_storage, Bytes weight_ingress0_24_storage,
-    Bytes weight_ingress1_24_storage, Bytes weight_ingress2_24_storage,
-    Bytes weight_ingress3_24_storage, Bytes weight_ingress4_24_storage,
-    Bytes weight_ingress5_24_storage, Bytes weight_ingress6_24_storage,
-    Bytes weight_ingress7_24_storage, loomt::index layer) {
-  auto weight_ingress0_16 = bind_weight_ingress<16>(weight_ingress0_16_storage);
-  auto weight_ingress1_16 = bind_weight_ingress<16>(weight_ingress1_16_storage);
-  auto weight_ingress2_16 = bind_weight_ingress<16>(weight_ingress2_16_storage);
-  auto weight_ingress3_16 = bind_weight_ingress<16>(weight_ingress3_16_storage);
-  auto weight_ingress4_16 = bind_weight_ingress<16>(weight_ingress4_16_storage);
-  auto weight_ingress5_16 = bind_weight_ingress<16>(weight_ingress5_16_storage);
-  auto weight_ingress6_16 = bind_weight_ingress<16>(weight_ingress6_16_storage);
-  auto weight_ingress7_16 = bind_weight_ingress<16>(weight_ingress7_16_storage);
-  auto weight_ingress0_24 = bind_weight_ingress<24>(weight_ingress0_24_storage);
-  auto weight_ingress1_24 = bind_weight_ingress<24>(weight_ingress1_24_storage);
-  auto weight_ingress2_24 = bind_weight_ingress<24>(weight_ingress2_24_storage);
-  auto weight_ingress3_24 = bind_weight_ingress<24>(weight_ingress3_24_storage);
-  auto weight_ingress4_24 = bind_weight_ingress<24>(weight_ingress4_24_storage);
-  auto weight_ingress5_24 = bind_weight_ingress<24>(weight_ingress5_24_storage);
-  auto weight_ingress6_24 = bind_weight_ingress<24>(weight_ingress6_24_storage);
-  auto weight_ingress7_24 = bind_weight_ingress<24>(weight_ingress7_24_storage);
-  [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    replay_attention_records(weight_ingress0_16, weights0, weights1, weights2,
-                             weights3);
-  }
-  [[loom::strand(loomt::indices{loomt::index{1}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    replay_attention_records(weight_ingress1_16, weights4, weights5, weights6,
-                             weights7);
-  }
-  [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    replay_attention_records(weight_ingress2_16, weights8, weights9, weights10,
-                             weights11);
-  }
-  [[loom::strand(loomt::indices{loomt::index{3}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    replay_attention_records(weight_ingress3_16, weights12, weights13,
-                             weights14, weights15);
-  }
-  [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    replay_attention_records(weight_ingress4_16, weights16, weights17,
-                             weights18, weights19);
-  }
-  [[loom::strand(loomt::indices{loomt::index{5}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    replay_attention_records(weight_ingress5_16, weights20, weights21,
-                             weights22, weights23);
-  }
-  [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    replay_attention_records(weight_ingress6_16, weights24, weights25,
-                             weights26, weights27);
-  }
-  [[loom::strand(loomt::indices{loomt::index{7}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    replay_attention_records(weight_ingress7_16, weights28, weights29,
-                             weights30, weights31);
-  }
-  [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_query_key_ingress_root_attention(
-        sequence0_storage, loomt::offset{0}, storage0, loomt::offset{10624},
-        storage1, gather_cache0, activations, activations0, loomt::index{0},
-        loomt::index{1}, constants, embedding, state, arrival0, departure0,
-        query_output0, output, weights0, loomt::offset{18816}, probability0,
-        result0, phase_complete, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{3}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_attention(
-        false, dimensions1_storage, loomt::offset{0}, storage1,
-        loomt::offset{10624}, storage0, activations1, loomt::index{0},
-        loomt::index{1}, arrival1, arrival0, departure0, departure1,
-        query_output0, weights1, loomt::offset{18816}, probability0, result0,
-        loomt::index{0}, loomt::index{0}, loomt::index{0}, loomt::index{0},
-        layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{4}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_fill_attention_column(
-        loom::buffer::cast<std::bfloat16_t>(state),
-        loom::buffer::cast<unsigned>(activations), weight_ingress0_16,
-        loomt::offset{0});
-    qwen3_embedding_query_key_egress_attention(
-        sequence2_storage, loomt::offset{0}, storage2, loomt::offset{10624},
-        storage3, activations2, loomt::index{0}, loomt::index{1}, arrival2,
-        arrival1, departure1, departure2, query_output2, output, state,
-        weights2, loomt::offset{18816}, probability2, result2, loomt::index{0},
-        loomt::index{0}, loomt::offset{262144}, loomt::offset{1073152},
-        loomt::index{0}, loomt::offset{548864}, loomt::offset{24576},
-        loomt::offset{271360}, loomt::offset{1859584}, loomt::offset{2760704},
-        loomt::offset{1351680}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{0}, loomt::index{5}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_attention(
-        false, dimensions3_storage, loomt::offset{0}, storage3,
-        loomt::offset{10624}, storage2, activations3, loomt::index{0},
-        loomt::index{1}, arrival3, arrival2, departure2, departure3,
-        query_output2, weights3, loomt::offset{18816}, probability2, result2,
-        loomt::index{0}, loomt::index{64}, loomt::index{0}, loomt::index{0},
-        layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{1}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_fill_attention_column(
-        loom::buffer::cast<std::bfloat16_t>(state),
-        loom::buffer::cast<unsigned>(activations), weight_ingress1_16,
-        loomt::offset{32768});
-    qwen3_embedding_query_key_egress_attention(
-        sequence4_storage, loomt::offset{0}, storage4, loomt::offset{10624},
-        storage5, activations4, loomt::index{0}, loomt::index{1}, arrival4,
-        arrival5, departure5, departure4, query_output4, output, state,
-        weights4, loomt::offset{18816}, probability4, result4,
-        loomt::index{512}, loomt::index{1}, loomt::offset{16384},
-        loomt::offset{1056832}, loomt::index{128}, loomt::offset{794624},
-        loomt::offset{40960}, loomt::offset{303104}, loomt::offset{1875968},
-        loomt::offset{2629888}, loomt::offset{1384448}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{1}, loomt::index{3}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_attention(
-        false, dimensions5_storage, loomt::offset{0}, storage5,
-        loomt::offset{10624}, storage4, activations5, loomt::index{0},
-        loomt::index{1}, arrival5, arrival6, departure6, departure5,
-        query_output4, weights5, loomt::offset{18816}, probability4, result4,
-        loomt::index{512}, loomt::index{4}, loomt::index{1}, loomt::index{128},
-        layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{1}, loomt::index{4}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_query_key_egress_attention(
-        sequence6_storage, loomt::offset{0}, storage6, loomt::offset{10624},
-        storage7, activations6, loomt::index{0}, loomt::index{1}, arrival6,
-        arrival7, departure7, departure6, query_output6, output, state,
-        weights6, loomt::offset{18816}, probability6, result6,
-        loomt::index{512}, loomt::index{1}, loomt::offset{278528},
-        loomt::offset{1073216}, loomt::index{128}, loomt::offset{811008},
-        loomt::offset{57344}, loomt::offset{304128}, loomt::offset{1892352},
-        loomt::offset{2760960}, loomt::offset{1417216}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{1}, loomt::index{5}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_attention(
-        false, dimensions7_storage, loomt::offset{0}, storage7,
-        loomt::offset{10624}, storage6, activations7, loomt::index{0},
-        loomt::index{1}, arrival7, arrival3, departure3, departure7,
-        query_output6, weights7, loomt::offset{18816}, probability6, result6,
-        loomt::index{512}, loomt::index{68}, loomt::index{1}, loomt::index{128},
-        layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_query_key_epilogue_attention(
-        sequence8_storage, loomt::offset{0}, dimensions8_storage, storage8,
-        loomt::offset{10624}, storage9, activations8, loomt::index{0},
-        loomt::index{1}, arrival8, arrival4, departure4, departure8,
-        normal_output8, weights8, loomt::offset{18816}, query_output8,
-        probability8, loomt::index{1024}, loomt::index{8}, loomt::index{2},
-        loomt::index{256}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{3}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_ingress_attention(
-        dimensions8_storage, storage9, loomt::offset{0}, loomt::offset{10624},
-        storage8, gather_cache9, activations, activations9, loomt::index{0},
-        loomt::index{1}, constants, embedding, state, arrival9, arrival8,
-        departure8, departure9, normal_output8, output, weights9,
-        loomt::offset{18816}, query_output8, probability8, sequence8_storage,
-        result8, loomt::index{1024}, loomt::index{32}, loomt::index{2},
-        loomt::offset{2695168}, loomt::offset{32768}, loomt::offset{1056896},
-        loomt::offset{1064960}, loomt::offset{1327104}, loomt::offset{1851392},
-        loomt::offset{2695168}, loomt::offset{2899968}, loomt::index{256},
-        loomt::offset{565248}, loomt::offset{73728}, loomt::offset{335872},
-        loomt::offset{1908736}, loomt::offset{2630144}, loomt::offset{1449984},
-        layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{4}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_query_key_epilogue_attention(
-        sequence10_storage, loomt::offset{0}, dimensions10_storage, storage10,
-        loomt::offset{10624}, storage11, activations10, loomt::index{0},
-        loomt::index{1}, arrival10, arrival9, departure9, departure10,
-        normal_output10, weights10, loomt::offset{18816}, query_output10,
-        probability10, loomt::index{1024}, loomt::index{72}, loomt::index{2},
-        loomt::index{256}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{2}, loomt::index{5}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_fill_attention_column(
-        loom::buffer::cast<std::bfloat16_t>(state),
-        loom::buffer::cast<unsigned>(activations), weight_ingress2_16,
-        loomt::offset{65536});
-    qwen3_embedding_probability_value_egress_attention(
-        storage11, loomt::offset{0}, loomt::offset{10624}, storage10,
-        activations11, loomt::index{0}, loomt::index{1}, arrival11, arrival10,
-        departure10, departure11, normal_output10, output, state, weights11,
-        loomt::offset{18816}, query_output10, probability10, result10,
-        loomt::index{1024}, loomt::index{2}, loomt::offset{294912},
-        loomt::offset{1073280}, loomt::index{256}, loomt::offset{581632},
-        loomt::offset{90112}, loomt::offset{336896}, loomt::offset{1925120},
-        loomt::offset{2761216}, loomt::offset{1482752}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{3}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_fill_attention_column(
-        loom::buffer::cast<std::bfloat16_t>(state),
-        loom::buffer::cast<unsigned>(activations), weight_ingress3_16,
-        loomt::offset{98304});
-    qwen3_embedding_query_key_egress_attention(
-        sequence12_storage, loomt::offset{0}, storage12, loomt::offset{10624},
-        storage13, activations12, loomt::index{0}, loomt::index{1}, arrival12,
-        arrival13, departure13, departure12, query_output12, output, state,
-        weights12, loomt::offset{18816}, probability12, result12,
-        loomt::index{1536}, loomt::index{3}, loomt::offset{49152},
-        loomt::offset{1056960}, loomt::index{384}, loomt::offset{827392},
-        loomt::offset{106496}, loomt::offset{368640}, loomt::offset{1941504},
-        loomt::offset{2630400}, loomt::offset{1515520}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{3}, loomt::index{3}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_attention(
-        false, dimensions13_storage, loomt::offset{0}, storage13,
-        loomt::offset{10624}, storage12, activations13, loomt::index{0},
-        loomt::index{1}, arrival13, arrival14, departure14, departure13,
-        query_output12, weights13, loomt::offset{18816}, probability12,
-        result12, loomt::index{1536}, loomt::index{12}, loomt::index{3},
-        loomt::index{384}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{3}, loomt::index{4}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_query_key_egress_attention(
-        sequence14_storage, loomt::offset{0}, storage14, loomt::offset{10624},
-        storage15, activations14, loomt::index{0}, loomt::index{1}, arrival14,
-        arrival15, departure15, departure14, query_output14, output, state,
-        weights14, loomt::offset{18816}, probability14, result14,
-        loomt::index{1536}, loomt::index{3}, loomt::offset{311296},
-        loomt::offset{1073344}, loomt::index{384}, loomt::offset{843776},
-        loomt::offset{122880}, loomt::offset{369664}, loomt::offset{1957888},
-        loomt::offset{2761472}, loomt::offset{1548288}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{3}, loomt::index{5}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_attention(
-        false, dimensions15_storage, loomt::offset{0}, storage15,
-        loomt::offset{10624}, storage14, activations15, loomt::index{0},
-        loomt::index{1}, arrival15, arrival11, departure11, departure15,
-        query_output14, weights15, loomt::offset{18816}, probability14,
-        result14, loomt::index{1536}, loomt::index{76}, loomt::index{3},
-        loomt::index{384}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_fill_attention_column(
-        loom::buffer::cast<std::bfloat16_t>(state),
-        loom::buffer::cast<unsigned>(activations), weight_ingress4_16,
-        loomt::offset{131072});
-    qwen3_embedding_query_key_egress_attention(
-        sequence16_storage, loomt::offset{0}, storage16, loomt::offset{10624},
-        storage17, activations16, loomt::index{0}, loomt::index{1}, arrival16,
-        arrival12, departure12, departure16, query_output16, output, state,
-        weights16, loomt::offset{18816}, probability16, result16,
-        loomt::index{2048}, loomt::index{4}, loomt::offset{65536},
-        loomt::offset{1057024}, loomt::index{512}, loomt::offset{598016},
-        loomt::offset{139264}, loomt::offset{401408}, loomt::offset{1974272},
-        loomt::offset{2630656}, loomt::offset{1581056}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{3}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_attention(
-        false, dimensions17_storage, loomt::offset{0}, storage17,
-        loomt::offset{10624}, storage16, activations17, loomt::index{0},
-        loomt::index{1}, arrival17, arrival16, departure16, departure17,
-        query_output16, weights17, loomt::offset{18816}, probability16,
-        result16, loomt::index{2048}, loomt::index{16}, loomt::index{4},
-        loomt::index{512}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{4}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_query_key_ingress_attention(
-        sequence18_storage, loomt::offset{0}, storage18, loomt::offset{10624},
-        storage19, gather_cache18, activations, activations18, loomt::index{0},
-        loomt::index{1}, constants, embedding, state, arrival18, arrival17,
-        departure17, departure18, query_output18, output, weights18,
-        loomt::offset{18816}, probability18, result18, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{4}, loomt::index{5}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_attention(
-        false, dimensions19_storage, loomt::offset{0}, storage19,
-        loomt::offset{10624}, storage18, activations19, loomt::index{0},
-        loomt::index{1}, arrival19, arrival18, departure18, departure19,
-        query_output18, weights19, loomt::offset{18816}, probability18,
-        result18, loomt::index{2048}, loomt::index{80}, loomt::index{4},
-        loomt::index{512}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{5}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_fill_attention_column(
-        loom::buffer::cast<std::bfloat16_t>(state),
-        loom::buffer::cast<unsigned>(activations), weight_ingress5_16,
-        loomt::offset{163840});
-    qwen3_embedding_query_key_egress_attention(
-        sequence20_storage, loomt::offset{0}, storage20, loomt::offset{10624},
-        storage21, activations20, loomt::index{0}, loomt::index{1}, arrival20,
-        arrival21, departure21, departure20, query_output20, output, state,
-        weights20, loomt::offset{18816}, probability20, result20,
-        loomt::index{2560}, loomt::index{5}, loomt::offset{81920},
-        loomt::offset{1057088}, loomt::index{640}, loomt::offset{860160},
-        loomt::offset{172032}, loomt::offset{434176}, loomt::offset{2007040},
-        loomt::offset{2630912}, loomt::offset{1646592}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{5}, loomt::index{3}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_attention(
-        false, dimensions21_storage, loomt::offset{0}, storage21,
-        loomt::offset{10624}, storage20, activations21, loomt::index{0},
-        loomt::index{1}, arrival21, arrival22, departure22, departure21,
-        query_output20, weights21, loomt::offset{18816}, probability20,
-        result20, loomt::index{2560}, loomt::index{20}, loomt::index{5},
-        loomt::index{640}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{5}, loomt::index{4}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_query_key_egress_attention(
-        sequence22_storage, loomt::offset{0}, storage22, loomt::offset{10624},
-        storage23, activations22, loomt::index{0}, loomt::index{1}, arrival22,
-        arrival23, departure23, departure22, query_output22, output, state,
-        weights22, loomt::offset{18816}, probability22, result22,
-        loomt::index{2560}, loomt::index{5}, loomt::offset{344064},
-        loomt::offset{1073472}, loomt::index{640}, loomt::offset{876544},
-        loomt::offset{188416}, loomt::offset{435200}, loomt::offset{2023424},
-        loomt::offset{2761984}, loomt::offset{1679360}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{5}, loomt::index{5}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_attention(
-        false, dimensions23_storage, loomt::offset{0}, storage23,
-        loomt::offset{10624}, storage22, activations23, loomt::index{0},
-        loomt::index{1}, arrival23, arrival19, departure19, departure23,
-        query_output22, weights23, loomt::offset{18816}, probability22,
-        result22, loomt::index{2560}, loomt::index{84}, loomt::index{5},
-        loomt::index{640}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_query_key_epilogue_attention(
-        sequence24_storage, loomt::offset{0}, dimensions24_storage, storage24,
-        loomt::offset{10624}, storage25, activations24, loomt::index{0},
-        loomt::index{1}, arrival24, arrival20, departure20, departure24,
-        normal_output24, weights24, loomt::offset{18816}, query_output24,
-        probability24, loomt::index{3072}, loomt::index{24}, loomt::index{6},
-        loomt::index{768}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{3}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_fill_attention_column(
-        loom::buffer::cast<std::bfloat16_t>(state),
-        loom::buffer::cast<unsigned>(activations), weight_ingress6_16,
-        loomt::offset{196608});
-    qwen3_embedding_probability_value_egress_attention(
-        storage25, loomt::offset{0}, loomt::offset{10624}, storage24,
-        activations25, loomt::index{0}, loomt::index{1}, arrival25, arrival24,
-        departure24, departure25, normal_output24, output, state, weights25,
-        loomt::offset{18816}, query_output24, probability24, result24,
-        loomt::index{3072}, loomt::index{6}, loomt::offset{98304},
-        loomt::offset{1057152}, loomt::index{768}, loomt::offset{630784},
-        loomt::offset{204800}, loomt::offset{466944}, loomt::offset{2039808},
-        loomt::offset{2631168}, loomt::offset{1712128}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{4}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_query_key_epilogue_attention(
-        sequence26_storage, loomt::offset{0}, dimensions26_storage, storage26,
-        loomt::offset{10624}, storage27, activations26, loomt::index{0},
-        loomt::index{1}, arrival26, arrival25, departure25, departure26,
-        normal_output26, weights26, loomt::offset{18816}, query_output26,
-        probability26, loomt::index{3072}, loomt::index{88}, loomt::index{6},
-        loomt::index{768}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{6}, loomt::index{5}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_ingress_attention(
-        dimensions26_storage, storage27, loomt::offset{0}, loomt::offset{10624},
-        storage26, gather_cache27, activations, activations27, loomt::index{0},
-        loomt::index{1}, constants, embedding, state, arrival27, arrival26,
-        departure26, departure27, normal_output26, output, weights27,
-        loomt::offset{18816}, query_output26, probability26, sequence26_storage,
-        result26, loomt::index{3072}, loomt::index{96}, loomt::index{6},
-        loomt::offset{2826240}, loomt::offset{360448}, loomt::offset{1073536},
-        loomt::offset{1081344}, loomt::offset{1343488}, loomt::offset{1867776},
-        loomt::offset{2826240}, loomt::offset{2916352}, loomt::index{768},
-        loomt::offset{647168}, loomt::offset{221184}, loomt::offset{467968},
-        loomt::offset{2056192}, loomt::offset{2762240}, loomt::offset{1744896},
-        layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{7}, loomt::index{2}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_fill_attention_column(
-        loom::buffer::cast<std::bfloat16_t>(state),
-        loom::buffer::cast<unsigned>(activations), weight_ingress7_16,
-        loomt::offset{229376});
-    qwen3_embedding_query_key_egress_terminal_attention(
-        sequence28_storage, loomt::offset{0}, storage28, loomt::offset{10624},
-        storage29, activations28, loomt::index{0}, loomt::index{1}, arrival29,
-        departure29, query_output28, output, state, weights28,
-        loomt::offset{18816}, probability28, result28, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{7}, loomt::index{3}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_attention(
-        false, dimensions29_storage, loomt::offset{0}, storage29,
-        loomt::offset{10624}, storage28, activations29, loomt::index{0},
-        loomt::index{1}, arrival29, arrival30, departure30, departure29,
-        query_output28, weights29, loomt::offset{18816}, probability28,
-        result28, loomt::index{3584}, loomt::index{28}, loomt::index{7},
-        loomt::index{896}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{7}, loomt::index{4}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_query_key_egress_attention(
-        sequence30_storage, loomt::offset{0}, storage30, loomt::offset{10624},
-        storage31, activations30, loomt::index{0}, loomt::index{1}, arrival30,
-        arrival31, departure31, departure30, query_output30, output, state,
-        weights30, loomt::offset{18816}, probability30, result30,
-        loomt::index{3584}, loomt::index{7}, loomt::offset{376832},
-        loomt::offset{1073600}, loomt::index{896}, loomt::offset{909312},
-        loomt::offset{253952}, loomt::offset{500736}, loomt::offset{2088960},
-        loomt::offset{2762496}, loomt::offset{1810432}, layer);
-  }
-  [[loom::strand(loomt::indices{loomt::index{7}, loomt::index{5}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}},
-                 loomt::indices{loomt::index{1}, loomt::index{1}})]] {
-    qwen3_embedding_probability_value_attention(
-        false, dimensions31_storage, loomt::offset{0}, storage31,
-        loomt::offset{10624}, storage30, activations31, loomt::index{0},
-        loomt::index{1}, arrival31, arrival27, departure27, departure31,
-        query_output30, weights31, loomt::offset{18816}, probability30,
-        result30, loomt::index{3584}, loomt::index{92}, loomt::index{7},
-        loomt::index{896}, layer);
-  }
-}
-
-#endif // QWEN3_EMBEDDING_ARRAY_PHASES_H_
+#endif  // QWEN3_EMBEDDING_ARRAY_PHASES_H_

@@ -13,15 +13,19 @@ checkpoint during every test.
 
 Three original synthetic sentences cover English and French tokenization.
 `reference.json` records their exact publisher token IDs and the EOS convention.
-An explicit 129-token input exercises a sequence spanning token panels.
-`publisher.f32` contains four independently computed, normalized 1,024-element
+Explicit 129-, 513-, and 32,768-token inputs exercise panel and context
+boundaries. `publisher.f32` contains six independently computed, normalized 1,024-element
 vectors in little-endian F32 order. The reference uses the pinned publisher
-checkpoint through Transformers `Qwen3Model`, eager F32 attention, one sequence
-at a time, and the final real token's hidden state. Text cases append EOS;
+checkpoint through Transformers `Qwen3Model`, F32 attention, one sequence
+at a time, and the final real token's hidden state. The full-context case uses
+PyTorch's CPU Flash SDPA implementation to bound reference memory; its
+agreement with eager attention on shorter inputs is recorded in the reference.
+The other cases use eager attention. Text cases append EOS;
 explicit token inputs retain their authored contents. It does not use the Loom
 panel packing, matrix operations, or normalization implementation. Dependency
 versions, the checkpoint revision, and the reference digest are recorded beside
-the data.
+the data. Long explicit inputs use a lossless prefix/repeated-pattern/suffix
+representation with a digest of the expanded little-endian token IDs.
 
 Reproduce those publisher vectors from the HF cache without acquiring weights:
 
@@ -42,21 +46,37 @@ vector digests are recorded for comparing source and archive results, while
 identical request replays must remain bit-exact.
 
 The checker compares single requests, explicit token IDs, reordered cohorts,
-concurrent requests, float and base64 encodings, 64-dimensional prefixes, and
-a full thirty-two-sequence cohort. A 129-token sequence crosses the panel
+concurrent requests, float and base64 encodings, 64- and 257-dimensional
+prefixes, and a thirty-three-sequence cohort. A 129-token sequence crosses the panel
 boundary alone and in both positions of a mixed-length cohort. Each placement
 is checked against the independent publisher vector because placement changes
 the attention reduction partitions. Repeating the same mixed cohort checks
-exact state reuse after another request. The checker verifies token accounting
-and rejects invalid IDs, dimensions, sequence lengths, and rounded cohort
-overflow. Successful results are written only after the owned server exits
-cleanly.
+exact state reuse after another request. A logical request containing a
+32,768-token sequence, a 513-token sequence, and a short sequence requires two
+cohorts. A late short peer must finish before that logical request, whose
+output order, numerical agreement, and total token usage are checked together.
+An accepted continuing request is then disconnected; cancellation must retire
+and a later 513-token replay must reproduce its output. Long text and its
+explicit token IDs must agree exactly. Invalid IDs, dimensions, and sequences
+longer than 32,768 tokens are rejected. Successful results are written only
+after the owned server exits cleanly.
 
-The broader qualification also replays a frozen retrieval subset containing
-256 queries and 2,048 documents. That corpus is separate from these compact
-in-repository tests and evaluates retrieval quality against the frozen publisher
-ranking. A pass of these compact service regressions does not establish the
-broader input-family or retrieval qualification.
+Both full-model targets are explicit `manual` stress tests. Full-context
+attention makes them unsuitable for the ordinary short CI suite.
+
+The small native attention regression exercises the production recurrence
+leaves over 512 equal-score key blocks. Its independent reference requires an
+exact sum of 32,768, a unit rescaling factor, and the exact final reciprocal.
+This catches exponential approximations that slightly discount retained state
+even when the maximum is unchanged; such an error compounds across a long
+context. The fixture compiles the private production functions into its test
+module without adding model exports.
+
+The broader qualification also replays 2,624 frozen retrieval inputs: a Quora
+subset containing 256 queries and 2,048 documents, plus 320 SciFact inputs.
+Those corpora are separate from these compact in-repository tests and evaluate
+retrieval quality against the frozen publisher ranking. A pass of these compact
+service regressions does not establish the broader retrieval qualification.
 
 Replacement implementations preserve or improve aggregate nDCG@10 and
 recall@10 against the qualified baseline, while retaining the 0.995 publisher

@@ -1,0 +1,225 @@
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+// Model-owned preparation of the validated embedding protocol envelope.
+// Output is i64 [sequence_count, dimensions, useful_tokens, aligned_slots],
+// followed by sequence_count i64 [absolute_id_offset, token_count] records
+// and packed little-endian i32 IDs. Sequence directory order is output order.
+// Arena admission and model progress are not encoded as input-size limits.
+func.decl import("input") @encode(%text: buffer, %flags: i32, %capacity: i64) -> (buffer, i64)
+
+func.decl import("input") @require(%condition: i32, %diagnostic: buffer)
+
+func.def @check(%condition: i1) {
+  %condition32 = scalar.extui %condition : i1 to i32
+  %error = buffer.constant utf8("Qwen3 Embedding requires 1-32768 tokens per sequence, vocabulary IDs below 151669, and 1-1024 dimensions.") : buffer
+  func.call @require(%condition32, %error) : (i32, buffer)
+  func.return
+}
+
+// Amortized linear growth avoids reserving a maximum-context row for each
+// short input. Both buffers are ordinary source-owned VM allocations.
+func.def @grow(%storage: buffer, %capacity: i64, %used: i64, %required: i64) -> (buffer, i64) {
+  %fits = scalar.cmpi ule, %required, %capacity : i64
+  %result, %result_capacity = scf.if %fits -> (buffer, i64) {
+    scf.yield %storage, %capacity : buffer, i64
+  } else {
+    %half_maximum = scalar.constant 4611686018427387903 : i64
+    %can_double = scalar.cmpi ule, %capacity, %half_maximum : i64
+    %growth_factor = scalar.constant 2 : i64
+    %doubled = scalar.muli %capacity, %growth_factor : i64
+    %geometric = scf.select %can_double, %doubled, %required : i64
+    %large_enough = scalar.cmpi uge, %geometric, %required : i64
+    %next = scf.select %large_enough, %geometric, %required : i64
+    %bounded_next = scalar.assume %next [range(%next, 1, 9223372036854775807)] : i64
+    %extent = index.cast %bounded_next : i64 to offset
+    %replacement = buffer.alloca<private> align(8) %extent : buffer
+    %bounded_used = scalar.assume %used [range(%used, 0, 9223372036854775807)] : i64
+    %copy_length = index.cast %bounded_used : i64 to offset
+    %origin = index.constant 0 : offset
+    buffer.copy %storage[%origin], %replacement[%origin], %copy_length
+    scf.yield %replacement, %next : buffer, i64
+  }
+  func.return %result, %result_capacity : buffer, i64
+}
+
+func.def public @prepare_sequences(%request: buffer) -> (buffer) {
+  %origin = index.constant 0 : offset
+  %c0_index = index.constant 0 : index
+  %c1_index = index.constant 1 : index
+  %c0_i64 = scalar.constant 0 : i64
+  %token_byte_width = scalar.constant 4 : i64
+  %maximum_dimensions = scalar.constant 1024 : i64
+  %maximum_tokens = scalar.constant 32768 : i64
+  %maximum_size = scalar.constant 9223372036854775807 : i64
+  %input_header_bytes = index.constant 16 : offset
+  %header_bytes = index.constant 32 : offset
+  %record_bytes = index.constant 16 : offset
+  %token_element_bytes = index.constant 4 : offset
+  %input_header = buffer.view %request[%origin] : buffer -> view<2xi64>
+  %requested_dimensions = view.load %input_header[0] : view<2xi64> -> i64
+  %sequence_count = view.load %input_header[1] : view<2xi64> -> i64
+  %use_default = scalar.cmpi eq, %requested_dimensions, %c0_i64 : i64
+  %dimensions = scf.select %use_default, %maximum_dimensions, %requested_dimensions : i64
+  %positive_dimensions = scalar.cmpi ugt, %dimensions, %c0_i64 : i64
+  %bounded_dimensions = scalar.cmpi ule, %dimensions, %maximum_dimensions : i64
+  %valid_dimensions = scalar.andi %positive_dimensions, %bounded_dimensions : i1
+  func.call @check(%valid_dimensions) : (i1)
+  // The service parser already established the envelope and directory extent.
+  %positive_count = scalar.assume %sequence_count [range(%sequence_count, 1, 9223372036854775807)] : i64
+  %sequences = index.cast %positive_count : i64 to index
+  %inputs = buffer.view %request[%input_header_bytes] : buffer -> view<[%sequences]x3xi64>
+  %directory_bytes = index.scale %sequences, %record_bytes : index, offset -> offset
+  %payload_begin = index.add %header_bytes, %directory_bytes : offset
+  %initial_capacity = index.cast %payload_begin : offset to i64
+  %initial = buffer.alloca<private> align(8) %payload_begin : buffer
+  %initial_header = buffer.view %initial[%origin] : buffer -> view<4xi64>
+  view.store %sequence_count, %initial_header[0] : i64, view<4xi64>
+  view.store %dimensions, %initial_header[1] : i64, view<4xi64>
+  %packed, %capacity, %used, %tokens, %slots = scf.for %row = [%c0_index to %sequences step %c1_index](%storage = %initial : buffer, %storage_capacity = %initial_capacity : i64, %position = %initial_capacity : i64, %token_total = %c0_i64 : i64, %slot_total = %c0_i64 : i64) -> (buffer, i64, i64, i64, i64) {
+    %kind = view.load %inputs[%row, 0] : view<[%sequences]x3xi64> -> i64
+    %source_offset = view.load %inputs[%row, 1] : view<[%sequences]x3xi64> -> i64
+    %source_length = view.load %inputs[%row, 2] : view<[%sequences]x3xi64> -> i64
+    %bounded_offset = scalar.assume %source_offset [range(%source_offset, 0, 9223372036854775807)] : i64
+    %bounded_length = scalar.assume %source_length [range(%source_length, 0, 9223372036854775807)] : i64
+    %source = index.cast %bounded_offset : i64 to offset
+    %length = index.cast %bounded_length : i64 to offset
+    %data = buffer.alloca<private> align(8) %length : buffer
+    buffer.copy %request[%source], %data[%origin], %length
+    %is_text = scalar.cmpi eq, %kind, %c0_i64 : i64
+    %ids, %count = scf.if %is_text -> (buffer, i64) {
+      %flags = scalar.constant 4 : i32
+      %encoding_capacity = scalar.constant 32769 : i64
+      %encoded, %encoded_count = func.call @encode(%data, %flags, %encoding_capacity) : (buffer, i32, i64) -> (buffer, i64)
+      scf.yield %encoded, %encoded_count : buffer, i64
+    } else {
+      %id_count = scalar.divui %source_length, %token_byte_width : i64
+      scf.yield %data, %id_count : buffer, i64
+    }
+    %nonempty = scalar.cmpi ugt, %count, %c0_i64 : i64
+    %within_context = scalar.cmpi ule, %count, %maximum_tokens : i64
+    %valid_count = scalar.andi %nonempty, %within_context : i1
+    func.call @check(%valid_count) : (i1)
+    %bounded_count = scalar.assume %count [range(%count, 1, 32768)] : i64
+    %id_count = index.cast %bounded_count : i64 to index
+    %values = buffer.view %ids[%origin] : buffer -> view<[%id_count]xi32>
+    %vocabulary = scalar.constant 151669 : i32
+    scf.for %i = [%c0_index to %id_count step %c1_index] {
+      %id = view.load %values[%i] : view<[%id_count]xi32> -> i32
+      %valid_id = scalar.cmpi ult, %id, %vocabulary : i32
+      func.call @check(%valid_id) : (i1)
+    }
+    %id_bytes = scalar.muli %count, %token_byte_width : i64
+    %required = scalar.addi %position, %id_bytes : i64
+    %fits_storage = scalar.cmpi ule, %required, %maximum_size : i64
+    func.call @check(%fits_storage) : (i1)
+    %next_storage, %next_capacity = func.call @grow(%storage, %storage_capacity, %position, %required) : (buffer, i64, i64, i64) -> (buffer, i64)
+    %directory = buffer.view %next_storage[%header_bytes] : buffer -> view<[%sequences]x2xi64>
+    view.store %position, %directory[%row, 0] : i64, view<[%sequences]x2xi64>
+    view.store %count, %directory[%row, 1] : i64, view<[%sequences]x2xi64>
+    %bounded_position = scalar.assume %position [range(%position, 0, 9223372036854775807)] : i64
+    %destination = index.cast %bounded_position : i64 to offset
+    %copy_bytes = index.scale %id_count, %token_element_bytes : index, offset -> offset
+    buffer.copy %ids[%origin], %next_storage[%destination], %copy_bytes
+    %next_tokens = scalar.addi %token_total, %count : i64
+    %alignment_bias = scalar.constant 7 : i64
+    %alignment_mask = scalar.constant -8 : i64
+    %extended = scalar.addi %count, %alignment_bias : i64
+    %aligned = scalar.andi %extended, %alignment_mask : i64
+    %next_slots = scalar.addi %slot_total, %aligned : i64
+    scf.yield %next_storage, %next_capacity, %required, %next_tokens, %next_slots : buffer, i64, i64, i64, i64
+  }
+  %header = buffer.view %packed[%origin] : buffer -> view<4xi64>
+  view.store %tokens, %header[2] : i64, view<4xi64>
+  view.store %slots, %header[3] : i64, view<4xi64>
+  %bounded_used = scalar.assume %used [range(%used, 1, 9223372036854775807)] : i64
+  %used_bytes = index.cast %bounded_used : i64 to offset
+  %result = buffer.alloca<private> align(8) %used_bytes : buffer
+  buffer.copy %packed[%origin], %result[%origin], %used_bytes
+  func.return %result : buffer
+}
+
+// The cohort owner supplies an admitted panel extent. Padding carries an
+// invalid sequence identity so it never participates in real attention.
+func.def public @create_metadata(%panel_count: i32) -> (buffer) {
+  %bounded_panels = scalar.assume %panel_count [range(%panel_count, 1, 256)] : i32
+  %panels = index.cast %bounded_panels : i32 to index
+  %panel_bytes = index.constant 8192 : offset
+  %bytes = index.scale %panels, %panel_bytes : index, offset -> offset
+  %metadata = buffer.alloca<private> align(64) %bytes : buffer
+  %c0_index = index.constant 0 : index
+  %c1_index = index.constant 1 : index
+  %origin = index.constant 0 : offset
+  %clear_byte = scalar.constant 0 : i8
+  buffer.fill %clear_byte, %metadata[%origin], %bytes : i8
+  %panel_slots = index.constant 128 : index
+  %slots = index.mul %panels, %panel_slots : index
+  %rows = buffer.view %metadata[%origin] : buffer -> view<[%slots]x16xi32>
+  %padding_identity = scalar.constant -1 : i32
+  %full_dimensions = scalar.constant 1024 : i32
+  scf.for %row = [%c0_index to %slots step %c1_index] {
+    view.store %padding_identity, %rows[%row, 1] : i32, view<[%slots]x16xi32>
+    view.store %full_dimensions, %rows[%row, 3] : i32, view<[%slots]x16xi32>
+  }
+  func.return %metadata : buffer
+}
+
+// Append one selected sequence to an admitted cohort. Membership chooses the
+// sequence's identity and slot; the token record retains its original ordinal.
+// Returns the next eight-aligned slot, relative final-output byte offset, and
+// useful token count. Neither this operation nor packing advances NPU progress.
+func.def public @append_sequence(%prepared: buffer, %ordinal: i64, %metadata: buffer, %panel_count: i32, %first_slot: i32, %identity: i32) -> (i32, i64, i64) {
+  %origin = index.constant 0 : offset
+  %c0_index = index.constant 0 : index
+  %c1_index = index.constant 1 : index
+  %header_bytes = index.constant 32 : offset
+  %header = buffer.view %prepared[%origin] : buffer -> view<4xi64>
+  %sequence_count = view.load %header[0] : view<4xi64> -> i64
+  %dimensions = view.load %header[1] : view<4xi64> -> i64
+  %bounded_count = scalar.assume %sequence_count [range(%sequence_count, 1, 9223372036854775807)] : i64
+  %sequences = index.cast %bounded_count : i64 to index
+  %bounded_ordinal = scalar.assume %ordinal [range(%ordinal, 0, 9223372036854775807)] : i64
+  %sequence_value = index.cast %bounded_ordinal : i64 to index
+  %sequence = index.assume %sequence_value [lt(%sequence_value, %sequences)] : index
+  %directory = buffer.view %prepared[%header_bytes] : buffer -> view<[%sequences]x2xi64>
+  %source = view.load %directory[%sequence, 0] : view<[%sequences]x2xi64> -> i64
+  %count = view.load %directory[%sequence, 1] : view<[%sequences]x2xi64> -> i64
+  %bounded_source = scalar.assume %source [range(%source, 0, 9223372036854775807)] : i64
+  %source_offset = index.cast %bounded_source : i64 to offset
+  %bounded_tokens = scalar.assume %count [range(%count, 1, 32768)] : i64
+  %tokens = index.cast %bounded_tokens : i64 to index
+  %ids = buffer.view %prepared[%source_offset] : buffer -> view<[%tokens]xi32>
+  %bounded_panels = scalar.assume %panel_count [range(%panel_count, 1, 256)] : i32
+  %panels = index.cast %bounded_panels : i32 to index
+  %panel_slots = index.constant 128 : index
+  %slots = index.mul %panels, %panel_slots : index
+  %rows = buffer.view %metadata[%origin] : buffer -> view<[%slots]x16xi32>
+  %bounded_slot = scalar.assume %first_slot [range(%first_slot, 0, 32767)] : i32
+  %begin = index.cast %bounded_slot : i32 to index
+  %dimensions32 = scalar.trunci %dimensions : i64 to i32
+  scf.for %position = [%c0_index to %tokens step %c1_index] {
+    %slot_value = index.add %begin, %position : index
+    %slot = index.assume %slot_value [lt(%slot_value, %slots)] : index
+    %id = view.load %ids[%position] : view<[%tokens]xi32> -> i32
+    %position32 = index.cast %position : index to i32
+    view.store %id, %rows[%slot, 0] : i32, view<[%slots]x16xi32>
+    view.store %identity, %rows[%slot, 1] : i32, view<[%slots]x16xi32>
+    view.store %position32, %rows[%slot, 2] : i32, view<[%slots]x16xi32>
+    view.store %dimensions32, %rows[%slot, 3] : i32, view<[%slots]x16xi32>
+  }
+  %last = index.add %begin, %tokens : index
+  %last_row = index.sub %last, %c1_index : index
+  %output_stride = index.constant 4096 : offset
+  %output_offset = index.scale %last_row, %output_stride : index, offset -> offset
+  %output_offset64 = index.cast %output_offset : offset to i64
+  %alignment_bias = scalar.constant 7 : i64
+  %mask = scalar.constant -8 : i64
+  %rounded = scalar.addi %count, %alignment_bias : i64
+  %aligned = scalar.andi %rounded, %mask : i64
+  %aligned32 = scalar.trunci %aligned : i64 to i32
+  %next = scalar.addi %first_slot, %aligned32 : i32
+  func.return %next, %output_offset64, %count : i32, i64, i64
+}
