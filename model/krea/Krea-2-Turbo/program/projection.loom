@@ -34,7 +34,10 @@ kernel.def target(@projection_wave32) @krea_image_projection() {
   %output_tiles = index.constant 384 : index
   %c1 = index.constant 1 : index
   %threads = index.constant 32 : index
-  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 64 : index
+  %physical_groups_x = index.min %row_tiles, %grid_axis_limit : index
+  %physical_groups_y = index.min %output_tiles, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %physical_groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
   %storage = config.get @krea2.dit_int8 : index
   %zero_storage = index.constant 0 : index
@@ -43,14 +46,22 @@ kernel.def target(@projection_wave32) @krea_image_projection() {
   %inputs = index.constant 64 : index
   %outputs = index.constant 6144 : index
   %projection_tile = index.constant 16 : index
-  %row_tile = kernel.workgroup.id<x> : index
-  %output_tile = kernel.workgroup.id<y> : index
-  %row_origin = index.mul %row_tile, %projection_tile : index
-  %output_origin = index.mul %output_tile, %projection_tile : index
-  %result = template.apply<@projection.linear_storage_bf16>(%rows, %inputs, %outputs, %weight_is_bf16, %row_origin, %output_origin, %input, %weight) : (index, index, index, i1, index, index, buffer, buffer) -> (vector<8xf32>)
-  %biased = template.apply<@projection.bias_storage_bf16>(%outputs, %output_origin, %weight_is_bf16, %result, %bias) : (index, index, i1, vector<8xf32>, buffer) -> (vector<8xf32>)
-  %output_layout = encoding.layout.dense : encoding<layout>
-  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %biased, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  %logical_groups_x = index.div %rows, %projection_tile : index
+  %logical_groups_y = index.div %outputs, %projection_tile : index
+  %first_grid_y = kernel.workgroup.id<y> : index
+  %grid_stride_y = kernel.workgroup.count<y> : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %output_tile = [%first_grid_y to %logical_groups_y step %grid_stride_y] {
+    scf.for %row_tile = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+      %row_origin = index.mul %row_tile, %projection_tile : index
+      %output_origin = index.mul %output_tile, %projection_tile : index
+      %result = template.apply<@projection.linear_storage_bf16>(%rows, %inputs, %outputs, %weight_is_bf16, %row_origin, %output_origin, %input, %weight) : (index, index, index, i1, index, index, buffer, buffer) -> (vector<8xf32>)
+      %biased = template.apply<@projection.bias_storage_bf16>(%outputs, %output_origin, %weight_is_bf16, %result, %bias) : (index, index, i1, vector<8xf32>, buffer) -> (vector<8xf32>)
+      %output_layout = encoding.layout.dense : encoding<layout>
+      template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %biased, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+    }
+  }
   kernel.return
 }
 

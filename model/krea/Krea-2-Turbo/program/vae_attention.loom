@@ -60,7 +60,10 @@ kernel.def target(@vae_attention_wave32) @krea_vae_attention_qkv() {
   %groups = index.div %rounded, %threads : index
   %outputs = index.constant 1152 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%groups, %outputs, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 64 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  %physical_groups_y = index.min %outputs, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %physical_groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
   %height = config.get @krea2.latent_height : index
   %width = config.get @krea2.latent_width : index
@@ -70,28 +73,38 @@ kernel.def target(@vae_attention_wave32) @krea_vae_attention_qkv() {
   %c2 = index.constant 2 : index
   %threads = index.constant 128 : index
   %origin = index.constant 0 : offset
-  %group = kernel.workgroup.id<x> : index
-  %channel = kernel.workgroup.id<y> : index
-  %lane = kernel.workitem.id<x> : index
-  %pixel = index.madd %group, %threads, %lane : index
-  %pixels = index.mul %height, %width : index
-  %live = index.cmp ult, %pixel, %pixels : index
-  scf.if %live {
-    %value = template.apply<@image.convolution_nchw_element_f32>(%height, %width, %inputs, %outputs, %c1, %c1, %c1, %channel, %pixel, %input, %weight, %bias) : (index, index, index, index, index, index, index, index, index, buffer, buffer, buffer) -> (f32)
-    // Q/K preserve their coalesced token lanes. V is written token-first for
-    // channel-owned attention accumulation, directly in its existing plane.
-    %query_key_channels = index.mul %c2, %inputs : index
-    %is_value = index.cmp uge, %channel, %query_key_channels : index
-    scf.if %is_value {
-      %value_channel = index.sub %channel, %query_key_channels : index
-      %value_start = index.mul %query_key_channels, %pixels : index
-      %element_bytes = index.constant 4 : offset
-      %value_base = index.scale %value_start, %element_bytes : index, offset -> offset
-      %value_view = buffer.view %output[%value_base] : buffer -> view<[%pixels]x[%inputs]xf32>
-      view.store %value, %value_view[%pixel, %value_channel] : f32, view<[%pixels]x[%inputs]xf32>
-    } else {
-      %query_key_view = buffer.view %output[%origin] : buffer -> view<[%query_key_channels]x[%pixels]xf32>
-      view.store %value, %query_key_view[%channel, %pixel] : f32, view<[%query_key_channels]x[%pixels]xf32>
+  %logical_pixels = index.mul %height, %width : index
+  %grid_padding = index.constant 127 : index
+  %logical_rounded = index.add %logical_pixels, %grid_padding : index
+  %logical_groups_x = index.div %logical_rounded, %threads : index
+  %first_grid_y = kernel.workgroup.id<y> : index
+  %grid_stride_y = kernel.workgroup.count<y> : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %channel = [%first_grid_y to %outputs step %grid_stride_y] {
+    scf.for %group = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+      %lane = kernel.workitem.id<x> : index
+      %pixel = index.madd %group, %threads, %lane : index
+      %pixels = index.mul %height, %width : index
+      %live = index.cmp ult, %pixel, %pixels : index
+      scf.if %live {
+        %value = template.apply<@image.convolution_nchw_element_f32>(%height, %width, %inputs, %outputs, %c1, %c1, %c1, %channel, %pixel, %input, %weight, %bias) : (index, index, index, index, index, index, index, index, index, buffer, buffer, buffer) -> (f32)
+        // Q/K preserve their coalesced token lanes. V is written token-first for
+        // channel-owned attention accumulation, directly in its existing plane.
+        %query_key_channels = index.mul %c2, %inputs : index
+        %is_value = index.cmp uge, %channel, %query_key_channels : index
+        scf.if %is_value {
+          %value_channel = index.sub %channel, %query_key_channels : index
+          %value_start = index.mul %query_key_channels, %pixels : index
+          %element_bytes = index.constant 4 : offset
+          %value_base = index.scale %value_start, %element_bytes : index, offset -> offset
+          %value_view = buffer.view %output[%value_base] : buffer -> view<[%pixels]x[%inputs]xf32>
+          view.store %value, %value_view[%pixel, %value_channel] : f32, view<[%pixels]x[%inputs]xf32>
+        } else {
+          %query_key_view = buffer.view %output[%origin] : buffer -> view<[%query_key_channels]x[%pixels]xf32>
+          view.store %value, %query_key_view[%channel, %pixel] : f32, view<[%query_key_channels]x[%pixels]xf32>
+        }
+      }
     }
   }
   kernel.return
@@ -107,7 +120,10 @@ kernel.def target(@vae_attention_wave32) @krea_vae_attention_projection() {
   %groups = index.div %rounded, %threads : index
   %outputs = index.constant 384 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%groups, %outputs, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 64 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  %physical_groups_y = index.min %outputs, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %physical_groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
   %height = config.get @krea2.latent_height : index
   %width = config.get @krea2.latent_width : index
@@ -129,7 +145,10 @@ kernel.def target(@vae_attention_wave32) @krea_vae_attention_projection_add() {
   %groups = index.div %rounded, %threads : index
   %outputs = index.constant 384 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%groups, %outputs, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 64 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  %physical_groups_y = index.min %outputs, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %physical_groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) {
   %height = config.get @krea2.latent_height : index
   %width = config.get @krea2.latent_width : index

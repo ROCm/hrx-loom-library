@@ -38,7 +38,9 @@ kernel.def target(@fusion_wave32) @fusion_layerwise_norm() {
   %rows = index.mul %texts, %layers : index
   %c1 = index.constant 1 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 8192 : index
+  %physical_groups_x = index.min %rows, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %output: buffer) {
   %texts = config.get @krea2.text_tokens : index
   %layers = index.constant 12 : index
@@ -58,7 +60,9 @@ kernel.def target(@fusion_wave32) @fusion_layerwise_head_norm() {
   %norm_rows = index.mul %rows, %heads : index
   %c1 = index.constant 1 : index
   %threads = index.constant 128 : index
-  kernel.launch.config workgroups(%norm_rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 8192 : index
+  %physical_groups_x = index.min %norm_rows, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %output: buffer) {
   %texts = config.get @krea2.text_tokens : index
   %layers = index.constant 12 : index
@@ -81,7 +85,10 @@ kernel.def target(@fusion_wave32) @fusion_layerwise_linear_2560_2560() {
   %columns = index.constant 160 : index
   %c1 = index.constant 1 : index
   %threads = index.constant 32 : index
-  kernel.launch.config workgroups(%groups, %columns, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 64 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  %physical_groups_y = index.min %columns, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %physical_groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %output: buffer) {
   %texts = config.get @krea2.text_tokens : index
   %layers = index.constant 12 : index
@@ -89,13 +96,21 @@ kernel.def target(@fusion_wave32) @fusion_layerwise_linear_2560_2560() {
   %inputs = index.constant 2560 : index
   %outputs = index.constant 2560 : index
   %projection_tile = index.constant 16 : index
-  %row_tile = kernel.workgroup.id<x> : index
-  %output_tile = kernel.workgroup.id<y> : index
-  %row_origin = index.mul %row_tile, %projection_tile : index
-  %output_origin = index.mul %output_tile, %projection_tile : index
-  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
-  %output_layout = encoding.layout.dense : encoding<layout>
-  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %result, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  %logical_groups_x = index.div %rows, %projection_tile : index
+  %logical_groups_y = index.div %outputs, %projection_tile : index
+  %first_grid_y = kernel.workgroup.id<y> : index
+  %grid_stride_y = kernel.workgroup.count<y> : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %output_tile = [%first_grid_y to %logical_groups_y step %grid_stride_y] {
+    scf.for %row_tile = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+      %row_origin = index.mul %row_tile, %projection_tile : index
+      %output_origin = index.mul %output_tile, %projection_tile : index
+      %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+      %output_layout = encoding.layout.dense : encoding<layout>
+      template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %result, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+    }
+  }
   kernel.return
 }
 
@@ -108,7 +123,10 @@ kernel.def target(@fusion_wave32) @fusion_layerwise_linear_2560_6912() {
   %columns = index.constant 432 : index
   %c1 = index.constant 1 : index
   %threads = index.constant 32 : index
-  kernel.launch.config workgroups(%groups, %columns, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 64 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  %physical_groups_y = index.min %columns, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %physical_groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %output: buffer) {
   %texts = config.get @krea2.text_tokens : index
   %layers = index.constant 12 : index
@@ -116,13 +134,21 @@ kernel.def target(@fusion_wave32) @fusion_layerwise_linear_2560_6912() {
   %inputs = index.constant 2560 : index
   %outputs = index.constant 6912 : index
   %projection_tile = index.constant 16 : index
-  %row_tile = kernel.workgroup.id<x> : index
-  %output_tile = kernel.workgroup.id<y> : index
-  %row_origin = index.mul %row_tile, %projection_tile : index
-  %output_origin = index.mul %output_tile, %projection_tile : index
-  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
-  %output_layout = encoding.layout.dense : encoding<layout>
-  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %result, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  %logical_groups_x = index.div %rows, %projection_tile : index
+  %logical_groups_y = index.div %outputs, %projection_tile : index
+  %first_grid_y = kernel.workgroup.id<y> : index
+  %grid_stride_y = kernel.workgroup.count<y> : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %output_tile = [%first_grid_y to %logical_groups_y step %grid_stride_y] {
+    scf.for %row_tile = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+      %row_origin = index.mul %row_tile, %projection_tile : index
+      %output_origin = index.mul %output_tile, %projection_tile : index
+      %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+      %output_layout = encoding.layout.dense : encoding<layout>
+      template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %result, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+    }
+  }
   kernel.return
 }
 
@@ -135,7 +161,10 @@ kernel.def target(@fusion_wave32) @fusion_layerwise_linear_6912_2560() {
   %columns = index.constant 160 : index
   %c1 = index.constant 1 : index
   %threads = index.constant 32 : index
-  kernel.launch.config workgroups(%groups, %columns, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 64 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  %physical_groups_y = index.min %columns, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %physical_groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %output: buffer) {
   %texts = config.get @krea2.text_tokens : index
   %layers = index.constant 12 : index
@@ -143,13 +172,21 @@ kernel.def target(@fusion_wave32) @fusion_layerwise_linear_6912_2560() {
   %inputs = index.constant 6912 : index
   %outputs = index.constant 2560 : index
   %projection_tile = index.constant 16 : index
-  %row_tile = kernel.workgroup.id<x> : index
-  %output_tile = kernel.workgroup.id<y> : index
-  %row_origin = index.mul %row_tile, %projection_tile : index
-  %output_origin = index.mul %output_tile, %projection_tile : index
-  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
-  %output_layout = encoding.layout.dense : encoding<layout>
-  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %result, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  %logical_groups_x = index.div %rows, %projection_tile : index
+  %logical_groups_y = index.div %outputs, %projection_tile : index
+  %first_grid_y = kernel.workgroup.id<y> : index
+  %grid_stride_y = kernel.workgroup.count<y> : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %output_tile = [%first_grid_y to %logical_groups_y step %grid_stride_y] {
+    scf.for %row_tile = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+      %row_origin = index.mul %row_tile, %projection_tile : index
+      %output_origin = index.mul %output_tile, %projection_tile : index
+      %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+      %output_layout = encoding.layout.dense : encoding<layout>
+      template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %result, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+    }
+  }
   kernel.return
 }
 
@@ -161,7 +198,9 @@ kernel.def target(@fusion_wave32) @fusion_layerwise_residual() {
   %groups = index.mul %rows, %groups_per_row : index
   %c1 = index.constant 1 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 8192 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %update: buffer, %output: buffer) {
   %texts = config.get @krea2.text_tokens : index
   %layers = index.constant 12 : index
@@ -170,19 +209,23 @@ kernel.def target(@fusion_wave32) @fusion_layerwise_residual() {
   %elements = index.mul %rows, %width : index
   %origin = index.constant 0 : offset
   %threads = index.constant 256 : index
-  %group = kernel.workgroup.id<x> : index
-  %lane = kernel.workitem.id<x> : index
-  %element = index.madd %group, %threads, %lane : index
-  %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xbf16>
-  %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
-  %value = view.load %input_view[%element] : view<[%elements]xbf16> -> bf16
-  %update_view = buffer.view %update[%origin] : buffer -> view<[%elements]xbf16>
-  %delta = view.load %update_view[%element] : view<[%elements]xbf16> -> bf16
-  %value_f32 = scalar.extf %value : bf16 to f32
-  %delta_f32 = scalar.extf %delta : bf16 to f32
-  %sum = scalar.addf %value_f32, %delta_f32 : f32
-  %result = scalar.fptrunc %sum : f32 to bf16
-  view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  %logical_groups_x = index.div %elements, %threads : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %group = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+    %lane = kernel.workitem.id<x> : index
+    %element = index.madd %group, %threads, %lane : index
+    %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xbf16>
+    %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
+    %value = view.load %input_view[%element] : view<[%elements]xbf16> -> bf16
+    %update_view = buffer.view %update[%origin] : buffer -> view<[%elements]xbf16>
+    %delta = view.load %update_view[%element] : view<[%elements]xbf16> -> bf16
+    %value_f32 = scalar.extf %value : bf16 to f32
+    %delta_f32 = scalar.extf %delta : bf16 to f32
+    %sum = scalar.addf %value_f32, %delta_f32 : f32
+    %result = scalar.fptrunc %sum : f32 to bf16
+    view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  }
   kernel.return
 }
 
@@ -194,7 +237,9 @@ kernel.def target(@fusion_wave32) @fusion_layerwise_product() {
   %groups = index.mul %rows, %groups_per_row : index
   %c1 = index.constant 1 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 8192 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %up: buffer, %output: buffer) {
   %texts = config.get @krea2.text_tokens : index
   %layers = index.constant 12 : index
@@ -203,20 +248,24 @@ kernel.def target(@fusion_wave32) @fusion_layerwise_product() {
   %elements = index.mul %rows, %width : index
   %origin = index.constant 0 : offset
   %threads = index.constant 256 : index
-  %group = kernel.workgroup.id<x> : index
-  %lane = kernel.workitem.id<x> : index
-  %element = index.madd %group, %threads, %lane : index
-  %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xbf16>
-  %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
-  %value = view.load %input_view[%element] : view<[%elements]xbf16> -> bf16
-  %up_view = buffer.view %up[%origin] : buffer -> view<[%elements]xbf16>
-  %up_value = view.load %up_view[%element] : view<[%elements]xbf16> -> bf16
-  %activated = template.apply<@activation.silu_bf16>(%value) : (bf16) -> (bf16)
-  %activated_f32 = scalar.extf %activated : bf16 to f32
-  %up_f32 = scalar.extf %up_value : bf16 to f32
-  %product = scalar.mulf %activated_f32, %up_f32 : f32
-  %result = scalar.fptrunc %product : f32 to bf16
-  view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  %logical_groups_x = index.div %elements, %threads : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %group = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+    %lane = kernel.workitem.id<x> : index
+    %element = index.madd %group, %threads, %lane : index
+    %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xbf16>
+    %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
+    %value = view.load %input_view[%element] : view<[%elements]xbf16> -> bf16
+    %up_view = buffer.view %up[%origin] : buffer -> view<[%elements]xbf16>
+    %up_value = view.load %up_view[%element] : view<[%elements]xbf16> -> bf16
+    %activated = template.apply<@activation.silu_bf16>(%value) : (bf16) -> (bf16)
+    %activated_f32 = scalar.extf %activated : bf16 to f32
+    %up_f32 = scalar.extf %up_value : bf16 to f32
+    %product = scalar.mulf %activated_f32, %up_f32 : f32
+    %result = scalar.fptrunc %product : f32 to bf16
+    view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  }
   kernel.return
 }
 
@@ -224,7 +273,9 @@ kernel.def target(@fusion_wave32) @fusion_refiner_norm() {
   %rows = config.get @krea2.text_tokens : index
   %c1 = index.constant 1 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 8192 : index
+  %physical_groups_x = index.min %rows, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %output: buffer) {
   %rows = config.get @krea2.text_tokens : index
   %width = index.constant 2560 : index
@@ -240,7 +291,9 @@ kernel.def target(@fusion_wave32) @fusion_refiner_head_norm() {
   %norm_rows = index.mul %rows, %heads : index
   %c1 = index.constant 1 : index
   %threads = index.constant 128 : index
-  kernel.launch.config workgroups(%norm_rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 8192 : index
+  %physical_groups_x = index.min %norm_rows, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %output: buffer) {
   %rows = config.get @krea2.text_tokens : index
   %heads = index.constant 20 : index
@@ -259,19 +312,30 @@ kernel.def target(@fusion_wave32) @fusion_refiner_linear_2560_2560() {
   %columns = index.constant 160 : index
   %c1 = index.constant 1 : index
   %threads = index.constant 32 : index
-  kernel.launch.config workgroups(%groups, %columns, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 64 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  %physical_groups_y = index.min %columns, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %physical_groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %output: buffer) {
   %rows = config.get @krea2.text_tokens : index
   %inputs = index.constant 2560 : index
   %outputs = index.constant 2560 : index
   %projection_tile = index.constant 16 : index
-  %row_tile = kernel.workgroup.id<x> : index
-  %output_tile = kernel.workgroup.id<y> : index
-  %row_origin = index.mul %row_tile, %projection_tile : index
-  %output_origin = index.mul %output_tile, %projection_tile : index
-  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
-  %output_layout = encoding.layout.dense : encoding<layout>
-  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %result, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  %logical_groups_x = index.div %rows, %projection_tile : index
+  %logical_groups_y = index.div %outputs, %projection_tile : index
+  %first_grid_y = kernel.workgroup.id<y> : index
+  %grid_stride_y = kernel.workgroup.count<y> : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %output_tile = [%first_grid_y to %logical_groups_y step %grid_stride_y] {
+    scf.for %row_tile = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+      %row_origin = index.mul %row_tile, %projection_tile : index
+      %output_origin = index.mul %output_tile, %projection_tile : index
+      %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+      %output_layout = encoding.layout.dense : encoding<layout>
+      template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %result, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+    }
+  }
   kernel.return
 }
 
@@ -282,19 +346,30 @@ kernel.def target(@fusion_wave32) @fusion_refiner_linear_2560_6912() {
   %columns = index.constant 432 : index
   %c1 = index.constant 1 : index
   %threads = index.constant 32 : index
-  kernel.launch.config workgroups(%groups, %columns, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 64 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  %physical_groups_y = index.min %columns, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %physical_groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %output: buffer) {
   %rows = config.get @krea2.text_tokens : index
   %inputs = index.constant 2560 : index
   %outputs = index.constant 6912 : index
   %projection_tile = index.constant 16 : index
-  %row_tile = kernel.workgroup.id<x> : index
-  %output_tile = kernel.workgroup.id<y> : index
-  %row_origin = index.mul %row_tile, %projection_tile : index
-  %output_origin = index.mul %output_tile, %projection_tile : index
-  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
-  %output_layout = encoding.layout.dense : encoding<layout>
-  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %result, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  %logical_groups_x = index.div %rows, %projection_tile : index
+  %logical_groups_y = index.div %outputs, %projection_tile : index
+  %first_grid_y = kernel.workgroup.id<y> : index
+  %grid_stride_y = kernel.workgroup.count<y> : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %output_tile = [%first_grid_y to %logical_groups_y step %grid_stride_y] {
+    scf.for %row_tile = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+      %row_origin = index.mul %row_tile, %projection_tile : index
+      %output_origin = index.mul %output_tile, %projection_tile : index
+      %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+      %output_layout = encoding.layout.dense : encoding<layout>
+      template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %result, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+    }
+  }
   kernel.return
 }
 
@@ -305,19 +380,30 @@ kernel.def target(@fusion_wave32) @fusion_refiner_linear_6912_2560() {
   %columns = index.constant 160 : index
   %c1 = index.constant 1 : index
   %threads = index.constant 32 : index
-  kernel.launch.config workgroups(%groups, %columns, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 64 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  %physical_groups_y = index.min %columns, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %physical_groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %output: buffer) {
   %rows = config.get @krea2.text_tokens : index
   %inputs = index.constant 6912 : index
   %outputs = index.constant 2560 : index
   %projection_tile = index.constant 16 : index
-  %row_tile = kernel.workgroup.id<x> : index
-  %output_tile = kernel.workgroup.id<y> : index
-  %row_origin = index.mul %row_tile, %projection_tile : index
-  %output_origin = index.mul %output_tile, %projection_tile : index
-  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
-  %output_layout = encoding.layout.dense : encoding<layout>
-  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %result, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  %logical_groups_x = index.div %rows, %projection_tile : index
+  %logical_groups_y = index.div %outputs, %projection_tile : index
+  %first_grid_y = kernel.workgroup.id<y> : index
+  %grid_stride_y = kernel.workgroup.count<y> : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %output_tile = [%first_grid_y to %logical_groups_y step %grid_stride_y] {
+    scf.for %row_tile = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+      %row_origin = index.mul %row_tile, %projection_tile : index
+      %output_origin = index.mul %output_tile, %projection_tile : index
+      %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+      %output_layout = encoding.layout.dense : encoding<layout>
+      template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %result, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+    }
+  }
   kernel.return
 }
 
@@ -327,26 +413,32 @@ kernel.def target(@fusion_wave32) @fusion_refiner_residual() {
   %groups = index.mul %rows, %groups_per_row : index
   %c1 = index.constant 1 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 8192 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %update: buffer, %output: buffer) {
   %rows = config.get @krea2.text_tokens : index
   %width = index.constant 2560 : index
   %elements = index.mul %rows, %width : index
   %origin = index.constant 0 : offset
   %threads = index.constant 256 : index
-  %group = kernel.workgroup.id<x> : index
-  %lane = kernel.workitem.id<x> : index
-  %element = index.madd %group, %threads, %lane : index
-  %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xbf16>
-  %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
-  %value = view.load %input_view[%element] : view<[%elements]xbf16> -> bf16
-  %update_view = buffer.view %update[%origin] : buffer -> view<[%elements]xbf16>
-  %delta = view.load %update_view[%element] : view<[%elements]xbf16> -> bf16
-  %value_f32 = scalar.extf %value : bf16 to f32
-  %delta_f32 = scalar.extf %delta : bf16 to f32
-  %sum = scalar.addf %value_f32, %delta_f32 : f32
-  %result = scalar.fptrunc %sum : f32 to bf16
-  view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  %logical_groups_x = index.div %elements, %threads : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %group = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+    %lane = kernel.workitem.id<x> : index
+    %element = index.madd %group, %threads, %lane : index
+    %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xbf16>
+    %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
+    %value = view.load %input_view[%element] : view<[%elements]xbf16> -> bf16
+    %update_view = buffer.view %update[%origin] : buffer -> view<[%elements]xbf16>
+    %delta = view.load %update_view[%element] : view<[%elements]xbf16> -> bf16
+    %value_f32 = scalar.extf %value : bf16 to f32
+    %delta_f32 = scalar.extf %delta : bf16 to f32
+    %sum = scalar.addf %value_f32, %delta_f32 : f32
+    %result = scalar.fptrunc %sum : f32 to bf16
+    view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  }
   kernel.return
 }
 
@@ -356,27 +448,33 @@ kernel.def target(@fusion_wave32) @fusion_refiner_product() {
   %groups = index.mul %rows, %groups_per_row : index
   %c1 = index.constant 1 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 8192 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %up: buffer, %output: buffer) {
   %rows = config.get @krea2.text_tokens : index
   %width = index.constant 6912 : index
   %elements = index.mul %rows, %width : index
   %origin = index.constant 0 : offset
   %threads = index.constant 256 : index
-  %group = kernel.workgroup.id<x> : index
-  %lane = kernel.workitem.id<x> : index
-  %element = index.madd %group, %threads, %lane : index
-  %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xbf16>
-  %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
-  %value = view.load %input_view[%element] : view<[%elements]xbf16> -> bf16
-  %up_view = buffer.view %up[%origin] : buffer -> view<[%elements]xbf16>
-  %up_value = view.load %up_view[%element] : view<[%elements]xbf16> -> bf16
-  %activated = template.apply<@activation.silu_bf16>(%value) : (bf16) -> (bf16)
-  %activated_f32 = scalar.extf %activated : bf16 to f32
-  %up_f32 = scalar.extf %up_value : bf16 to f32
-  %product = scalar.mulf %activated_f32, %up_f32 : f32
-  %result = scalar.fptrunc %product : f32 to bf16
-  view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  %logical_groups_x = index.div %elements, %threads : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %group = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+    %lane = kernel.workitem.id<x> : index
+    %element = index.madd %group, %threads, %lane : index
+    %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xbf16>
+    %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
+    %value = view.load %input_view[%element] : view<[%elements]xbf16> -> bf16
+    %up_view = buffer.view %up[%origin] : buffer -> view<[%elements]xbf16>
+    %up_value = view.load %up_view[%element] : view<[%elements]xbf16> -> bf16
+    %activated = template.apply<@activation.silu_bf16>(%value) : (bf16) -> (bf16)
+    %activated_f32 = scalar.extf %activated : bf16 to f32
+    %up_f32 = scalar.extf %up_value : bf16 to f32
+    %product = scalar.mulf %activated_f32, %up_f32 : f32
+    %result = scalar.fptrunc %product : f32 to bf16
+    view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  }
   kernel.return
 }
 

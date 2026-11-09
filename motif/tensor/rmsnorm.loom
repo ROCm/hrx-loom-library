@@ -73,7 +73,8 @@ template.decl @normalization.rms_inverse_bf16(%rows: index, %width: index, %thre
 // in F32 before rounding the final value. No intermediate value rounding.
 template.decl @normalization.zero_centered_bf16(%value: bf16, %weight: f32, %inverse: f32) -> (bf16)
 
-// One complete workgroup owns each row. Output may equal input or be disjoint;
+// Each whole workgroup traverses disjoint rows at the X grid stride. The grid
+// may be smaller than the row count. Output may equal input or be disjoint;
 // immutable F32 weights are separate. All buffers are naturally aligned.
 template.decl @normalization.zero_centered_rows_bf16(%rows: index, %width: index, %threads: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer)
 
@@ -121,17 +122,20 @@ template.def<@normalization.zero_centered_bf16> device @normalization_zero_cente
 
 template.def<@normalization.zero_centered_rows_bf16> device @normalization_zero_centered_rows_bf16(%rows: index, %width: index, %threads: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer) {
   %origin = index.constant 0 : offset
-  %row = kernel.workgroup.id<x> : index
-  %lane = kernel.workitem.id<x> : index
-  %inverse = template.apply<@normalization.rms_inverse_bf16>(%rows, %width, %threads, %row, %epsilon, %input) : (index, index, index, index, f32, buffer) -> (f32)
-  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x[%width]xbf16>
-  %weight_view = buffer.view %weight[%origin] : buffer -> view<[%width]xf32>
-  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%width]xbf16>
-  scf.for %column = [%lane to %width step %threads] {
-    %value = view.load %input_view[%row, %column] : view<[%rows]x[%width]xbf16> -> bf16
-    %scale = view.load %weight_view[%column] : view<[%width]xf32> -> f32
-    %result = template.apply<@normalization.zero_centered_bf16>(%value, %scale, %inverse) : (bf16, f32, f32) -> (bf16)
-    view.store %result, %output_view[%row, %column] : bf16, view<[%rows]x[%width]xbf16>
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %row = [%first_grid_x to %rows step %grid_stride_x] {
+    %lane = kernel.workitem.id<x> : index
+    %inverse = template.apply<@normalization.rms_inverse_bf16>(%rows, %width, %threads, %row, %epsilon, %input) : (index, index, index, index, f32, buffer) -> (f32)
+    %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x[%width]xbf16>
+    %weight_view = buffer.view %weight[%origin] : buffer -> view<[%width]xf32>
+    %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%width]xbf16>
+    scf.for %column = [%lane to %width step %threads] {
+      %value = view.load %input_view[%row, %column] : view<[%rows]x[%width]xbf16> -> bf16
+      %scale = view.load %weight_view[%column] : view<[%width]xf32> -> f32
+      %result = template.apply<@normalization.zero_centered_bf16>(%value, %scale, %inverse) : (bf16, f32, f32) -> (bf16)
+      view.store %result, %output_view[%row, %column] : bf16, view<[%rows]x[%width]xbf16>
+    }
   }
   template.return
 }
@@ -151,17 +155,20 @@ template.def<@normalization.scaled_bf16> device @normalization_scaled_bf16(%valu
 // Each lane then owns its original strided channels, including in-place use.
 template.def<@normalization.scaled_rows_bf16> device @normalization_scaled_rows_bf16(%rows: index, %width: index, %threads: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer) {
   %origin = index.constant 0 : offset
-  %row = kernel.workgroup.id<x> : index
-  %lane = kernel.workitem.id<x> : index
-  %inverse = template.apply<@normalization.rms_inverse_bf16>(%rows, %width, %threads, %row, %epsilon, %input) : (index, index, index, index, f32, buffer) -> (f32)
-  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x[%width]xbf16>
-  %weight_view = buffer.view %weight[%origin] : buffer -> view<[%width]xbf16>
-  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%width]xbf16>
-  scf.for %column = [%lane to %width step %threads] {
-    %value = view.load %input_view[%row, %column] : view<[%rows]x[%width]xbf16> -> bf16
-    %scale = view.load %weight_view[%column] : view<[%width]xbf16> -> bf16
-    %result = template.apply<@normalization.scaled_bf16>(%value, %scale, %inverse) : (bf16, bf16, f32) -> (bf16)
-    view.store %result, %output_view[%row, %column] : bf16, view<[%rows]x[%width]xbf16>
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %row = [%first_grid_x to %rows step %grid_stride_x] {
+    %lane = kernel.workitem.id<x> : index
+    %inverse = template.apply<@normalization.rms_inverse_bf16>(%rows, %width, %threads, %row, %epsilon, %input) : (index, index, index, index, f32, buffer) -> (f32)
+    %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x[%width]xbf16>
+    %weight_view = buffer.view %weight[%origin] : buffer -> view<[%width]xbf16>
+    %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%width]xbf16>
+    scf.for %column = [%lane to %width step %threads] {
+      %value = view.load %input_view[%row, %column] : view<[%rows]x[%width]xbf16> -> bf16
+      %scale = view.load %weight_view[%column] : view<[%width]xbf16> -> bf16
+      %result = template.apply<@normalization.scaled_bf16>(%value, %scale, %inverse) : (bf16, bf16, f32) -> (bf16)
+      view.store %result, %output_view[%row, %column] : bf16, view<[%rows]x[%width]xbf16>
+    }
   }
   template.return
 }

@@ -24,26 +24,38 @@ template.decl @image.convolution_nchw_element_f32(%height: index, %width: index,
 template.def<@krea2.vae_convolution_f32> device @krea2_vae_convolution_f32(%height: index, %width: index, %inputs: index, %outputs: index, %extent: index, %planes: index, %upsample: index, %add_residual: i1, %input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) {
   %threads = index.constant 128 : index
   %origin = index.constant 0 : offset
-  %group = kernel.workgroup.id<x> : index
-  %channel = kernel.workgroup.id<y> : index
-  %lane = kernel.workitem.id<x> : index
-  %pixel = index.madd %group, %threads, %lane : index
-  %output_height = index.mul %height, %upsample : index
-  %output_width = index.mul %width, %upsample : index
-  %pixels = index.mul %output_height, %output_width : index
-  %output_view = buffer.view %output[%origin] : buffer -> view<[%outputs]x[%pixels]xf32>
-  %live = index.cmp ult, %pixel, %pixels : index
-  scf.if %live {
-    %biased = template.apply<@image.convolution_nchw_element_f32>(%height, %width, %inputs, %outputs, %extent, %planes, %upsample, %channel, %pixel, %input, %weight, %bias) : (index, index, index, index, index, index, index, index, index, buffer, buffer, buffer) -> (f32)
-    %result = scf.if %add_residual -> (f32) {
-      %residual_view = buffer.view %residual[%origin] : buffer -> view<[%outputs]x[%pixels]xf32>
-      %skip = view.load %residual_view[%channel, %pixel] : view<[%outputs]x[%pixels]xf32> -> f32
-      %combined = scalar.addf %biased, %skip : f32
-      scf.yield %combined : f32
-    } else {
-      scf.yield %biased : f32
+  %logical_output_height = index.mul %height, %upsample : index
+  %logical_output_width = index.mul %width, %upsample : index
+  %logical_pixels = index.mul %logical_output_height, %logical_output_width : index
+  %grid_padding = index.constant 127 : index
+  %logical_rounded = index.add %logical_pixels, %grid_padding : index
+  %logical_groups_x = index.div %logical_rounded, %threads : index
+  %first_grid_y = kernel.workgroup.id<y> : index
+  %grid_stride_y = kernel.workgroup.count<y> : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %channel = [%first_grid_y to %outputs step %grid_stride_y] {
+    scf.for %group = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+      %lane = kernel.workitem.id<x> : index
+      %pixel = index.madd %group, %threads, %lane : index
+      %output_height = index.mul %height, %upsample : index
+      %output_width = index.mul %width, %upsample : index
+      %pixels = index.mul %output_height, %output_width : index
+      %output_view = buffer.view %output[%origin] : buffer -> view<[%outputs]x[%pixels]xf32>
+      %live = index.cmp ult, %pixel, %pixels : index
+      scf.if %live {
+        %biased = template.apply<@image.convolution_nchw_element_f32>(%height, %width, %inputs, %outputs, %extent, %planes, %upsample, %channel, %pixel, %input, %weight, %bias) : (index, index, index, index, index, index, index, index, index, buffer, buffer, buffer) -> (f32)
+        %result = scf.if %add_residual -> (f32) {
+          %residual_view = buffer.view %residual[%origin] : buffer -> view<[%outputs]x[%pixels]xf32>
+          %skip = view.load %residual_view[%channel, %pixel] : view<[%outputs]x[%pixels]xf32> -> f32
+          %combined = scalar.addf %biased, %skip : f32
+          scf.yield %combined : f32
+        } else {
+          scf.yield %biased : f32
+        }
+        view.store %result, %output_view[%channel, %pixel] : f32, view<[%outputs]x[%pixels]xf32>
+      }
     }
-    view.store %result, %output_view[%channel, %pixel] : f32, view<[%outputs]x[%pixels]xf32>
   }
   template.return
 }
@@ -94,7 +106,10 @@ kernel.def target(@vae_wave32) @krea_vae_post_quant() {
   %groups = index.div %rounded, %threads : index
   %channels = index.constant 16 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%groups, %channels, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 64 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  %physical_groups_y = index.min %channels, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %physical_groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
   %height = config.get @krea2.latent_height : index
   %width = config.get @krea2.latent_width : index
@@ -115,7 +130,10 @@ kernel.def target(@vae_wave32) @krea_vae_conv_in() {
   %groups = index.div %rounded, %threads : index
   %channels = index.constant 384 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%groups, %channels, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %grid_axis_limit = index.constant 64 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  %physical_groups_y = index.min %channels, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %physical_groups_y, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
   %height = config.get @krea2.latent_height : index
   %width = config.get @krea2.latent_width : index

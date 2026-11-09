@@ -20,7 +20,9 @@ kernel.def target(@block_pointwise_wave32) @block_residual() {
   %groups = index.mul %tokens, %groups_per_token : index
   %unit = index.constant 1 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+  %grid_axis_limit = index.constant 8192 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
 } launch(%residual: buffer, %update: buffer, %modulation: buffer, %table: buffer, %output: buffer) {
   %storage = config.get @krea2.dit_int8 : index
   %zero_storage = index.constant 0 : index
@@ -29,31 +31,35 @@ kernel.def target(@block_pointwise_wave32) @block_residual() {
   %width = index.constant 6144 : index
   %elements = index.mul %tokens, %width : index
   %threads = index.constant 256 : index
-  %group = kernel.workgroup.id<x> : index
-  %lane = kernel.workitem.id<x> : index
-  %element = index.madd %group, %threads, %lane : index
-  %column = index.rem %element, %width : index
-  %origin = index.constant 0 : offset
-  %residual_view = buffer.view %residual[%origin] : buffer -> view<[%elements]xbf16>
-  %update_view = buffer.view %update[%origin] : buffer -> view<[%elements]xbf16>
-  %modulation_view = buffer.view %modulation[%origin] : buffer -> view<6144xbf16>
-  %table_view = buffer.view %table[%origin] : buffer -> view<6144xf32>
-  %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
-  %value = view.load %residual_view[%element] : view<[%elements]xbf16> -> bf16
-  %delta = view.load %update_view[%element] : view<[%elements]xbf16> -> bf16
-  %modulation_value = view.load %modulation_view[%column] : view<6144xbf16> -> bf16
-  %table_value = scf.if %table_is_bf16 -> (f32) {
-    %table_bf16 = buffer.view %table[%origin] : buffer -> view<6144xbf16>
-    %stored = view.load %table_bf16[%column] : view<6144xbf16> -> bf16
-    %value = scalar.extf %stored : bf16 to f32
-    scf.yield %value : f32
-  } else {
-    %value = view.load %table_view[%column] : view<6144xf32> -> f32
-    scf.yield %value : f32
+  %logical_groups_x = index.div %elements, %threads : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %group = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+    %lane = kernel.workitem.id<x> : index
+    %element = index.madd %group, %threads, %lane : index
+    %column = index.rem %element, %width : index
+    %origin = index.constant 0 : offset
+    %residual_view = buffer.view %residual[%origin] : buffer -> view<[%elements]xbf16>
+    %update_view = buffer.view %update[%origin] : buffer -> view<[%elements]xbf16>
+    %modulation_view = buffer.view %modulation[%origin] : buffer -> view<6144xbf16>
+    %table_view = buffer.view %table[%origin] : buffer -> view<6144xf32>
+    %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
+    %value = view.load %residual_view[%element] : view<[%elements]xbf16> -> bf16
+    %delta = view.load %update_view[%element] : view<[%elements]xbf16> -> bf16
+    %modulation_value = view.load %modulation_view[%column] : view<6144xbf16> -> bf16
+    %table_value = scf.if %table_is_bf16 -> (f32) {
+      %table_bf16 = buffer.view %table[%origin] : buffer -> view<6144xbf16>
+      %stored = view.load %table_bf16[%column] : view<6144xbf16> -> bf16
+      %value = scalar.extf %stored : bf16 to f32
+      scf.yield %value : f32
+    } else {
+      %value = view.load %table_view[%column] : view<6144xf32> -> f32
+      scf.yield %value : f32
+    }
+    %gate = template.apply<@modulation.combine_bf16>(%modulation_value, %table_value) : (bf16, f32) -> (bf16)
+    %result = template.apply<@residual.gated_bf16>(%value, %delta, %gate) : (bf16, bf16, bf16) -> (bf16)
+    view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
   }
-  %gate = template.apply<@modulation.combine_bf16>(%modulation_value, %table_value) : (bf16, f32) -> (bf16)
-  %result = template.apply<@residual.gated_bf16>(%value, %delta, %gate) : (bf16, bf16, bf16) -> (bf16)
-  view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
   kernel.return
 }
 
@@ -63,21 +69,27 @@ kernel.def target(@block_pointwise_wave32) @block_feed_forward_silu() {
   %groups = index.mul %tokens, %groups_per_token : index
   %unit = index.constant 1 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+  %grid_axis_limit = index.constant 8192 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
 } launch(%input: buffer, %output: buffer) {
   %tokens = config.get @krea2.block_tokens : index
   %width = index.constant 16384 : index
   %elements = index.mul %tokens, %width : index
   %threads = index.constant 256 : index
-  %group = kernel.workgroup.id<x> : index
-  %lane = kernel.workitem.id<x> : index
-  %element = index.madd %group, %threads, %lane : index
-  %origin = index.constant 0 : offset
-  %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xbf16>
-  %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
-  %value = view.load %input_view[%element] : view<[%elements]xbf16> -> bf16
-  %result = template.apply<@activation.silu_bf16>(%value) : (bf16) -> (bf16)
-  view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  %logical_groups_x = index.div %elements, %threads : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %group = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+    %lane = kernel.workitem.id<x> : index
+    %element = index.madd %group, %threads, %lane : index
+    %origin = index.constant 0 : offset
+    %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xbf16>
+    %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
+    %value = view.load %input_view[%element] : view<[%elements]xbf16> -> bf16
+    %result = template.apply<@activation.silu_bf16>(%value) : (bf16) -> (bf16)
+    view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  }
   kernel.return
 }
 
@@ -87,27 +99,33 @@ kernel.def target(@block_pointwise_wave32) @block_feed_forward_product() {
   %groups = index.mul %tokens, %groups_per_token : index
   %unit = index.constant 1 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+  %grid_axis_limit = index.constant 8192 : index
+  %physical_groups_x = index.min %groups, %grid_axis_limit : index
+  kernel.launch.config workgroups(%physical_groups_x, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
 } launch(%gate: buffer, %up: buffer, %output: buffer) {
   %tokens = config.get @krea2.block_tokens : index
   %width = index.constant 16384 : index
   %elements = index.mul %tokens, %width : index
   %threads = index.constant 256 : index
-  %group = kernel.workgroup.id<x> : index
-  %lane = kernel.workitem.id<x> : index
-  %element = index.madd %group, %threads, %lane : index
-  %origin = index.constant 0 : offset
-  %gate_view = buffer.view %gate[%origin] : buffer -> view<[%elements]xbf16>
-  %up_view = buffer.view %up[%origin] : buffer -> view<[%elements]xbf16>
-  %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
-  %gate_value = view.load %gate_view[%element] : view<[%elements]xbf16> -> bf16
-  %up_value = view.load %up_view[%element] : view<[%elements]xbf16> -> bf16
-  %activated = template.apply<@activation.silu_bf16>(%gate_value) : (bf16) -> (bf16)
-  %activated_f32 = scalar.extf %activated : bf16 to f32
-  %up_f32 = scalar.extf %up_value : bf16 to f32
-  %product = scalar.mulf %activated_f32, %up_f32 : f32
-  %result = scalar.fptrunc %product : f32 to bf16
-  view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  %logical_groups_x = index.div %elements, %threads : index
+  %first_grid_x = kernel.workgroup.id<x> : index
+  %grid_stride_x = kernel.workgroup.count<x> : index
+  scf.for %group = [%first_grid_x to %logical_groups_x step %grid_stride_x] {
+    %lane = kernel.workitem.id<x> : index
+    %element = index.madd %group, %threads, %lane : index
+    %origin = index.constant 0 : offset
+    %gate_view = buffer.view %gate[%origin] : buffer -> view<[%elements]xbf16>
+    %up_view = buffer.view %up[%origin] : buffer -> view<[%elements]xbf16>
+    %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
+    %gate_value = view.load %gate_view[%element] : view<[%elements]xbf16> -> bf16
+    %up_value = view.load %up_view[%element] : view<[%elements]xbf16> -> bf16
+    %activated = template.apply<@activation.silu_bf16>(%gate_value) : (bf16) -> (bf16)
+    %activated_f32 = scalar.extf %activated : bf16 to f32
+    %up_f32 = scalar.extf %up_value : bf16 to f32
+    %product = scalar.mulf %activated_f32, %up_f32 : f32
+    %result = scalar.fptrunc %product : f32 to bf16
+    view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  }
   kernel.return
 }
 
