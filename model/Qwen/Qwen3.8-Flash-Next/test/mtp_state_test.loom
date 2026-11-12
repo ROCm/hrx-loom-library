@@ -5,11 +5,11 @@ kernel.decl @input_packet_fixture() launch(%capacity: index, %ids: buffer, %pack
 
 kernel.decl @flash_next_mtp_compact() launch(%accepted: buffer, %compact: buffer, %origins: buffer)
 
-kernel.decl @flash_next_mtp_restore() launch(%epoch: buffer, %rows: buffer, %carry: buffer, %cache: buffer, %hidden: buffer)
+kernel.decl @flash_next_mtp_restore() launch(%epoch: buffer, %rows: buffer, %carry: buffer, %working_state: buffer, %hidden: buffer)
 
 kernel.decl @flash_next_mtp_ids() launch(%epoch: buffer, %origins: buffer, %target_tokens: buffer, %tokens: buffer, %rows: buffer, %cache: buffer)
 
-kernel.decl @flash_next_mtp_commit() launch(%epoch: buffer, %rows: buffer, %origins: buffer, %target: buffer, %cache: buffer, %ids: buffer, %carry: buffer)
+kernel.decl @flash_next_mtp_commit() launch(%epoch: buffer, %rows: buffer, %origins: buffer, %target: buffer, %working_state: buffer, %ids: buffer, %carry: buffer)
 
 config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
 
@@ -35,7 +35,8 @@ kernel.def @publish_tail() {
 // Four original spans leave holes, one is empty, and physical owner order
 // differs from packed order. Positions cross both page and index boundaries;
 // source coordinates deliberately differ from those causal positions.
-// Tail writers follow the paged cache prefix in reversed resident order.
+// Tail writers share the carry allocation after its retained records, in
+// reversed resident order. Cache pages have a separate allocation.
 // Accepted IDs cross discontiguous physical pages; rejected and unused history
 // remains poisoned, including pages belonging to other resident rows.
 // Continued rows are past their anchor frontier and use the directory writer.
@@ -54,9 +55,9 @@ kernel.def @fixture() {
   %carry = buffer.view %expected_carry[%origin] : buffer -> view<16x11008xi32>
   %actual_state = buffer.view %actual_carry[%origin] : buffer -> view<16x11008xi32>
   %history_origin = index.constant 1081344 : offset
-  %tails_origin = index.constant 1083392 : offset
+  %tails_origin = index.constant 704512 : offset
   %history = buffer.view %expected_cache[%history_origin] : buffer -> view<512xi32>
-  %published = buffer.view %expected_cache[%tails_origin] : buffer -> view<17x256xi32>
+  %published = buffer.view %expected_carry[%tails_origin] : buffer -> view<17x256xi32>
   %c0_word = scalar.constant 0 : i32
   %c1_word = scalar.constant 1 : i32
   %c2_word = scalar.constant 2 : i32
@@ -152,8 +153,17 @@ kernel.def @fixture() {
   %c64 = index.constant 64 : index
   %c128 = index.constant 128 : index
   %c192 = index.constant 192 : index
+  // Poison working storage independently of the retained iota records.
+  %actual_working = buffer.view %actual_carry[%tails_origin] : buffer -> view<4352xi32>
+  %expected_working = buffer.view %expected_carry[%tails_origin] : buffer -> view<4352xi32>
+  %working_words = index.constant 4352 : index
+  %unwritten = scalar.constant -7 : i32
+  scf.for %word = [%c0 to %working_words step %c1] {
+    view.store %unwritten, %actual_working[%word] : i32, view<4352xi32>
+    view.store %unwritten, %expected_working[%word] : i32, view<4352xi32>
+  }
   %tail_bytes = scalar.constant 1024 : i64
-  %tail_base = scalar.constant 1083392 : i64
+  %tail_base = scalar.constant 704512 : i64
   %map_origin = index.constant 640 : offset
   %maps = buffer.view %rows[%map_origin] : buffer -> view<16x2xi32>
   %map_base = scalar.constant 640 : i64
@@ -314,26 +324,26 @@ check.case public @accepted_carry_with_holes {
   %expected_hidden = check.generate.fill value(-7) : tensor<16x5120xi32>
   %ids = check.generate.fill value(-7) : tensor<16xi32>
   %expected_ids = check.generate.fill value(-7) : tensor<16xi32>
-  %carry = check.generate.iota offset(100000) step(1) : tensor<16x11008xi32>
-  %expected_carry = check.generate.iota offset(100000) step(1) : tensor<16x11008xi32>
-  %cache = check.generate.fill value(-7) : tensor<275200xi32>
-  %expected_cache = check.generate.fill value(-7) : tensor<275200xi32>
+  %carry = check.generate.iota offset(100000) step(1) : tensor<180480xi32>
+  %expected_carry = check.generate.iota offset(100000) step(1) : tensor<180480xi32>
+  %cache = check.generate.fill value(-7) : tensor<270848xi32>
+  %expected_cache = check.generate.fill value(-7) : tensor<270848xi32>
   %raw = check.generate.iota offset(150000) step(1) : tensor<16x64xi32>
-  kernel.launch @fixture(%epoch, %expected_epoch, %expected_origins, %rows, %expected_hidden, %source_ids, %expected_ids, %carry, %expected_carry, %expected_cache) : (tensor<99xi32>, tensor<99xi32>, tensor<16xi32>, tensor<96xi64>, tensor<16x5120xi32>, tensor<16xi32>, tensor<16xi32>, tensor<16x11008xi32>, tensor<16x11008xi32>, tensor<275200xi32>)
+  kernel.launch @fixture(%epoch, %expected_epoch, %expected_origins, %rows, %expected_hidden, %source_ids, %expected_ids, %carry, %expected_carry, %expected_cache) : (tensor<99xi32>, tensor<99xi32>, tensor<16xi32>, tensor<96xi64>, tensor<16x5120xi32>, tensor<16xi32>, tensor<16xi32>, tensor<180480xi32>, tensor<180480xi32>, tensor<270848xi32>)
   %input_capacity = check.literal value(16) : index
   %inputs = check.generate.fill value(12345) : tensor<16x8xi32>
   kernel.launch @input_packet_fixture(%input_capacity, %source_ids, %inputs) : (index, tensor<16xi32>, tensor<16x8xi32>)
   kernel.launch @flash_next_mtp_compact(%epoch, %compact, %origins) : (tensor<99xi32>, tensor<99xi32>, tensor<16xi32>)
   check.expect.bitwise actual(%compact) expected(%expected_epoch) : tensor<99xi32>
   check.expect.bitwise actual(%origins) expected(%expected_origins) : tensor<16xi32>
-  kernel.launch @flash_next_mtp_restore(%compact, %rows, %carry, %cache, %hidden) : (tensor<99xi32>, tensor<96xi64>, tensor<16x11008xi32>, tensor<275200xi32>, tensor<16x5120xi32>)
-  kernel.launch @flash_next_mtp_ids(%compact, %origins, %inputs, %ids, %rows, %cache) : (tensor<99xi32>, tensor<16xi32>, tensor<16x8xi32>, tensor<16xi32>, tensor<96xi64>, tensor<275200xi32>)
+  kernel.launch @flash_next_mtp_restore(%compact, %rows, %carry, %carry, %hidden) : (tensor<99xi32>, tensor<96xi64>, tensor<180480xi32>, tensor<180480xi32>, tensor<16x5120xi32>)
+  kernel.launch @flash_next_mtp_ids(%compact, %origins, %inputs, %ids, %rows, %cache) : (tensor<99xi32>, tensor<16xi32>, tensor<16x8xi32>, tensor<16xi32>, tensor<96xi64>, tensor<270848xi32>)
   check.expect.bitwise actual(%hidden) expected(%expected_hidden) : tensor<16x5120xi32>
   check.expect.bitwise actual(%ids) expected(%expected_ids) : tensor<16xi32>
-  kernel.launch @publish_tail(%compact, %rows, %raw, %inputs, %origins, %cache) : (tensor<99xi32>, tensor<96xi64>, tensor<16x64xi32>, tensor<16x8xi32>, tensor<16xi32>, tensor<275200xi32>)
-  kernel.launch @flash_next_mtp_commit(%compact, %rows, %origins, %source, %cache, %ids, %carry) : (tensor<99xi32>, tensor<96xi64>, tensor<16xi32>, tensor<16x5120xi32>, tensor<275200xi32>, tensor<16xi32>, tensor<16x11008xi32>)
-  check.expect.bitwise actual(%cache) expected(%expected_cache) : tensor<275200xi32>
-  check.expect.bitwise actual(%carry) expected(%expected_carry) : tensor<16x11008xi32>
+  kernel.launch @publish_tail(%compact, %rows, %raw, %inputs, %origins, %carry) : (tensor<99xi32>, tensor<96xi64>, tensor<16x64xi32>, tensor<16x8xi32>, tensor<16xi32>, tensor<180480xi32>)
+  kernel.launch @flash_next_mtp_commit(%compact, %rows, %origins, %source, %carry, %ids, %carry) : (tensor<99xi32>, tensor<96xi64>, tensor<16xi32>, tensor<16x5120xi32>, tensor<180480xi32>, tensor<16xi32>, tensor<180480xi32>)
+  check.expect.bitwise actual(%cache) expected(%expected_cache) : tensor<270848xi32>
+  check.expect.bitwise actual(%carry) expected(%expected_carry) : tensor<180480xi32>
   check.return
 }
 
