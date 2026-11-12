@@ -143,7 +143,7 @@ def synchronize(
     output = context.bazel(
         [
             "cquery",
-            "kind('loom_model rule', set(" + " ".join(patterns) + "))",
+            "kind('.* rule', set(" + " ".join(patterns) + "))",
             "--output=starlark",
             "--starlark:expr=" + _MODEL_QUERY,
         ],
@@ -166,6 +166,8 @@ def synchronize(
                 )
             programs[name] = declarations
             owners[key] = result["target"]
+    if not cards:
+        raise UserError("No model providers matched: " + ", ".join(patterns))
     changes = []
     for name, programs in sorted(cards.items()):
         path = _card_path(context.repository_root, name)
