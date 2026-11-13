@@ -1,0 +1,101 @@
+// The unchanged convolution corpus owns general tap/reduction accuracy. Sparse
+// center filters here make its final values analytically known while exercising
+// the production output kernel, packing, alpha ownership, and output guards.
+// Literal byte oracles include saturation, both even ties, and the two sides of
+// zero's quantization boundary. No conversion math is shared with the reference.
+
+config.def @krea2.vae_tile_height = 2 : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+config.def @krea2.vae_tile_width = 2 : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+kernel.decl @krea_vae_rgba_convolution() launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer)
+
+func.def @prepare_output_inputs(%input: buffer, %weight: buffer, %bias: buffer) {
+  %origin = index.constant 0 : offset
+  %first = index.constant 0 : index
+  %step = index.constant 1 : index
+  %pixels = index.constant 256 : index
+  %period = index.constant 16 : index
+  %green_rotation = index.constant 5 : index
+  %blue_rotation = index.constant 11 : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<96x256xf32>
+  %weights = buffer.view %weight[%origin] : buffer -> view<3x96x3x3x3xf32>
+  %biases = buffer.view %bias[%origin] : buffer -> view<3xf32>
+  %samples = vector.constantf [-2.0, -1.0, -0.75, -0.5, -0.25, -0.0078431377187371254, -1.0000000116860974e-07, 0.0, 1.0000000116860974e-07, 0.0078431377187371254, 0.25, 0.5, 0.75, 1.0, 1.25, 2.0] : vector<16xf32>
+  scf.for %pixel = [%first to %pixels step %step] {
+    %red_index = index.rem %pixel, %period : index
+    %green_origin = index.add %pixel, %green_rotation : index
+    %green_index = index.rem %green_origin, %period : index
+    %blue_origin = index.add %pixel, %blue_rotation : index
+    %blue_index = index.rem %blue_origin, %period : index
+    %red = vector.extract %samples[%red_index] : vector<16xf32> -> f32
+    %green = vector.extract %samples[%green_index] : vector<16xf32> -> f32
+    %blue = vector.extract %samples[%blue_index] : vector<16xf32> -> f32
+    view.store %red, %input_view[0, %pixel] : f32, view<96x256xf32>
+    view.store %green, %input_view[31, %pixel] : f32, view<96x256xf32>
+    view.store %blue, %input_view[95, %pixel] : f32, view<96x256xf32>
+  }
+  %identity = scalar.constant 1.0 : f32
+  %negate = scalar.constant -1.0 : f32
+  %half = scalar.constant 0.5 : f32
+  %quarter = scalar.constant 0.25 : f32
+  view.store %identity, %weights[0, 0, 2, 1, 1] : f32, view<3x96x3x3x3xf32>
+  view.store %negate, %weights[1, 31, 2, 1, 1] : f32, view<3x96x3x3x3xf32>
+  view.store %half, %weights[2, 95, 2, 1, 1] : f32, view<3x96x3x3x3xf32>
+  view.store %quarter, %biases[2] : f32, view<3xf32>
+  func.return
+}
+
+func.def @expected_output_bytes(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %first = index.constant 0 : index
+  %step = index.constant 1 : index
+  %pixels = index.constant 256 : index
+  %period = index.constant 16 : index
+  %green_rotation = index.constant 5 : index
+  %blue_rotation = index.constant 11 : index
+  %red_bytes = vector.constanti [0, 0, 32, 64, 96, 126, 127, 128, 128, 128, 159, 191, 223, 255, 255, 255] : vector<16xi32>
+  %green_bytes = vector.constanti [255, 255, 223, 191, 159, 128, 128, 128, 127, 126, 96, 64, 32, 0, 0, 0] : vector<16xi32>
+  %blue_bytes = vector.constanti [32, 96, 112, 128, 143, 159, 159, 159, 159, 160, 175, 191, 207, 223, 239, 255] : vector<16xi32>
+  %opaque = scalar.constant -1 : i8
+  %output_view = buffer.view %output[%origin] : buffer -> view<256x4xi8>
+  scf.for %pixel = [%first to %pixels step %step] {
+    %red_index = index.rem %pixel, %period : index
+    %green_origin = index.add %pixel, %green_rotation : index
+    %green_index = index.rem %green_origin, %period : index
+    %blue_origin = index.add %pixel, %blue_rotation : index
+    %blue_index = index.rem %blue_origin, %period : index
+    %red_wide = vector.extract %red_bytes[%red_index] : vector<16xi32> -> i32
+    %green_wide = vector.extract %green_bytes[%green_index] : vector<16xi32> -> i32
+    %blue_wide = vector.extract %blue_bytes[%blue_index] : vector<16xi32> -> i32
+    %red = scalar.trunci %red_wide : i32 to i8
+    %green = scalar.trunci %green_wide : i32 to i8
+    %blue = scalar.trunci %blue_wide : i32 to i8
+    view.store %red, %output_view[%pixel, 0] : i8, view<256x4xi8>
+    view.store %green, %output_view[%pixel, 1] : i8, view<256x4xi8>
+    view.store %blue, %output_view[%pixel, 2] : i8, view<256x4xi8>
+    view.store %opaque, %output_view[%pixel, 3] : i8, view<256x4xi8>
+  }
+  func.return
+}
+
+check.scenario public @rgba_output configure[1](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(0.0) : tensor<96x256xf32>
+    %weights = check.generate.fill value(0.0) : tensor<3x96x3x3x3xf32>
+    %bias = check.generate.fill value(0.0) : tensor<3xf32>
+    check.generate<@prepare_output_inputs>(%input, %weights, %bias) : (tensor<96x256xf32>, tensor<3x96x3x3x3xf32>, tensor<3xf32>) -> ()
+    %storage = check.generate.fill value(77) : tensor<1152xi8>
+    %output = check.tensor.view %storage offset(64) : tensor<1152xi8> -> tensor<256x4xi8>
+    check.compare<@krea_vae_rgba_convolution, @expected_output_bytes>(%input, %weights, %bias, %output) : (tensor<96x256xf32>, tensor<3x96x3x3x3xf32>, tensor<3xf32>, tensor<256x4xi8>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<96x256xf32>
+      check.expect.bitwise actual(%weights) expected(%weights) : tensor<3x96x3x3x3xf32>
+      check.expect.bitwise actual(%bias) expected(%bias) : tensor<3xf32>
+      check.expect.bitwise actual(%storage) expected(%storage) : tensor<1152xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@rgba_output> @rgba_output_benchmark

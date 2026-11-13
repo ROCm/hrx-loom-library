@@ -15,6 +15,8 @@ template.decl @krea2.vae_convolution_f32(%height: index, %width: index, %inputs:
 
 template.decl @image.convolution_3x3_matrix_f32(%height: index, %width: index, %inputs: index, %outputs: index, %planes: index, %upsample: index, %add_residual: i1, %input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer)
 
+template.decl @image.convolution_nchw_element_f32(%height: index, %width: index, %inputs: index, %outputs: index, %extent: index, %planes: index, %upsample: index, %channel: index, %pixel: index, %input: buffer, %weight: buffer, %bias: buffer) -> (f32)
+
 kernel.def target(@vae_upsample_wave32) @krea_vae_up0_norm() {
   %latent_height = config.get @krea2.vae_tile_height : index
   %latent_width = config.get @krea2.vae_tile_width : index
@@ -742,7 +744,7 @@ command.def public @krea2.vae_up3_residual(%block: index) launch(%parameters: bu
   command.return
 }
 
-kernel.def target(@vae_upsample_wave32) @krea_vae_rgb_convolution() {
+kernel.def target(@vae_upsample_wave32) @krea_vae_rgba_convolution() {
   %latent_height = config.get @krea2.vae_tile_height : index
   %latent_width = config.get @krea2.vae_tile_width : index
   %scale = index.constant 8 : index
@@ -767,8 +769,39 @@ kernel.def target(@vae_upsample_wave32) @krea_vae_rgb_convolution() {
   %extent = index.constant 3 : index
   %planes = index.constant 3 : index
   %upsample = index.constant 1 : index
-  %add_residual = scalar.constant false : i1
-  template.apply<@krea2.vae_convolution_f32>(%height, %width, %inputs, %outputs, %extent, %planes, %upsample, %add_residual, %input, %weight, %bias, %output, %output) : (index, index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer, buffer)
+  %pixels = index.mul %height, %width : index
+  %threads = index.constant 128 : index
+  %group = kernel.workgroup.id<x> : index
+  %channel = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %pixel = index.madd %group, %threads, %lane : index
+  %live = index.cmp ult, %pixel, %pixels : index
+  %origin = index.constant 0 : offset
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%pixels]x4xi8>
+  scf.if %live {
+    %value = template.apply<@image.convolution_nchw_element_f32>(%height, %width, %inputs, %outputs, %extent, %planes, %upsample, %channel, %pixel, %input, %weight, %bias) : (index, index, index, index, index, index, index, index, index, buffer, buffer, buffer) -> (f32)
+    // Quantize at the convolution store: no float image or packing pass.
+    // Separate rounding preserves the model's normalized-image conversion.
+    %minimum = scalar.constant -1.0 : f32
+    %maximum = scalar.constant 1.0 : f32
+    %half = scalar.constant 0.5 : f32
+    %scale = scalar.constant 255.0 : f32
+    %above = scalar.maxnumf %value, %minimum : f32
+    %clamped = scalar.minnumf %above, %maximum : f32
+    %scaled = scalar.mulf %clamped, %half : f32
+    %shifted = scalar.addf %scaled, %half : f32
+    %intensity = scalar.mulf %shifted, %scale : f32
+    %rounded = scalar.roundevenf %intensity : f32
+    %wide = scalar.fptoui %rounded : f32 to i32
+    %byte = scalar.trunci %wide : i32 to i8
+    view.store %byte, %output_view[%pixel, %channel] : i8, view<[%pixels]x4xi8>
+    %red_channel = index.constant 0 : index
+    %owns_alpha = index.cmp eq, %channel, %red_channel : index
+    scf.if %owns_alpha {
+      %opaque = scalar.constant -1 : i8
+      view.store %opaque, %output_view[%pixel, 3] : i8, view<[%pixels]x4xi8>
+    }
+  }
   kernel.return
 }
 
@@ -781,6 +814,6 @@ command.def public @krea2.vae_output_norm() launch(%parameters: buffer, %input: 
 command.def public @krea2.vae_output_convolution() launch(%parameters: buffer, %input: buffer, %output: buffer) {
   %weight = command.parameter %parameters, "decoder.conv_out.weight" : view<3x96x3x3x3xf32>
   %bias = command.parameter %parameters, "decoder.conv_out.bias" : view<3xf32>
-  kernel.launch @krea_vae_rgb_convolution(%input, %weight, %bias, %output) : (buffer, view<3x96x3x3x3xf32>, view<3xf32>, buffer)
+  kernel.launch @krea_vae_rgba_convolution(%input, %weight, %bias, %output) : (buffer, view<3x96x3x3x3xf32>, view<3xf32>, buffer)
   command.return
 }

@@ -12,8 +12,8 @@ bytes and stage identities instead of reconstructing model-specific shapes.
 device. `text_encoder.loom` composes the encoder, and the text-fusion providers
 mix its retained layer outputs. `generate.loom`, `sample.loom`, `denoise.loom`,
 and the transformer/block providers compose the eight denoising steps.
-`vae.loom` and its decoder providers turn the final latent into F32 RGB planes;
-the native image service encodes those planes as PNG.
+`vae.loom` and its decoder providers turn the final latent into packed RGBA8
+pixels; the native image service encodes those bytes as PNG.
 
 Generic tensor algorithms live under `motif/tensor`. These model providers
 bind their geometry, configuration, and concrete AMD targets. The signed-I8
@@ -47,7 +47,7 @@ records, checkpoint paths, or serving APIs.
 
 Compatible cohorts contain up to two images. Each member retains its actual
 selection count, while the maximum count sizes shared rank scratch. Execution
-reuses that scratch between members and writes disjoint RGB output ranges.
+reuses that scratch between members and writes disjoint RGBA8 output ranges.
 All matrix families accumulate selected contributions before one base update;
 the twelve-layer text fusion remains a fused scalar operation. Native bank
 leases survive device completion and cancellation, so another request cannot
@@ -84,3 +84,9 @@ public commands are `krea2.vae_extract_tile` and `krea2.vae_stitch_tile`.
 They allocate no intermediate storage; the decoder owns and reuses one feature
 tile and one output tile. Sequential tiles share that storage while writing
 disjoint portions of the full image.
+
+The final convolution writes row-major RGBA8 directly. RGB values are clamped
+and mapped from `[-1, 1]` to `[0, 255]` with nearest-even rounding; alpha is 255.
+The convolution accumulation remains F32. Tiled decoding copies complete packed
+pixels, and each cohort member owns four bytes per output pixel. This removes
+the separate clamp pass and the full float-image allocation and readback.
