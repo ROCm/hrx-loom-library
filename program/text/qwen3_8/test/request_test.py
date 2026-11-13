@@ -372,7 +372,7 @@ class RequestCheckTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
                 self.assertIn("agree with enable_thinking", result.stderr)
-        for effort in (None, False, 1, [], {}, "", "LOW", "unknown"):
+        for effort in (False, 1, [], {}, "", "LOW", "unknown"):
             with self.subTest(effort=effort):
                 result = self.execute(self.request(reasoning_effort=effort))
                 self.assertNotEqual(result.returncode, 0)
@@ -428,11 +428,10 @@ class RequestCheckTest(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertIn("must agree", result.stderr)
         invalid = (
-            None,
             [],
             True,
             {"enable_thinking": "false"},
-            {"reasoning_effort": None},
+            {"reasoning_effort": False},
             {"preserve_thinking": 1},
         )
         for controls in invalid:
@@ -451,6 +450,40 @@ class RequestCheckTest(unittest.TestCase):
             self.success(self.execute(request)),
             self.success(self.execute(self.request(preserve_thinking=True))),
         )
+
+    def test_nullable_template_controls_preserve_defaults_and_explicit_values(self):
+        nullable = {
+            "enable_thinking": None,
+            "reasoning_effort": None,
+            "preserve_thinking": None,
+        }
+        request = self.request(messages=self.history())
+        expected = self.success(self.execute(request))
+        for controls in (None, nullable):
+            with self.subTest(controls=controls):
+                actual = self.success(
+                    self.execute(
+                        {
+                            **request,
+                            **nullable,
+                            "chat_template_kwargs": controls,
+                            "model_options": None,
+                        }
+                    )
+                )
+                self.assertEqual(actual, expected)
+        explicit = {
+            "enable_thinking": True,
+            "reasoning_effort": "low",
+            "preserve_thinking": False,
+        }
+        expected = self.success(self.execute({**request, **explicit}))
+        for top, nested in ((explicit, nullable), (nullable, explicit)):
+            with self.subTest(top=top):
+                actual = self.success(
+                    self.execute({**request, **top, "chat_template_kwargs": nested})
+                )
+                self.assertEqual(actual, expected)
 
     def test_unused_template_keywords_do_not_change_model_controls(self):
         controls = {
@@ -680,10 +713,14 @@ class RequestCheckTest(unittest.TestCase):
             self.image((0, 0, 255), 32, 32),
             {"type": "text", "text": " please.  "},
         ]
-        value = self.success(self.execute(self.request(
-            messages=[{"role": "user", "content": parts}],
-            media_io_kwargs=self.video_options([0.0, 0.75, 2.1, 3.9, 8.2]),
-        )))
+        value = self.success(
+            self.execute(
+                self.request(
+                    messages=[{"role": "user", "content": parts}],
+                    media_io_kwargs=self.video_options([0.0, 0.75, 2.1, 3.9, 8.2]),
+                )
+            )
+        )
         pair = "<|vision_start|>" + "<|video_pad|>" * 2 + "<|vision_end|>"
         video = "".join(
             f"<{timestamp} seconds>" + pair for timestamp in ("0.4", "3.0", "8.2")
@@ -694,14 +731,21 @@ class RequestCheckTest(unittest.TestCase):
         self.assertEqual([span[2] for span in value["media_spans"]], [64, 2, 2, 2, 64])
         for projection, offset, count in value["media_spans"]:
             token = 132 if 1 <= projection <= 3 else 131
-            self.assertEqual(value["tokens"][offset:offset + count], [token] * count)
+            self.assertEqual(value["tokens"][offset : offset + count], [token] * count)
 
     def test_video_rounding_and_group_count_through_native_caller(self):
         # One tiny clip covers both tie directions and more than four groups.
         times = [0.25, 0.25, 0.75, 0.75, 4.0, 5.0, 7.0, 8.0, 9.25]
-        value = self.success(self.execute(self.request(messages=[{
-            "role": "user", "content": [self.video(len(times), 1, 1)]
-        }], media_io_kwargs=self.video_options(times))))
+        value = self.success(
+            self.execute(
+                self.request(
+                    messages=[
+                        {"role": "user", "content": [self.video(len(times), 1, 1)]}
+                    ],
+                    media_io_kwargs=self.video_options(times),
+                )
+            )
+        )
         pair = "<|vision_start|><|video_pad|><|vision_end|>"
         expected = ("0.2", "0.8", "4.5", "7.5", "9.2")
         self.assertIn(
@@ -713,17 +757,18 @@ class RequestCheckTest(unittest.TestCase):
     def test_video_requires_a_pair_and_uniform_display_geometry(self):
         short = self.video(1)
         mismatched = self.video(1)
-        mismatched["video_url"]["url"] += "," + self.video(1, 32, 32)[
-            "video_url"
-        ]["url"].split(",", 1)[1]
+        mismatched["video_url"]["url"] += (
+            "," + self.video(1, 32, 32)["video_url"]["url"].split(",", 1)[1]
+        )
         for video in (short, mismatched):
             with self.subTest(video=video):
-                result = self.execute(self.request(
-                    messages=[{"role": "user", "content": [video]}]
-                ))
+                result = self.execute(
+                    self.request(messages=[{"role": "user", "content": [video]}])
+                )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(
-                    "at least two frames with identical display dimensions", result.stderr
+                    "at least two frames with identical display dimensions",
+                    result.stderr,
                 )
 
     def test_general_image_shapes_and_request_budget(self):
@@ -1006,6 +1051,13 @@ class RequestCheckTest(unittest.TestCase):
         self.assertAlmostEqual(temperature, 0.7)
         self.assertAlmostEqual(top_p, 0.95)
         self.assertEqual((top_k, explicit_seed, seed), (20, 1, 9007199254740993))
+        nullable = dict.fromkeys(
+            ("temperature", "top_p", "top_k", "seed", "tool_choice")
+        )
+        self.assertEqual(
+            self.success(self.execute(self.request(**nullable), defaults=defaults)),
+            value,
+        )
         value = self.success(
             self.execute(
                 self.request(
@@ -1022,11 +1074,12 @@ class RequestCheckTest(unittest.TestCase):
         self.assertEqual(
             struct.unpack("<ffiiq", bytes(value["request_options"])), (0, 1, 0, 0, 1)
         )
+        self.assertEqual(self.success(self.execute(self.request(**nullable))), value)
 
     def test_invalid_sampling_fails_before_admission(self):
         for field, values in {
-            "temperature": [-1, 1e100, 1e-45, None, "0.7"],
-            "top_p": [0, -1, 1.01, 1e-45, None],
+            "temperature": [-1, 1e100, 1e-45, "0.7"],
+            "top_p": [0, -1, 1.01, 1e-45],
             "top_k": [-1, 1.5, 2147483648],
             "seed": [1.5, 9223372036854775808, -9223372036854775809],
         }.items():
@@ -1037,6 +1090,7 @@ class RequestCheckTest(unittest.TestCase):
                     self.assertEqual(result.stdout, "")
         for defaults in (
             {"sampling": {"top_p": 0}},
+            {"sampling": {"temperature": None}},
             {"sampling": {"typo": 1}},
             {"samplng": {}},
             {"sampling": []},
@@ -1046,6 +1100,15 @@ class RequestCheckTest(unittest.TestCase):
                 result = self.execute(self.request(), defaults=defaults)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
+
+    def test_nullable_sampling_controls_still_reject_duplicates(self):
+        request = json.dumps(self.request(temperature=None))
+        request = request.replace(
+            '"temperature": null', '"temperature": null, "temperature": 0.7'
+        )
+        result = self.execute(request)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
 
     def test_tool_token_suppression_is_request_local_and_preserves_history(self):
         for thinking in (False, True):
