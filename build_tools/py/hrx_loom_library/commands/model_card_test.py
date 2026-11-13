@@ -140,6 +140,12 @@ class ModelCardTest(unittest.TestCase):
         self.assertEqual(self.path.stat().st_mtime_ns, modified_time)
         self.assertIn("0 stale", self.run_sync())
 
+    def test_empty_analysis_does_not_report_success(self):
+        self.context.bazel.return_value = ""
+        with self.assertRaisesRegex(UserError, "No model providers matched"):
+            self.run_sync()
+        self.assertEqual(self.path.read_text(), self.original)
+
     def test_conflicting_preset_compositions_do_not_write(self):
         conflict = copy.deepcopy(self.record)
         conflict["target"] = "//model/example:alternate"

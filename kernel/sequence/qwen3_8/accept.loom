@@ -2,13 +2,16 @@
 // Launch arguments are (mixed_inputs, verification_width, token_capacity, packet_capacity,
 // epoch, inputs, predictions, committed, replay, results). mixed_inputs is 0
 // for contiguous I32 IDs and 1 for eight-word media records; the composition
-// supplies this fact. Width is 1..8 and allocation capacity is positive.
+// supplies this fact. Width is the 1..8 verification ceiling; each speculative
+// descriptor supplies its actual anchor-plus-draft count within that ceiling.
+// Allocation capacity is positive.
 // Packet capacity bounds spans and selected predictions independently of the
 // current token shape. Each output control has a three-word header and six
-// words per span; feedback has ten words per span. Allocations are disjoint.
-// Input storage
-// contains token_capacity records and remains immutable with the epoch and
-// predictions until completion. Unused output rows retain their prior bytes.
+// words per span; feedback has a work-observation header and ten words per span.
+// Allocations are disjoint. Acceptance preserves the header's queue timestamps.
+// Input storage contains token_capacity records and remains immutable with
+// the epoch and predictions until completion. Unused output rows retain their
+// prior bytes.
 // One device thread publishes the accepted prefix and compact replay plan.
 
 func.decl @qwen38_input_token(%mixed: index, %capacity: index, %inputs: buffer, %input: index) -> (i32)
@@ -16,6 +19,8 @@ func.decl @qwen38_input_token(%mixed: index, %capacity: index, %inputs: buffer, 
 func.decl @qwen38_packet_options_origin(%capacity: index) -> (offset)
 
 func.decl @qwen38_packet_eos_origin(%capacity: index) -> (offset)
+
+func.decl @qwen38_feedback_records_origin() -> (offset)
 
 // Greedy acceptance is the sole owner of speculative publication. A result
 // record is {consumed_inputs, output_count, token[8]}. The final selected token
@@ -42,7 +47,8 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
   %eos_view = buffer.view %metadata[%eos_origin] : buffer -> view<1xi32>
   %eos = view.load %eos_view[0] : view<1xi32> -> i32
   %selected = buffer.view %predictions[%origin] : buffer -> view<[%packet_capacity]xi32>
-  %outputs = buffer.view %results[%origin] : buffer -> view<[%packet_capacity]x10xi32>
+  %result_origin = func.call @qwen38_feedback_records_origin() : () -> (offset)
+  %outputs = buffer.view %results[%result_origin] : buffer -> view<[%packet_capacity]x10xi32>
   %accepted_header = buffer.view %committed[%origin] : buffer -> view<3xi32>
   %accepted = buffer.view %committed[%descriptor_origin] : buffer -> view<[%packet_capacity]x6xi32>
   %replay_header = buffer.view %replay[%origin] : buffer -> view<3xi32>
@@ -51,7 +57,6 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
   %capacity = index.constant 8 : index
-  %draft_count = index.sub %width, %c1 : index
   %c0_2 = scalar.constant 0 : i32
   %c1_2 = scalar.constant 1 : i32
   %true = scalar.constant true : i1
@@ -61,10 +66,20 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
   %span_word = view.load %header[1] : view<3xi32> -> i32
   %span_value = index.cast %span_word : i32 to index
   %spans = index.assume %span_value [range(%span_value, 0, %packet_capacity)] : index
+  %counts_origin = index.constant 24 : offset
+  %counts = buffer.view %results[%counts_origin] : buffer -> view<2xi32>
+  view.store %total, %counts[0] : i32, view<2xi32>
+  view.store %span_word, %counts[1] : i32, view<2xi32>
   view.store %total, %accepted_header[0] : i32, view<3xi32>
   view.store %span_word, %accepted_header[1] : i32, view<3xi32>
   view.store %c0_2, %accepted_header[2] : i32, view<3xi32>
-  %replay_count = scf.for %span = [%c0 to %spans step %c1](%prior_replay = %c0 : index) -> (index) {
+  %widths = vector.iota %c1_2 step %c1_2 : vector<8xi32>
+  %empty_histogram = vector.splati 0 : vector<8xi32>
+  %zero_pairs = scalar.constant 0 : i64
+  %one64 = scalar.constant 1 : i64
+  %two64 = scalar.constant 2 : i64
+  %generated_flag = scalar.constant 2 : i32
+  %replay_count, %histogram, %known_inputs, %maximum_context, %causal_pairs, %generated = scf.for %span = [%c0 to %spans step %c1](%prior_replay = %c0 : index, %bins = %empty_histogram : vector<8xi32>, %known = %c0_2 : i32, %maximum = %c0_2 : i32, %pairs = %zero_pairs : i64, %has_generated = %false : i1) -> (index, vector<8xi32>, i32, i32, i64, i1) {
     %count_word = view.load %descriptors[%span, 0] : view<[%packet_capacity]x6xi32> -> i32
     %position = view.load %descriptors[%span, 1] : view<[%packet_capacity]x6xi32> -> i32
     %begin_word = view.load %descriptors[%span, 2] : view<[%packet_capacity]x6xi32> -> i32
@@ -73,6 +88,25 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
     %selection_word = view.load %descriptors[%span, 5] : view<[%packet_capacity]x6xi32> -> i32
     %flag = view.load %options[%span, 0] : view<[%packet_capacity]x2xi32> -> i32
     %speculative = scalar.cmpi ne, %flag, %c0_2 : i32
+    %is_generated = scalar.cmpi eq, %flag, %generated_flag : i32
+    %next_generated = scalar.ori %has_generated, %is_generated : i1
+    %observed_width = scf.select %speculative, %count_word, %c0_2 : i32
+    %width_vector = vector.splat %observed_width : vector<8xi32>
+    %matches_width = vector.cmpi eq, %widths, %width_vector : vector<8xi32> -> vector<8xi1>
+    %increments = vector.extui %matches_width : vector<8xi1> to vector<8xi32>
+    %next_bins = vector.addi %bins, %increments : vector<8xi32>
+    %known_count = scf.select %speculative, %c0_2, %count_word : i32
+    %next_known = scalar.addi %known, %known_count : i32
+    %context = scalar.addi %position, %count_word : i32
+    %next_maximum = scalar.maxui %maximum, %context : i32
+    %queries = scalar.extui %count_word : i32 to i64
+    %prior_keys = scalar.extui %position : i32 to i64
+    %prefix_pairs = scalar.muli %queries, %prior_keys : i64
+    %query_end = scalar.addi %queries, %one64 : i64
+    %triangle_twice = scalar.muli %queries, %query_end : i64
+    %triangle = scalar.divui %triangle_twice, %two64 : i64
+    %span_pairs = scalar.addi %prefix_pairs, %triangle : i64
+    %next_pairs = scalar.addi %pairs, %span_pairs : i64
     %begin = index.cast %begin_word : i32 to index
     %selection = index.cast %selection_word : i32 to index
     scf.for %token = [%c0 to %capacity step %c1] {
@@ -80,9 +114,12 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
       view.store %c0_2, %outputs[%span, %slot] : i32, view<[%packet_capacity]x10xi32>
     }
     %consumed_word, %emitted_word = scf.if %speculative -> (i32, i32) {
+      %span_width_value = index.cast %count_word : i32 to index
+      %span_width = index.assume %span_width_value [range(%span_width_value, 1, %width)] : index
+      %draft_count = index.sub %span_width, %c1 : index
       %limit_word = view.load %options[%span, 1] : view<[%packet_capacity]x2xi32> -> i32
       %limit = index.cast %limit_word : i32 to index
-      %output_count, %continuing = scf.for %token = [%c0 to %width step %c1](%count = %c0 : index, %live = %true : i1) -> (index, i1) {
+      %output_count, %continuing = scf.for %token = [%c0 to %span_width step %c1](%count = %c0 : index, %live = %true : i1) -> (index, i1) {
         %credited = index.cmp ult, %token, %limit : index
         %emit = scalar.andi %live, %credited : i1
         %next_count, %next_live = scf.if %emit -> (index, i1) {
@@ -147,7 +184,27 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
     } else {
       scf.yield %prior_replay : index
     }
-    scf.yield %next_replay : index
+    scf.yield %next_replay, %next_bins, %next_known, %next_maximum, %next_pairs, %next_generated : index, vector<8xi32>, i32, i32, i64, i1
+  }
+  %histogram_origin = index.constant 64 : offset
+  %width_counts = buffer.view %results[%histogram_origin] : buffer -> view<8xi32>
+  vector.store %histogram, %width_counts[0] : vector<8xi32>, view<8xi32>
+  %context_origin = index.constant 96 : offset
+  %context_counts = buffer.view %results[%context_origin] : buffer -> view<2xi32>
+  view.store %known_inputs, %context_counts[0] : i32, view<2xi32>
+  view.store %maximum_context, %context_counts[1] : i32, view<2xi32>
+  %pairs_origin = index.constant 104 : offset
+  %pair_count = buffer.view %results[%pairs_origin] : buffer -> view<1xi64>
+  view.store %causal_pairs, %pair_count[0] : i64, view<1xi64>
+  %shape_origin = index.constant 112 : offset
+  %shape = buffer.view %results[%shape_origin] : buffer -> view<1xi32>
+  %capacity_word = index.cast %token_capacity : index to i32
+  view.store %capacity_word, %shape[0] : i32, view<1xi32>
+  %not_generated = scalar.xori %generated, %true : i1
+  scf.if %not_generated {
+    %proposal_origin = index.constant 32 : offset
+    %proposal_steps = buffer.view %results[%proposal_origin] : buffer -> view<1xi32>
+    view.store %c0_2, %proposal_steps[0] : i32, view<1xi32>
   }
   %replay_word = index.cast %replay_count : index to i32
   view.store %total, %replay_header[0] : i32, view<3xi32>

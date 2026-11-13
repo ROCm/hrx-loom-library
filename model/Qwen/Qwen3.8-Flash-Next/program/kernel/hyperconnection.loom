@@ -65,9 +65,9 @@ kernel.def target(@flash_next_hc_wave32) @hc_normalize(%neural_enabled: i1) {
   kernel.return
 }
 
-// Down/inject keeps one token per workgroup at small capacities so each F32
-// injection row can use all four waves. Larger epochs share each decoded Q8
-// block across four tokens. Capacity selects the schedule during specialization.
+// Larger epochs share each decoded Q8 block across four tokens. F32 injection
+// rows use separate workgroups within the same dispatch, so that reuse does
+// not serialize their reductions. Capacity specializes the Q8 token batch.
 func.def pure inline @hc_down_token_batch_size() -> (index) {
   %tokens = config.get @flash_next.token_count : index
   %c1 = index.constant 1 : index
@@ -181,14 +181,17 @@ func.def inline @hc_down_inject_body(%first_row: index, %q8_injection: i1, %span
   func.return
 }
 
-// One workgroup reduces an injection row; each wave contributes a quarter.
-// The active-token and projection guards are uniform for the whole group.
-func.def inline @hc_down_inject_narrow(%span_arg: buffer, %normalized_arg: buffer, %down_weight_arg: buffer, %injection_weight_arg: buffer, %lowrank_arg: buffer, %injection_arg: buffer) {
+// Projection groups share Q8 loads across the token batch. Each remaining
+// workgroup reduces one F32 injection row of one token with four waves.
+// Every guard containing the exchange barrier is workgroup-uniform.
+func.def inline @hc_down_inject_parallel(%span_arg: buffer, %normalized_arg: buffer, %down_weight_arg: buffer, %injection_weight_arg: buffer, %lowrank_arg: buffer, %injection_arg: buffer) {
   %span, %normalized, %down_weight, %injection_weight, %lowrank, %injection = buffer.assume.noalias %span_arg, %normalized_arg, %down_weight_arg, %injection_weight_arg, %lowrank_arg, %injection_arg : buffer, buffer, buffer, buffer, buffer, buffer
   %capacity = config.get @flash_next.token_count : index
-  %token = kernel.workgroup.id<y> : index
+  %token_group = kernel.workgroup.id<y> : index
+  %batch_size = func.call pure @hc_down_token_batch_size() : () -> (index)
+  %first_token = index.mul %token_group, %batch_size : index
   %end = func.call @flash_next_token_count(%span, %capacity) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %end : index
+  %active = index.cmp ult, %first_token, %end : index
   scf.if %active {
     %group = kernel.workgroup.id<x> : index
     %projection_groups = index.constant 80 : index
@@ -198,51 +201,58 @@ func.def inline @hc_down_inject_narrow(%span_arg: buffer, %normalized_arg: buffe
       %f32_injection = scalar.constant false : i1
       func.call @hc_down_inject_body(%c0_index, %f32_injection, %span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : (index, i1, buffer, buffer, buffer, buffer, buffer, buffer)
     } else {
-      %row = index.sub %group, %projection_groups : index
-      %workitem = kernel.workitem.id<x> : index
-      %wave = kernel.subgroup.id : index
-      %lane = kernel.subgroup.lane.id : index
-      %origin = index.constant 0 : offset
-      %c0_index_2 = index.constant 0 : index
-      %c8_index = index.constant 8 : index
-      %stride = index.constant 1024 : index
-      %width = index.constant 10240 : index
-      %first = index.mul %workitem, %c8_index : index
-      %input_view = buffer.view %normalized[%origin] : buffer -> view<[%capacity]x10240xbf16>
-      %weight_view = buffer.view %injection_weight[%origin] : buffer -> view<4x10240xf32>
-      %initial = vector.splatf 0.0 : vector<8xf32>
-      %parts = scf.for %channel = [%first to %width step %stride](%accumulator = %initial : vector<8xf32>) -> (vector<8xf32>) {
-        %stored = vector.load %input_view[%token, %channel] : view<[%capacity]x10240xbf16> -> vector<8xbf16>
-        %values = vector.extf %stored : vector<8xbf16> to vector<8xf32>
-        %weights = vector.load %weight_view[%row, %channel] : view<4x10240xf32> -> vector<8xf32>
-        %next = vector.fmaf %values, %weights, %accumulator : vector<8xf32>
-        scf.yield %next : vector<8xf32>
-      }
-      %c0_f32 = scalar.constant 0.0 : f32
-      %lane_sum = vector.reduce<addf> %parts, %c0_f32 : vector<8xf32>, f32
-      %wave_sum = kernel.subgroup.reduce<addf> %lane_sum : f32
-      %exchange_bytes = index.constant 16 : offset
-      %storage = buffer.alloca<workgroup> align(16) %exchange_bytes : buffer
-      %exchange = buffer.view %storage[%origin] : buffer -> view<4xf32>
-      %wave_leader = index.cmp eq, %lane, %c0_index_2 : index
-      scf.if %wave_leader {
-        view.store %wave_sum, %exchange[%wave] : f32, view<4xf32>
-      }
-      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-      %leader = index.cmp eq, %workitem, %c0_index_2 : index
-      scf.if %leader {
-        %sums = vector.load %exchange[%c0_index_2] : view<4xf32> -> vector<4xf32>
-        %dot = vector.reduce<addf> %sums, %c0_f32 : vector<4xf32>, f32
-        %quarter = scalar.constant 0.25 : f32
-        %c1_f32 = scalar.constant 1.0 : f32
-        %c2_f32 = scalar.constant 2.0 : f32
-        %scaled = scalar.mulf %dot, %quarter : f32
-        %negative = scalar.negf %scaled : f32
-        %exponential = scalar.expf<afn> %negative : f32
-        %denominator = scalar.addf %c1_f32, %exponential : f32
-        %gate = scalar.divf %c2_f32, %denominator : f32
-        %output = buffer.view %injection[%origin] : buffer -> view<[%capacity]x4xf32>
-        view.store %gate, %output[%token, %row] : f32, view<[%capacity]x4xf32>
+      %injection_group = index.sub %group, %projection_groups : index
+      %injection_rows = index.constant 4 : index
+      %relative_token = index.div %injection_group, %injection_rows : index
+      %row = index.rem %injection_group, %injection_rows : index
+      %token = index.add %first_token, %relative_token : index
+      %live = index.cmp ult, %token, %end : index
+      scf.if %live {
+        %workitem = kernel.workitem.id<x> : index
+        %wave = kernel.subgroup.id : index
+        %lane = kernel.subgroup.lane.id : index
+        %origin = index.constant 0 : offset
+        %c0_index_2 = index.constant 0 : index
+        %c8_index = index.constant 8 : index
+        %stride = index.constant 1024 : index
+        %width = index.constant 10240 : index
+        %first = index.mul %workitem, %c8_index : index
+        %input_view = buffer.view %normalized[%origin] : buffer -> view<[%capacity]x10240xbf16>
+        %weight_view = buffer.view %injection_weight[%origin] : buffer -> view<4x10240xf32>
+        %initial = vector.splatf 0.0 : vector<8xf32>
+        %parts = scf.for %channel = [%first to %width step %stride](%accumulator = %initial : vector<8xf32>) -> (vector<8xf32>) {
+          %stored = vector.load %input_view[%token, %channel] : view<[%capacity]x10240xbf16> -> vector<8xbf16>
+          %values = vector.extf %stored : vector<8xbf16> to vector<8xf32>
+          %weights = vector.load %weight_view[%row, %channel] : view<4x10240xf32> -> vector<8xf32>
+          %next = vector.fmaf %values, %weights, %accumulator : vector<8xf32>
+          scf.yield %next : vector<8xf32>
+        }
+        %c0_f32 = scalar.constant 0.0 : f32
+        %lane_sum = vector.reduce<addf> %parts, %c0_f32 : vector<8xf32>, f32
+        %wave_sum = kernel.subgroup.reduce<addf> %lane_sum : f32
+        %exchange_bytes = index.constant 16 : offset
+        %storage = buffer.alloca<workgroup> align(16) %exchange_bytes : buffer
+        %exchange = buffer.view %storage[%origin] : buffer -> view<4xf32>
+        %wave_leader = index.cmp eq, %lane, %c0_index_2 : index
+        scf.if %wave_leader {
+          view.store %wave_sum, %exchange[%wave] : f32, view<4xf32>
+        }
+        kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+        %leader = index.cmp eq, %workitem, %c0_index_2 : index
+        scf.if %leader {
+          %sums = vector.load %exchange[%c0_index_2] : view<4xf32> -> vector<4xf32>
+          %dot = vector.reduce<addf> %sums, %c0_f32 : vector<4xf32>, f32
+          %quarter = scalar.constant 0.25 : f32
+          %c1_f32 = scalar.constant 1.0 : f32
+          %c2_f32 = scalar.constant 2.0 : f32
+          %scaled = scalar.mulf %dot, %quarter : f32
+          %negative = scalar.negf %scaled : f32
+          %exponential = scalar.expf<afn> %negative : f32
+          %denominator = scalar.addf %c1_f32, %exponential : f32
+          %gate = scalar.divf %c2_f32, %denominator : f32
+          %output = buffer.view %injection[%origin] : buffer -> view<[%capacity]x4xf32>
+          view.store %gate, %output[%token, %row] : f32, view<[%capacity]x4xf32>
+        }
       }
     }
   }
@@ -251,14 +261,12 @@ func.def inline @hc_down_inject_narrow(%span_arg: buffer, %normalized_arg: buffe
 
 kernel.def target(@flash_next_hc_wave32) @hc_down_inject(%neural_enabled: i1) {
   %tokens = config.get @flash_next.token_count : index
-  %original_groups = index.constant 81 : index
-  %parallel_groups = index.constant 84 : index
-  %narrow_limit = index.constant 4 : index
-  %narrow = index.cmp ule, %tokens, %narrow_limit : index
-  %groups = scf.select %narrow, %parallel_groups, %original_groups : index
   %c1 = index.constant 1 : index
   %threads = index.constant 128 : index
   %batch_size = func.call pure @hc_down_token_batch_size() : () -> (index)
+  %projection_groups = index.constant 80 : index
+  %injection_rows = index.constant 4 : index
+  %groups = index.madd %batch_size, %injection_rows, %projection_groups : index
   %tail = index.sub %batch_size, %c1 : index
   %padded = index.add %tokens, %tail : index
   %rows = index.div %padded, %batch_size : index
@@ -266,16 +274,7 @@ kernel.def target(@flash_next_hc_wave32) @hc_down_inject(%neural_enabled: i1) {
   %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
   kernel.launch.config workgroups(%active_groups, %rows, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span: buffer, %normalized: buffer, %down_weight: buffer, %injection_weight: buffer, %lowrank: buffer, %injection: buffer) {
-  %capacity = config.get @flash_next.token_count : index
-  %narrow_limit = index.constant 4 : index
-  %narrow = index.cmp ule, %capacity, %narrow_limit : index
-  scf.if %narrow {
-    func.call @hc_down_inject_narrow(%span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : (buffer, buffer, buffer, buffer, buffer, buffer)
-  } else {
-    %q8_injection = scalar.constant false : i1
-    %first_row = index.constant 0 : index
-    func.call @hc_down_inject_body(%first_row, %q8_injection, %span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : (index, i1, buffer, buffer, buffer, buffer, buffer, buffer)
-  }
+  func.call @hc_down_inject_parallel(%span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : (buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }
 

@@ -7,7 +7,7 @@ func.decl @sequence_input_words(%mixed: index, %capacity: index) -> (index)
 
 kernel.decl @qwen38_mtp_proposal_prepare() launch(%mixed_inputs: index, %target_capacity: index, %draft_capacity: index, %epoch: buffer, %target_tokens: buffer, %draft: buffer, %origins: buffer, %draft_tokens: buffer)
 
-kernel.decl @qwen38_mtp_proposal_advance(%round: index) launch(%mixed_inputs: index, %round_value: index, %target_capacity: index, %draft_capacity: index, %draft: buffer, %origins: buffer, %predictions: buffer, %draft_tokens: buffer, %target_tokens: buffer)
+kernel.decl @qwen38_mtp_proposal_advance(%round: index) launch(%mixed_inputs: index, %round_value: index, %target_capacity: index, %draft_capacity: index, %draft: buffer, %origins: buffer, %predictions: buffer, %draft_tokens: buffer, %target_tokens: buffer, %results: buffer)
 
 // Build real mixed descriptors and independently derive a proposal sequence's
 // publication. A bit mask selects generated spans; other spans alternate
@@ -467,14 +467,42 @@ check.case public @proposal_compaction_full_media_draft {
   check.return
 }
 
+// Full-header comparison also checks that only the valid step prefix changes.
+kernel.def @proposal_observation_oracle() {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%capacity: index, %first: index, %steps: index, %draft: buffer, %results: buffer) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
+  %count = view.load %header[1] : view<3xi32> -> i32
+  %step_origin = index.constant 32 : offset
+  %observed = buffer.view %results[%step_origin] : buffer -> view<8xi32>
+  %c1 = index.constant 1 : index
+  %end = index.add %first, %steps : index
+  %end_word = index.cast %end : index to i32
+  view.store %end_word, %observed[0] : i32, view<8xi32>
+  %shape_origin = index.constant 116 : offset
+  %shape = buffer.view %results[%shape_origin] : buffer -> view<1xi32>
+  %capacity_word = index.cast %capacity : index to i32
+  view.store %capacity_word, %shape[0] : i32, view<1xi32>
+  scf.for %step = [%first to %end step %c1] {
+    %slot_value = index.add %step, %c1 : index
+    %slot = index.assume %slot_value [range(%slot_value, 1, 7)] : index
+    view.store %count, %observed[%slot] : i32, view<8xi32>
+  }
+  kernel.return
+}
+
 check.case public @proposal_publication {
   %mixed_inputs = check.param.choice values([0, 1]) name("mixed_inputs") : index
   %target_capacity = check.literal value(16384) : index
   %draft_capacity = check.literal value(67) : index
-  %span_count = check.literal value(65) : index
+  %span_count = check.param.choice values([0, 65]) name("span_count") : index
   %round = check.param.range linear bounds(0 to 6) step(1) : index
   %step_count = check.literal value(1) : index
   %mask = check.literal value(-2147483647) : i32
+  %observations = check.generate.fill value(-99) : tensor<30xi32>
+  %expected_observations = check.generate.fill value(-99) : tensor<30xi32>
   %epoch = check.generate.fill value(-99) : tensor<[%target_capacity]x29xi32>
   %draft = check.generate.fill value(-99) : tensor<[%draft_capacity]x7xi32>
   %origins = check.generate.fill value(-99) : tensor<[%draft_capacity]x2xi32>
@@ -487,12 +515,14 @@ check.case public @proposal_publication {
   %expected_inputs = check.generate.fill value(0) : tensor<[%draft_capacity]xi32>
   %expected_target = check.generate.iota offset(1000) step(1) : tensor<[%target_capacity]x8xi32>
   kernel.launch @proposal_fixture(%mixed_inputs, %draft_capacity, %target_capacity, %span_count, %round, %step_count, %mask, %epoch, %expected_draft, %expected_origins, %expected_anchors, %expected_inputs, %expected_target) : (index, index, index, index, index, index, i32, tensor<[%target_capacity]x29xi32>, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @proposal_observation_oracle(%draft_capacity, %round, %step_count, %expected_draft, %expected_observations) : (index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<30xi32>)
   kernel.launch @qwen38_mtp_proposal_prepare(%mixed_inputs, %target_capacity, %draft_capacity, %epoch, %target, %draft, %origins, %inputs) : (index, index, index, tensor<[%target_capacity]x29xi32>, tensor<[%target_capacity]x8xi32>, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>)
-  kernel.launch @qwen38_mtp_proposal_advance[%round](%mixed_inputs, %round, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @qwen38_mtp_proposal_advance[%round](%mixed_inputs, %round, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target, %observations) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>, tensor<30xi32>)
   check.expect.bitwise actual(%draft) expected(%expected_draft) : tensor<[%draft_capacity]x7xi32>
   check.expect.bitwise actual(%origins) expected(%expected_origins) : tensor<[%draft_capacity]x2xi32>
   check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<[%draft_capacity]xi32>
   check.expect.bitwise actual(%target) expected(%expected_target) : tensor<[%target_capacity]x8xi32>
+  check.expect.bitwise actual(%observations) expected(%expected_observations) : tensor<30xi32>
   check.return
 }
 
@@ -504,6 +534,8 @@ check.case public @proposal_publication_3_rounds {
   %round = check.literal value(0) : index
   %step_count = check.literal value(3) : index
   %mask = check.literal value(-1) : i32
+  %observations = check.generate.fill value(-99) : tensor<30xi32>
+  %expected_observations = check.generate.fill value(-99) : tensor<30xi32>
   %epoch = check.generate.fill value(-99) : tensor<[%target_capacity]x29xi32>
   %draft = check.generate.fill value(-99) : tensor<[%draft_capacity]x7xi32>
   %origins = check.generate.fill value(-99) : tensor<[%draft_capacity]x2xi32>
@@ -516,17 +548,19 @@ check.case public @proposal_publication_3_rounds {
   %expected_inputs = check.generate.fill value(0) : tensor<[%draft_capacity]xi32>
   %expected_target = check.generate.iota offset(1000) step(1) : tensor<[%target_capacity]x8xi32>
   kernel.launch @proposal_fixture(%mixed_inputs, %draft_capacity, %target_capacity, %span_count, %round, %step_count, %mask, %epoch, %expected_draft, %expected_origins, %expected_anchors, %expected_inputs, %expected_target) : (index, index, index, index, index, index, i32, tensor<[%target_capacity]x29xi32>, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @proposal_observation_oracle(%draft_capacity, %round, %step_count, %expected_draft, %expected_observations) : (index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<30xi32>)
   kernel.launch @qwen38_mtp_proposal_prepare(%mixed_inputs, %target_capacity, %draft_capacity, %epoch, %target, %draft, %origins, %inputs) : (index, index, index, tensor<[%target_capacity]x29xi32>, tensor<[%target_capacity]x8xi32>, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>)
   %round0 = check.literal value(0) : index
-  kernel.launch @qwen38_mtp_proposal_advance[%round0](%mixed_inputs, %round0, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @qwen38_mtp_proposal_advance[%round0](%mixed_inputs, %round0, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target, %observations) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>, tensor<30xi32>)
   %round1 = check.literal value(1) : index
-  kernel.launch @qwen38_mtp_proposal_advance[%round1](%mixed_inputs, %round1, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @qwen38_mtp_proposal_advance[%round1](%mixed_inputs, %round1, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target, %observations) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>, tensor<30xi32>)
   %round2 = check.literal value(2) : index
-  kernel.launch @qwen38_mtp_proposal_advance[%round2](%mixed_inputs, %round2, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @qwen38_mtp_proposal_advance[%round2](%mixed_inputs, %round2, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target, %observations) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>, tensor<30xi32>)
   check.expect.bitwise actual(%draft) expected(%expected_draft) : tensor<[%draft_capacity]x7xi32>
   check.expect.bitwise actual(%origins) expected(%expected_origins) : tensor<[%draft_capacity]x2xi32>
   check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<[%draft_capacity]xi32>
   check.expect.bitwise actual(%target) expected(%expected_target) : tensor<[%target_capacity]x8xi32>
+  check.expect.bitwise actual(%observations) expected(%expected_observations) : tensor<30xi32>
   check.return
 }
 
@@ -538,6 +572,8 @@ check.case public @proposal_publication_7_rounds {
   %round = check.literal value(0) : index
   %step_count = check.literal value(7) : index
   %mask = check.literal value(-1431655766) : i32
+  %observations = check.generate.fill value(-99) : tensor<30xi32>
+  %expected_observations = check.generate.fill value(-99) : tensor<30xi32>
   %epoch = check.generate.fill value(-99) : tensor<[%target_capacity]x29xi32>
   %draft = check.generate.fill value(-99) : tensor<[%draft_capacity]x7xi32>
   %origins = check.generate.fill value(-99) : tensor<[%draft_capacity]x2xi32>
@@ -550,25 +586,27 @@ check.case public @proposal_publication_7_rounds {
   %expected_inputs = check.generate.fill value(0) : tensor<[%draft_capacity]xi32>
   %expected_target = check.generate.iota offset(1000) step(1) : tensor<[%target_capacity]x8xi32>
   kernel.launch @proposal_fixture(%mixed_inputs, %draft_capacity, %target_capacity, %span_count, %round, %step_count, %mask, %epoch, %expected_draft, %expected_origins, %expected_anchors, %expected_inputs, %expected_target) : (index, index, index, index, index, index, i32, tensor<[%target_capacity]x29xi32>, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @proposal_observation_oracle(%draft_capacity, %round, %step_count, %expected_draft, %expected_observations) : (index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<30xi32>)
   kernel.launch @qwen38_mtp_proposal_prepare(%mixed_inputs, %target_capacity, %draft_capacity, %epoch, %target, %draft, %origins, %inputs) : (index, index, index, tensor<[%target_capacity]x29xi32>, tensor<[%target_capacity]x8xi32>, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>)
   %round0 = check.literal value(0) : index
-  kernel.launch @qwen38_mtp_proposal_advance[%round0](%mixed_inputs, %round0, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @qwen38_mtp_proposal_advance[%round0](%mixed_inputs, %round0, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target, %observations) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>, tensor<30xi32>)
   %round1 = check.literal value(1) : index
-  kernel.launch @qwen38_mtp_proposal_advance[%round1](%mixed_inputs, %round1, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @qwen38_mtp_proposal_advance[%round1](%mixed_inputs, %round1, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target, %observations) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>, tensor<30xi32>)
   %round2 = check.literal value(2) : index
-  kernel.launch @qwen38_mtp_proposal_advance[%round2](%mixed_inputs, %round2, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @qwen38_mtp_proposal_advance[%round2](%mixed_inputs, %round2, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target, %observations) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>, tensor<30xi32>)
   %round3 = check.literal value(3) : index
-  kernel.launch @qwen38_mtp_proposal_advance[%round3](%mixed_inputs, %round3, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @qwen38_mtp_proposal_advance[%round3](%mixed_inputs, %round3, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target, %observations) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>, tensor<30xi32>)
   %round4 = check.literal value(4) : index
-  kernel.launch @qwen38_mtp_proposal_advance[%round4](%mixed_inputs, %round4, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @qwen38_mtp_proposal_advance[%round4](%mixed_inputs, %round4, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target, %observations) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>, tensor<30xi32>)
   %round5 = check.literal value(5) : index
-  kernel.launch @qwen38_mtp_proposal_advance[%round5](%mixed_inputs, %round5, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @qwen38_mtp_proposal_advance[%round5](%mixed_inputs, %round5, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target, %observations) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>, tensor<30xi32>)
   %round6 = check.literal value(6) : index
-  kernel.launch @qwen38_mtp_proposal_advance[%round6](%mixed_inputs, %round6, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>)
+  kernel.launch @qwen38_mtp_proposal_advance[%round6](%mixed_inputs, %round6, %target_capacity, %draft_capacity, %draft, %origins, %predictions, %inputs, %target, %observations) : [index](index, index, index, index, tensor<[%draft_capacity]x7xi32>, tensor<[%draft_capacity]x2xi32>, tensor<[%draft_capacity]xi32>, tensor<[%draft_capacity]xi32>, tensor<[%target_capacity]x8xi32>, tensor<30xi32>)
   check.expect.bitwise actual(%draft) expected(%expected_draft) : tensor<[%draft_capacity]x7xi32>
   check.expect.bitwise actual(%origins) expected(%expected_origins) : tensor<[%draft_capacity]x2xi32>
   check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<[%draft_capacity]xi32>
   check.expect.bitwise actual(%target) expected(%expected_target) : tensor<[%target_capacity]x8xi32>
+  check.expect.bitwise actual(%observations) expected(%expected_observations) : tensor<30xi32>
   check.return
 }
 

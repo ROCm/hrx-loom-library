@@ -1,0 +1,66 @@
+// Qwen verification feedback. Each bank begins with three raw queue-clock
+// timestamps (proposal start, target start, target end), then I32 counts of
+// the tokens and spans actually verified. Proposal appends a valid step count
+// and seven neural-input counts; lookup-satisfied rows do not count as neural
+// work. Acceptance appends eight speculative-width bins, known-input count,
+// maximum attended context, and U64 logical causal query/key pairs. These are
+// logical work facts, not measured memory traffic. Two I32 shape capacities
+// identify the selected target and proposal executable variants. The 120-byte
+// header is followed by ten I32 words per span: consumed inputs, output count,
+// and eight token IDs.
+// The queued bank additionally carries one first-cohort owner tag per span.
+// Queue capture owns timestamps; proposal owns its valid count prefix;
+// acceptance owns target facts and records. Without generated spans,
+// acceptance invalidates the proposal prefix. Unused step slots are unspecified.
+// Compaction preserves both headers and the first bank. Completion publishes
+// only after the corresponding feedback transfer retires.
+
+func.def public @qwen38_feedback_records_origin() -> (offset) {
+  %bytes = index.constant 120 : offset
+  func.return %bytes : offset
+}
+
+// Called once by the owner of each completed proposal step. MTP counts one
+// token per compacted neural row; a parallel block drafter counts all tokens
+// processed in its single pass. The caller identifies the proposal algorithm.
+func.def public @qwen38_feedback_proposal(%results: buffer, %step_value: index, %tokens: i32, %capacity: index) {
+  %step = index.assume %step_value [range(%step_value, 0, 6)] : index
+  %origin = index.constant 32 : offset
+  %steps = buffer.view %results[%origin] : buffer -> view<8xi32>
+  %c1 = index.constant 1 : index
+  %slot = index.add %step, %c1 : index
+  %count = index.cast %slot : index to i32
+  view.store %tokens, %steps[%slot] : i32, view<8xi32>
+  view.store %count, %steps[0] : i32, view<8xi32>
+  %shape_origin = index.constant 116 : offset
+  %shape = buffer.view %results[%shape_origin] : buffer -> view<1xi32>
+  %capacity_word = index.cast %capacity : index to i32
+  view.store %capacity_word, %shape[0] : i32, view<1xi32>
+  func.return
+}
+
+// Also the second bank's origin in a two-bank allocation, or the owner-tag
+// origin relative to a tagged bank. Allocation capacity is independent of the
+// smaller live span count and of resident-session capacity.
+func.def public @qwen38_feedback_bank_bytes(%capacity: index) -> (offset) {
+  %header = func.call @qwen38_feedback_records_origin() : () -> (offset)
+  %stride = index.constant 40 : offset
+  %records = index.scale %capacity, %stride : index, offset -> offset
+  %bytes = index.add %header, %records : offset
+  func.return %bytes : offset
+}
+
+func.def public @qwen38_feedback_tagged_bytes(%capacity: index) -> (offset) {
+  %bank = func.call @qwen38_feedback_bank_bytes(%capacity) : (index) -> (offset)
+  %stride = index.constant 4 : offset
+  %tags = index.scale %capacity, %stride : index, offset -> offset
+  %bytes = index.add %bank, %tags : offset
+  func.return %bytes : offset
+}
+
+func.def public @qwen38_feedback_bytes(%capacity: index) -> (offset) {
+  %first = func.call @qwen38_feedback_bank_bytes(%capacity) : (index) -> (offset)
+  %next = func.call @qwen38_feedback_tagged_bytes(%capacity) : (index) -> (offset)
+  %bytes = index.add %first, %next : offset
+  func.return %bytes : offset
+}
