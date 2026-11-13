@@ -5,17 +5,23 @@ Target records stay here, while shared GGML decoding, packed sequence
 descriptors, and sampling algorithms come from the library's motifs and
 kernels. Host command sequencing lives in the adjacent dispatch package.
 
-Packed epoch capacities determine launch geometry and specialization. The
-immutable epoch header separately bounds live work. Inactive rows retain
-their storage, and partial tiles mask their loads and publications. Parameter
-views carry exact checkpoint shapes and encodings; kernels consume those
-prepared contracts rather than discovering a format from bytes or filenames.
+Packed epoch capacities determine storage layout and physical tile sizes.
+The epoch header bounds live work. Inactive rows retain their storage, and
+partial tiles mask their loads and publications. Parameter views carry exact
+checkpoint shapes and encodings; kernels consume those prepared contracts
+rather than discovering a format from bytes or filenames.
 
-Kernels shared with recursive drafting take `neural_enabled` as a staged
-launch argument. A false value selects zero workgroups; the numerical body
-and its runtime bindings remain identical. Ordinary callers supply a constant
-true value, allowing specialization to retain the direct launch geometry.
-The projection template forwards this argument to every shape-selected entry.
+Commands pass a sampled `workload_count` through the projection composition.
+The target samples its header once, while each recursive draft round forwards
+the count published by cohort compaction. Q8 projections use that value to
+select dot or matrix execution and size the grid; a large reservation with a
+short live prefix can therefore use the dot path. Capacity still specializes
+the physical matrix tile. The unselected entry receives zero workgroups.
+Dot panels reuse each decoded block across four tokens for capacities up to
+eight and eight tokens for larger reservations, keeping wide partial cohorts
+within the bounded grid without changing individual reduction trees.
+Other draft kernels derive their `neural_enabled` predicate from the same
+sample, preserving the observation without a separate read per projection.
 
 | Family | Storage and numerical contract |
 | --- | --- |

@@ -1,14 +1,29 @@
-// Q8 launch policy and concrete matrix entries. Prepared capacity and exact
-// projection dimensions select tile/wave geometry; runtime epoch extent
-// bounds the live prefix.
+// Q8 launch policy and concrete matrix entries. Capacity selects physical
+// tile geometry; the caller's sampled live count selects dot versus matrix
+// execution and sizes the grid. No projection reloads the launch observation.
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
 amdgpu.target<gfx11-generic> @flash_next_q8_wave32 {subgroup_size = 32}
 
-kernel.decl @flash_next_linear_q8(%neural_enabled: i1, %configured_outputs: index) launch(%inputs: index, %outputs: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @flash_next_linear_q8(%workload_count: index, %configured_outputs: index) launch(%inputs: index, %outputs: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 template.decl @flash_next.q8_schedule(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+
+// The same crossover applies to capacity specialization and live selection.
+func.def public pure inline @flash_next_q8_uses_matrix(%count: index, %outputs: index) -> (i1) {
+  %c16 = index.constant 16 : index
+  %c64 = index.constant 64 : index
+  %c512 = index.constant 512 : index
+  %small_batch = index.cmp ult, %count, %c16 : index
+  %few_columns = index.cmp ule, %outputs, %c512 : index
+  %few_rows = index.cmp ult, %count, %c64 : index
+  %small_grid = scalar.andi %few_columns, %few_rows : i1
+  %use_dot = scalar.ori %small_batch, %small_grid : i1
+  %yes = scalar.constant true : i1
+  %use_matrix = scalar.xori %use_dot, %yes : i1
+  func.return %use_matrix : i1
+}
 
 // The command caller supplies exact dimensions. The policy balances output
 // reuse against the number of independent workgroups: narrow output grids need
@@ -25,13 +40,8 @@ func.def public pure inline @flash_next_q8_geometry(%capacity: index, %outputs: 
   %c256 = index.constant 256 : index
   %c512 = index.constant 512 : index
   %c2560 = index.constant 2560 : index
-  %small_batch = index.cmp ult, %capacity, %c16 : index
+  %use_matrix = func.call pure @flash_next_q8_uses_matrix(%capacity, %outputs) : (index, index) -> (i1)
   %few_columns = index.cmp ule, %outputs, %c512 : index
-  %few_rows = index.cmp ult, %capacity, %c64 : index
-  %small_grid = scalar.andi %few_columns, %few_rows : i1
-  %use_dot = scalar.ori %small_batch, %small_grid : i1
-  %yes = scalar.constant true : i1
-  %use_matrix = scalar.xori %use_dot, %yes : i1
   %rows, %columns, %wave_rows, %wave_columns = scf.if %few_columns -> (index, index, index, index) {
     %large_batch = index.cmp uge, %capacity, %c512 : index
     %tile = scf.select %large_batch, %c64, %c32 : index
@@ -63,48 +73,52 @@ func.def public pure inline @flash_next_q8_geometry(%capacity: index, %outputs: 
 
 // Fixed physical launch sizes keep workitem and subgroup bounds available
 // in each device entry. Both entries instantiate the same schedule family.
-kernel.def target(@flash_next_q8_wave32) @flash_next_q8_matrix_128(%neural_enabled: i1, %capacity: index, %outputs: index, %tile_rows: index, %tile_columns: index) {
+kernel.def target(@flash_next_q8_wave32) @flash_next_q8_matrix_128(%workload_count: index, %outputs: index, %tile_rows: index, %tile_columns: index) {
+  %capacity = config.get @flash_next.token_count : index
+  %count = index.assume %workload_count [range(%workload_count, 0, %capacity)] : index
   %c1 = index.constant 1 : index
   %row_rounding = index.sub %tile_rows, %c1 : index
   %column_rounding = index.sub %tile_columns, %c1 : index
-  %rounded_rows = index.add %capacity, %row_rounding : index
+  %rounded_rows = index.add %count, %row_rounding : index
   %rounded_columns = index.add %outputs, %column_rounding : index
   %row_tiles = index.div %rounded_rows, %tile_rows : index
   %column_tiles = index.div %rounded_columns, %tile_columns : index
   %threads = index.constant 128 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %column_tiles, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %row_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%column_tiles, %row_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%inputs: index, %outputs: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
   template.apply<@flash_next.q8_schedule>(%capacity, %inputs, %outputs, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %depth, %span, %input, %weight, %output) : (index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
   kernel.return
 }
 
-kernel.def target(@flash_next_q8_wave32) @flash_next_q8_matrix_256(%neural_enabled: i1, %capacity: index, %outputs: index, %tile_rows: index, %tile_columns: index) {
+kernel.def target(@flash_next_q8_wave32) @flash_next_q8_matrix_256(%workload_count: index, %outputs: index, %tile_rows: index, %tile_columns: index) {
+  %capacity = config.get @flash_next.token_count : index
+  %count = index.assume %workload_count [range(%workload_count, 0, %capacity)] : index
   %c1 = index.constant 1 : index
   %row_rounding = index.sub %tile_rows, %c1 : index
   %column_rounding = index.sub %tile_columns, %c1 : index
-  %rounded_rows = index.add %capacity, %row_rounding : index
+  %rounded_rows = index.add %count, %row_rounding : index
   %rounded_columns = index.add %outputs, %column_rounding : index
   %row_tiles = index.div %rounded_rows, %tile_rows : index
   %column_tiles = index.div %rounded_columns, %tile_columns : index
   %threads = index.constant 256 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %column_tiles, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %row_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%column_tiles, %row_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%inputs: index, %outputs: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
   template.apply<@flash_next.q8_schedule>(%capacity, %inputs, %outputs, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %depth, %span, %input, %weight, %output) : (index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
   kernel.return
 }
 
-template.decl @flash_next.project_dense_q8(%neural_enabled: i1, %inputs: index, %outputs: index, %blocks: index, %span: buffer, %input: buffer, %weight: view<[%outputs]x[%blocks]x34xi8>, %output: buffer)
+template.decl @flash_next.project_dense_q8(%workload_count: index, %inputs: index, %outputs: index, %blocks: index, %span: buffer, %input: buffer, %weight: view<[%outputs]x[%blocks]x34xi8>, %output: buffer)
 
-template.def<@flash_next.project_dense_q8> @flash_next_project_dense_q8(%neural_enabled: i1, %inputs: index, %outputs: index, %blocks: index, %span: buffer, %input: buffer, %weight: view<[%outputs]x[%blocks]x34xi8>, %output: buffer) {
+template.def<@flash_next.project_dense_q8> @flash_next_project_dense_q8(%workload_count: index, %inputs: index, %outputs: index, %blocks: index, %span: buffer, %input: buffer, %weight: view<[%outputs]x[%blocks]x34xi8>, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %matrix, %rows, %columns, %wave_rows, %wave_columns = func.call pure @flash_next_q8_geometry(%capacity, %outputs) : (index, index) -> (i1, index, index, index, index)
   scf.if %matrix {
+    %live_matrix = func.call pure @flash_next_q8_uses_matrix(%workload_count, %outputs) : (index, index) -> (i1)
+    %c0 = index.constant 0 : index
+    %matrix_count = scf.select %live_matrix, %workload_count, %c0 : index
+    %dot_count = scf.select %live_matrix, %c0, %workload_count : index
     %single = index.constant 1 : index
     %double = index.constant 2 : index
     %wide_rows = index.constant 128 : index
@@ -114,12 +128,13 @@ template.def<@flash_next.project_dense_q8> @flash_next_project_dense_q8(%neural_
     %c4 = index.constant 4 : index
     %four_waves = index.cmp eq, %wave_count, %c4 : index
     scf.if %four_waves {
-      kernel.launch @flash_next_q8_matrix_128[%neural_enabled, %capacity, %outputs, %rows, %columns](%inputs, %outputs, %rows, %columns, %wave_rows, %wave_columns, %depth, %span, %input, %weight, %output) : [i1, index, index, index, index](index, index, index, index, index, index, index, buffer, buffer, view<[%outputs]x[%blocks]x34xi8>, buffer)
+      kernel.launch @flash_next_q8_matrix_128[%matrix_count, %outputs, %rows, %columns](%inputs, %outputs, %rows, %columns, %wave_rows, %wave_columns, %depth, %span, %input, %weight, %output) : [index, index, index, index](index, index, index, index, index, index, index, buffer, buffer, view<[%outputs]x[%blocks]x34xi8>, buffer)
     } else {
-      kernel.launch @flash_next_q8_matrix_256[%neural_enabled, %capacity, %outputs, %rows, %columns](%inputs, %outputs, %rows, %columns, %wave_rows, %wave_columns, %depth, %span, %input, %weight, %output) : [i1, index, index, index, index](index, index, index, index, index, index, index, buffer, buffer, view<[%outputs]x[%blocks]x34xi8>, buffer)
+      kernel.launch @flash_next_q8_matrix_256[%matrix_count, %outputs, %rows, %columns](%inputs, %outputs, %rows, %columns, %wave_rows, %wave_columns, %depth, %span, %input, %weight, %output) : [index, index, index, index](index, index, index, index, index, index, index, buffer, buffer, view<[%outputs]x[%blocks]x34xi8>, buffer)
     }
+    kernel.launch @flash_next_linear_q8[%dot_count, %outputs](%inputs, %outputs, %span, %input, %weight, %output) : [index, index](index, index, buffer, buffer, view<[%outputs]x[%blocks]x34xi8>, buffer)
   } else {
-    kernel.launch @flash_next_linear_q8[%neural_enabled, %outputs](%inputs, %outputs, %span, %input, %weight, %output) : [i1, index](index, index, buffer, buffer, view<[%outputs]x[%blocks]x34xi8>, buffer)
+    kernel.launch @flash_next_linear_q8[%workload_count, %outputs](%inputs, %outputs, %span, %input, %weight, %output) : [index, index](index, index, buffer, buffer, view<[%outputs]x[%blocks]x34xi8>, buffer)
   }
   template.return
 }
