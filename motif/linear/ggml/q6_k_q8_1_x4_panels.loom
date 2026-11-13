@@ -1,0 +1,106 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Bounded Q6_K contractions over Q8_1 x4 row cohorts.
+//
+// The caller specializes rows (1..32) and panels (1..4), and supplies K
+// (256..32768, divisible by 256), N (1..262144), and disjoint buffers:
+// rows*K/128*144 activation bytes, N*K/256*210 weight bytes, and rows*N F32
+// results. Each 256-workitem group contains eight logical 32-lane clusters
+// on a 32- or 64-lane subgroup. A cluster retains rows*panels accumulators;
+// decoded weights serve every row, and activations serve every output panel.
+// No expanded weights, scratch partials, or extra weight pass are required.
+//
+// The caller owns the workgroup population. Groups stride over ceil(N/(8*panels))
+// logical tiles, so larger output matrices extend useful work per group. Tail
+// channels are masked before access; reductions remain outside divergent
+// channel masks. The shared block primitive owns signed packed decoding and
+// F32 products; each output accumulates blocks in F32 and reduces 32 lanes.
+
+func.decl @ggml_q6k_q8_1_x4_block_lane(%weight: buffer, %weight_row_byte_base: offset, %q8_input: buffer, %q8_row_byte_base: offset, %q6_block: index, %lane: index) -> (f32)
+
+template.decl @ggml.q6k.q8_1_x4.panels.body(%row_count: index, %panel_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer)
+
+template.def<@ggml.q6k.q8_1_x4.panels.body> device @ggml_q6k_q8_1_x4_panels_body(%row_count: index, %panel_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %input_noalias, %weight_noalias, %output_noalias = buffer.assume.noalias %input, %weight, %output : buffer, buffer, buffer
+  %rows = index.assume %row_count [range(%row_count, 1, 32)] : index
+  %panels = index.assume %panel_count [range(%panel_count, 1, 4)] : index
+  %inputs = index.assume %input_size [range(%input_size, 256, 32768), multiple_of(%input_size, 256)] : index
+  %outputs = index.assume %output_size [range(%output_size, 1, 262144)] : index
+  %group = kernel.workgroup.id<x> : index
+  %groups = kernel.workgroup.count<x> : index
+  %subgroup = kernel.subgroup.id : index
+  %subgroup_lane = kernel.subgroup.lane.id : index
+  %subgroup_size = target.subgroup.size : index
+  %cluster_size = index.constant 32 : index
+  %clusters_per_subgroup = index.div %subgroup_size, %cluster_size : index
+  %subgroup_base = index.mul %subgroup, %clusters_per_subgroup : index
+  %cluster_in_subgroup = index.div %subgroup_lane, %cluster_size : index
+  %cluster = index.add %subgroup_base, %cluster_in_subgroup : index
+  %lane = index.rem %subgroup_lane, %cluster_size : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %q6_values = index.constant 256 : index
+  %q8_values = index.constant 128 : index
+  %q6_bytes = index.constant 210 : offset
+  %q8_bytes = index.constant 144 : offset
+  %tile_width = index.mul %panels, %c8 : index
+  %tile_padding = index.sub %tile_width, %c1 : index
+  %padded_outputs = index.add %outputs, %tile_padding : index
+  %tile_count = index.div %padded_outputs, %tile_width : index
+  %block_count = index.div %inputs, %q6_values : index
+  %weight_stride = index.scale %block_count, %q6_bytes : index, offset -> offset
+  %input_groups = index.div %inputs, %q8_values : index
+  %input_stride = index.scale %input_groups, %q8_bytes : index, offset -> offset
+  %slots = index.mul %rows, %panels : index
+  %origin = index.constant 0 : offset
+  %accumulator_identity = vector.splatf 0.0 : vector<[%slots]xf32>
+  %leader = index.cmp eq, %lane, %c0 : index
+  %output_view = buffer.view %output_noalias[%origin] : buffer -> view<[%rows]x[%outputs]xf32>
+  scf.for %tile = [%group to %tile_count step %groups] {
+    %tile_begin = index.mul %tile, %tile_width : index
+    %cluster_begin = index.add %tile_begin, %cluster : index
+    %partials = scf.for %block = [%c0 to %block_count step %c1](%bank = %accumulator_identity : vector<[%slots]xf32>) -> (vector<[%slots]xf32>) {
+      %updated = scf.for %panel = [%c0 to %panels step %c1](%accumulators = %bank : vector<[%slots]xf32>) -> (vector<[%slots]xf32>) unroll schedule(recurrence) {
+        %panel_begin = index.mul %panel, %c8 : index
+        %channel = index.add %cluster_begin, %panel_begin : index
+        %valid = index.cmp ult, %channel, %outputs : index
+        %panel_values = scf.if %valid -> (vector<[%slots]xf32>) {
+          %weight_origin = index.scale %channel, %weight_stride : index, offset -> offset
+          %panel_slots = index.mul %panel, %rows : index
+          %row_updated = scf.for %row = [%c0 to %rows step %c1](%row_accumulators = %accumulators : vector<[%slots]xf32>) -> (vector<[%slots]xf32>) unroll schedule(recurrence) {
+            %input_origin = index.scale %row, %input_stride : index, offset -> offset
+            %slot = index.add %panel_slots, %row : index
+            %contribution = func.call @ggml_q6k_q8_1_x4_block_lane(%weight_noalias, %weight_origin, %input_noalias, %input_origin, %block, %lane) : (buffer, offset, buffer, offset, index, index) -> (f32)
+            %prior = vector.extract %row_accumulators[%slot] : vector<[%slots]xf32> -> f32
+            %next = scalar.addf<reassoc|nnan|ninf|nsz> %prior, %contribution : f32
+            %result = vector.insert %next into %row_accumulators[%slot] : f32, vector<[%slots]xf32>
+            scf.yield %result : vector<[%slots]xf32>
+          }
+          scf.yield %row_updated : vector<[%slots]xf32>
+        } else {
+          scf.yield %accumulators : vector<[%slots]xf32>
+        }
+        scf.yield %panel_values : vector<[%slots]xf32>
+      }
+      scf.yield %updated : vector<[%slots]xf32>
+    }
+    scf.for %panel = [%c0 to %panels step %c1] unroll {
+      %panel_begin = index.mul %panel, %c8 : index
+      %channel = index.add %cluster_begin, %panel_begin : index
+      %valid = index.cmp ult, %channel, %outputs : index
+      %write = scalar.andi %leader, %valid : i1
+      %panel_slots = index.mul %panel, %rows : index
+      scf.for %row = [%c0 to %rows step %c1] unroll {
+        %slot = index.add %panel_slots, %row : index
+        %partial = vector.extract %partials[%slot] : vector<[%slots]xf32> -> f32
+        %dot = kernel.subgroup.reduce<addf> %partial {cluster_size = 32} : f32
+        scf.if %write {
+          view.store %dot, %output_view[%row, %channel] : f32, view<[%rows]x[%outputs]xf32>
+        }
+      }
+    }
+  }
+  template.return
+}
