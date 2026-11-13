@@ -35,6 +35,18 @@ PLE adds hashed n-gram lookup and its own token and convolution history.
 Read anchors and writable endpoints are distinct arguments, allowing forks
 to share immutable history while publishing into private state.
 
+Each sparse-attention layer pairs K and V within four-token, single-head
+records. A record contains a 2 KiB K tile followed by a 2 KiB V tile. K keeps
+its `[channel / 16, member, channel % 16]` order; V keeps its
+`[channel, member]` order. Appenders write those encodings directly, and
+attention reads contiguous operand packets without a conversion pass.
+Sixteen panels across both heads fill one 128 KiB, 64-token ownership page.
+Target and predictor storage publish this byte geometry through the ordinary
+retention descriptors; the shared runtime does not interpret the tile format.
+The independently scanned compressed index remains a separate plane.
+Native-code variants must preserve this retained-state representation;
+changing its geometry requires a fresh model instance.
+
 MTP has separate proposal, target-verification, accepted-prefix replay, and
 catch-up stages. Recursive proposals consume private working history.
 Target sampling decides acceptance; compact captured inputs replay only the

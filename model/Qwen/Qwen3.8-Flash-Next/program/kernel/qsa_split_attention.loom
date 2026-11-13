@@ -67,8 +67,9 @@ kernel.def target(@qsa_split_wave32) @qsa_attention_partial(%neural_enabled: i1)
     %query_view = buffer.view %queries[%origin] : buffer -> view<[%tokens]x24x256xbf16>
     %gate_view = buffer.view %query_gate[%origin] : buffer -> view<[%tokens]x24x512xbf16>
     %blocks = index.div %pool, %c4 : index
-    %key_view = buffer.view %arena[%key_base] : buffer -> view<[%blocks]x2x16x4x16xbf16>
-    %value_layout = encoding.layout.strided [2048, 1024, 1, 4] : encoding<layout>
+    %key_layout = encoding.layout.strided [4096, 2048, 64, 16, 1] : encoding<layout>
+    %key_view = buffer.view %arena[%key_base] : buffer -> view<[%blocks]x2x16x4x16xbf16, %key_layout>
+    %value_layout = encoding.layout.strided [4096, 2048, 1, 4] : encoding<layout>
     %value_view = buffer.view %arena[%value_base] : buffer -> view<[%blocks]x2x4x256xbf16, %value_layout>
     %ids_view = buffer.view %selected_blocks[%origin] : buffer -> view<[%tokens]x512xi32>
     %output_view = buffer.view %output[%origin] : buffer -> view<[%tokens]x24x8x258xf32>
@@ -88,7 +89,8 @@ kernel.def target(@qsa_split_wave32) @qsa_attention_partial(%neural_enabled: i1)
     %c0v = vector.splatf 0.0 : vector<8xf32>
     %dot_zeros = vector.splatf 0.0 : vector<4xf32>
     %scale = scalar.constant 0.0625 : f32
-    %value_panel_view = buffer.view %arena[%value_base] : buffer -> view<[%blocks]x2x256x4xbf16>
+    %value_panel_layout = encoding.layout.strided [4096, 2048, 4, 1] : encoding<layout>
+    %value_panel_view = buffer.view %arena[%value_base] : buffer -> view<[%blocks]x2x256x4xbf16, %value_panel_layout>
     // Each selected complete block is four adjacent members of one physical page.
     %block_maximum, %block_denominator, %block_accumulated = scf.for %block_slot = [%first_block to %selected_block_count step %block_stride](%old_maximum = %initial_maximum : f32, %old_denominator = %c0 : f32, %old_accumulated = %c0v : vector<8xf32>) -> (f32, f32, vector<8xf32>) {
       %id = view.load %ids_view[%token, %block_slot] : view<[%tokens]x512xi32> -> i32
@@ -100,8 +102,8 @@ kernel.def target(@qsa_split_wave32) @qsa_attention_partial(%neural_enabled: i1)
       %group_width = index.constant 16 : index
       %channel_group = index.div %channel, %group_width : index
       %channel_component = index.rem %channel, %group_width : index
-      %key_panel = vector.load %key_view[%physical_block, %kv_head, %channel_group, 0, %channel_component] : view<[%blocks]x2x16x4x16xbf16> -> vector<4x8xbf16>
-      %value_panel = vector.load %value_panel_view[%physical_block, %kv_head, %channel, 0] : view<[%blocks]x2x256x4xbf16> -> vector<8x4xbf16>
+      %key_panel = vector.load %key_view[%physical_block, %kv_head, %channel_group, 0, %channel_component] : view<[%blocks]x2x16x4x16xbf16, %key_layout> -> vector<4x8xbf16>
+      %value_panel = vector.load %value_panel_view[%physical_block, %kv_head, %channel, 0] : view<[%blocks]x2x256x4xbf16, %value_panel_layout> -> vector<8x4xbf16>
       %value_panel_f32 = vector.extf %value_panel : vector<8x4xbf16> to vector<8x4xf32>
       %values_by_key = vector.transpose<[1, 0]> %value_panel_f32 : vector<8x4xf32> -> vector<4x8xf32>
       %key0 = vector.extract %key_panel[0] : vector<4x8xbf16> -> vector<8xbf16>
@@ -170,7 +172,7 @@ kernel.def target(@qsa_split_wave32) @qsa_attention_partial(%neural_enabled: i1)
       %physical_member = index.rem %key_token, %c4 : index
       %channel_group = index.div %channel, %group_width : index
       %channel_component = index.rem %channel, %group_width : index
-      %key = vector.load %key_view[%physical_block, %kv_head, %channel_group, %physical_member, %channel_component] : view<[%blocks]x2x16x4x16xbf16> -> vector<8xbf16>
+      %key = vector.load %key_view[%physical_block, %kv_head, %channel_group, %physical_member, %channel_component] : view<[%blocks]x2x16x4x16xbf16, %key_layout> -> vector<8xbf16>
       %pairs = vector.dot2f %query, %key, %dot_zeros : vector<8xbf16>, vector<8xbf16>, vector<4xf32>
       %partial = vector.reduce<addf> %pairs, %c0 : vector<4xf32>, f32
       %dot = kernel.subgroup.reduce<addf> %partial : f32
