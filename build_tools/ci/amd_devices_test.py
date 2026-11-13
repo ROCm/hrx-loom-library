@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,9 +16,9 @@ from build_tools.ci.amd_devices import Device
 def device_dump(scheme: str, devices: list[Device]) -> str:
     return f"# Enumerated devices for driver '{scheme}'\n" + "".join(
         f"# --device={device.uri}\n"
-        f"#   AMD GPU 1002:74a1:00 ({device.pci_address})\n"
+        "#   AMD Radeon PRO W7900\n"
         "# ===----------------------------------------------------------------------===\n"
-        f"AMD endpoint: AMD GPU 1002:74a1:00 ({device.pci_address})\n"
+        "AMD endpoint: AMD Radeon PRO W7900\n"
         for device in devices
     )
 
@@ -59,8 +60,29 @@ class AmdDevicesTest(unittest.TestCase):
             ]
             for scheme, order in orders.items()
         }
+        self.inventory = {
+            "schema_version": 1,
+            "endpoints": [
+                {
+                    "id": f"{index + 1:032x}",
+                    "family": "rdna" if index == 1 else "cdna",
+                    "gpu": {"unique_id": f"0x{101 + index:016x}"},
+                    "pci_address": {
+                        "domain": 0,
+                        "bus": int(self.addresses[index][5:7], 16),
+                        "device": 0,
+                        "function": 0,
+                    },
+                }
+                for index in range(3)
+            ],
+        }
 
-    def sdk_query(self, command, *, env, **kwargs):
+    def sdk_query(self, command, *, env=None, **kwargs):
+        if command[0] == "/sdk/amdf-info":
+            self.assertEqual(command[1:], ["--engine=gpu", "--format=json"])
+            self.assertTrue(kwargs["check"])
+            return mock.Mock(stdout=json.dumps(self.inventory))
         self.assertEqual(command[0], "/sdk/loom-serve")
         self.assertTrue(kwargs["check"])
         scheme = command[1].removeprefix("--dump_devices=")
@@ -77,7 +99,12 @@ class AmdDevicesTest(unittest.TestCase):
             amd_devices.subprocess, "run", side_effect=self.sdk_query
         ):
             return amd_devices.configure_visibility(
-                "/sdk/loom-serve", environment, self.topology, self.drm, self.dri
+                "/sdk/loom-serve",
+                "/sdk/amdf-info",
+                environment,
+                self.topology,
+                self.drm,
+                self.dri,
             )
 
     def test_rocr_ordinal_maps_to_physical_device_in_each_native_view(self):
@@ -232,13 +259,17 @@ class AmdDevicesTest(unittest.TestCase):
                 )
 
     def test_sdk_ignoring_visibility_is_rejected(self):
-        def ignores_mask(tool, scheme, environment):
-            return self.views[scheme]
+        def ignores_mask(command, **kwargs):
+            return self.sdk_query(command, **(kwargs | {"env": {}}))
 
-        with mock.patch.object(amd_devices, "query_devices", side_effect=ignores_mask):
+        with mock.patch.object(
+            amd_devices.subprocess, "run", side_effect=ignores_mask
+        ):
             with self.assertRaisesRegex(ValueError, "filtered amdgpu devices differ"):
                 amd_devices.configure_visibility(
-                    "/sdk/loom-serve", {"HAL_VISIBLE_AMDGPU_DEVICES": "1"}
+                    "/sdk/loom-serve",
+                    "/sdk/amdf-info",
+                    {"HAL_VISIBLE_AMDGPU_DEVICES": "1"},
                 )
 
     def test_device_dump_rejects_missing_or_ambiguous_physical_identity(self):
@@ -247,26 +278,69 @@ class AmdDevicesTest(unittest.TestCase):
             "# Enumerated devices for driver 'amdgpu'\n# --device=amdgpu://id/abc\n",
         ):
             with self.subTest(output=output), self.assertRaises(ValueError):
-                amd_devices.parse_device_dump(output, "amdgpu")
+                amd_devices.parse_device_dump(output, "amdgpu", {})
+        device = self.views["amdgpu"][0]
         with self.assertRaisesRegex(ValueError, "Ambiguous"):
             amd_devices.parse_device_dump(
-                device_dump("amdgpu", [self.views["amdgpu"][0]] * 2), "amdgpu"
+                device_dump("amdgpu", [device] * 2),
+                "amdgpu",
+                {device.uri: [device.pci_address]},
             )
 
-    def test_device_dump_accepts_endpoint_and_native_gpu_identities(self):
-        for scheme in amd_devices.GPU_SCHEMES:
-            devices = [
+    def test_native_gpu_identities_correlate_across_family_views(self):
+        for scheme, devices in self.views.items():
+            self.views[scheme] = [
                 Device(
-                    f"{scheme}://id/00000000000000010000000000000002",
-                    self.addresses[0],
-                ),
-                Device(f"{scheme}://GPU-0000000000000065", self.addresses[1]),
-            ]
-            with self.subTest(scheme=scheme):
-                self.assertEqual(
-                    amd_devices.parse_device_dump(device_dump(scheme, devices), scheme),
-                    devices,
+                    f"{scheme}://GPU-{100 + int(device.uri[-2:]):016x}",
+                    device.pci_address,
                 )
+                for device in devices
+            ]
+        result = self.configure(ROCR_VISIBLE_DEVICES="1,0")
+        self.assertEqual(
+            [device["pci_address"] for device in result["devices"]],
+            [self.addresses[1], self.addresses[0]],
+        )
+        self.assertEqual(result["environment"]["HAL_VISIBLE_RDNA_DEVICES"], "0")
+        self.assertEqual(result["environment"]["HAL_VISIBLE_CDNA_DEVICES"], "1")
+
+    def test_missing_or_ambiguous_inventory_identity_is_rejected(self):
+        endpoint = self.inventory["endpoints"][0]
+        for replacement in (None, {"error": {"message": "PCI query failed"}}):
+            with self.subTest(address=replacement):
+                endpoint["pci_address"] = replacement
+                with self.assertRaisesRegex(
+                    ValueError, "No unique physical PCI identity"
+                ):
+                    self.configure(ROCR_VISIBLE_DEVICES="0")
+        self.inventory["endpoints"].pop(0)
+        with self.assertRaisesRegex(ValueError, "No unique physical PCI identity"):
+            self.configure(ROCR_VISIBLE_DEVICES="0")
+
+    def test_duplicate_gpu_identity_requires_exact_endpoint_path(self):
+        self.inventory["endpoints"][2]["gpu"]["unique_id"] = "0x0000000000000065"
+        self.assertEqual(
+            self.configure(ROCR_VISIBLE_DEVICES="0")["devices"][0]["pci_address"],
+            self.addresses[0],
+        )
+        self.views["amdgpu"][1] = Device(
+            "amdgpu://GPU-0000000000000065", self.addresses[0]
+        )
+        with self.assertRaisesRegex(ValueError, "No unique physical PCI identity"):
+            self.configure(ROCR_VISIBLE_DEVICES="0")
+
+    def test_unavailable_optional_metadata_does_not_hide_physical_identity(self):
+        self.inventory["result"] = {"complete": False, "exit_code": 0}
+        self.inventory["endpoints"][0]["gpu"] = {"error": {"message": "unavailable"}}
+        self.assertEqual(
+            self.configure(ROCR_VISIBLE_DEVICES="0")["devices"][0]["pci_address"],
+            self.addresses[0],
+        )
+
+    def test_unsupported_inventory_schema_is_rejected(self):
+        self.inventory["schema_version"] = 2
+        with self.assertRaisesRegex(ValueError, "schema"):
+            self.configure(ROCR_VISIBLE_DEVICES="0")
 
 
 if __name__ == "__main__":
