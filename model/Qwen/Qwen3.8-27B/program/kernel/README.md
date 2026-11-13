@@ -50,6 +50,12 @@ Gated DeltaNet retains causal state within each span. Capture and
 accepted-prefix replay keep rejected proposals from advancing committed history.
 The output head and predictors preserve request-owned policy and accepted carry.
 
+The output-head contraction lives in the shared Q6_K/Q8_1 x4 panel kernel
+family. Its model-local leaf adds only the device-controlled live-prefix
+contract. Greedy and sampled partial selection receive explicit logical
+row/tile coordinates, allowing their groups to stride under the composition's
+budget while preserving tie-breaking, excluded tokens, and output ownership.
+
 Vision leaves specialize the [shared encoder](../../../../../motif/vision/qwen3_8/)
 with original F16 weights and the dense model's feature width. The command owner
 can reuse K/V and temporary banks after their consumers retire while preserving

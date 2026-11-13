@@ -34,6 +34,30 @@ replacing its bytes, preserving the packed footprint. `dflash_weights.loom`
 selects draft preparation. These policies are auxiliary compiler inputs in
 both representations; checkpoints stay outside the build payload graph.
 
+## Output-head execution scope
+
+Activation packing, the Q6_K vocabulary contraction, and partial winner
+selection use bounded workgroup populations. Groups visit multiple logical
+tiles as the workload grows. Projection cohorts retain weights across rows
+through the shared panel template; subgroup width comes from the execution
+target. Greedy selection still ignores padded vocabulary entries, and sampled
+selection applies each request's token permissions before choosing winners.
+
+`qwen38.output.workgroup_budget` defaults to zero, selecting four workgroups
+per execution unit in the deployment scope. This is the head's launch policy,
+not a claim about exact kernel residency. A positive value supplies the budget
+directly, including for deployments whose target profile lacks a capacity
+fact. The selected service variant's existing `config` object can contain,
+for example, `"qwen38.output.workgroup_budget": 160`. Explicit budgets bypass
+the capacity query. Each bounded launch clamps its budget to useful tiles.
+Automatic selection requires a capacity fact from the queue or target profile
+before its launch counts can be compiled.
+
+The prefix projection preserves complete inactive cohorts and computes all
+eight rows of a partially live cohort. Caller-owned byte origins and the
+logical live prefix retain their existing meaning. The final short cohort
+uses the same shared projection entries as ordinary decode.
+
 ## Image input
 
 The image-input providers connect the text image service to Qwen's trained
