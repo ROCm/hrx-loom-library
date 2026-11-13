@@ -23,10 +23,11 @@ amdgpu.target<gfx11-generic> @qsa_attention_wave32 {subgroup_size = 32}
 func.decl @qsa_normalize_rotate(%width: index, %position: index, %input: buffer, %input_origin: offset, %weight: buffer, %output: buffer, %output_origin: offset, %output_group_stride: index)
 
 // Four-token panels remain entirely within each 64-token physical cache page.
-// K uses [block, head, channel/16, member, channel%16]; V uses
-// [block, head, channel, member]. This permits contiguous matrix operand loads
-// without a second cache or a repacking pass. Page byte size, copy-on-write,
-// and retention ownership are unchanged. Each appender writes only its member.
+// Each [block, head] record pairs a 2 KiB K tile with a 2 KiB V tile. K uses
+// [channel/16, member, channel%16]; V uses [channel, member], preserving
+// contiguous matrix operand loads without a second cache or a repacking pass.
+// A 64-token ownership page contains both heads' K/V records. Each appender
+// writes only its member; unpublished members remain untouched.
 template.decl @flash_next.qsa_append_kv(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer)
 
 template.def<@flash_next.qsa_append_kv> device @qsa_append_kv_body(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer) {
@@ -50,7 +51,7 @@ template.def<@flash_next.qsa_append_kv> device @qsa_append_kv_body(%mixed: index
     %physical_member = index.rem %physical, %members : index
     %blocks = index.div %pool, %members : index
     %output_block_head = index.madd %physical_block, %c2, %head : index
-    %block_head_bytes = index.constant 2048 : offset
+    %block_head_bytes = index.constant 4096 : offset
     %member_bytes = index.constant 32 : offset
     %output_block_relative = index.scale %output_block_head, %block_head_bytes : index, offset -> offset
     %member_relative = index.scale %physical_member, %member_bytes : index, offset -> offset
@@ -64,7 +65,7 @@ template.def<@flash_next.qsa_append_kv> device @qsa_append_kv_body(%mixed: index
     func.call @qsa_normalize_rotate(%width, %coordinate, %keys, %input_origin, %weight, %arena, %output_origin, %output_group_stride) : (index, index, buffer, offset, buffer, buffer, offset, index)
     %origin = index.constant 0 : offset
     %input_view = buffer.view %values[%origin] : buffer -> view<[%tokens]x2x256xbf16>
-    %value_layout = encoding.layout.strided [2048, 1024, 1, 4] : encoding<layout>
+    %value_layout = encoding.layout.strided [4096, 2048, 1, 4] : encoding<layout>
     %output_view = buffer.view %arena[%value_base] : buffer -> view<[%blocks]x2x4x256xbf16, %value_layout>
     %lane = kernel.subgroup.lane.id : index
     %c8 = index.constant 8 : index

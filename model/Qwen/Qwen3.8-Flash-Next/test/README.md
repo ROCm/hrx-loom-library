@@ -44,10 +44,13 @@ Independent captures from the original model establish exact text, finish
 reasons, and token accounting for every published preset. Concurrent forks
 share a retained checkpoint beyond one page, continue independently, and match
 fresh-history replays. The test also checks checkpoint reuse after unloading
-and reloading weights without recompiling, recovery after a reset streaming
+and reloading weights without recompiling, suspension to a host snapshot and
+restoration of the same retained branch, recovery after a reset streaming
 connection, and joined server shutdown. A preset check establishes these
 service and allocation contracts at its configured capacities; short requests
 do not establish quality or performance at the maximum context length.
+The result retains each checked reply's request and first-text timing alongside
+its token accounting, so controlled runs can compare the same request phases.
 
 The separate `serve_source_long_context_native_test` and
 `serve_archive_long_context_mtp_native_test` targets exercise native context

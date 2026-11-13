@@ -7,6 +7,9 @@ config.decl @storage_test.target_page_bytes : i64
 
 config.decl @storage_test.draft_page_bytes : i64
 
+// Per-resident working state lives after retained carry, outside snapshots.
+config.decl @storage_test.draft_working_stride : i64
+
 func.decl @qwen38.control_create(%packet_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer)
 
 func.decl @qwen38.storage(%packet_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer, buffer, buffer, buffer, buffer)
@@ -94,7 +97,7 @@ func.def @equal_words(%left: buffer, %right: buffer, %begin: offset, %count: ind
   func.return %result : i1
 }
 
-func.def @equal_origins(%left: buffer, %right: buffer, %rows: index) -> (i1) {
+func.def @equal_origins(%left: buffer, %right: buffer, %rows: index, %first_field: index) -> (i1) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -104,7 +107,7 @@ func.def @equal_origins(%left: buffer, %right: buffer, %rows: index) -> (i1) {
   %true = scalar.constant true : i1
   %result = scf.for %i = [%c0 to %rows step %c1](%same = %true : i1) -> (i1) {
     // The fifth word points into the replaceable page directory, not payload.
-    %row_same = scf.for %j = [%c0 to %c4 step %c1](%prior = %same : i1) -> (i1) {
+    %row_same = scf.for %j = [%first_field to %c4 step %c1](%prior = %same : i1) -> (i1) {
       %a = view.load %lhs[%i, %j] : view<[%rows]x5xi64> -> i64
       %b = view.load %rhs[%i, %j] : view<[%rows]x5xi64> -> i64
       %equal = scalar.cmpi eq, %a, %b : i64
@@ -114,6 +117,63 @@ func.def @equal_origins(%left: buffer, %right: buffer, %rows: index) -> (i1) {
     scf.yield %row_same : i1
   }
   func.return %result : i1
+}
+
+// The draft cache allocation contains only paged payload. Working bytes are
+// backed with carry but never overlap retained records or request snapshots.
+func.def @valid_draft_storage(%allocations: buffer, %draft: buffer, %geometry: buffer, %rows: i64, %pins: i64, %pool: i64, %enabled: i1) -> (i1) {
+  %valid = scf.if %enabled -> (i1) {
+    %origin = index.constant 0 : offset
+    %records = buffer.view %allocations[%origin] : buffer -> view<11x3xi64>
+    %header = buffer.view %geometry[%origin] : buffer -> view<8xi64>
+    %cache_bytes = view.load %records[9, 0] : view<11x3xi64> -> i64
+    %cache_clear = view.load %records[9, 2] : view<11x3xi64> -> i64
+    %carry_bytes = view.load %records[6, 0] : view<11x3xi64> -> i64
+    %carry_clear = view.load %records[6, 2] : view<11x3xi64> -> i64
+    %carry_stride = view.load %header[2] : view<8xi64> -> i64
+    %page_tokens = view.load %header[0] : view<8xi64> -> i64
+    %page_bytes = config.get @storage_test.draft_page_bytes : i64
+    %working_stride = config.get @storage_test.draft_working_stride : i64
+    %c0_i64 = scalar.constant 0 : i64
+    %pages = scalar.divui %pool, %page_tokens : i64
+    %expected_cache = scalar.muli %pages, %page_bytes : i64
+    %owners = scalar.addi %rows, %pins : i64
+    %retained_bytes = scalar.muli %owners, %carry_stride : i64
+    %working_bytes = scalar.muli %rows, %working_stride : i64
+    %expected_carry = scalar.addi %retained_bytes, %working_bytes : i64
+    %cache_sized = scalar.cmpi eq, %cache_bytes, %expected_cache : i64
+    %cache_uninitialized = scalar.cmpi eq, %cache_clear, %c0_i64 : i64
+    %carry_sized = scalar.cmpi eq, %carry_bytes, %expected_carry : i64
+    %has_working = scalar.cmpi ne, %working_stride, %c0_i64 : i64
+    %carry_uninitialized = scalar.cmpi eq, %carry_clear, %c0_i64 : i64
+    %true = scalar.constant true : i1
+    %working_uninitialized = scf.select %has_working, %carry_uninitialized, %true : i1
+    %cache_valid = scalar.andi %cache_sized, %cache_uninitialized : i1
+    %carry_valid = scalar.andi %carry_sized, %working_uninitialized : i1
+    %storage_valid = scalar.andi %cache_valid, %carry_valid : i1
+    %row_count = index.cast %rows : i64 to index
+    %directory = buffer.view %draft[%origin] : buffer -> view<[%row_count]x5xi64>
+    %begin = index.constant 0 : index
+    %step = index.constant 1 : index
+    %origins_valid = scf.for %row = [%begin to %row_count step %step](%prior = %storage_valid : i1) -> (i1) {
+      %row_value = index.cast %row : index to i64
+      %relative = scalar.muli %row_value, %working_stride : i64
+      %working_origin = scalar.addi %retained_bytes, %relative : i64
+      %expected_origin = scf.select %has_working, %working_origin, %c0_i64 : i64
+      %anchor = view.load %directory[%row, 0] : view<[%row_count]x5xi64> -> i64
+      %writer = view.load %directory[%row, 1] : view<[%row_count]x5xi64> -> i64
+      %anchor_valid = scalar.cmpi eq, %anchor, %expected_origin : i64
+      %writer_valid = scalar.cmpi eq, %writer, %expected_origin : i64
+      %both = scalar.andi %anchor_valid, %writer_valid : i1
+      %next = scalar.andi %prior, %both : i1
+      scf.yield %next : i1
+    }
+    scf.yield %origins_valid : i1
+  } else {
+    %true = scalar.constant true : i1
+    scf.yield %true : i1
+  }
+  func.return %valid : i1
 }
 
 func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64, %context: i64, %pool: i64) -> (i1, i1) {
@@ -138,8 +198,13 @@ func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64, %context:
   %view_words = index.constant 32 : index
   %views_equal = func.call @equal_words(%views, %grown_views, %origin, %view_words) : (buffer, buffer, offset, index) -> (i1)
   %rows = index.constant 4 : index
-  %target_equal = func.call @equal_origins(%target, %grown_target, %rows) : (buffer, buffer, index) -> (i1)
-  %draft_equal = func.call @equal_origins(%draft, %grown_draft, %rows) : (buffer, buffer, index) -> (i1)
+  %retained_field = index.constant 0 : index
+  %cache_field = index.constant 2 : index
+  %target_equal = func.call @equal_origins(%target, %grown_target, %rows, %retained_field) : (buffer, buffer, index, index) -> (i1)
+  // Draft working state is reconstructed after growth; its cache origins stay.
+  %draft_equal = func.call @equal_origins(%draft, %grown_draft, %rows, %cache_field) : (buffer, buffer, index, index) -> (i1)
+  %initial_working = func.call @valid_draft_storage(%allocations, %draft, %geometry, %initial_rows, %pins, %pool, %enabled) : (buffer, buffer, buffer, i64, i64, i64, i1) -> (i1)
+  %grown_working = func.call @valid_draft_storage(%grown_allocations, %grown_draft, %grown_geometry, %final_rows, %pins, %pool, %enabled) : (buffer, buffer, buffer, i64, i64, i64, i1) -> (i1)
   %regions_begin = index.constant 64 : offset
   %geometry_bytes = buffer.length %geometry
   %regions_bytes = index.sub %geometry_bytes, %regions_begin : offset
@@ -181,7 +246,9 @@ func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64, %context:
   %ab = scalar.andi %a, %b : i1
   %cd = scalar.andi %c, %empty : i1
   %layouts_equal = scalar.andi %ab, %cd : i1
-  %result = scalar.andi %layouts_equal, %feedback_equal : i1
+  %working_valid = scalar.andi %initial_working, %grown_working : i1
+  %layout_valid = scalar.andi %layouts_equal, %working_valid : i1
+  %result = scalar.andi %layout_valid, %feedback_equal : i1
   %initial_origins = buffer.view %target[%origin] : buffer -> view<4x5xi64>
   %first_payload = view.load %initial_origins[0, 0] : view<4x5xi64> -> i64
   %maximum_32_bit_offset = scalar.constant 4294967295 : i64

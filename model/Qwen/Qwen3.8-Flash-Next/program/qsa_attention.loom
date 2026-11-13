@@ -1,6 +1,7 @@
 // Sparse-attention cache append and query composition. Paged K/V and
 // compressed index blocks share physical page ownership, while partial-block
-// history publishes to the retained writer.
+// history publishes to the retained writer. The cache arena and working-state
+// buffer may alias; their row-directory offsets are relative to their own root.
 
 config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
 
@@ -24,11 +25,11 @@ kernel.decl @qsa_prepare_queries_remapped(%neural_enabled: i1, %head_capacity: i
 
 kernel.decl @qsa_pool_blocks(%neural_enabled: i1) launch(%tail_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %raw: buffer, %arena: buffer, %pooled: buffer)
 
-kernel.decl @qsa_prepare_blocks(%neural_enabled: i1) launch(%coordinate_origin: offset, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer)
+kernel.decl @qsa_prepare_blocks(%neural_enabled: i1) launch(%coordinate_origin: offset, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer, %working: buffer)
 
-kernel.decl @qsa_prepare_blocks_mixed(%neural_enabled: i1) launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %coordinate_origin: offset, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer)
+kernel.decl @qsa_prepare_blocks_mixed(%neural_enabled: i1) launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %coordinate_origin: offset, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer, %working: buffer)
 
-kernel.decl @qsa_prepare_blocks_remapped(%neural_enabled: i1) launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %coordinate_origin: offset, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer)
+kernel.decl @qsa_prepare_blocks_remapped(%neural_enabled: i1) launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %coordinate_origin: offset, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %pooled: buffer, %weight: buffer, %arena: buffer, %working: buffer)
 
 kernel.decl @qsa_publish_tail(%neural_enabled: i1) launch(%tail_origin: offset, %epoch: buffer, %rows: buffer, %raw: buffer, %arena: buffer)
 
@@ -61,7 +62,7 @@ template.decl @flash_next.project_dense_q8(%neural_enabled: i1, %inputs: index, 
 // Append publishes the same paged K/V, complete index blocks, and partial tail
 // for ordinary attention and predictor catch-up. No query or MoE work is needed
 // when target acceptance supplies the hidden rows being caught up.
-command.def public @flash_next_qsa_append(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset, %mixed_inputs: index, %remapped: i1, %origin_capacity: index) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %capture: buffer, %inputs: buffer, %origins: buffer) {
+command.def public @flash_next_qsa_append(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset, %mixed_inputs: index, %remapped: i1, %origin_capacity: index) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %working: buffer, %capture: buffer, %inputs: buffer, %origins: buffer) {
   %plain = index.constant 0 : index
   %mixed = index.cmp ne, %mixed_inputs, %plain : index
   %last_target = index.constant 47 : index
@@ -95,28 +96,28 @@ command.def public @flash_next_qsa_append(%neural_enabled: i1, %layer: index, %k
   %capture_relative = index.scale %ordinal, %index_key_bytes : index, offset -> offset
   %capture_prefix = index.add %capture_base, %capture_relative : offset
   command.launch @flash_next_capture_inputs[%neural_enabled, %capture_prefix, %index_key_bytes](%span, %index_key_raw, %capture) : [i1, offset, offset](buffer, buffer, buffer)
-  kernel.launch @qsa_pool_blocks[%neural_enabled](%tail_origin, %span, %mapping, %rows, %index_key_raw, %arena, %pooled) : [i1](offset, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @qsa_pool_blocks[%neural_enabled](%tail_origin, %span, %mapping, %rows, %index_key_raw, %working, %pooled) : [i1](offset, buffer, buffer, buffer, buffer, buffer, buffer)
   scf.if %mixed {
     scf.if %remapped {
-      kernel.launch @qsa_prepare_blocks_remapped[%neural_enabled](%tokens, %origin_capacity, %inputs, %origins, %coordinate_origin, %index_origin, %span, %mapping, %rows, %pooled, %index_key_norm, %arena) : [i1](index, index, buffer, buffer, offset, offset, buffer, buffer, buffer, buffer, view<128xf32>, buffer)
+      kernel.launch @qsa_prepare_blocks_remapped[%neural_enabled](%tokens, %origin_capacity, %inputs, %origins, %coordinate_origin, %index_origin, %span, %mapping, %rows, %pooled, %index_key_norm, %arena, %working) : [i1](index, index, buffer, buffer, offset, offset, buffer, buffer, buffer, buffer, view<128xf32>, buffer, buffer)
     } else {
-      kernel.launch @qsa_prepare_blocks_mixed[%neural_enabled](%tokens, %origin_capacity, %inputs, %origins, %coordinate_origin, %index_origin, %span, %mapping, %rows, %pooled, %index_key_norm, %arena) : [i1](index, index, buffer, buffer, offset, offset, buffer, buffer, buffer, buffer, view<128xf32>, buffer)
+      kernel.launch @qsa_prepare_blocks_mixed[%neural_enabled](%tokens, %origin_capacity, %inputs, %origins, %coordinate_origin, %index_origin, %span, %mapping, %rows, %pooled, %index_key_norm, %arena, %working) : [i1](index, index, buffer, buffer, offset, offset, buffer, buffer, buffer, buffer, view<128xf32>, buffer, buffer)
     }
   } else {
-    kernel.launch @qsa_prepare_blocks[%neural_enabled](%coordinate_origin, %index_origin, %span, %mapping, %rows, %pooled, %index_key_norm, %arena) : [i1](offset, offset, buffer, buffer, buffer, buffer, view<128xf32>, buffer)
+    kernel.launch @qsa_prepare_blocks[%neural_enabled](%coordinate_origin, %index_origin, %span, %mapping, %rows, %pooled, %index_key_norm, %arena, %working) : [i1](offset, offset, buffer, buffer, buffer, buffer, view<128xf32>, buffer, buffer)
   }
   scf.if %publishes_coordinates {
     scf.if %mixed {
       scf.if %remapped {
-        kernel.launch @qsa_publish_coordinates_remapped[%neural_enabled](%tokens, %origin_capacity, %coordinate_origin, %inputs, %origins, %tail_origin, %span, %rows, %index_key_raw, %arena) : [i1](index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
+        kernel.launch @qsa_publish_coordinates_remapped[%neural_enabled](%tokens, %origin_capacity, %coordinate_origin, %inputs, %origins, %tail_origin, %span, %rows, %index_key_raw, %working) : [i1](index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
       } else {
-        kernel.launch @qsa_publish_coordinates_mixed[%neural_enabled](%tokens, %origin_capacity, %coordinate_origin, %inputs, %origins, %tail_origin, %span, %rows, %index_key_raw, %arena) : [i1](index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
+        kernel.launch @qsa_publish_coordinates_mixed[%neural_enabled](%tokens, %origin_capacity, %coordinate_origin, %inputs, %origins, %tail_origin, %span, %rows, %index_key_raw, %working) : [i1](index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
       }
     } else {
-      kernel.launch @qsa_publish_coordinates_text[%neural_enabled](%tokens, %origin_capacity, %coordinate_origin, %inputs, %origins, %tail_origin, %span, %rows, %index_key_raw, %arena) : [i1](index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
+      kernel.launch @qsa_publish_coordinates_text[%neural_enabled](%tokens, %origin_capacity, %coordinate_origin, %inputs, %origins, %tail_origin, %span, %rows, %index_key_raw, %working) : [i1](index, index, offset, buffer, buffer, offset, buffer, buffer, buffer, buffer)
     }
   } else {
-    kernel.launch @qsa_publish_tail[%neural_enabled](%tail_origin, %span, %rows, %index_key_raw, %arena) : [i1](offset, buffer, buffer, buffer, buffer)
+    kernel.launch @qsa_publish_tail[%neural_enabled](%tail_origin, %span, %rows, %index_key_raw, %working) : [i1](offset, buffer, buffer, buffer, buffer)
   }
   %key_weight_block_size = index.constant 32 : index
   %key_weight_blocks = index.div %hidden_width, %key_weight_block_size : index
@@ -138,10 +139,10 @@ command.def public @flash_next_qsa_append(%neural_enabled: i1, %layer: index, %k
   command.return
 }
 
-command.def public @flash_next_qsa_attention(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset, %mixed_inputs: index) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %output: buffer, %capture: buffer, %inputs: buffer) {
+command.def public @flash_next_qsa_attention(%neural_enabled: i1, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset, %mixed_inputs: index) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %working: buffer, %output: buffer, %capture: buffer, %inputs: buffer) {
   %remapped = scalar.constant false : i1
   %capacity = config.get @flash_next.token_count : index
-  command.launch @flash_next_qsa_append[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin, %mixed_inputs, %remapped, %capacity](%parameters, %span, %mapping, %rows, %input, %arena, %capture, %inputs, %span) : [i1, index, offset, offset, offset, offset, index, i1, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.launch @flash_next_qsa_append[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin, %mixed_inputs, %remapped, %capacity](%parameters, %span, %mapping, %rows, %input, %arena, %working, %capture, %inputs, %span) : [i1, index, offset, offset, offset, offset, index, i1, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   command.launch @flash_next_qsa_queries[%neural_enabled, %layer, %key_origin, %value_origin, %index_origin, %tail_origin, %mixed_inputs, %remapped, %capacity](%parameters, %span, %mapping, %rows, %input, %arena, %output, %capture, %inputs, %span) : [i1, index, offset, offset, offset, offset, index, i1, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   command.return
 }
