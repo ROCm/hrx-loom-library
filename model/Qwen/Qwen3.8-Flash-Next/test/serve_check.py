@@ -203,10 +203,28 @@ def run(address, model, reference):
         restored = chat("restored", branches[0], checkpoint=prefix)
         same_output(restored, forks[0])
         assert cached(restored) == receipt["position"], restored
+        # Host snapshots must round-trip the source-owned cache geometry,
+        # including the predictor's retained history and a partial cache page.
+        suspended = control(
+            address, "POST", checkpoint_path + "/suspend", 200, headers=headers
+        )
+        assert suspended["position"] == receipt["position"], suspended
+        assert suspended["host_snapshot_bytes"] > 0, suspended
+        snapshot_restored = request(
+            address,
+            prefix + "-snapshot-restored",
+            branches[0],
+            16,
+            model=model,
+            checkpoint=prefix,
+        )
+        same_output(snapshot_restored, forks[0])
+        assert cached(snapshot_restored) == receipt["position"], snapshot_restored
+        responses.append({"case": "snapshot-restored", **snapshot_restored})
         print(
             json.dumps(
                 {
-                    "qualified": "text, concurrent forks, page boundary, continuation, replay, and weight reactivation",
+                    "qualified": "text, concurrent forks, page boundary, continuation, replay, weight reactivation, and snapshot restoration",
                     "parameter_bytes": warm["parameters"]["primary"]["committed_bytes"],
                     "checkpoint_position": receipt["position"],
                 }
@@ -257,8 +275,9 @@ def run(address, model, reference):
     )
     assert recovery["text"].strip() == "4", recovery
     return {
-        "checked_responses": sum(consumed.values()),
+        "checked_responses": len(responses),
         "checkpoint_position": receipt["position"],
+        "host_snapshot_bytes": suspended["host_snapshot_bytes"],
         "parameter_bytes": warm["parameters"]["primary"]["committed_bytes"],
         "peer_reset_recovered": True,
         "responses": responses,
