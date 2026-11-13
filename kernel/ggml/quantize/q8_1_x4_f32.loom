@@ -46,3 +46,33 @@ kernel.def export("ggml_quantize_q8_1_x4_f32") @ggml_quantize_q8_1_x4_f32(%token
   template.apply<@ggml.quantize_q8_1_x4.group_body>(%publish_output, %group_count, %group, %input, %output) : (i1, index, index, buffer, buffer)
   kernel.return
 }
+
+// The bounded entry adds a positive workgroup budget to the configuration ABI.
+// The launch ABI and packed bytes are identical. Each group processes multiple
+// physical records, synchronizing shared scratch before beginning the next one.
+kernel.def export("ggml_quantize_q8_1_x4_f32_bounded") @ggml_quantize_q8_1_x4_f32_bounded(%token_count0: index, %input_size0: index, %workgroup_budget: index) {
+  %token_count = index.assume %token_count0 [range(%token_count0, 1, 2048)] : index
+  %input_size = index.assume %input_size0 [range(%input_size0, 128, 32768), multiple_of(%input_size0, 128)] : index
+  %budget = index.assume %workgroup_budget [range(%workgroup_budget, 1, 2147483647)] : index
+  %elements_per_group = index.constant 128 : index
+  %element_count = index.mul %token_count, %input_size : index
+  %record_count = index.div %element_count, %elements_per_group : index
+  %groups = index.min %record_count, %budget : index
+  %unit = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%token_count0: index, %input_size0: index, %input: buffer, %output: buffer) {
+  %token_count = index.assume %token_count0 [range(%token_count0, 1, 2048)] : index
+  %input_size = index.assume %input_size0 [range(%input_size0, 128, 32768), multiple_of(%input_size0, 128)] : index
+  %elements_per_group = index.constant 128 : index
+  %element_count = index.mul %token_count, %input_size : index
+  %record_count = index.div %element_count, %elements_per_group : index
+  %group = kernel.workgroup.id<x> : index
+  %groups = kernel.workgroup.count<x> : index
+  %publish_output = scalar.constant true : i1
+  scf.for %record = [%group to %record_count step %groups] {
+    template.apply<@ggml.quantize_q8_1_x4.group_body>(%publish_output, %record_count, %record, %input, %output) : (i1, index, index, buffer, buffer)
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  }
+  kernel.return
+}
