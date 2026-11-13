@@ -19,7 +19,7 @@ def chunk(kind, payload):
     )
 
 
-def png(rows, *, color=2):
+def png(rows, *, color=6):
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 5, 8, color, 0, 0, 0))
@@ -30,45 +30,13 @@ def png(rows, *, color=2):
 
 # One row per PNG filter. Rows zero through three reconstruct identical pixels;
 # the last row changes every channel, including both byte-wrapping directions.
-ROWS = bytes(
-    [
-        0,
-        10,
-        20,
-        30,
-        40,
-        50,
-        60,
-        1,
-        10,
-        20,
-        30,
-        30,
-        30,
-        30,
-        2,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        3,
-        5,
-        10,
-        15,
-        15,
-        15,
-        15,
-        4,
-        251,
-        5,
-        15,
-        210,
-        216,
-        10,
-    ]
-)
+ROWS = bytes([
+    0, 10, 20, 30, 255, 40, 50, 60, 255,
+    1, 10, 20, 30, 255, 30, 30, 30, 0,
+    2, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 5, 10, 15, 128, 15, 15, 15, 0,
+    4, 251, 5, 15, 0, 210, 216, 10, 0,
+])
 
 
 class ImageDecoderTest(unittest.TestCase):
@@ -91,8 +59,14 @@ class ImageDecoderTest(unittest.TestCase):
             decode_png(png(ROWS[:-1]))
 
     def test_unsupported_pixel_format(self):
-        with self.assertRaisesRegex(AssertionError, "RGB8"):
-            decode_png(png(ROWS, color=6))
+        with self.assertRaisesRegex(AssertionError, "RGBA8"):
+            decode_png(png(ROWS, color=2))
+
+    def test_transparent_output(self):
+        rows = bytearray(ROWS)
+        rows[4] = 0
+        with self.assertRaisesRegex(AssertionError, "non-opaque"):
+            decode_png(png(rows))
 
     def test_unknown_filter(self):
         with self.assertRaisesRegex(AssertionError, "filter"):

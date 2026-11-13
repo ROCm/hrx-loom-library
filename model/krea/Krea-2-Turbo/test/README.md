@@ -21,7 +21,8 @@ Bazel input. No checkpoint is downloaded, prepared offline, or archived by the
 test action.
 
 The checker launches and joins a native server, requests real images, decodes
-the PNG response, and compares whole RGB digests from `reference.json`.
+the RGBA8 PNG response, verifies opaque alpha, and compares whole RGB digests
+from `reference.json`.
 The fixed requests cover 384×384 and 1024×1024, with both 128- and 512-token text
 stages for both checkpoint variants. The same INT8 reference checks ordinary and bounded-workspace
 presets, so tiling must preserve every pixel. These references establish port
@@ -85,3 +86,10 @@ strengths, source order, repeated selections, cancellation, and replay. The
 pressure check rejects an oversized union before the first successful capture,
 alternates the two originals in space for one bank, rejects the union again,
 and verifies that subsequent single-bank and base requests remain exact.
+
+`vae_output_test.loom` exercises the production final convolution with sparse
+filters selecting three distinct input channels. Known normalized samples cover
+saturation, nearest-even ties, and values around quantization boundaries. Literal byte
+oracles check packed channel order, opaque alpha, and guards without sharing
+the device conversion arithmetic. The general convolution corpus owns tap and
+reduction coverage; `vae_tiles_test.loom` checks packed-pixel crop ownership.

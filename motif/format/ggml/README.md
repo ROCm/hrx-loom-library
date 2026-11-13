@@ -15,7 +15,12 @@ or an expanded-weight allocation.
 Each source owns its byte layout, alignment, element interpretation, and
 upstream provenance. Consumers declare each format provider whose public
 symbols they use; an aggregate dependency does not re-export its symbols.
-The [format checks](test/) use independent scalar-byte interpretations.
+Word carriers in the halfword-aligned Q5_1, Q6_K, and Q8_0 formats use
+`align(2)` views. A carrier's `i32` type describes its bits; it does not make
+packed records four-byte aligned. Q4_K/Q5_K readers require naturally aligned
+word origins, and the Q8_1 x4 representation contains aligned `i32` words.
+The [format checks](test/) use independent scalar-byte interpretations and
+exercise both lane-dependent and uniform packed addresses.
 [Component authoring](../../../docs/component-authoring.md) covers declarations
 and the shared build/test workflow.
 

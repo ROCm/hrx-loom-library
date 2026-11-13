@@ -43,8 +43,11 @@ The hardware job also resolves the runner's `ROCR_VISIBLE_DEVICES` or
 addresses supported by the native HAL. An allocation may include older GPUs
 that the HAL does not enumerate; the selected set must still contain at least
 one allocated GPU. ROCr and native HAL ordinals can differ.
-The preflight uses KFD/sysfs and the installed SDK's query-only `--dump_devices`;
-it needs no ROCm runtime. Explicit native selectors must stay within the
+The preflight correlates KFD/sysfs with the installed SDK's structured
+`amdf-info --engine=gpu --format=json` inventory and query-only HAL
+`--dump_devices` views. Physical identity comes from PCI records, independently
+of human-readable device names; no device is activated and no ROCm runtime is
+needed. Explicit native selectors must stay within the
 allocation, and a multi-GPU host without an allocation fails preflight.
 
 The job verifies the filtered device lists and forwards `HAL_VISIBLE_*_DEVICES`

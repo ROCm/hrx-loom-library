@@ -31,7 +31,7 @@ func.def @tile_counts() -> (index, index, index, index, index, index, index, ind
   %tile_height = config.get @krea2.vae_tile_height : index
   %tile_width = config.get @krea2.vae_tile_width : index
   %feature_channels = index.constant 384 : index
-  %output_channels_scale = index.constant 192 : index
+  %output_channels_scale = index.constant 64 : index
   %guards = index.constant 32 : index
   %pixels = index.mul %height, %width : index
   %tile_pixels = index.mul %tile_height, %tile_width : index
@@ -132,12 +132,9 @@ func.def @stitch_reference(%origin_y: index, %origin_x: index, %y_begin: index, 
   %tile_width = config.get @krea2.vae_tile_width : index
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
-  %channels = index.constant 3 : index
   %scale = index.constant 8 : index
   %word = index.constant 4 : offset
-  %full_rows = index.mul %height, %scale : index
   %full_columns = index.mul %width, %scale : index
-  %tile_rows = index.mul %tile_height, %scale : index
   %tile_columns = index.mul %tile_width, %scale : index
   %first_row = index.mul %y_begin, %scale : index
   %end_row = index.mul %y_end, %scale : index
@@ -148,19 +145,13 @@ func.def @stitch_reference(%origin_y: index, %origin_x: index, %y_begin: index, 
   %latent_columns = index.sub %x_end, %x_begin : index
   %columns = index.mul %latent_columns, %scale : index
   %row_bytes = index.scale %columns, %word : index, offset -> offset
-  scf.for %channel = [%c0 to %channels step %c1] {
-    %source_channel = index.mul %channel, %tile_rows : index
-    %destination_channel = index.mul %channel, %full_rows : index
-    scf.for %row = [%first_row to %end_row step %c1] {
-      %local_row = index.sub %row, %tile_first_row : index
-      %source_row = index.add %source_channel, %local_row : index
-      %destination_row = index.add %destination_channel, %row : index
-      %source_pixel = index.madd %source_row, %tile_columns, %local_column : index
-      %destination_pixel = index.madd %destination_row, %full_columns, %first_column : index
-      %source = index.scale %source_pixel, %word : index, offset -> offset
-      %destination = index.scale %destination_pixel, %word : index, offset -> offset
-      buffer.copy %input[%source], %output[%destination], %row_bytes
-    }
+  scf.for %row = [%first_row to %end_row step %c1] {
+    %local_row = index.sub %row, %tile_first_row : index
+    %source_pixel = index.madd %local_row, %tile_columns, %local_column : index
+    %destination_pixel = index.madd %row, %full_columns, %first_column : index
+    %source = index.scale %source_pixel, %word : index, offset -> offset
+    %destination = index.scale %destination_pixel, %word : index, offset -> offset
+    buffer.copy %input[%source], %output[%destination], %row_bytes
   }
   func.return
 }
@@ -168,7 +159,7 @@ func.def @stitch_reference(%origin_y: index, %origin_x: index, %y_begin: index, 
 check.scenario public @extract configure[5](%configuration: index, %configuration_entropy: check.entropy) {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   check.trial[1](%trial: index, %entropy: check.entropy) {
-    %full, %tile, %rgb, %tile_rgb, %full_storage, %tile_storage, %rgb_storage, %tile_rgb_storage = check.generate<@tile_counts>() : () -> (index, index, index, index, index, index, index, index)
+    %full, %tile, %rgba, %tile_rgba, %full_storage, %tile_storage, %rgba_storage, %tile_rgba_storage = check.generate<@tile_counts>() : () -> (index, index, index, index, index, index, index, index)
     %origin_y, %origin_x, %y_begin, %y_end, %x_begin, %x_end = check.generate<@tile_position>(%configuration) : (index) -> (index, index, index, index, index, index)
     %input_storage = check.generate.iota offset(0.0) step(1.0) : tensor<[%full_storage]xf32>
     %input = check.tensor.view %input_storage offset(64) : tensor<[%full_storage]xf32> -> tensor<[%full]xf32>
@@ -188,16 +179,16 @@ check.benchmark<@extract> @extract_benchmark
 check.scenario public @stitch configure[5](%configuration: index, %configuration_entropy: check.entropy) {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   check.trial[1](%trial: index, %entropy: check.entropy) {
-    %full, %tile, %rgb, %tile_rgb, %full_storage, %tile_storage, %rgb_storage, %tile_rgb_storage = check.generate<@tile_counts>() : () -> (index, index, index, index, index, index, index, index)
+    %full, %tile, %rgba, %tile_rgba, %full_storage, %tile_storage, %rgba_storage, %tile_rgba_storage = check.generate<@tile_counts>() : () -> (index, index, index, index, index, index, index, index)
     %origin_y, %origin_x, %y_begin, %y_end, %x_begin, %x_end = check.generate<@tile_position>(%configuration) : (index) -> (index, index, index, index, index, index)
-    %input_storage = check.generate.iota offset(0.0) step(1.0) : tensor<[%tile_rgb_storage]xf32>
-    %input = check.tensor.view %input_storage offset(64) : tensor<[%tile_rgb_storage]xf32> -> tensor<[%tile_rgb]xf32>
-    check.generate<@seed_copy_bits>(%input) : (tensor<[%tile_rgb]xf32>) -> ()
-    %output_storage = check.generate.fill value(-77.0) : tensor<[%rgb_storage]xf32>
-    %output = check.tensor.view %output_storage offset(64) : tensor<[%rgb_storage]xf32> -> tensor<[%rgb]xf32>
-    check.compare<@krea_vae_stitch_tile, @stitch_reference>[%y_begin, %y_end, %x_begin, %x_end](%origin_y, %origin_x, %y_begin, %y_end, %x_begin, %x_end, %input, %output) : [index, index, index, index](index, index, index, index, index, index, tensor<[%tile_rgb]xf32>, tensor<[%rgb]xf32>) -> () {
-      check.expect.bitwise actual(%input_storage) expected(%input_storage) : tensor<[%tile_rgb_storage]xf32>
-      check.expect.bitwise actual(%output_storage) expected(%output_storage) : tensor<[%rgb_storage]xf32>
+    %input_storage = check.generate.iota offset(0) step(1) : tensor<[%tile_rgba_storage]xi32>
+    %input = check.tensor.view %input_storage offset(64) : tensor<[%tile_rgba_storage]xi32> -> tensor<[%tile_rgba]xi32>
+    check.generate<@seed_copy_bits>(%input) : (tensor<[%tile_rgba]xi32>) -> ()
+    %output_storage = check.generate.fill value(-77) : tensor<[%rgba_storage]xi32>
+    %output = check.tensor.view %output_storage offset(64) : tensor<[%rgba_storage]xi32> -> tensor<[%rgba]xi32>
+    check.compare<@krea_vae_stitch_tile, @stitch_reference>[%y_begin, %y_end, %x_begin, %x_end](%origin_y, %origin_x, %y_begin, %y_end, %x_begin, %x_end, %input, %output) : [index, index, index, index](index, index, index, index, index, index, tensor<[%tile_rgba]xi32>, tensor<[%rgba]xi32>) -> () {
+      check.expect.bitwise actual(%input_storage) expected(%input_storage) : tensor<[%tile_rgba_storage]xi32>
+      check.expect.bitwise actual(%output_storage) expected(%output_storage) : tensor<[%rgba_storage]xi32>
     }
   }
   check.return

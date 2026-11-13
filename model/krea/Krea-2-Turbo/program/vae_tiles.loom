@@ -127,8 +127,8 @@ kernel.def target(@vae_tiles_wave32) @krea_vae_extract_tile() {
 }
 
 // Copies the uniquely owned output rectangle from one dense decoder tile into
-// the full channel-first image. Cropping after the pointwise clamp preserves
-// the untiled decoder's exact values.
+// the full packed RGBA8 image. One word carries all four bytes; cropping
+// preserves the final convolution's quantized pixels without conversion.
 kernel.def target(@vae_tiles_wave32) @krea_vae_stitch_tile(%crop_y_begin: index, %crop_y_end: index, %crop_x_begin: index, %crop_x_end: index) {
   %height0 = index.sub %crop_y_end, %crop_y_begin : index
   %width0 = index.sub %crop_x_end, %crop_x_begin : index
@@ -140,18 +140,13 @@ kernel.def target(@vae_tiles_wave32) @krea_vae_stitch_tile(%crop_y_begin: index,
   %threads = index.constant 128 : index
   %rounded_width = index.add %output_width, %padding : index
   %column_groups = index.div %rounded_width, %threads : index
-  %channels = index.constant 3 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%column_groups, %output_height, %channels) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%column_groups, %output_height, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%origin_y: index, %origin_x: index, %crop_y_begin: index, %crop_y_end: index, %crop_x_begin: index, %crop_x_end: index, %input: buffer, %output: buffer) where [range(%origin_y, 0, 1022), range(%origin_x, 0, 1022), range(%crop_y_begin, 0, 1024), range(%crop_y_end, 0, 1024), range(%crop_x_begin, 0, 1024), range(%crop_x_end, 0, 1024)] {
-  %full_height = config.get @krea2.latent_height : index
   %full_width = config.get @krea2.latent_width : index
-  %tile_height = config.get @krea2.vae_tile_height : index
   %tile_width = config.get @krea2.vae_tile_width : index
   %scale = index.constant 8 : index
-  %full_output_height = index.mul %full_height, %scale : index
   %full_output_width = index.mul %full_width, %scale : index
-  %tile_output_height = index.mul %tile_height, %scale : index
   %tile_output_width = index.mul %tile_width, %scale : index
   %crop_height0 = index.sub %crop_y_end, %crop_y_begin : index
   %crop_width0 = index.sub %crop_x_end, %crop_x_begin : index
@@ -164,7 +159,6 @@ kernel.def target(@vae_tiles_wave32) @krea_vae_stitch_tile(%crop_y_begin: index,
   %threads = index.constant 128 : index
   %column_group = kernel.workgroup.id<x> : index
   %y0 = kernel.workgroup.id<y> : index
-  %channel0 = kernel.workgroup.id<z> : index
   %lane = kernel.workitem.id<x> : index
   %x0 = index.madd %column_group, %threads, %lane : index
   %live = index.cmp ult, %x0, %output_width : index
@@ -177,17 +171,15 @@ kernel.def target(@vae_tiles_wave32) @krea_vae_stitch_tile(%crop_y_begin: index,
   %element_bytes = index.constant 4 : offset
   %source_base = index.scale %source_pixel_origin, %element_bytes : index, offset -> offset
   %destination_base = index.scale %destination_pixel_origin, %element_bytes : index, offset -> offset
-  %tile_output_pixels = index.mul %tile_output_height, %tile_output_width : index
-  %full_output_pixels = index.mul %full_output_height, %full_output_width : index
   %c1 = index.constant 1 : index
-  %source_layout = encoding.layout.strided [%tile_output_pixels, %tile_output_width, %c1] : encoding<layout>
-  %destination_layout = encoding.layout.strided [%full_output_pixels, %full_output_width, %c1] : encoding<layout>
-  %source = buffer.view %input[%source_base] : buffer -> view<3x[%output_height]x[%output_width]xf32, %source_layout>
-  %destination = buffer.view %output[%destination_base] : buffer -> view<3x[%output_height]x[%output_width]xf32, %destination_layout>
+  %source_layout = encoding.layout.strided [%tile_output_width, %c1] : encoding<layout>
+  %destination_layout = encoding.layout.strided [%full_output_width, %c1] : encoding<layout>
+  %source = buffer.view %input[%source_base] : buffer -> view<[%output_height]x[%output_width]xi32, %source_layout>
+  %destination = buffer.view %output[%destination_base] : buffer -> view<[%output_height]x[%output_width]xi32, %destination_layout>
   scf.if %live {
-    %channel, %y, %x = index.assume %channel0, %y0, %x0 [range(%channel0, 0, 2), ge(%y0, 0), lt(%y0, %output_height), ge(%x0, 0), lt(%x0, %output_width)] : index, index, index
-    %value = view.load %source[%channel, %y, %x] : view<3x[%output_height]x[%output_width]xf32, %source_layout> -> f32
-    view.store %value, %destination[%channel, %y, %x] : f32, view<3x[%output_height]x[%output_width]xf32, %destination_layout>
+    %y, %x = index.assume %y0, %x0 [ge(%y0, 0), lt(%y0, %output_height), ge(%x0, 0), lt(%x0, %output_width)] : index, index
+    %value = view.load %source[%y, %x] : view<[%output_height]x[%output_width]xi32, %source_layout> -> i32
+    view.store %value, %destination[%y, %x] : i32, view<[%output_height]x[%output_width]xi32, %destination_layout>
   }
   kernel.return
 }

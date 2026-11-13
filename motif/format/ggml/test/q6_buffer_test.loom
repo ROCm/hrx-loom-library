@@ -5,6 +5,9 @@
 
 amdgpu.target<gfx11-generic> @native
 
+// Both scalar-uniform and per-lane addresses must preserve packed alignment.
+config.decl @q6_buffer_test.uniform_packets : i1
+
 func.decl @ggml_q6_k_load_values4_f16(%weight: buffer, %row_origin: offset, %block: index, %group: index, %packet: index) -> (vector<4xf16>)
 
 func.decl @ggml_q6_k_load_codes4(%weight: buffer, %row_origin: offset, %block: index, %group: index, %packet: index) -> (vector<4xf32>)
@@ -81,12 +84,25 @@ kernel.def target(@native) @materialize() {
   %blocks = index.constant 3 : index
   %rows = index.constant 2 : index
   %unit = index.constant 1 : index
-  %threads = index.constant 64 : index
-  kernel.launch.config workgroups(%blocks, %rows, %unit) workgroup_size(%threads, %unit, %unit) : index
+  %packets = index.constant 64 : index
+  %uniform = config.get @q6_buffer_test.uniform_packets : i1
+  %packet_groups, %threads = scf.if %uniform -> (index, index) {
+    scf.yield %packets, %unit : index, index
+  } else {
+    scf.yield %unit, %packets : index, index
+  }
+  kernel.launch.config workgroups(%blocks, %rows, %packet_groups) workgroup_size(%threads, %unit, %unit) : index
 } launch(%input: buffer, %output: buffer, %codes_output: buffer, %scales_output: buffer) {
   %block = kernel.workgroup.id<x> : index
   %row = kernel.workgroup.id<y> : index
-  %thread = kernel.workitem.id<x> : index
+  %uniform = config.get @q6_buffer_test.uniform_packets : i1
+  %thread = scf.if %uniform -> (index) {
+    %packet = kernel.workgroup.id<z> : index
+    scf.yield %packet : index
+  } else {
+    %packet = kernel.workitem.id<x> : index
+    scf.yield %packet : index
+  }
   %packets_per_group = index.constant 8 : index
   %packet_width = index.constant 4 : index
   %origin = index.constant 2 : offset

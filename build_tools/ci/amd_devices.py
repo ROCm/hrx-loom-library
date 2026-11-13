@@ -29,26 +29,69 @@ class Device:
     pci_address: str
 
 
-def parse_device_dump(output: str, scheme: str) -> list[Device]:
-    """Reads endpoint identity and PCI address from the SDK's query-only dump."""
+def query_physical_devices(tool: str) -> dict[str, list[str | None]]:
+    """Indexes structured physical identities independently of HAL visibility."""
+    result = subprocess.run(
+        [tool, "--engine=gpu", "--format=json"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    inventory = json.loads(result.stdout)
+    if inventory["schema_version"] != 1:
+        raise ValueError("Unsupported amdf-info inventory schema")
+    identities = {}
+    for endpoint in inventory["endpoints"]:
+        address = endpoint.get("pci_address")
+        pci_address = (
+            f"{address['domain']:04x}:{address['bus']:02x}:"
+            f"{address['device']:02x}.{address['function']:x}"
+            if address and "error" not in address
+            else None
+        )
+        paths = [f"id/{endpoint['id']}"]
+        unique_id = int(endpoint.get("gpu", {}).get("unique_id", "0"), 16)
+        if unique_id:
+            paths.append(f"GPU-{unique_id:016x}")
+        schemes = ["amdgpu"]
+        if endpoint["family"] in ("rdna", "cdna"):
+            schemes.append(endpoint["family"])
+        for scheme in schemes:
+            for path in paths:
+                identities.setdefault(f"{scheme}://{path}", []).append(pci_address)
+    return identities
+
+
+def parse_device_dump(
+    output: str, scheme: str, identities: dict[str, list[str | None]]
+) -> list[Device]:
+    """Resolves the SDK's ordered HAL view without interpreting display names."""
     if f"# Enumerated devices for driver '{scheme}'" not in output:
         raise ValueError(f"Missing {scheme} enumeration in the SDK device dump")
     device_path = rf"(?:id/[0-9a-f]{{32}}|GPU-[0-9a-f]{{16}})"
-    pattern = (
-        rf"^# --device=({scheme}://{device_path})\n"
-        r"#   AMD GPU [0-9a-f:]+ \(([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])\)$"
-    )
-    devices = [Device(*match) for match in re.findall(pattern, output, re.MULTILINE)]
-    if len(devices) != output.count("# --device="):
+    pattern = rf"^# --device=({scheme}://{device_path})$"
+    uris = re.findall(pattern, output, re.MULTILINE)
+    if len(uris) != output.count("# --device="):
         raise ValueError(
             f"Cannot identify every {scheme} endpoint in the SDK device dump"
         )
+    devices = []
+    for uri in uris:
+        addresses = identities.get(uri, [])
+        if len(addresses) != 1 or addresses[0] is None:
+            raise ValueError(f"No unique physical PCI identity for {uri}")
+        devices.append(Device(uri, addresses[0]))
     if len({device.pci_address for device in devices}) != len(devices):
         raise ValueError(f"Ambiguous {scheme} endpoints share a PCI address")
     return devices
 
 
-def query_devices(tool: str, scheme: str, environment: dict[str, str]) -> list[Device]:
+def query_devices(
+    tool: str,
+    scheme: str,
+    environment: dict[str, str],
+    identities: dict[str, list[str | None]],
+) -> list[Device]:
     result = subprocess.run(
         [tool, f"--dump_devices={scheme}"],
         env=environment,
@@ -56,7 +99,7 @@ def query_devices(tool: str, scheme: str, environment: dict[str, str]) -> list[D
         capture_output=True,
         text=True,
     )
-    return parse_device_dump(result.stdout, scheme)
+    return parse_device_dump(result.stdout, scheme, identities)
 
 
 def select_ordinals(value: str, devices: list[Device], variable: str) -> list[Device]:
@@ -112,6 +155,7 @@ def rocr_allocation(value: str, topology: Path, drm: Path, dri: Path) -> list[st
 
 def configure_visibility(
     tool: str,
+    amdf_info: str,
     environment: dict[str, str],
     topology: Path = Path("/sys/class/kfd/kfd/topology/nodes"),
     drm: Path = Path("/sys/class/drm"),
@@ -122,7 +166,11 @@ def configure_visibility(
         for name, value in environment.items()
         if name not in GPU_VISIBILITY.values()
     }
-    views = {scheme: query_devices(tool, scheme, unmasked) for scheme in GPU_SCHEMES}
+    identities = query_physical_devices(amdf_info)
+    views = {
+        scheme: query_devices(tool, scheme, unmasked, identities)
+        for scheme in GPU_SCHEMES
+    }
     all_devices = views["amdgpu"]
     if not all_devices:
         raise ValueError("The native HAL reports no available AMD GPUs")
@@ -205,7 +253,7 @@ def configure_visibility(
 
     masked = environment | updates
     for scheme in GPU_SCHEMES:
-        if query_devices(tool, scheme, masked) != expected[scheme]:
+        if query_devices(tool, scheme, masked, identities) != expected[scheme]:
             raise ValueError(
                 f"The SDK's filtered {scheme} devices differ from the runner allocation"
             )
@@ -227,6 +275,9 @@ def main() -> None:
         "--loom-serve", required=True, help="Installed SDK loom-serve executable."
     )
     parser.add_argument(
+        "--amdf-info", required=True, help="The same SDK's amdf-info executable."
+    )
+    parser.add_argument(
         "--github-env",
         type=Path,
         required=True,
@@ -234,7 +285,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     try:
-        result = configure_visibility(args.loom_serve, dict(os.environ))
+        result = configure_visibility(args.loom_serve, args.amdf_info, dict(os.environ))
         with args.github_env.open("a") as output:
             for name, value in result["environment"].items():
                 output.write(f"{name}={value}\n")

@@ -33,7 +33,7 @@ from loom_serve_testing.model_staging import stage_model
 
 
 def decode_png(png):
-    """Decode the service's noninterlaced eight-bit RGB response with stdlib."""
+    """Decode the service's noninterlaced opaque eight-bit RGBA response with stdlib."""
     if png[:8] != b"\x89PNG\r\n\x1a\n":
         raise AssertionError("image response is not PNG")
     offset = 8
@@ -64,11 +64,11 @@ def decode_png(png):
         elif not kind[0] & 32:
             raise AssertionError(f"unsupported critical PNG chunk {kind!r}")
         offset = end
-    if not ended or header is None or header[2:] != (8, 2, 0, 0, 0):
-        raise AssertionError(f"expected noninterlaced RGB8 PNG: {header}")
+    if not ended or header is None or header[2:] != (8, 6, 0, 0, 0):
+        raise AssertionError(f"expected noninterlaced RGBA8 PNG: {header}")
     width, height = header[:2]
     rows = zlib.decompress(compressed)
-    stride = width * 3
+    stride = width * 4
     if not width or not height or len(rows) != (stride + 1) * height:
         raise AssertionError("PNG pixels do not match its dimensions")
     pixels = bytearray(stride * height)
@@ -79,9 +79,9 @@ def decode_png(png):
             raise AssertionError(f"invalid PNG row filter {method}")
         for column, value in enumerate(rows[begin + 1 : begin + 1 + stride]):
             position = row * stride + column
-            left = pixels[position - 3] if column >= 3 else 0
+            left = pixels[position - 4] if column >= 4 else 0
             above = pixels[position - stride] if row else 0
-            corner = pixels[position - stride - 3] if row and column >= 3 else 0
+            corner = pixels[position - stride - 4] if row and column >= 4 else 0
             if method == 1:
                 value += left
             elif method == 2:
@@ -93,7 +93,13 @@ def decode_png(png):
                 candidates = (left, above, corner)
                 value += min(candidates, key=lambda item: abs(estimate - item))
             pixels[position] = value & 255
-    return (width, height), bytes(pixels)
+    if any(alpha != 255 for alpha in pixels[3::4]):
+        raise AssertionError("Krea produced non-opaque alpha")
+    # Preserve the learned RGB digest independently of its transport format.
+    rgb = bytearray(width * height * 3)
+    for channel in range(3):
+        rgb[channel::3] = pixels[channel::4]
+    return (width, height), bytes(rgb)
 
 
 def image(address, request, *, status=200):
