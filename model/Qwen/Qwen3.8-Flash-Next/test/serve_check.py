@@ -61,6 +61,7 @@ def run(address, model, reference):
     headers = {"Content-Type": "application/json", "X-Loom-Model": model}
     selector = json.dumps({"model": model})
     consumed = {label: 0 for label in reference["responses"]}
+    responses = []
 
     def chat(label, history, maximum=16, checkpoint=None):
         result = request(
@@ -90,6 +91,7 @@ def run(address, model, reference):
         for field, value in expected["usage"].items():
             assert result["usage"][field] == value, (label, field, result, expected)
         assert not result["reasoning_content"] and not result["tool_calls"], result
+        responses.append({"case": label, "ordinal": ordinal, **result})
         return result
 
     def operation(name, expected=200):
@@ -259,6 +261,8 @@ def run(address, model, reference):
         "checkpoint_position": receipt["position"],
         "parameter_bytes": warm["parameters"]["primary"]["committed_bytes"],
         "peer_reset_recovered": True,
+        "responses": responses,
+        "recovery": recovery,
     }
 
 
