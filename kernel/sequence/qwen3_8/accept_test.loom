@@ -34,6 +34,7 @@ func.def @accept_fixture(%mixed_inputs: index, %token_capacity: index, %width_va
   %c5 = index.constant 5 : index
   %c6 = index.constant 6 : index
   %c7 = index.constant 7 : index
+  %output_credit = index.constant 8 : index
   %small_capacity = index.constant 512 : index
   %selected_capacity = index.mul %span_count, %width : index
   %large = index.cmp ugt, %token_capacity, %small_capacity : index
@@ -73,7 +74,7 @@ func.def @accept_fixture(%mixed_inputs: index, %token_capacity: index, %width_va
     %generated_flag = scalar.constant 2 : i32
     %flag = scf.select %generated_span, %generated_flag, %supplied_flag : i32
     %limited = index.cmp eq, %span, %c7 : index
-    %credit = scf.select %limited, %trial, %width : index
+    %credit = scf.select %limited, %trial, %output_credit : index
     %credit_word = index.cast %credit : index to i32
     view.store %count_word, %descriptors[%span, 0] : i32, view<[%packet_capacity]x6xi32>
     view.store %position_word, %descriptors[%span, 1] : i32, view<[%packet_capacity]x6xi32>
@@ -85,6 +86,8 @@ func.def @accept_fixture(%mixed_inputs: index, %token_capacity: index, %width_va
     view.store %credit_word, %options[%span, 1] : i32, view<[%packet_capacity]x2xi32>
     %phase = index.add %span, %trial : index
     %mismatch = index.rem %phase, %width : index
+    %all_matched = index.cmp eq, %span, %c4 : index
+    %has_mismatch = scalar.xori %all_matched, %true : i1
     %eos_span = index.cmp eq, %span, %c5 : index
     %not_eos_span = scalar.xori %eos_span, %true : i1
     scf.for %token = [%c0 to %output_count step %c1] {
@@ -94,7 +97,8 @@ func.def @accept_fixture(%mixed_inputs: index, %token_capacity: index, %width_va
       %matching = index.add %input_base, %input_word : index
       %replacement = index.add %wrong, %token : index
       %wrong_position = index.cmp eq, %token, %mismatch : index
-      %replace = scalar.andi %wrong_position, %not_eos_span : i1
+      %wrong_candidate = scalar.andi %wrong_position, %has_mismatch : i1
+      %replace = scalar.andi %wrong_candidate, %not_eos_span : i1
       %value = scf.select %replace, %replacement, %matching : index
       %word = index.cast %value : index to i32
       %eos_position = index.cmp eq, %token, %trial : index
@@ -143,7 +147,6 @@ func.def @accept_oracle(%mixed_inputs: index, %width_value: index, %token_capaci
   %c3 = index.constant 3 : index
   %c4 = index.constant 4 : index
   %capacity = index.constant 8 : index
-  %draft_count = index.sub %width, %c1 : index
   %c0_2 = scalar.constant 0 : i32
   %c1_2 = scalar.constant 1 : i32
   %eos = view.load %terminal[0] : view<1xi32> -> i32
@@ -227,11 +230,14 @@ func.def @accept_oracle(%mixed_inputs: index, %width_value: index, %token_capaci
     %selection = index.cast %selection_word : i32 to index
     %has_output = scalar.cmpi sge, %selection_word, %c0_2 : i32
     %consumed, %emitted = scf.if %speculative -> (i32, i32) {
+      %length = index.cast %count_word : i32 to index
+      %live_width = index.assume %length [range(%length, 1, %width)] : index
+      %draft_count = index.sub %live_width, %c1 : index
       %credit_word = view.load %options[%span, 1] : view<[%packet_capacity]x2xi32> -> i32
       %credit = index.cast %credit_word : i32 to index
-      %limited = index.cmp ult, %credit, %width : index
-      %initial = scf.select %limited, %credit, %width : index
-      %frontier = scf.for %token = [%c0 to %width step %c1](%limit = %initial : index) -> (index) {
+      %limited = index.cmp ult, %credit, %live_width : index
+      %initial = scf.select %limited, %credit, %live_width : index
+      %frontier = scf.for %token = [%c0 to %live_width step %c1](%limit = %initial : index) -> (index) {
         %slot_value = index.add %selection, %token : index
         %slot = index.assume %slot_value [ge(%slot_value, 0), lt(%slot_value, %packet_capacity)] : index
         %prediction = view.load %selected[%slot] : view<[%packet_capacity]xi32> -> i32
@@ -309,10 +315,12 @@ func.def @accept_oracle(%mixed_inputs: index, %width_value: index, %token_capaci
   func.return
 }
 
-// Each width 1..8 runs in both layouts. Sixteen live spans place mismatches
-// across the verification width, while separate known, hidden, EOS, and
-// credit-limited spans exercise each publication path. The layouts alternate
-// compact and nearly full prompt allocations, with middle and final EOS stops.
+// Actual widths 1..8 run under one verification ceiling in both layouts.
+// Sixteen live spans place mismatches across the verification width, while
+// known, hidden, fully matched, EOS, and credit-limited spans exercise each
+// publication path. Output credit can exceed the actual drafted prefix.
+// The layouts alternate compact and nearly full prompt allocations, with
+// middle and final EOS stops.
 func.def @accept_parameters(%trial: index) -> (index, index, index, index, index, index) {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -340,6 +348,7 @@ func.def @accept_parameters(%trial: index) -> (index, index, index, index, index
 check.scenario public @accept_frontiers {
   check.trial[16](%trial: index, %entropy: check.entropy) {
     %mixed_inputs, %width, %span_count, %position, %token_capacity, %input_words = check.generate<@accept_parameters>(%trial) : (index) -> (index, index, index, index, index, index)
+    %maximum_width = check.literal value(8) : index
     %packet_capacity = check.literal value(128) : index
     %feedback_words = check.literal value(1310) : index
     %epoch = check.generate.fill value(-99) : tensor<[%packet_capacity]x29xi32>
@@ -349,7 +358,7 @@ check.scenario public @accept_frontiers {
     %replay = check.generate.fill value(-99) : tensor<[%packet_capacity]x7xi32>
     %results = check.generate.fill value(-99) : tensor<[%feedback_words]xi32>
     check.generate<@accept_fixture>(%mixed_inputs, %token_capacity, %width, %span_count, %position, %packet_capacity, %epoch, %predictions) : (index, index, index, index, index, index, tensor<[%packet_capacity]x29xi32>, tensor<[%packet_capacity]xi32>) -> ()
-    check.compare<@qwen38_accept_spans, @accept_oracle>(%mixed_inputs, %width, %token_capacity, %packet_capacity, %epoch, %inputs, %predictions, %committed, %replay, %results) : (index, index, index, index, tensor<[%packet_capacity]x29xi32>, tensor<[%input_words]xi32>, tensor<[%packet_capacity]xi32>, tensor<[%packet_capacity]x7xi32>, tensor<[%packet_capacity]x7xi32>, tensor<[%feedback_words]xi32>) -> () {
+    check.compare<@qwen38_accept_spans, @accept_oracle>(%mixed_inputs, %maximum_width, %token_capacity, %packet_capacity, %epoch, %inputs, %predictions, %committed, %replay, %results) : (index, index, index, index, tensor<[%packet_capacity]x29xi32>, tensor<[%input_words]xi32>, tensor<[%packet_capacity]xi32>, tensor<[%packet_capacity]x7xi32>, tensor<[%packet_capacity]x7xi32>, tensor<[%feedback_words]xi32>) -> () {
       check.expect.bitwise actual(%results) expected(%results) : tensor<[%feedback_words]xi32>
       check.expect.bitwise actual(%committed) expected(%committed) : tensor<[%packet_capacity]x7xi32>
       check.expect.bitwise actual(%replay) expected(%replay) : tensor<[%packet_capacity]x7xi32>
