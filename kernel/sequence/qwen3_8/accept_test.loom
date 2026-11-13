@@ -41,7 +41,7 @@ func.def @accept_fixture(%mixed_inputs: index, %token_capacity: index, %width_va
   %hidden_length = scf.select %large, %long_prompt, %c3 : index
   %last_row = index.constant 1048576 : index
   %source_base = index.constant 23 : index
-  %c100 = index.constant 100 : index
+  %context_base = index.constant 262144 : index
   %input_base = index.constant 1000 : index
   %wrong = index.constant 7777 : index
   %eos = scalar.constant 42 : i32
@@ -59,7 +59,7 @@ func.def @accept_fixture(%mixed_inputs: index, %token_capacity: index, %width_va
     %count = scf.select %hidden, %hidden_length, %visible_count : index
     %output_count = scf.select %hidden, %c0, %visible_count : index
     %row = index.sub %last_row, %span : index
-    %position = index.add %c100, %span : index
+    %position = index.add %context_base, %span : index
     %count_word = index.cast %count : index to i32
     %begin_word = index.cast %begin : index to i32
     %position_word = index.cast %position : index to i32
@@ -68,7 +68,10 @@ func.def @accept_fixture(%mixed_inputs: index, %token_capacity: index, %width_va
     %row_word = index.cast %row : index to i32
     %selected_word = index.cast %selection : index to i32
     %selection_word = scf.select %hidden, %none, %selected_word : i32
-    %flag = scalar.extui %speculative : i1 to i32
+    %supplied_flag = scalar.extui %speculative : i1 to i32
+    %generated_span = index.cmp eq, %span, %c1 : index
+    %generated_flag = scalar.constant 2 : i32
+    %flag = scf.select %generated_span, %generated_flag, %supplied_flag : i32
     %limited = index.cmp eq, %span, %c7 : index
     %credit = scf.select %limited, %trial, %width : index
     %credit_word = index.cast %credit : index to i32
@@ -132,7 +135,7 @@ func.def @accept_oracle(%mixed_inputs: index, %width_value: index, %token_capaci
   %accepted = buffer.view %committed[%descriptor_origin] : buffer -> view<[%packet_capacity]x6xi32>
   %replay_header = buffer.view %replay[%origin] : buffer -> view<3xi32>
   %replayed = buffer.view %replay[%descriptor_origin] : buffer -> view<[%packet_capacity]x6xi32>
-  %feedback_origin = index.constant 32 : offset
+  %feedback_origin = index.constant 120 : offset
   %records = buffer.view %results[%feedback_origin] : buffer -> view<[%packet_capacity]x10xi32>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -152,6 +155,63 @@ func.def @accept_oracle(%mixed_inputs: index, %width_value: index, %token_capaci
   view.store %span_word, %counts[1] : i32, view<2xi32>
   %span_value = index.cast %span_word : i32 to index
   %span_count = index.assume %span_value [range(%span_value, 0, %packet_capacity)] : index
+  // Count the causal keys one query at a time, independently of the kernel's
+  // closed-form sum. Long prompt fixtures exceed 32-bit pair counts.
+  %observation_origin = index.constant 64 : offset
+  %observations = buffer.view %results[%observation_origin] : buffer -> view<10xi32>
+  %histogram_bytes = index.constant 32 : offset
+  buffer.fill %c0_2, %results[%observation_origin], %histogram_bytes : i32
+  %zero64 = scalar.constant 0 : i64
+  %generated_flag = scalar.constant 2 : i32
+  %true = scalar.constant true : i1
+  %false = scalar.constant false : i1
+  %known, %maximum, %pairs, %generated = scf.for %span = [%c0 to %span_count step %c1](%known = %c0_2 : i32, %maximum = %c0_2 : i32, %pairs = %zero64 : i64, %generated = %false : i1) -> (i32, i32, i64, i1) {
+    %length = view.load %descriptors[%span, 0] : view<[%packet_capacity]x6xi32> -> i32
+    %position = view.load %descriptors[%span, 1] : view<[%packet_capacity]x6xi32> -> i32
+    %flag = view.load %options[%span, 0] : view<[%packet_capacity]x2xi32> -> i32
+    %speculative = scalar.cmpi ne, %flag, %c0_2 : i32
+    %known_next = scf.if %speculative -> (i32) {
+      %width = index.cast %length : i32 to index
+      %bin_value = index.sub %width, %c1 : index
+      %bin = index.assume %bin_value [range(%bin_value, 0, 7)] : index
+      %previous = view.load %observations[%bin] : view<10xi32> -> i32
+      %incremented = scalar.addi %previous, %c1_2 : i32
+      view.store %incremented, %observations[%bin] : i32, view<10xi32>
+      scf.yield %known : i32
+    } else {
+      %next = scalar.addi %known, %length : i32
+      scf.yield %next : i32
+    }
+    %queries = index.cast %length : i32 to index
+    %sum = scf.for %query = [%c0 to %queries step %c1](%sum = %pairs : i64) -> (i64) {
+      %relative = index.cast %query : index to i32
+      %absolute = scalar.addi %position, %relative : i32
+      %count = scalar.addi %absolute, %c1_2 : i32
+      %count64 = scalar.extui %count : i32 to i64
+      %next = scalar.addi %sum, %count64 : i64
+      scf.yield %next : i64
+    }
+    %end = scalar.addi %position, %length : i32
+    %maximum_next = scalar.maxui %maximum, %end : i32
+    %is_generated = scalar.cmpi eq, %flag, %generated_flag : i32
+    %generated_next = scalar.ori %generated, %is_generated : i1
+    scf.yield %known_next, %maximum_next, %sum, %generated_next : i32, i32, i64, i1
+  }
+  view.store %known, %observations[8] : i32, view<10xi32>
+  view.store %maximum, %observations[9] : i32, view<10xi32>
+  %pairs_origin = index.constant 104 : offset
+  %pair_count = buffer.view %results[%pairs_origin] : buffer -> view<1xi64>
+  view.store %pairs, %pair_count[0] : i64, view<1xi64>
+  %shape_origin = index.constant 112 : offset
+  %shape = buffer.view %results[%shape_origin] : buffer -> view<1xi32>
+  %capacity_word = index.cast %token_capacity : index to i32
+  view.store %capacity_word, %shape[0] : i32, view<1xi32>
+  %absent_proposal = scalar.xori %generated, %true : i1
+  scf.if %absent_proposal {
+    %proposal_origin = index.constant 32 : offset
+    %proposal = buffer.view %results[%proposal_origin] : buffer -> view<1xi32>
+    view.store %c0_2, %proposal[0] : i32, view<1xi32>
+  }
   view.store %total, %accepted_header[0] : i32, view<3xi32>
   view.store %span_word, %accepted_header[1] : i32, view<3xi32>
   view.store %c0_2, %accepted_header[2] : i32, view<3xi32>
@@ -281,7 +341,7 @@ check.scenario public @accept_frontiers {
   check.trial[16](%trial: index, %entropy: check.entropy) {
     %mixed_inputs, %width, %span_count, %position, %token_capacity, %input_words = check.generate<@accept_parameters>(%trial) : (index) -> (index, index, index, index, index, index)
     %packet_capacity = check.literal value(128) : index
-    %feedback_words = check.literal value(1288) : index
+    %feedback_words = check.literal value(1310) : index
     %epoch = check.generate.fill value(-99) : tensor<[%packet_capacity]x29xi32>
     %inputs = check.generate.iota offset(1000) step(1) : tensor<[%input_words]xi32>
     %predictions = check.generate.fill value(-99) : tensor<[%packet_capacity]xi32>
@@ -311,7 +371,7 @@ check.scenario public @accept_empty_epoch {
     %token_capacity = check.literal value(1) : index
     %input_words = check.generate<@sequence_input_words>(%trial, %token_capacity) : (index, index) -> (index)
     %packet_capacity = check.literal value(128) : index
-    %feedback_words = check.literal value(1288) : index
+    %feedback_words = check.literal value(1310) : index
     %epoch = check.generate.fill value(-99) : tensor<[%packet_capacity]x29xi32>
     %inputs = check.generate.iota offset(1000) step(1) : tensor<[%input_words]xi32>
     %predictions = check.generate.fill value(-99) : tensor<[%packet_capacity]xi32>
@@ -360,7 +420,7 @@ check.scenario public @accept_wide_epoch {
     %token_capacity = check.literal value(16384) : index
     %input_words = check.generate<@sequence_input_words>(%trial, %token_capacity) : (index, index) -> (index)
     %packet_capacity = check.literal value(2048) : index
-    %feedback_words = check.literal value(20488) : index
+    %feedback_words = check.literal value(20510) : index
     %epoch = check.generate.fill value(-99) : tensor<[%packet_capacity]x29xi32>
     %inputs = check.generate.iota offset(1000) step(1) : tensor<[%input_words]xi32>
     %predictions = check.generate.fill value(-99) : tensor<[%packet_capacity]xi32>
