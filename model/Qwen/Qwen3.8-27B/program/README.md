@@ -34,6 +34,29 @@ replacing its bytes, preserving the packed footprint. `dflash_weights.loom`
 selects draft preparation. These policies are auxiliary compiler inputs in
 both representations; checkpoints stay outside the build payload graph.
 
+## Output-head execution scope
+
+Activation packing, the Q6_K vocabulary contraction, and partial winner
+selection use bounded workgroup populations. Groups visit multiple logical
+tiles as the workload grows. Projection cohorts retain weights across rows
+through the shared panel template; subgroup width comes from the execution
+target. Greedy selection still ignores padded vocabulary entries, and sampled
+selection applies each request's token permissions before choosing winners.
+
+The head launches up to four workgroups per execution unit in the selected
+queue's deployment scope, clamped to useful tiles. The model requires
+`target.execution.unit.count`; its launch counts cannot compile without that
+fact. The serving runtime supplies the selected queue's count during target
+specialization. Source and relocatable-bytecode packages both use that path.
+Native AOT compilation requires a deployment profile carrying the count; an
+architecture name alone does not specify device capacity. Four groups per unit
+is the head's launch policy, not a claim about exact kernel residency.
+
+The prefix projection preserves complete inactive cohorts and computes all
+eight rows of a partially live cohort. Caller-owned byte origins and the
+logical live prefix retain their existing meaning. The final short cohort
+uses the same shared projection entries as ordinary decode.
+
 ## Image input
 
 The image-input providers connect the text image service to Qwen's trained

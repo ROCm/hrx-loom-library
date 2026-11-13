@@ -13,7 +13,7 @@ func.decl @qwen38_packet_identity_origin(%capacity: index) -> (offset)
 
 template.decl @sampling.categorical_excluding_f32(%columns: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64) -> (i32)
 
-template.decl @qwen38.greedy_argmax_f32.partial(%token_count: index, %logit_stride: index, %output_size: index, %excluded_id: i32, %logits: buffer, %partial_logits: buffer, %partial_token_ids: buffer)
+template.decl @qwen38.greedy_argmax_f32.partial(%row: index, %partial: index, %token_count: index, %logit_stride: index, %output_size: index, %excluded_id: i32, %logits: buffer, %partial_logits: buffer, %partial_token_ids: buffer)
 
 func.def @qwen38_sampling_excluded_token(%flags: i32) -> (i32) {
   %tool_bit = scalar.constant 2 : i32
@@ -28,35 +28,46 @@ func.def @qwen38_sampling_excluded_token(%flags: i32) -> (i32) {
 
 // Apply current-turn permissions at the first winner reduction, including
 // every speculative target row. Padded identities are never dereferenced.
-kernel.def @qwen38_sampling_partial_rows(%rows_value: index) {
+kernel.def @qwen38_sampling_partial_rows(%rows_value: index, %workgroup_budget: index) {
   %rows = index.assume %rows_value [range(%rows_value, 1, 2147483647)] : index
+  %budget = index.assume %workgroup_budget [range(%workgroup_budget, 1, 2147483647)] : index
   %partials = index.constant 61 : index
+  %tiles = index.mul %partials, %rows : index
+  %groups = index.min %tiles, %budget : index
   %c1_index = index.constant 1 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%partials, %rows, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
+  kernel.launch.config workgroups(%groups, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
 } launch(%rows_value: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer) {
   %packet_capacity = config.get @qwen38.packet_capacity : index
   %rows = index.assume %rows_value [range(%rows_value, 1, 2147483647)] : index
-  %row = kernel.workgroup.id<y> : index
   %origin = index.constant 0 : offset
   %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
   %count = view.load %header[2] : view<3xi32> -> i32
-  %row_word = index.cast %row : index to i32
-  %live = scalar.cmpi ult, %row_word, %count : i32
-  scf.if %live {
-    %bounded_row = index.assume %row [ge(%row, 0), lt(%row, %packet_capacity)] : index
-    %identity_origin = func.call @qwen38_packet_identity_origin(%packet_capacity) : (index) -> (offset)
-    %identities = buffer.view %epoch[%identity_origin] : buffer -> view<[%packet_capacity]x2xi32>
-    %owner_word = view.load %identities[%bounded_row, 0] : view<[%packet_capacity]x2xi32> -> i32
-    %owner_value = index.cast %owner_word : i32 to index
-    %owner = index.assume %owner_value [ge(%owner_value, 0), lt(%owner_value, %packet_capacity)] : index
-    %policy_origin = func.call @qwen38_packet_policy_origin(%packet_capacity) : (index) -> (offset)
-    %policies = buffer.view %epoch[%policy_origin] : buffer -> view<[%packet_capacity]x6xi32>
-    %flags = view.load %policies[%owner, 3] : view<[%packet_capacity]x6xi32> -> i32
-    %excluded = func.call @qwen38_sampling_excluded_token(%flags) : (i32) -> (i32)
-    %stride = index.constant 248320 : index
-    %columns = index.constant 248077 : index
-    template.apply<@qwen38.greedy_argmax_f32.partial>(%rows, %stride, %columns, %excluded, %logits, %partial_logits, %partial_ids) : (index, index, index, i32, buffer, buffer, buffer)
+  %partials = index.constant 61 : index
+  %tiles = index.mul %partials, %rows : index
+  %group = kernel.workgroup.id<x> : index
+  %groups = kernel.workgroup.count<x> : index
+  scf.for %tile = [%group to %tiles step %groups] {
+    %row = index.div %tile, %partials : index
+    %partial = index.rem %tile, %partials : index
+    %row_word = index.cast %row : index to i32
+    %live = scalar.cmpi ult, %row_word, %count : i32
+    scf.if %live {
+      %bounded_row = index.assume %row [ge(%row, 0), lt(%row, %packet_capacity)] : index
+      %identity_origin = func.call @qwen38_packet_identity_origin(%packet_capacity) : (index) -> (offset)
+      %identities = buffer.view %epoch[%identity_origin] : buffer -> view<[%packet_capacity]x2xi32>
+      %owner_word = view.load %identities[%bounded_row, 0] : view<[%packet_capacity]x2xi32> -> i32
+      %owner_value = index.cast %owner_word : i32 to index
+      %owner = index.assume %owner_value [ge(%owner_value, 0), lt(%owner_value, %packet_capacity)] : index
+      %policy_origin = func.call @qwen38_packet_policy_origin(%packet_capacity) : (index) -> (offset)
+      %policies = buffer.view %epoch[%policy_origin] : buffer -> view<[%packet_capacity]x6xi32>
+      %flags = view.load %policies[%owner, 3] : view<[%packet_capacity]x6xi32> -> i32
+      %excluded = func.call @qwen38_sampling_excluded_token(%flags) : (i32) -> (i32)
+      %stride = index.constant 248320 : index
+      %columns = index.constant 248077 : index
+      template.apply<@qwen38.greedy_argmax_f32.partial>(%row, %partial, %rows, %stride, %columns, %excluded, %logits, %partial_logits, %partial_ids) : (index, index, index, index, index, i32, buffer, buffer, buffer)
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   }
   kernel.return
 }

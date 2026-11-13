@@ -143,7 +143,7 @@ def synchronize(
     output = context.bazel(
         [
             "cquery",
-            "kind('loom_model rule', set(" + " ".join(patterns) + "))",
+            "attr('model_name', '.+', set(" + " ".join(patterns) + "))",
             "--output=starlark",
             "--starlark:expr=" + _MODEL_QUERY,
         ],

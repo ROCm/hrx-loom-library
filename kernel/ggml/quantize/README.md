@@ -10,6 +10,11 @@ block access, and reusable encode/decode computation. Keeping that boundary
 explicit lets compatibility entry points and native fused kernels share the
 same representation code without sharing an execution contract.
 
+The bounded entry adds a caller-owned workgroup budget to the configuration
+ABI while preserving the conversion and buffer contract. Groups stride through
+physical records, reusing their shared scratch after a workgroup barrier. The
+budget is clamped to useful records and does not change quantization order.
+
 The production source documents its upstream reference and ABI. Adjacent
 [`q8_1_x4_f32_test.loom`](q8_1_x4_f32_test.loom) owns the nonzero correctness
 cases and representative benchmarks through a `loom_test` dependency on the

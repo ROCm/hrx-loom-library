@@ -1,0 +1,82 @@
+// The model owns only the live-prefix contract around the shared contraction.
+// A complete inactive cohort must preserve its destination bitwise; an active
+// cohort computes all eight rows even when the live prefix ends inside it.
+// Small finite packed operands use the independent scalar-byte F64 oracle.
+
+kernel.decl @qwen38_output_projection_q6k_m8_prefix(%inputs: index, %outputs: index, %workgroup_budget: index) launch(%row_begin: index, %inputs_argument: index, %outputs_argument: index, %control: buffer, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @initialize_q6(%uniform: i1, %quantized: i1, %rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
+
+func.decl @q6_q8_reference(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.def @prefix_reference(%row_begin: index, %inputs: index, %outputs: index, %control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %control[%origin] : buffer -> view<1xi32>
+  %live_word = view.load %header[0] : view<1xi32> -> i32
+  %live = index.cast %live_word : i32 to index
+  %active = index.cmp ult, %row_begin, %live : index
+  scf.if %active {
+    %rows = index.constant 8 : index
+    func.call @q6_q8_reference(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  }
+  func.return
+}
+
+func.def @prefix_configuration(%configuration: index, %control: buffer) -> (index) {
+  %cohort_rows = index.constant 8 : index
+  %row_begin = index.mul %configuration, %cohort_rows : index
+  %live_rows = index.add %cohort_rows, %configuration : index
+  %live_word = index.cast %live_rows : index to i32
+  %origin = index.constant 0 : offset
+  %header = buffer.view %control[%origin] : buffer -> view<1xi32>
+  view.store %live_word, %header[0] : i32, view<1xi32>
+  func.return %row_begin : index
+}
+
+check.scenario public @output_projection_live_cohort configure[2](%configuration: index, %configuration_entropy: check.entropy) {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %rows = check.literal value(8) : index
+    %inputs = check.literal value(768) : index
+    %outputs = check.literal value(33) : index
+    %budget = check.literal value(2) : index
+    %control = check.generate.fill value(0) : tensor<1xi32>
+    %row_begin = check.generate<@prefix_configuration>(%configuration, %control) : (index, tensor<1xi32>) -> (index)
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<6912xi8>
+    %weight = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<20790xi8>
+    %uniform = check.literal value(false) : i1
+    %quantized = check.literal value(true) : i1
+    check.generate<@initialize_q6>(%uniform, %quantized, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<6912xi8>, tensor<20790xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<8x33xf32>
+    check.compare<@qwen38_output_projection_q6k_m8_prefix, @prefix_reference>[%inputs, %outputs, %budget](%row_begin, %inputs, %outputs, %control, %input, %weight, %output) : [index, index, index](index, index, index, tensor<1xi32>, tensor<6912xi8>, tensor<20790xi8>, tensor<8x33xf32>) -> () {
+      check.expect.approximate actual(%output) expected(%output) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<8x33xf32>, tensor<8x33xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<6912xi8>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<20790xi8>
+      check.expect.bitwise actual(%control) expected(%control) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.case public @output_projection_inactive_cohort {
+  %inputs = check.literal value(256) : index
+  %outputs = check.literal value(17) : index
+  %budget = check.literal value(2) : index
+  %row_begin = check.literal value(8) : index
+  %control = check.generate.fill value(8) : tensor<1xi32>
+  %input = check.generate.fill value(0) : tensor<2304xi8>
+  %weight = check.generate.fill value(0) : tensor<3570xi8>
+  %output = check.generate.fill value(-99.0) : tensor<8x17xf32>
+  %untouched = check.generate.fill value(-99.0) : tensor<8x17xf32>
+  kernel.launch @qwen38_output_projection_q6k_m8_prefix[%inputs, %outputs, %budget](%row_begin, %inputs, %outputs, %control, %input, %weight, %output) : [index, index, index](index, index, index, tensor<1xi32>, tensor<2304xi8>, tensor<3570xi8>, tensor<8x17xf32>)
+  check.expect.bitwise actual(%output) expected(%untouched) : tensor<8x17xf32>
+  %first_row = check.literal value(0) : index
+  %empty_control = check.generate.fill value(0) : tensor<1xi32>
+  kernel.launch @qwen38_output_projection_q6k_m8_prefix[%inputs, %outputs, %budget](%first_row, %inputs, %outputs, %empty_control, %input, %weight, %output) : [index, index, index](index, index, index, tensor<1xi32>, tensor<2304xi8>, tensor<3570xi8>, tensor<8x17xf32>)
+  check.expect.bitwise actual(%output) expected(%untouched) : tensor<8x17xf32>
+  check.return
+}
+
+check.benchmark<@output_projection_live_cohort> @output_projection_live_cohort_benchmark
+
+check.benchmark<@output_projection_inactive_cohort> @output_projection_inactive_cohort_benchmark
