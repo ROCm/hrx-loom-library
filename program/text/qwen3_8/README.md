@@ -77,6 +77,24 @@ immutable feedback may be published. Continuations preserve their first-cohort
 owner while compacting live rows. Neither policy transforms nor packet writers
 wait for a device or infer ownership from buffer contents.
 
+Each verified epoch brackets proposal and target execution with three ordered
+queue-clock captures. The samples share the normal feedback banks and retire
+before publication, so observing them adds no host wait or separate readback.
+The shared feedback header also carries the work actually executed: neural
+inputs per proposal step, verification-width counts, known inputs, context
+extent, logical causal query/key pairs, and selected executable capacities.
+Lookup-satisfied rows contribute no neural work, and the parallel drafter
+reports one block-processing step. These counts describe logical work rather
+than measured memory traffic. Raw ticks use the runner's clock frequency and
+valid-bit width.
+
+Acceptance follows each span's actual anchor-plus-draft length within the
+compiled verification ceiling. Different spans can therefore stop drafting at
+different widths without reading unused candidate slots. The completed
+publication callback receives the model's retained control state alongside
+both immutable feedback banks. The current policy retains its configured
+drafting depth; measurements do not themselves change proposal selection.
+
 `chat_media.loom` plans and renders ordered images and timestamped video frames.
 Native inspection supplies decoded dimensions, source ranges, and finite,
 nondecreasing timestamps; source selects temporal pairs, geometry, marker ranges,
