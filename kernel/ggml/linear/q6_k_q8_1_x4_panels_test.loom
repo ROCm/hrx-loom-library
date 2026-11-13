@@ -1,0 +1,158 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Independent scalar-byte F64 contractions check row/panel reuse, signed
+// codes and factors, strided tile ownership, odd K-block counts, channel
+// tails, and nonzero origins. The shared reference never calls production
+// readers. A protected input header carries the case ordinal to the CPU
+// reference; the command specializes it from the scenario configuration.
+// Whole-storage checks retain input immutability and output guards.
+
+kernel.decl @ggml_linear_q6k_q8_1_x4_panels_m1(%inputs: index, %outputs: index, %budget: index) launch(%inputs_argument: index, %outputs_argument: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q6k_q8_1_x4_panels_m2(%inputs: index, %outputs: index, %budget: index) launch(%inputs_argument: index, %outputs_argument: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q6k_q8_1_x4_panels_m3(%inputs: index, %outputs: index, %budget: index) launch(%inputs_argument: index, %outputs_argument: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q6k_q8_1_x4_panels_m4(%inputs: index, %outputs: index, %budget: index) launch(%inputs_argument: index, %outputs_argument: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q6k_q8_1_x4_panels_m8(%inputs: index, %outputs: index, %budget: index) launch(%inputs_argument: index, %outputs_argument: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q6k_q8_1_x4_panels_m32(%inputs: index, %outputs: index, %budget: index) launch(%inputs_argument: index, %outputs_argument: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @initialize_q6(%uniform: i1, %quantized: i1, %rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
+
+func.decl @q6_reference(%quantized: i1, %rows: index, %inputs: index, %outputs: index, %input_base: offset, %weight_base: offset, %output_base: offset, %input: buffer, %weight: buffer, %output: buffer)
+
+// Each production cohort uses a final partial tile and multiple grid strides.
+// A second M1 case also clamps a budget larger than the useful tile count.
+func.def pure inline @panel_case_shape(%configuration: index) -> (index, index, index, index, index, index, index, index) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c6 = index.constant 6 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c128 = index.constant 128 : index
+  %c144 = index.constant 144 : index
+  %c210 = index.constant 210 : index
+  %c256 = index.constant 256 : index
+  %c768 = index.constant 768 : index
+  %small = index.cmp ult, %configuration, %c4 : index
+  %eight = index.cmp eq, %configuration, %c4 : index
+  %clamped = index.cmp eq, %configuration, %c6 : index
+  %small_rows = index.add %configuration, %c1 : index
+  %large_rows = scf.select %eight, %c8, %c32 : index
+  %cohort_rows = scf.select %small, %small_rows, %large_rows : index
+  %rows = scf.select %clamped, %c1, %cohort_rows : index
+  %large_panels = scf.select %eight, %c2, %c1 : index
+  %narrow = index.cmp ule, %rows, %c4 : index
+  %panels = scf.select %narrow, %c4, %large_panels : index
+  %parity = index.rem %configuration, %c2 : index
+  %odd = index.cmp ne, %parity, %c0 : index
+  %inputs = scf.select %odd, %c768, %c256 : index
+  %full_channels = index.mul %panels, %c16 : index
+  %outputs = index.add %full_channels, %c1 : index
+  %ordinary_budget = index.add %parity, %c1 : index
+  %budget = scf.select %clamped, %c32, %ordinary_budget : index
+  %q8_groups = index.div %inputs, %c128 : index
+  %q8_row_bytes = index.mul %q8_groups, %c144 : index
+  %input_bytes = index.mul %rows, %q8_row_bytes : index
+  %q6_blocks = index.div %inputs, %c256 : index
+  %weight_row_bytes = index.mul %q6_blocks, %c210 : index
+  %weight_bytes = index.mul %outputs, %weight_row_bytes : index
+  %input_storage_bytes = index.add %input_bytes, %c32 : index
+  %weight_storage_bytes = index.add %weight_bytes, %c32 : index
+  func.return %rows, %inputs, %outputs, %budget, %input_bytes, %weight_bytes, %input_storage_bytes, %weight_storage_bytes : index, index, index, index, index, index, index, index
+}
+
+func.def @initialize_case_header(%configuration: index, %input: buffer) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %input[%origin] : buffer -> view<1xi32>
+  %value = index.cast %configuration : index to i32
+  view.store %value, %header[0] : i32, view<1xi32>
+  func.return
+}
+
+func.def @panel_reference(%input_storage: buffer, %weight_storage: buffer, %output_storage: buffer) {
+  %origin = index.constant 0 : offset
+  %payload = index.constant 16 : offset
+  %header = buffer.view %input_storage[%origin] : buffer -> view<1xi32>
+  %word = view.load %header[0] : view<1xi32> -> i32
+  %configuration = index.cast %word : i32 to index
+  %rows, %inputs, %outputs, %budget, %input_bytes, %weight_bytes, %input_storage_bytes, %weight_storage_bytes = func.call pure @panel_case_shape(%configuration) : (index) -> (index, index, index, index, index, index, index, index)
+  %quantized = scalar.constant true : i1
+  func.call @q6_reference(%quantized, %rows, %inputs, %outputs, %payload, %payload, %payload, %input_storage, %weight_storage, %output_storage) : (i1, index, index, index, offset, offset, offset, buffer, buffer, buffer)
+  func.return
+}
+
+command.def @panel_projection(%configuration: index) launch(%input_storage: buffer, %weight_storage: buffer, %output_storage: buffer) {
+  %rows, %inputs, %outputs, %budget, %input_bytes, %weight_bytes, %input_storage_bytes, %weight_storage_bytes = func.call pure @panel_case_shape(%configuration) : (index) -> (index, index, index, index, index, index, index, index)
+  %payload = index.constant 16 : offset
+  %input = buffer.view %input_storage[%payload] : buffer -> view<[%input_bytes]xi8>
+  %weight = buffer.view %weight_storage[%payload] : buffer -> view<[%weight_bytes]xi8>
+  %output = buffer.view %output_storage[%payload] : buffer -> view<[%rows]x[%outputs]xf32>
+  %c1 = index.constant 1 : index
+  %is_m1 = index.cmp eq, %rows, %c1 : index
+  scf.if %is_m1 {
+    kernel.launch @ggml_linear_q6k_q8_1_x4_panels_m1[%inputs, %outputs, %budget](%inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, view<[%input_bytes]xi8>, view<[%weight_bytes]xi8>, view<[%rows]x[%outputs]xf32>)
+  }
+  %c2 = index.constant 2 : index
+  %is_m2 = index.cmp eq, %rows, %c2 : index
+  scf.if %is_m2 {
+    kernel.launch @ggml_linear_q6k_q8_1_x4_panels_m2[%inputs, %outputs, %budget](%inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, view<[%input_bytes]xi8>, view<[%weight_bytes]xi8>, view<[%rows]x[%outputs]xf32>)
+  }
+  %c3 = index.constant 3 : index
+  %is_m3 = index.cmp eq, %rows, %c3 : index
+  scf.if %is_m3 {
+    kernel.launch @ggml_linear_q6k_q8_1_x4_panels_m3[%inputs, %outputs, %budget](%inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, view<[%input_bytes]xi8>, view<[%weight_bytes]xi8>, view<[%rows]x[%outputs]xf32>)
+  }
+  %c4 = index.constant 4 : index
+  %is_m4 = index.cmp eq, %rows, %c4 : index
+  scf.if %is_m4 {
+    kernel.launch @ggml_linear_q6k_q8_1_x4_panels_m4[%inputs, %outputs, %budget](%inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, view<[%input_bytes]xi8>, view<[%weight_bytes]xi8>, view<[%rows]x[%outputs]xf32>)
+  }
+  %c8 = index.constant 8 : index
+  %is_m8 = index.cmp eq, %rows, %c8 : index
+  scf.if %is_m8 {
+    kernel.launch @ggml_linear_q6k_q8_1_x4_panels_m8[%inputs, %outputs, %budget](%inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, view<[%input_bytes]xi8>, view<[%weight_bytes]xi8>, view<[%rows]x[%outputs]xf32>)
+  }
+  %c32 = index.constant 32 : index
+  %is_m32 = index.cmp eq, %rows, %c32 : index
+  scf.if %is_m32 {
+    kernel.launch @ggml_linear_q6k_q8_1_x4_panels_m32[%inputs, %outputs, %budget](%inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, view<[%input_bytes]xi8>, view<[%weight_bytes]xi8>, view<[%rows]x[%outputs]xf32>)
+  }
+  command.return
+}
+
+check.scenario public @q6_q8_panel_cohorts configure[7](%configuration: index, %configuration_entropy: check.entropy) {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %rows, %inputs, %outputs, %budget, %input_bytes, %weight_bytes, %input_storage_bytes, %weight_storage_bytes = check.generate<@panel_case_shape>(%configuration) : (index) -> (index, index, index, index, index, index, index, index)
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input_storage = check.generate.random.uniform seed(%input_seed) range(-128 to 127) : tensor<[%input_storage_bytes]xi8>
+    %weight_storage = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<[%weight_storage_bytes]xi8>
+    %input = check.tensor.view %input_storage offset(16) : tensor<[%input_storage_bytes]xi8> -> tensor<[%input_bytes]xi8>
+    %weight = check.tensor.view %weight_storage offset(16) : tensor<[%weight_storage_bytes]xi8> -> tensor<[%weight_bytes]xi8>
+    check.generate<@initialize_case_header>(%configuration, %input_storage) : (index, tensor<[%input_storage_bytes]xi8>) -> ()
+    %uniform = check.literal value(false) : i1
+    %quantized = check.literal value(true) : i1
+    check.generate<@initialize_q6>(%uniform, %quantized, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%input_bytes]xi8>, tensor<[%weight_bytes]xi8>) -> ()
+    // The largest case writes 32*17 values. Padding stays sentinel-filled.
+    %storage = check.generate.fill value(-99.0) : tensor<552xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<552xf32> -> tensor<4xf32>
+    %suffix = check.tensor.view %storage offset(2192) : tensor<552xf32> -> tensor<4xf32>
+    check.compare<@panel_projection, @panel_reference>[%configuration](%input_storage, %weight_storage, %storage) : [index](tensor<[%input_storage_bytes]xi8>, tensor<[%weight_storage_bytes]xi8>, tensor<552xf32>) -> () {
+      check.expect.approximate actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<552xf32>, tensor<552xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%suffix) expected(%suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%input_storage) expected(%input_storage) : tensor<[%input_storage_bytes]xi8>
+      check.expect.bitwise actual(%weight_storage) expected(%weight_storage) : tensor<[%weight_storage_bytes]xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q6_q8_panel_cohorts> @q6_q8_panel_projection
