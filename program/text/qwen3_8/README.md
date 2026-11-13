@@ -53,6 +53,24 @@ and repeated values must agree after effort alias resolution; member order
 never overrides an explicit preference. Unused keywords do not affect the
 template. The policy checks the types and values of controls it consumes.
 
+Nullable request controls inherit the omission defaults. This includes
+`enable_thinking`, `reasoning_effort`, `preserve_thinking`, and
+`chat_template_kwargs`: a null control does not conflict with an explicit
+top-level or nested value. A null `model_options` leaves the image budget at its
+default.
+
+Sampling consumes `temperature`, `top_p`, `top_k`, and `seed`. Request nulls
+preserve the deployment's sampling defaults, including an explicit default
+seed; otherwise the normal request nonce supplies the seed. Deployment sampling
+configuration remains strict. Invalid numeric values and duplicate sampling
+members are rejected before admission.
+
+Other client fields pass through without adding generation behavior. In
+particular, this policy does not implement `stop`, presence/frequency penalties,
+or `response_format` constraints. The server's
+[HTTP profile](https://rocm.github.io/hrx-system/loom/serving/http-profiles/#request-compatibility)
+documents native controls, nullable defaults, and accepted compatibility fields.
+
 Tool declarations are prompt data, not an execution allowlist. The string
 `tool_choice: "none"` suppresses the tool token through the model's sampling
 packet without changing retained history. The policy does not validate tool
