@@ -28,6 +28,16 @@ remain unchanged. Whole and partitioned Q6 contractions use the same range
 body; command selection retains the tuned split preference. The matrix motif
 owns native operand layouts, so these entries inherit the execution target.
 
+Narrow RDNA Q6 projections use the shared GGML F32 register panel. A wave64
+worker retains decoded weights and sixteen activation rows across a 512-value
+K panel, with 40 KiB of reusable workgroup storage. The queue's execution-unit
+count bounds the worker grid; each worker traverses any remaining logical
+tiles. Query/key projections use this path through 32 live rows. Residual
+projections use it through 16 rows and retain the matrix schedule above that
+crossover. Other targets retain their matrix providers. The enclosing command
+samples the live count once and forwards it through the layers, allowing all
+indirect launch counts to share one device producer.
+
 Attention separates preparation, cache publication, history partitions, and
 merge. Four subgroups share each 16-query by 64-cache-row panel. Their actual
 width determines the staging stride, fragment carriers, score packets, and

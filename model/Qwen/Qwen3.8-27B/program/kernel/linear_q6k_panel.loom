@@ -1,0 +1,54 @@
+// Qwen's narrow RDNA projections bind the shared F32 Q6 panel to wave64.
+// The workload carries one saved epoch-row observation; the first control
+// word retains that value until completion. Other epoch words may change.
+// Numerical decoding, tiling, tails, and output ownership belong to GGML.
+
+amdgpu.target<gfx11-generic> @qwen38_q6_panel_rdna {subgroup_size = 64}
+
+func.decl pure @ggml_linear_q6k_f32_panel_grid(%rows: index, %outputs: index, %budget: index) -> (index)
+
+func.decl @ggml_linear_q6k_f32_panels(%add_residual: i1, %rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+// Bound queued work by the acquired queue's available execution units. Each
+// worker traverses additional tiles, retaining its 40 KiB staging allocation.
+func.def pure inline @panel_workgroups(%rows: index, %outputs: index) -> (index) {
+  %units = target.execution.unit.count : index
+  %unit_limit = index.constant 1250 : index
+  %groups_per_unit = index.constant 8 : index
+  %bounded_units = index.min %units, %unit_limit : index
+  %budget = index.mul %bounded_units, %groups_per_unit : index
+  %groups = func.call pure @ggml_linear_q6k_f32_panel_grid(%rows, %outputs, %budget) : (index, index, index) -> (index)
+  func.return %groups : index
+}
+
+func.def inline @project(%add_residual: i1, %control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %control[%origin] : buffer -> view<1xi32>
+  %word = view.load %header[0] : view<1xi32> -> i32
+  %count = index.cast %word : i32 to index
+  %rows = index.assume %count [range(%count, 0, 32)] : index
+  func.call @ggml_linear_q6k_f32_panels(%add_residual, %rows, %inputs, %outputs, %input, %weight, %output) : (i1, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+kernel.def target(@qwen38_q6_panel_rdna) @qwen38_linear_q6k_f32_panel(%rows: index, %input_size: index, %output_size: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %groups = func.call pure @panel_workgroups(%rows, %output_size) : (index, index) -> (index)
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %add_residual = scalar.constant false : i1
+  func.call @project(%add_residual, %control, %inputs, %outputs, %input, %weight, %output) : (i1, buffer, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@qwen38_q6_panel_rdna) @qwen38_linear_q6k_f32_panel_residual(%rows: index, %input_size: index, %output_size: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %groups = func.call pure @panel_workgroups(%rows, %output_size) : (index, index) -> (index)
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %residual: buffer) {
+  %add_residual = scalar.constant true : i1
+  func.call @project(%add_residual, %control, %inputs, %outputs, %input, %weight, %residual) : (i1, buffer, index, index, buffer, buffer, buffer)
+  kernel.return
+}

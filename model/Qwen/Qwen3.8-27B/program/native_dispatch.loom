@@ -178,20 +178,65 @@ command.def public target(@qwen38_execution) @qwen38_dispatch_linear_q6k_f16_x64
   command.return
 }
 
-// The shared c64t32 kernels inherit the command target. Their matrix templates
-// select native operand layouts without restricting these command ABIs to an
-// architecture family.
+// RDNA uses register panels where decoded-weight reuse wins. Wider residual
+// cohorts retain the matrix schedule; other targets retain their native matrix
+// providers. The live row count is sampled once by the enclosing command.
+template.decl @qwen38.prefill.q6_panel_rows(%add_residual: i1) -> (index)
+
+template.def<@qwen38.prefill.q6_panel_rows> priority(-1) @qwen38_prefill_q6_panel_rows_default(%add_residual: i1) -> (index) {
+  %rows = index.constant 0 : index
+  template.return %rows : index
+}
+
+template.def<@qwen38.prefill.q6_panel_rows> target(@qwen38_dispatch_rdna) @qwen38_prefill_q6_panel_rows_rdna(%add_residual: i1) -> (index) {
+  %residual_rows = index.constant 16 : index
+  %plain_rows = index.constant 32 : index
+  %rows = scf.select %add_residual, %residual_rows, %plain_rows : index
+  template.return %rows : index
+}
+
+kernel.decl @qwen38_linear_q6k_f32_panel(%live_rows: index, %input_size: index, %output_size: index) launch(%control: buffer, %input_size_data: index, %output_size_data: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_linear_q6k_f32_panel_residual(%live_rows: index, %input_size: index, %output_size: index) launch(%control: buffer, %input_size_data: index, %output_size_data: index, %input: buffer, %weight: buffer, %residual: buffer)
+
 kernel.decl @qwen38_linear_q6k_f16_c64t32_f32acc(%token_count: index, %input_size: index, %output_size: index) launch(%control: buffer, %input_size_data: index, %output_size_data: index, %input: buffer, %weight: buffer, %output: buffer)
 
-command.def public target(@qwen38_execution) @qwen38_dispatch_linear_q6k_f16_c64t32_f32acc(%dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
-  kernel.launch @qwen38_linear_q6k_f16_c64t32_f32acc[%dispatch_token_count, %dispatch_input_size, %dispatch_output_size](%control, %input_size_data, %output_size_data, %input, %weight, %output) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+command.def public target(@qwen38_execution) @qwen38_dispatch_linear_q6k_f16_c64t32_f32acc(%live_rows: index, %dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %c0 = index.constant 0 : index
+  %add_residual = scalar.constant false : i1
+  %panel_limit = template.apply<@qwen38.prefill.q6_panel_rows>(%add_residual) : (i1) -> (index)
+  %uses_panel = index.cmp ne, %panel_limit, %c0 : index
+  scf.if %uses_panel {
+    // Disabled families may carry a larger prefill count in the same header.
+    %active = index.cmp ne, %dispatch_token_count, %c0 : index
+    %selected_rows = scf.select %active, %live_rows, %c0 : index
+    %rows = index.assume %selected_rows [range(%selected_rows, 0, 32)] : index
+    kernel.launch @qwen38_linear_q6k_f32_panel[%rows, %dispatch_input_size, %dispatch_output_size](%control, %input_size_data, %output_size_data, %input, %weight, %output) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+  } else {
+    kernel.launch @qwen38_linear_q6k_f16_c64t32_f32acc[%dispatch_token_count, %dispatch_input_size, %dispatch_output_size](%control, %input_size_data, %output_size_data, %input, %weight, %output) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+  }
   command.return
 }
 
 kernel.decl @qwen38_linear_q6k_f16_c64t32_f32acc_residual(%token_count: index, %input_size: index, %output_size: index) launch(%token_count_data: buffer, %input_size_data: index, %output_size_data: index, %input: buffer, %weight: buffer, %residual: buffer)
 
-command.def public target(@qwen38_execution) @qwen38_dispatch_linear_q6k_f16_c64t32_f32acc_residual(%dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%token_count_data: buffer, %input: buffer, %weight: buffer, %residual: buffer) {
-  kernel.launch @qwen38_linear_q6k_f16_c64t32_f32acc_residual[%dispatch_token_count, %dispatch_input_size, %dispatch_output_size](%token_count_data, %input_size_data, %output_size_data, %input, %weight, %residual) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+command.def public target(@qwen38_execution) @qwen38_dispatch_linear_q6k_f16_c64t32_f32acc_residual(%live_rows: index, %dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%token_count_data: buffer, %input: buffer, %weight: buffer, %residual: buffer) {
+  %c0 = index.constant 0 : index
+  %add_residual = scalar.constant true : i1
+  %panel_limit = template.apply<@qwen38.prefill.q6_panel_rows>(%add_residual) : (i1) -> (index)
+  %has_panel = index.cmp ne, %panel_limit, %c0 : index
+  scf.if %has_panel {
+    %active = index.cmp ne, %dispatch_token_count, %c0 : index
+    %narrow = index.cmp ule, %live_rows, %panel_limit : index
+    %uses_panel = scalar.andi %active, %narrow : i1
+    %selected_rows = scf.select %uses_panel, %live_rows, %c0 : index
+    %rows = index.assume %selected_rows [range(%selected_rows, 0, 16)] : index
+    %matrix_rows = scf.select %uses_panel, %c0, %dispatch_token_count : index
+    kernel.launch @qwen38_linear_q6k_f32_panel_residual[%rows, %dispatch_input_size, %dispatch_output_size](%token_count_data, %input_size_data, %output_size_data, %input, %weight, %residual) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+    kernel.launch @qwen38_linear_q6k_f16_c64t32_f32acc_residual[%matrix_rows, %dispatch_input_size, %dispatch_output_size](%token_count_data, %input_size_data, %output_size_data, %input, %weight, %residual) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+  } else {
+    kernel.launch @qwen38_linear_q6k_f16_c64t32_f32acc_residual[%dispatch_token_count, %dispatch_input_size, %dispatch_output_size](%token_count_data, %input_size_data, %output_size_data, %input, %weight, %residual) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+  }
   command.return
 }
 
