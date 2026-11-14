@@ -1,0 +1,157 @@
+// F32 register panels against the shared scalar-byte/F64 oracle. Exact-sized
+// input rows and guarded outputs exercise empty, partial, and complete tiles,
+// odd K-block tails, and multiple logical tiles per worker. Plain and residual
+// publication use the same fixtures; the residual is the initial -99 sentinel.
+
+config.decl @q6_panel_test.residual : %value: index where [range(%value, 0, 1)]
+
+kernel.decl @ggml_linear_q6k_f32_panel(%configured_rows: index, %configured_inputs: index, %configured_outputs: index, %worker_budget: index) launch(%count: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q6k_f32_panel_residual(%configured_rows: index, %configured_inputs: index, %configured_outputs: index, %worker_budget: index) launch(%count: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @initialize_q6(%uniform: i1, %quantized: i1, %rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
+
+func.decl @q6_f32_reference(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.def pure @geometry(%trial: index) -> (index, index, index, index, index, index) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  %c15 = index.constant 15 : index
+  %c16 = index.constant 16 : index
+  %c17 = index.constant 17 : index
+  %c31 = index.constant 31 : index
+  %c32 = index.constant 32 : index
+  %c47 = index.constant 47 : index
+  %c48 = index.constant 48 : index
+  %c49 = index.constant 49 : index
+  %c96 = index.constant 96 : index
+  %c97 = index.constant 97 : index
+  %block_values = index.constant 256 : index
+  %panel_values = index.constant 512 : index
+  %tail_values = index.constant 768 : index
+  %maximum_inputs = index.constant 32768 : index
+  %block_bytes = index.constant 210 : index
+  %guards = index.constant 8 : index
+  %empty = index.cmp eq, %trial, %c0 : index
+  %single = index.cmp eq, %trial, %c1 : index
+  %short = index.cmp eq, %trial, %c2 : index
+  %aligned = index.cmp eq, %trial, %c3 : index
+  %tail = index.cmp eq, %trial, %c4 : index
+  %long = index.cmp eq, %trial, %c5 : index
+  %complete = index.cmp eq, %trial, %c6 : index
+  %long_reduction = index.cmp eq, %trial, %c7 : index
+  %last_rows = scf.select %long, %c31, %c32 : index
+  %tail_rows = scf.select %tail, %c17, %last_rows : index
+  %panel_rows = scf.select %aligned, %c16, %tail_rows : index
+  %short_rows = scf.select %short, %c15, %panel_rows : index
+  %single_row = scalar.ori %single, %long_reduction : i1
+  %nonempty_rows = scf.select %single_row, %c1, %short_rows : index
+  %rows = scf.select %empty, %c0, %nonempty_rows : index
+  %last_channels = scf.select %long, %c97, %c96 : index
+  %tail_channels = scf.select %tail, %c49, %last_channels : index
+  %panel_channels = scf.select %aligned, %c48, %tail_channels : index
+  %short_channels = scf.select %short, %c47, %panel_channels : index
+  %small = scalar.ori %empty, %single : i1
+  %ordinary_outputs = scf.select %small, %c1, %short_channels : index
+  %outputs = scf.select %long_reduction, %c49, %ordinary_outputs : index
+  %odd = scalar.ori %short, %tail : i1
+  %wide_inputs = scf.select %odd, %tail_values, %panel_values : index
+  %one_block = scalar.ori %small, %complete : i1
+  %ordinary_inputs = scf.select %one_block, %block_values, %wide_inputs : index
+  %inputs = scf.select %long_reduction, %maximum_inputs, %ordinary_inputs : index
+  %budget = scf.select %complete, %c2, %c1 : index
+  %blocks = index.div %inputs, %block_values : index
+  %records = index.mul %blocks, %outputs : index
+  %weight_bytes = index.mul %records, %block_bytes : index
+  %output_count = index.mul %rows, %outputs : index
+  %storage_count = index.add %output_count, %guards : index
+  func.return %rows, %inputs, %outputs, %budget, %weight_bytes, %storage_count : index, index, index, index, index, index
+}
+
+func.def @set_shape(%rows: index, %inputs: index, %outputs: index, %shape: buffer) {
+  %origin = index.constant 0 : offset
+  %rows32 = index.cast %rows : index to i32
+  %inputs32 = index.cast %inputs : index to i32
+  %outputs32 = index.cast %outputs : index to i32
+  %view = buffer.view %shape[%origin] : buffer -> view<3xi32>
+  view.store %rows32, %view[0] : i32, view<3xi32>
+  view.store %inputs32, %view[1] : i32, view<3xi32>
+  view.store %outputs32, %view[2] : i32, view<3xi32>
+  func.return
+}
+
+command.def @project(%configuration: index) launch(%count: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows, %inputs, %outputs, %budget, %weight_bytes, %storage_count = func.call pure @geometry(%configuration) : (index) -> (index, index, index, index, index, index)
+  %c0 = index.constant 0 : index
+  %mode = config.get @q6_panel_test.residual : index
+  %residual = index.cmp ne, %mode, %c0 : index
+  scf.if %residual {
+    kernel.launch @ggml_linear_q6k_f32_panel_residual[%rows, %inputs, %outputs, %budget](%count, %inputs, %outputs, %input, %weight, %output) : [index, index, index, index](buffer, index, index, buffer, buffer, buffer)
+  } else {
+    kernel.launch @ggml_linear_q6k_f32_panel[%rows, %inputs, %outputs, %budget](%count, %inputs, %outputs, %input, %weight, %output) : [index, index, index, index](buffer, index, index, buffer, buffer, buffer)
+  }
+  command.return
+}
+
+func.def @reference(%count: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %counts = buffer.view %count[%origin] : buffer -> view<3xi32>
+  %rows32 = view.load %counts[0] : view<3xi32> -> i32
+  %inputs32 = view.load %counts[1] : view<3xi32> -> i32
+  %outputs32 = view.load %counts[2] : view<3xi32> -> i32
+  %rows = index.cast %rows32 : i32 to index
+  %inputs = index.cast %inputs32 : i32 to index
+  %outputs = index.cast %outputs32 : i32 to index
+  func.call @q6_f32_reference(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  %mode = config.get @q6_panel_test.residual : index
+  %residual = index.cmp ne, %mode, %c0 : index
+  scf.if %residual {
+    %results = buffer.view %output[%origin] : buffer -> view<[%rows]x[%outputs]xf32>
+    %initial = scalar.constant -99.0 : f32
+    scf.for %row = [%c0 to %rows step %c1] {
+      scf.for %channel = [%c0 to %outputs step %c1] {
+        %value = view.load %results[%row, %channel] : view<[%rows]x[%outputs]xf32> -> f32
+        %sum = scalar.addf %value, %initial : f32
+        view.store %sum, %results[%row, %channel] : f32, view<[%rows]x[%outputs]xf32>
+      }
+    }
+  }
+  func.return
+}
+
+check.scenario public @q6_f32_panels configure[8](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {targets = ["gfx11-generic", "gfx9-4-generic"]}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %rows, %inputs, %outputs, %budget, %weight_bytes, %storage_count = check.generate<@geometry>(%configuration) : (index) -> (index, index, index, index, index, index)
+    %uniform = check.literal value(false) : i1
+    %quantized = check.literal value(false) : i1
+    %count = check.generate.fill value(0) : tensor<3xi32>
+    check.generate<@set_shape>(%rows, %inputs, %outputs, %count) : (index, index, index, tensor<3xi32>) -> ()
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0 to 1.0) : tensor<[%rows]x[%inputs]xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<[%weight_bytes]xi8>
+    check.generate<@initialize_q6>(%uniform, %quantized, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x[%inputs]xf32>, tensor<[%weight_bytes]xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_count]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_count]xf32> -> tensor<[%rows]x[%outputs]xf32>
+    %prefix = check.tensor.view %storage offset(0) : tensor<[%storage_count]xf32> -> tensor<4xf32>
+    check.compare<@project, @reference>[%configuration](%count, %input, %weight, %output) : [index](tensor<3xi32>, tensor<[%rows]x[%inputs]xf32>, tensor<[%weight_bytes]xi8>, tensor<[%rows]x[%outputs]xf32>) -> () {
+      check.expect.approximate actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_count]xf32>, tensor<[%storage_count]xf32>
+      check.expect.bitwise actual(%prefix) expected(%prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%count) expected(%count) : tensor<3xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x[%inputs]xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<[%weight_bytes]xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q6_f32_panels> @q6_f32_panel_shapes

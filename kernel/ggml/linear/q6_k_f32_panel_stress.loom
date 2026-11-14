@@ -1,0 +1,78 @@
+// Large-panel timing and exact analytical qualification. Uniform, nonzero
+// packed codes have value 1, group scales 3, block scale 0.125, and activations
+// 0.5. Every output is exactly K*0.1875. The shared reference avoids a full
+// scalar contraction while checking all output elements and both guards.
+
+config.decl @q6_panel_benchmark.rows : %value: index where [range(%value, 1, 32)]
+
+config.decl @q6_panel_benchmark.inputs : %value: index where [range(%value, 256, 32768), multiple_of(%value, 256)]
+
+config.decl @q6_panel_benchmark.outputs : %value: index where [range(%value, 1, 262144)]
+
+config.decl @q6_panel_benchmark.workers : %value: index where [range(%value, 1, 10000)]
+
+kernel.decl @ggml_linear_q6k_f32_panel(%configured_rows: index, %configured_inputs: index, %configured_outputs: index, %workers: index) launch(%count: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @initialize_q6(%uniform: i1, %quantized: i1, %rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
+
+func.decl @q6_uniform_reference(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.def @geometry(%count: buffer) -> (index, index, index, index, index) {
+  %rows = config.get @q6_panel_benchmark.rows : index
+  %inputs = config.get @q6_panel_benchmark.inputs : index
+  %outputs = config.get @q6_panel_benchmark.outputs : index
+  %block_values = index.constant 256 : index
+  %block_bytes = index.constant 210 : index
+  %guards = index.constant 8 : index
+  %blocks = index.div %inputs, %block_values : index
+  %records = index.mul %outputs, %blocks : index
+  %weight_bytes = index.mul %records, %block_bytes : index
+  %elements = index.mul %rows, %outputs : index
+  %storage_count = index.add %elements, %guards : index
+  %origin = index.constant 0 : offset
+  %rows32 = index.cast %rows : index to i32
+  %counts = buffer.view %count[%origin] : buffer -> view<1xi32>
+  view.store %rows32, %counts[0] : i32, view<1xi32>
+  func.return %rows, %inputs, %outputs, %weight_bytes, %storage_count : index, index, index, index, index
+}
+
+command.def @project() launch(%count: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @q6_panel_benchmark.rows : index
+  %inputs = config.get @q6_panel_benchmark.inputs : index
+  %outputs = config.get @q6_panel_benchmark.outputs : index
+  %workers = config.get @q6_panel_benchmark.workers : index
+  kernel.launch @ggml_linear_q6k_f32_panel[%rows, %inputs, %outputs, %workers](%count, %inputs, %outputs, %input, %weight, %output) : [index, index, index, index](buffer, index, index, buffer, buffer, buffer)
+  command.return
+}
+
+func.def @reference(%count: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @q6_panel_benchmark.rows : index
+  %inputs = config.get @q6_panel_benchmark.inputs : index
+  %outputs = config.get @q6_panel_benchmark.outputs : index
+  func.call @q6_uniform_reference(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @q6_f32_large_panel {
+  check.requires<hal.amdgpu.target> {targets = ["gfx11-generic", "gfx9-4-generic"]}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %count = check.generate.fill value(0) : tensor<1xi32>
+    %rows, %inputs, %outputs, %weight_bytes, %storage_count = check.generate<@geometry>(%count) : (tensor<1xi32>) -> (index, index, index, index, index)
+    %uniform = check.literal value(true) : i1
+    %quantized = check.literal value(false) : i1
+    %input = check.generate.fill value(0.5) : tensor<[%rows]x[%inputs]xf32>
+    %weight = check.generate.fill value(17) : tensor<[%weight_bytes]xi8>
+    check.generate<@initialize_q6>(%uniform, %quantized, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x[%inputs]xf32>, tensor<[%weight_bytes]xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_count]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_count]xf32> -> tensor<[%rows]x[%outputs]xf32>
+    check.compare<@project, @reference>(%count, %input, %weight, %output) : (tensor<1xi32>, tensor<[%rows]x[%inputs]xf32>, tensor<[%weight_bytes]xi8>, tensor<[%rows]x[%outputs]xf32>) -> () {
+      check.expect.bitwise actual(%storage) expected(%storage) : tensor<[%storage_count]xf32>
+      check.expect.bitwise actual(%count) expected(%count) : tensor<1xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x[%inputs]xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<[%weight_bytes]xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q6_f32_large_panel> @q6_f32_projection
