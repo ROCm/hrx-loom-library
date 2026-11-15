@@ -1,0 +1,49 @@
+// Bounded-worker Q6_K/F16 projections with F32 overwrite or residual output.
+//
+// Configuration supplies (row_capacity, K, N, worker_budget). Execution repeats
+// those facts and receives an I32 live-row count plus disjoint input, raw
+// weight, and output buffers. The live count remains within capacity through
+// completion. Zero capacity launches no work; a zero live prefix touches no
+// operands. Inactive output capacity is preserved in both publication modes.
+//
+// Storage, shapes, rounding, and aliasing follow the shared matrix motif.
+// A 512-thread wave32 worker reuses 64 KiB of workgroup storage across its
+// 256-row/256-channel tiles. The caller chooses a positive deployment budget
+// no greater than 10000; the grid is also capped by useful capacity tiles.
+
+func.decl pure @ggml_linear_q6k_f16_matrix_grid(%capacity: index, %outputs: index, %budget: index) -> (index)
+
+func.decl @ggml_linear_q6k_f16_matrix_panels(%adds_residual: i1, %capacity: index, %budget: index, %rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.def inline @dispatch_panels(%adds_residual: i1, %count: buffer, %capacity: index, %inputs: index, %outputs: index, %budget: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %counts = buffer.view %count[%origin] : buffer -> view<1xi32>
+  %word = view.load %counts[0] : view<1xi32> -> i32
+  %rows = index.cast %word : i32 to index
+  func.call @ggml_linear_q6k_f16_matrix_panels(%adds_residual, %capacity, %budget, %rows, %inputs, %outputs, %input, %weight, %output) : (i1, index, index, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+amdgpu.target<gfx11-generic> @matrix_wave32 {subgroup_size = 32}
+
+kernel.def target(@matrix_wave32) export("ggml_linear_q6k_f16_matrix") @ggml_linear_q6k_f16_matrix(%capacity: index, %inputs: index, %outputs: index, %worker_budget: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 512 : index
+  %groups = func.call pure @ggml_linear_q6k_f16_matrix_grid(%capacity, %outputs, %worker_budget) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%count: buffer, %capacity: index, %inputs: index, %outputs: index, %worker_budget: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %adds_residual = scalar.constant false : i1
+  func.call @dispatch_panels(%adds_residual, %count, %capacity, %inputs, %outputs, %worker_budget, %input, %weight, %output) : (i1, buffer, index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@matrix_wave32) export("ggml_linear_q6k_f16_matrix_residual") @ggml_linear_q6k_f16_matrix_residual(%capacity: index, %inputs: index, %outputs: index, %worker_budget: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 512 : index
+  %groups = func.call pure @ggml_linear_q6k_f16_matrix_grid(%capacity, %outputs, %worker_budget) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%count: buffer, %capacity: index, %inputs: index, %outputs: index, %worker_budget: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %adds_residual = scalar.constant true : i1
+  func.call @dispatch_panels(%adds_residual, %count, %capacity, %inputs, %outputs, %worker_budget, %input, %weight, %output) : (i1, buffer, index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}

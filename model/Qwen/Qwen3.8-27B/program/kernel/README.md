@@ -38,6 +38,13 @@ crossover. Other targets retain their matrix providers. The enclosing command
 samples the live count once and forwards it through the layers, allowing all
 indirect launch counts to share one device producer.
 
+Wide RDNA gate/up prefill calls the shared paired Q5_K/F16 kernel directly.
+Its 256-token/128-channel tile retains K64 activations and both projections in
+64 KiB of workgroup memory, then publishes SwiGLU without intermediate global
+gate/up matrices. The model supplies prepared channel-eight weights and its
+live-prefix contract. Numerical and tile-boundary checks belong to the shared
+kernel; the model checks in-place preparation followed by consumption.
+
 Attention separates preparation, cache publication, history partitions, and
 merge. Four subgroups share each 16-query by 64-cache-row panel. Their actual
 width determines the staging stride, fragment carriers, score packets, and

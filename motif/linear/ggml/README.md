@@ -25,8 +25,8 @@ weight words across two dot4 packets. The 64-lane `block4` path instead advances
 across four weight blocks per iteration. Each has a four-row form with separate
 accumulators and common immutable weight addresses. Block-level primitives
 remain available to model-specific cohort and output-reduction schedules.
-All Q6 forms use the signed carrier decoder without first rounding weights to
-F16 or materializing an expanded tensor.
+These scalar and integer-dot forms use the signed carrier decoder without
+first rounding weights to F16 or materializing an expanded tensor.
 
 The Q6_K/Q8_1 x4 panel template retains a row-by-panel accumulator bank around
 that same block decoder. Immutable weight packets serve the row cohort, and
@@ -64,6 +64,39 @@ These are reusable Loom schedules, qualified for correctness through the
 [`linear` kernels](../../../kernel/ggml/linear/). The native tests establish
 packed-byte semantics, addressing, and numerical results; they do not establish
 a throughput comparison against another implementation.
+
+## Paired Q5_K matrices with F16 storage
+
+`q5_k_f16_pair.loom` contracts two projections and publishes their SwiGLU
+combination without intermediate global gate/up matrices. A 256-row by
+128-channel output tile stages K64 activations and both weight panels in
+64 KiB of workgroup memory. Encoded packets and their K256 headers are read
+ahead for each K64 step. Reconstructed coefficients
+round to F16, matrix products accumulate in F32, and the fused result rounds
+once to F16. Raw and channel-eight records share this arithmetic.
+
+The tile accepts explicit origins. The traversal uses a caller-bounded worker
+grid and groups output panels to retain a useful weight working set. It visits
+only live rows, masks partial tiles, and retires shared readers before reusing
+storage. The concrete [paired kernel](../../../kernel/ggml/linear/q5_k_f16_pair.loom)
+owns the count-buffer ABI, target binding, and capacity/budget calculation.
+The matrix fragments require the RDNA wave32 interpretation; changing the
+target flag does not supply a wave64 implementation.
+
+## Q6_K matrices with F16 storage
+
+`q6_k_f16_matrix.loom` reuses a 256-row by 256-channel tile with K64 read-ahead
+and the same permuted F16 staging as paired Q5. Raw six-bit weights round to
+F16 at publication into shared memory; the dot accumulates in F32 and either
+overwrites F32 output or adds into it. Activations arrive as F16, so conversion
+placement is part of the producer contract. The existing F32 and integer-dot
+schedules retain their distinct arithmetic and storage contracts.
+
+The tile owns numerical work and the traversal groups eight channel tiles to
+bound the active weight set. Explicit capacity and worker-budget facts retain
+single-tile specialization while larger assignments reuse worker storage.
+The concrete wave32 kernel owns count-buffer sampling and target selection;
+empty prefixes and both tile tails require no padded global operands.
 
 ## Q6_K register panels with F32 storage
 

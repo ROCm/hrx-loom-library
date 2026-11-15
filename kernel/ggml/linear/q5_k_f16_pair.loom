@@ -1,0 +1,35 @@
+// Bounded-worker paired Q5_K/F16 projections with fused SwiGLU publication.
+//
+// Configuration: (row_capacity, K, N, weight_channels, worker_budget), index.
+// Execution repeats the configuration and receives an I32 live-row
+// count plus disjoint input, gate-weight, up-weight, and output buffers.
+// The live count remains within the sampled capacity through completion.
+// Zero capacity launches no work; zero live rows preserve the whole output.
+// Storage and arithmetic follow ggml_linear_q5k_f16_pair_panels: contiguous
+// live F16 activations/results, raw or channel-eight Q5_K weights, and F32
+// matrix accumulation. Inactive output capacity remains untouched.
+//
+// Each 512-thread wave32 worker reuses 64 KiB workgroup storage across its
+// assigned 256-row/128-channel tiles. The caller chooses a positive deployment
+// budget no greater than 10000. Workgroups are capped by useful capacity tiles;
+// the live prefix, rather than capacity, determines the executed traversal.
+
+func.decl pure @ggml_linear_q5k_f16_pair_grid(%capacity: index, %outputs: index, %budget: index) -> (index)
+
+func.decl @ggml_linear_q5k_f16_pair_panels(%capacity: index, %budget: index, %rows: index, %inputs: index, %outputs: index, %weight_channels: index, %input: buffer, %gate: buffer, %up: buffer, %output: buffer)
+
+amdgpu.target<gfx11-generic> @pair_wave32 {subgroup_size = 32}
+
+kernel.def target(@pair_wave32) export("ggml_linear_q5k_f16_pair") @ggml_linear_q5k_f16_pair(%capacity: index, %inputs: index, %outputs: index, %weight_channels: index, %worker_budget: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 512 : index
+  %groups = func.call pure @ggml_linear_q5k_f16_pair_grid(%capacity, %outputs, %worker_budget) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%count: buffer, %capacity: index, %inputs: index, %outputs: index, %weight_channels: index, %worker_budget: index, %input: buffer, %gate: buffer, %up: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %counts = buffer.view %count[%origin] : buffer -> view<1xi32>
+  %word = view.load %counts[0] : view<1xi32> -> i32
+  %rows = index.cast %word : i32 to index
+  func.call @ggml_linear_q5k_f16_pair_panels(%capacity, %worker_budget, %rows, %inputs, %outputs, %weight_channels, %input, %gate, %up, %output) : (index, index, index, index, index, index, buffer, buffer, buffer, buffer)
+  kernel.return
+}

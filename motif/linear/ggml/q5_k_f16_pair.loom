@@ -1,0 +1,250 @@
+// Paired Q5_K projections with F16 operands and a fused F16 SwiGLU result.
+//
+// A 512-thread wave32 workgroup contracts 256 input rows against 128 channels
+// from each of two projections. Its two 32 KiB workgroup panels retain K64
+// activations and interleaved gate/up coefficients. Compact encoded packets
+// are read ahead, decoded at publication, and reused by all 16 waves. Each
+// thread publishes two K16 parts for one row. One K64 loop carries the two
+// F32 accumulator banks directly; metadata is read with each encoded panel.
+// Weights are never expanded in global memory, and publication computes
+// SiLU(gate)*up after the complete contraction.
+//
+// Inputs are contiguous [rows,K] F16; output is [rows,N] F16. Each weight
+// buffer holds [N/channels,K/256,channels,176] bytes, with channels=1 for raw
+// records or 8 for prepared channel groups. K is 256..32768 in whole blocks,
+// N is 1..32768 and divisible by channels, and rows is 0..16384. Buffers are
+// disjoint. Tile origins are aligned to 256 rows and 128 channels. Partial
+// tiles clamp reads to a valid row and mask stores; no padding is required.
+//
+// The tile entry owns numerical work and staging. The panels entry distributes
+// tiles across the caller's bounded one-dimensional grid, grouping 32 channel
+// tiles for weight reuse. Neither entry reads a model configuration or count
+// buffer. The caller owns target binding, the sampled live count, and budget.
+// Capacity and budget retain the launch contract in the numerical program:
+// specialization removes worker recurrence when one tile per worker suffices.
+
+func.decl @ggml_q4_k_scaled_metadata(%header: vector<4xi32>, %group: index) -> (f32, f32)
+
+func.decl @ggml_q5_k_unpack_codes16(%low: vector<4xi32>, %high: vector<4xi32>, %group: index) -> (vector<16xi8>)
+
+func.decl @tensor_matrix_stage_f16_store(%stage: buffer, %part: index, %row: index, %values: vector<16xf16>)
+
+func.decl @tensor_matrix_stage_f16_load(%stage: buffer, %part: index, %row_base: index, %lane: index) -> (vector<16xf16>)
+
+func.def inline @decode_half(%header: vector<4xi32>, %low: vector<4xi32>, %high: vector<4xi32>, %group: index) -> (vector<16xf16>) {
+  %scale, %minimum = func.call @ggml_q4_k_scaled_metadata(%header, %group) : (vector<4xi32>, index) -> (f32, f32)
+  %bytes = func.call @ggml_q5_k_unpack_codes16(%low, %high, %group) : (vector<4xi32>, vector<4xi32>, index) -> (vector<16xi8>)
+  %codes = vector.uitofp %bytes : vector<16xi8> to vector<16xf32>
+  %scales = vector.splat %scale : vector<16xf32>
+  %minima = vector.splat %minimum : vector<16xf32>
+  %scaled = vector.mulf %codes, %scales : vector<16xf32>
+  %values = vector.subf %scaled, %minima : vector<16xf32>
+  %halves = vector.fptrunc %values : vector<16xf32> to vector<16xf16>
+  func.return %halves : vector<16xf16>
+}
+
+func.def public inline @ggml_linear_q5k_f16_pair_tile(%rows0: index, %inputs0: index, %outputs0: index, %weight_channels0: index, %token_base0: index, %channel_base0: index, %input_arg: buffer, %gate_arg: buffer, %up_arg: buffer, %output_arg: buffer) {
+  %rows = index.assume %rows0 [range(%rows0, 1, 16384)] : index
+  %inputs = index.assume %inputs0 [range(%inputs0, 256, 32768), multiple_of(%inputs0, 256)] : index
+  %weight_channels = index.assume %weight_channels0 [range(%weight_channels0, 1, 8)] : index
+  %outputs = index.assume %outputs0 [range(%outputs0, 1, 32768), multiple_of(%outputs0, %weight_channels)] : index
+  %token_base = index.assume %token_base0 [ge(%token_base0, 0), lt(%token_base0, %rows), multiple_of(%token_base0, 256)] : index
+  %channel_base = index.assume %channel_base0 [ge(%channel_base0, 0), lt(%channel_base0, %outputs), multiple_of(%channel_base0, 128)] : index
+  %input, %gate, %up, %output = buffer.assume.noalias %input_arg, %gate_arg, %up_arg, %output_arg : buffer, buffer, buffer, buffer
+  %origin = index.constant 0 : offset
+  %stage_bytes = index.constant 32768 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c12 = index.constant 12 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %rows_per_wave = index.constant 128 : index
+  %block_values = index.constant 256 : index
+  %blocks = index.div %inputs, %block_values : index
+  %quarters = index.div %inputs, %c64 : index
+  %weight_groups = index.div %outputs, %weight_channels : index
+  %thread = kernel.workitem.id<x> : index
+  %wave = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %sub_lane = index.rem %lane, %c16 : index
+  %lane_half = index.div %lane, %c16 : index
+  %wave_channel = index.div %wave, %c2 : index
+  %wave_token = index.rem %wave, %c2 : index
+  %consumer_row = index.mul %wave_channel, %c32 : index
+  %consumer_up = index.add %consumer_row, %c16 : index
+  %consumer_token = index.mul %wave_token, %rows_per_wave : index
+  %producer_row = index.div %thread, %c2 : index
+  %producer_group = index.rem %thread, %c2 : index
+  %producer_projection = index.rem %producer_row, %c32 : index
+  %is_up = index.cmp uge, %producer_projection, %c16 : index
+  %weight = scf.select %is_up, %up, %gate : buffer
+  %producer_row_group = index.div %producer_row, %c32 : index
+  %producer_lane = index.rem %producer_row, %c16 : index
+  %producer_channel_add = index.madd %producer_row_group, %c16, %producer_lane : index
+  %producer_channel0 = index.add %channel_base, %producer_channel_add : index
+  %channel_live = index.cmp ult, %producer_channel0, %outputs : index
+  %producer_channel = scf.select %channel_live, %producer_channel0, %c0 : index
+  %weight_group0 = index.div %producer_channel, %weight_channels : index
+  %weight_row = index.rem %producer_channel, %weight_channels : index
+  %producer_token0 = index.add %token_base, %producer_row : index
+  %producer_active = index.cmp ult, %producer_token0, %rows : index
+  %producer_token = scf.select %producer_active, %producer_token0, %c0 : index
+  %weight_group = index.assume %weight_group0 [ge(%weight_group0, 0), lt(%weight_group0, %weight_groups)] : index
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<[%weight_groups]x[%blocks]x[%weight_channels]x44xi32>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x[%blocks]x256xf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%outputs]xf16>
+  %weight_stage = buffer.alloca<workgroup> align(16) %stage_bytes : buffer
+  %input_stage = buffer.alloca<workgroup> align(16) %stage_bytes : buffer
+  %empty = vector.splatf 0.0 : vector<8x8xf32>
+  %gate_result, %up_result = scf.for %quarter_index = [%c0 to %quarters step %c1](%gate_accumulators = %empty : vector<8x8xf32>, %up_accumulators = %empty : vector<8x8xf32>) -> (vector<8x8xf32>, vector<8x8xf32>) pipeline(%c2) {
+    %block0 = index.div %quarter_index, %c4 : index
+    %block = index.assume %block0 [ge(%block0, 0), lt(%block0, %blocks)] : index
+    %quarter = index.rem %quarter_index, %c4 : index
+    %header = vector.load %weight_view[%weight_group, %block, %weight_row, %c0] : view<[%weight_groups]x[%blocks]x[%weight_channels]x44xi32> -> vector<4xi32>
+    %low_base = index.madd %quarter, %c8, %c12 : index
+    scf.for %producer_half = [%c0 to %c2 step %c1] unroll schedule(linear) {
+      %producer_part = index.madd %producer_group, %c2, %producer_half : index
+      %half_word = index.mul %producer_half, %c4 : index
+      %high_word = index.add %c4, %half_word : index
+      %low_word = index.add %low_base, %half_word : index
+      %input_part = index.mul %producer_part, %c16 : index
+      %low = vector.load %weight_view[%weight_group, %block, %weight_row, %low_word] : view<[%weight_groups]x[%blocks]x[%weight_channels]x44xi32> -> vector<4xi32>
+      %high = vector.load %weight_view[%weight_group, %block, %weight_row, %high_word] : view<[%weight_groups]x[%blocks]x[%weight_channels]x44xi32> -> vector<4xi32>
+      %input_column = index.madd %quarter, %c64, %input_part : index
+      %activation = vector.load %input_view[%producer_token, %block, %input_column] : view<[%rows]x[%blocks]x256xf16> -> vector<16xf16>
+      %quant_group = index.madd %quarter, %c2, %producer_group : index
+      %coefficients = func.call @decode_half(%header, %low, %high, %quant_group) : (vector<4xi32>, vector<4xi32>, vector<4xi32>, index) -> (vector<16xf16>)
+      func.call @tensor_matrix_stage_f16_store(%weight_stage, %producer_part, %producer_row, %coefficients) : (buffer, index, index, vector<16xf16>)
+      func.call @tensor_matrix_stage_f16_store(%input_stage, %producer_part, %producer_row, %activation) : (buffer, index, index, vector<16xf16>)
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %next_gate, %next_up = scf.for %part = [%c0 to %c4 step %c1](%part_gate = %gate_accumulators : vector<8x8xf32>, %part_up = %up_accumulators : vector<8x8xf32>) -> (vector<8x8xf32>, vector<8x8xf32>) unroll schedule(linear) {
+      %gate_values = func.call @tensor_matrix_stage_f16_load(%weight_stage, %part, %consumer_row, %sub_lane) : (buffer, index, index, index) -> (vector<16xf16>)
+      %up_values = func.call @tensor_matrix_stage_f16_load(%weight_stage, %part, %consumer_up, %sub_lane) : (buffer, index, index, index) -> (vector<16xf16>)
+      %gate_fragment = vector.fragment<rhs> %gate_values shape [%c16, %c16] : vector<16xf16>
+      %up_fragment = vector.fragment<rhs> %up_values shape [%c16, %c16] : vector<16xf16>
+      %updated_gate, %updated_up = scf.for %token_fragment = [%c0 to %c8 step %c1](%current_gate = %part_gate : vector<8x8xf32>, %current_up = %part_up : vector<8x8xf32>) -> (vector<8x8xf32>, vector<8x8xf32>) unroll schedule(linear) {
+        %token_row = index.madd %token_fragment, %c16, %consumer_token : index
+        %activation_values = func.call @tensor_matrix_stage_f16_load(%input_stage, %part, %token_row, %sub_lane) : (buffer, index, index, index) -> (vector<16xf16>)
+        %activation_fragment = vector.fragment<lhs> %activation_values shape [%c16, %c16] : vector<16xf16>
+        %gate_acc = vector.extract %current_gate[%token_fragment] : vector<8x8xf32> -> vector<8xf32>
+        %up_acc = vector.extract %current_up[%token_fragment] : vector<8x8xf32> -> vector<8xf32>
+        %gate_initial = vector.fragment<init> %gate_acc shape [%c16, %c16] : vector<8xf32>
+        %up_initial = vector.fragment<init> %up_acc shape [%c16, %c16] : vector<8xf32>
+        %gate_next = vector.mma %activation_fragment, %gate_fragment, %gate_initial : vector<16xf16>, vector<16xf16>, vector<8xf32>
+        %up_next = vector.mma %activation_fragment, %up_fragment, %up_initial : vector<16xf16>, vector<16xf16>, vector<8xf32>
+        %with_gate = vector.insert %gate_next into %current_gate[%token_fragment] : vector<8xf32>, vector<8x8xf32>
+        %with_up = vector.insert %up_next into %current_up[%token_fragment] : vector<8xf32>, vector<8x8xf32>
+        scf.yield %with_gate, %with_up : vector<8x8xf32>, vector<8x8xf32>
+      }
+      scf.yield %updated_gate, %updated_up : vector<8x8xf32>, vector<8x8xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %next_gate, %next_up : vector<8x8xf32>, vector<8x8xf32>
+  }
+  %wave_channel_base = index.madd %wave_channel, %c16, %channel_base : index
+  %output_channel = index.add %wave_channel_base, %sub_lane : index
+  %output_channel_live = index.cmp ult, %output_channel, %outputs : index
+  %wave_token_base = index.madd %wave_token, %rows_per_wave, %token_base : index
+  scf.for %token_fragment = [%c0 to %c8 step %c1] unroll schedule(linear) {
+    %gate_values = vector.extract %gate_result[%token_fragment] : vector<8x8xf32> -> vector<8xf32>
+    %up_values = vector.extract %up_result[%token_fragment] : vector<8x8xf32> -> vector<8xf32>
+    %activated = vector.siluf<afn> %gate_values : vector<8xf32>
+    %combined = vector.mulf %activated, %up_values : vector<8xf32>
+    %published = vector.fptrunc %combined : vector<8xf32> to vector<8xf16>
+    %fragment_token_base = index.madd %token_fragment, %c16, %wave_token_base : index
+    scf.for %element = [%c0 to %c8 step %c1] unroll schedule(linear) {
+      %token_add = index.madd %element, %c2, %lane_half : index
+      %token0 = index.add %fragment_token_base, %token_add : index
+      %token_live = index.cmp ult, %token0, %rows : index
+      %active = scalar.andi %token_live, %output_channel_live : i1
+      scf.if %active {
+        %token = index.assume %token0 [ge(%token0, 0), lt(%token0, %rows)] : index
+        %value = vector.extract %published[%element] : vector<8xf16> -> f16
+        view.store %value, %output_view[%token, %output_channel] : f16, view<[%rows]x[%outputs]xf16>
+      }
+    }
+  }
+  func.return
+}
+
+func.def public pure inline @ggml_linear_q5k_f16_pair_grid(%capacity0: index, %outputs0: index, %budget0: index) -> (index) {
+  %capacity = index.assume %capacity0 [range(%capacity0, 0, 16384)] : index
+  %outputs = index.assume %outputs0 [range(%outputs0, 1, 32768)] : index
+  %budget = index.assume %budget0 [range(%budget0, 1, 10000)] : index
+  %row_padding = index.constant 255 : index
+  %channel_padding = index.constant 127 : index
+  %rows_per_tile = index.constant 256 : index
+  %channels_per_tile = index.constant 128 : index
+  %padded_rows = index.add %capacity, %row_padding : index
+  %padded_channels = index.add %outputs, %channel_padding : index
+  %row_tiles = index.div %padded_rows, %rows_per_tile : index
+  %channel_tiles = index.div %padded_channels, %channels_per_tile : index
+  %tiles = index.mul %row_tiles, %channel_tiles : index
+  %groups = index.min %tiles, %budget : index
+  func.return %groups : index
+}
+
+// The final short channel group uses its actual width, preserving the
+// permutation when N is not a whole group of 32 channel tiles.
+func.def inline @run_tile(%tile0: index, %tiles: index, %row_tiles: index, %channel_tiles: index, %rows: index, %inputs: index, %outputs: index, %weight_channels: index, %input: buffer, %gate: buffer, %up: buffer, %output: buffer) {
+  %rows_per_tile = index.constant 256 : index
+  %channels_per_tile = index.constant 128 : index
+  %group_channels = index.constant 32 : index
+  %group_tiles = index.mul %row_tiles, %group_channels : index
+  %tile = index.assume %tile0 [range(%tile0, 0, 16383), lt(%tile0, %tiles)] : index
+  %live_group_tiles = index.assume %group_tiles [range(%group_tiles, 1, 2048)] : index
+  %group = index.div %tile, %live_group_tiles : index
+  %group_first = index.mul %group, %group_channels : index
+  %remaining = index.sub %channel_tiles, %group_first : index
+  %group_size0 = index.min %remaining, %group_channels : index
+  %group_size = index.assume %group_size0 [range(%group_size0, 1, 32)] : index
+  %ordinal = index.rem %tile, %live_group_tiles : index
+  %channel_delta = index.rem %ordinal, %group_size : index
+  %channel_tile = index.add %group_first, %channel_delta : index
+  %row_tile = index.div %ordinal, %group_size : index
+  %row_origin = index.mul %row_tile, %rows_per_tile : index
+  %channel_origin = index.mul %channel_tile, %channels_per_tile : index
+  func.call @ggml_linear_q5k_f16_pair_tile(%rows, %inputs, %outputs, %weight_channels, %row_origin, %channel_origin, %input, %gate, %up, %output) : (index, index, index, index, index, index, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+// Consecutive workers sweep a group of channel tiles before advancing rows.
+// The grid must be produced by the grid function with this capacity/budget;
+// rows is a live prefix of capacity. Empty prefixes perform no numerical work.
+func.def public inline @ggml_linear_q5k_f16_pair_panels(%capacity0: index, %budget0: index, %rows0: index, %inputs: index, %outputs0: index, %weight_channels: index, %input: buffer, %gate: buffer, %up: buffer, %output: buffer) {
+  %capacity = index.assume %capacity0 [range(%capacity0, 0, 16384)] : index
+  %budget = index.assume %budget0 [range(%budget0, 1, 10000)] : index
+  %rows = index.assume %rows0 [range(%rows0, 0, 16384), le(%rows0, %capacity)] : index
+  %outputs = index.assume %outputs0 [range(%outputs0, 1, 32768)] : index
+  %row_padding = index.constant 255 : index
+  %channel_padding = index.constant 127 : index
+  %rows_per_tile = index.constant 256 : index
+  %channels_per_tile = index.constant 128 : index
+  %padded_rows = index.add %rows, %row_padding : index
+  %padded_capacity = index.add %capacity, %row_padding : index
+  %padded_channels = index.add %outputs, %channel_padding : index
+  %row_tiles = index.div %padded_rows, %rows_per_tile : index
+  %capacity_rows = index.div %padded_capacity, %rows_per_tile : index
+  %channel_tiles = index.div %padded_channels, %channels_per_tile : index
+  %tiles = index.mul %row_tiles, %channel_tiles : index
+  %capacity_tiles = index.mul %capacity_rows, %channel_tiles : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
+  %single_tile = index.cmp ule, %capacity_tiles, %budget : index
+  scf.if %single_tile {
+    %live = index.cmp ult, %worker, %tiles : index
+    scf.if %live {
+      func.call @run_tile(%worker, %tiles, %row_tiles, %channel_tiles, %rows, %inputs, %outputs, %weight_channels, %input, %gate, %up, %output) : (index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
+    }
+  } else {
+    scf.for %tile = [%worker to %tiles step %workers] {
+      func.call @run_tile(%tile, %tiles, %row_tiles, %channel_tiles, %rows, %inputs, %outputs, %weight_channels, %input, %gate, %up, %output) : (index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
+    }
+  }
+  func.return
+}

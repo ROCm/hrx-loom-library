@@ -1,0 +1,48 @@
+// Permuted F16 staging for a 256-row by 64-column matrix panel.
+//
+// The caller supplies a 32 KiB workgroup buffer, divided into four K16 parts.
+// A producer stores sixteen consecutive values for one row and part. A
+// consumer loads the row selected by a 16-aligned fragment base and lane
+// ordinal in [0, 15]. Both operations use the same row/half permutation,
+// distributing packets across LDS banks without padding or extra capacity.
+// Allocation, publication barriers, fragment interpretation, and target
+// selection remain caller-owned. These helpers insert no synchronization.
+
+func.def public inline @tensor_matrix_stage_f16_store(%stage: buffer, %part: index, %row: index, %values: vector<16xf16>) {
+  %origin = index.constant 0 : offset
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %row_quarter = index.shrui %row, %c2 : index
+  %mixed = index.xori %row, %row_quarter : index
+  %half = index.andi %mixed, %c1 : index
+  %other = index.xori %half, %c1 : index
+  %placed = index.xori %row, %part : index
+  %local = buffer.assume.memory_space<workgroup> %stage : buffer
+  %view = buffer.view %local[%origin] : buffer -> view<4x256x2x8xf16>
+  %low = vector.slice %values[0] : vector<16xf16> -> vector<8xf16>
+  %high = vector.slice %values[8] : vector<16xf16> -> vector<8xf16>
+  vector.store %low, %view[%part, %placed, %half, 0] : vector<8xf16>, view<4x256x2x8xf16>
+  vector.store %high, %view[%part, %placed, %other, 0] : vector<8xf16>, view<4x256x2x8xf16>
+  func.return
+}
+
+// Only the low lane bits participate in the permutation. Keeping the aligned
+// base separate preserves this fact through address lowering and avoids
+// carrying a distinct general address for every accumulator fragment.
+func.def public inline @tensor_matrix_stage_f16_load(%stage: buffer, %part: index, %row_base: index, %lane: index) -> (vector<16xf16>) {
+  %origin = index.constant 0 : offset
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %row_quarter = index.shrui %lane, %c2 : index
+  %mixed = index.xori %lane, %row_quarter : index
+  %half = index.andi %mixed, %c1 : index
+  %other = index.xori %half, %c1 : index
+  %placed_lane = index.xori %lane, %part : index
+  %placed = index.add %row_base, %placed_lane : index
+  %local = buffer.assume.memory_space<workgroup> %stage : buffer
+  %view = buffer.view %local[%origin] : buffer -> view<4x256x2x8xf16>
+  %low = vector.load %view[%part, %placed, %half, 0] : view<4x256x2x8xf16> -> vector<8xf16>
+  %high = vector.load %view[%part, %placed, %other, 0] : view<4x256x2x8xf16> -> vector<8xf16>
+  %values = vector.concat<0> %low, %high : vector<8xf16>, vector<8xf16> -> vector<16xf16>
+  func.return %values : vector<16xf16>
+}
