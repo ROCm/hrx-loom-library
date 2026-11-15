@@ -12,6 +12,13 @@ of resident count. Accessors preserve those distinctions across ordinary and
 media inputs, page mappings, forks, and compacted continuations; field layouts
 and bounds live beside their declarations.
 
+Span workers divide a caller-supplied budget across heads, rows, and descriptors.
+Each worker keeps its descriptor while processing multiple rows, then advances
+to its next span. The sampled token extent bounds admission; descriptor counts
+bound actual access, including accepted spans with gaps. Empty epochs launch
+no workers. Deployment capacity and the queued-worker budget remain caller
+policy, and kernels retire collective scratch before reusing it for another row.
+
 Paged lookup uses 32-bit page IDs and signed native token indices. Its physical
 extent is a whole number of 64-token pages, up to 2,147,483,584 tokens; this is
 an address representation bound, not a model default or resident allocation.

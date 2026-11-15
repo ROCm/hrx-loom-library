@@ -60,15 +60,46 @@ func.def public inline @qwen38_kv_position(%logical_capacity: index, %map: buffe
   func.return %physical : index
 }
 
-func.def public inline @qwen38_span_active(%epoch: buffer, %span: index) -> (i1) {
+func.def public inline @qwen38_span_count(%epoch: buffer) -> (index) {
   %origin = index.constant 0 : offset
   %span_count_index = index.constant 1 : index
   %metadata = buffer.assume.memory_space<constant> %epoch : buffer
   %header = buffer.view %metadata[%origin] : buffer -> view<3xi32>
   %count_word = view.load %header[%span_count_index] : view<3xi32> -> i32
-  %count = index.cast %count_word : i32 to index
+  %count_value = index.cast %count_word : i32 to index
+  %count = index.assume %count_value [range(%count_value, 0, 2147483647)] : index
+  func.return %count : index
+}
+
+func.def public inline @qwen38_span_active(%epoch: buffer, %span: index) -> (i1) {
+  %count = func.call @qwen38_span_count(%epoch) : (buffer) -> (index)
   %active = index.cmp ult, %span, %count : index
   func.return %active : i1
+}
+
+// Counts only this descriptor's rows. Accepted spans can retain gaps in packed
+// storage, so the epoch's token extent cannot replace this count.
+func.def public inline @qwen38_span_token_count(%epoch: buffer, %control_origin: offset) -> (index) {
+  %metadata = buffer.assume.memory_space<constant> %epoch : buffer
+  %control = buffer.view %metadata[%control_origin] : buffer -> view<1xi32>
+  %count_word = view.load %control[0] : view<1xi32> -> i32
+  %count_value = index.cast %count_word : i32 to index
+  %count = index.assume %count_value [range(%count_value, 0, 2147483647)] : index
+  func.return %count : index
+}
+
+// Bounds the complete head/row/span grid by a caller-owned deployment budget.
+// Workers retain one descriptor while striding its rows, then advance to the
+// next assigned span. Empty epochs admit no workers and never divide by zero.
+// The budget covers at least one worker per head; the caller owns that policy.
+func.def public pure inline @qwen38_span_workers(%token_extent: index, %span_capacity: index, %heads: index, %budget: index) -> (index, index) {
+  %minimum_divisor = index.constant 1 : index
+  %head_budget = index.div %budget, %heads : index
+  %workers = index.min %token_extent, %head_budget : index
+  %span_workers = index.min %span_capacity, %workers : index
+  %span_divisor = index.max %span_workers, %minimum_divisor : index
+  %row_workers = index.div %workers, %span_divisor : index
+  func.return %row_workers, %span_workers : index, index
 }
 
 func.def public inline @qwen38_span_source_position(%epoch: buffer, %span: index) -> (i32) {
