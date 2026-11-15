@@ -70,8 +70,8 @@ a throughput comparison against another implementation.
 `q5_k_f16_pair.loom` contracts two projections and publishes their SwiGLU
 combination without intermediate global gate/up matrices. A 256-row by
 128-channel output tile stages K64 activations and both weight panels in
-64 KiB of workgroup memory. Encoded packets are read ahead; each original
-K256 header is retained across four contractions. Reconstructed coefficients
+64 KiB of workgroup memory. Encoded packets and their K256 headers are read
+ahead for each K64 step. Reconstructed coefficients
 round to F16, matrix products accumulate in F32, and the fused result rounds
 once to F16. Raw and channel-eight records share this arithmetic.
 
