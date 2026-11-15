@@ -311,19 +311,36 @@ kernel.def target(@flash_next_gdn_wave32) @gdn_recur_commit() {
 }
 
 // Normalization and the model's sigmoid gate share the final BF16 publication.
+// A workgroup visits a contiguous 256-token panel, with independent waves
+// owning rows. Paneling bounds the launch and keeps neighboring heads on the
+// same input region without changing the per-row subgroup reduction.
 kernel.def target(@flash_next_gdn_wave32) @gdn_gate() {
   %heads = index.constant 48 : index
   %tokens = config.get @flash_next.token_count : index
-  %lanes = index.constant 32 : index
+  %wave_size = index.constant 32 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%heads, %tokens, %c1) workgroup_size(%lanes, %c1, %c1) : index
+  %c8 = index.constant 8 : index
+  %large = index.cmp uge, %tokens, %c8 : index
+  %waves = scf.select %large, %c8, %c1 : index
+  %panel_rows = index.constant 256 : index
+  %rounding = index.sub %panel_rows, %c1 : index
+  %rounded = index.add %tokens, %rounding : index
+  %workers = index.div %rounded, %panel_rows : index
+  %threads = index.mul %waves, %wave_size : index
+  kernel.launch.config workgroups(%heads, %workers, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %raw_arg: buffer, %z_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
   %span, %raw, %z, %weight, %output = buffer.assume.noalias %span_arg, %raw_arg, %z_arg, %weight_arg, %output_arg : buffer, buffer, buffer, buffer, buffer
   %capacity = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%span, %capacity) : (buffer, index) -> (index)
-  %token = kernel.workgroup.id<y> : index
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
+  %worker = kernel.workgroup.id<y> : index
+  %wave = kernel.subgroup.id : index
+  %waves = kernel.subgroup.count : index
+  %panel_rows = index.constant 256 : index
+  %panel_begin = index.mul %worker, %panel_rows : index
+  %panel_limit = index.add %panel_begin, %panel_rows : index
+  %panel_end = index.min %end, %panel_limit : index
+  %first = index.add %panel_begin, %wave : index
+  scf.for %token = [%first to %panel_end step %waves] {
     %head = kernel.workgroup.id<x> : index
     %lane = kernel.subgroup.lane.id : index
     %c4 = index.constant 4 : index

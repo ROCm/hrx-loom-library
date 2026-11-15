@@ -54,6 +54,28 @@ template.def<@flash_next.gdn_window.fetch> device @gdn_window_fetch(%capacity: i
   template.return %packed_query, %packed_key, %packed_value0, %packed_value1, %query_inverse, %key_inverse, %alpha_value, %beta_value : vector<4xbf16>, vector<4xbf16>, bf16, bf16, f32, f32, f32, f32
 }
 
+// Both state rows consume the same component in their original FMA order.
+// Exposing independent accumulators together permits latency overlap without
+// changing the per-row reduction or introducing another operand pass.
+func.def inline @gdn_window_dot_pair(%left0: vector<32xf32>, %left1: vector<32xf32>, %right: vector<32xf32>) -> (f32, f32) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %initial = vector.splatf 0.0 : vector<2xf32>
+  %result = scf.for %component = [%c0 to %c32 step %c1](%running = %initial : vector<2xf32>) -> (vector<2xf32>) unroll {
+    %first = vector.extract %left0[%component] : vector<32xf32> -> f32
+    %second = vector.extract %left1[%component] : vector<32xf32> -> f32
+    %factor = vector.extract %right[%component] : vector<32xf32> -> f32
+    %left = vector.from_elements %first, %second : vector<2xf32>
+    %factors = vector.splat %factor : vector<2xf32>
+    %next = vector.fmaf %left, %factors, %running : vector<2xf32>
+    scf.yield %next : vector<2xf32>
+  }
+  %first = vector.extract %result[%c0] : vector<2xf32> -> f32
+  %second = vector.extract %result[%c1] : vector<2xf32> -> f32
+  func.return %first, %second : f32, f32
+}
+
 template.decl @flash_next.gdn_window.body(%capacity: index, %verification: index, %span_arg: buffer, %origins_arg: buffer, %layer_origin: offset, %qkv_arg: buffer, %norm_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer, %a_arg: buffer, %bias_arg: buffer, %state_arg: buffer, %output_arg: buffer)
 
 template.def<@flash_next.gdn_window.body> device @gdn_window_body(%capacity: index, %verification: index, %span_arg: buffer, %origins_arg: buffer, %layer_origin: offset, %qkv_arg: buffer, %norm_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer, %a_arg: buffer, %bias_arg: buffer, %state_arg: buffer, %output_arg: buffer) {
@@ -212,7 +234,9 @@ template.def<@flash_next.gdn_window.body> device @gdn_window_body(%capacity: ind
         %decays = vector.splat %decay : vector<8x4xf32>
         %decayed0 = vector.mulf %state0, %decays : vector<8x4xf32>
         %prediction_flat0 = vector.bitcast %decayed0 : vector<8x4xf32> to vector<32xf32>
-        %prediction_partial0 = vector.dotf %prediction_flat0, %key_flat, %c0_f32 : vector<32xf32>, vector<32xf32>, f32
+        %decayed1 = vector.mulf %state1, %decays : vector<8x4xf32>
+        %prediction_flat1 = vector.bitcast %decayed1 : vector<8x4xf32> to vector<32xf32>
+        %prediction_partial0, %prediction_partial1 = func.call @gdn_window_dot_pair(%prediction_flat0, %prediction_flat1, %key_flat) : (vector<32xf32>, vector<32xf32>, vector<32xf32>) -> (f32, f32)
         %prediction_peer2_0, %prediction_valid2_0 = kernel.subgroup.shuffle<xor> %prediction_partial0, %shuffle2, %shuffle_width : f32, i32, i32
         %prediction2_0 = scalar.addf %prediction_partial0, %prediction_peer2_0 : f32
         %prediction_peer1_0, %prediction_valid1_0 = kernel.subgroup.shuffle<xor> %prediction2_0, %shuffle1, %shuffle_width : f32, i32, i32
@@ -223,14 +247,6 @@ template.def<@flash_next.gdn_window.body> device @gdn_window_body(%capacity: ind
         %deltas0 = vector.splat %delta0 : vector<8x4xf32>
         %updated0 = vector.fmaf %key_rows, %deltas0, %decayed0 : vector<8x4xf32>
         %output_flat0 = vector.bitcast %updated0 : vector<8x4xf32> to vector<32xf32>
-        %output_partial0 = vector.dotf %output_flat0, %query_flat, %c0_f32 : vector<32xf32>, vector<32xf32>, f32
-        %output_peer2_0, %output_valid2_0 = kernel.subgroup.shuffle<xor> %output_partial0, %shuffle2, %shuffle_width : f32, i32, i32
-        %output2_0 = scalar.addf %output_partial0, %output_peer2_0 : f32
-        %output_peer1_0, %output_valid1_0 = kernel.subgroup.shuffle<xor> %output2_0, %shuffle1, %shuffle_width : f32, i32, i32
-        %result0 = scalar.addf %output2_0, %output_peer1_0 : f32
-        %decayed1 = vector.mulf %state1, %decays : vector<8x4xf32>
-        %prediction_flat1 = vector.bitcast %decayed1 : vector<8x4xf32> to vector<32xf32>
-        %prediction_partial1 = vector.dotf %prediction_flat1, %key_flat, %c0_f32 : vector<32xf32>, vector<32xf32>, f32
         %prediction_peer2_1, %prediction_valid2_1 = kernel.subgroup.shuffle<xor> %prediction_partial1, %shuffle2, %shuffle_width : f32, i32, i32
         %prediction2_1 = scalar.addf %prediction_partial1, %prediction_peer2_1 : f32
         %prediction_peer1_1, %prediction_valid1_1 = kernel.subgroup.shuffle<xor> %prediction2_1, %shuffle1, %shuffle_width : f32, i32, i32
@@ -241,7 +257,11 @@ template.def<@flash_next.gdn_window.body> device @gdn_window_body(%capacity: ind
         %deltas1 = vector.splat %delta1 : vector<8x4xf32>
         %updated1 = vector.fmaf %key_rows, %deltas1, %decayed1 : vector<8x4xf32>
         %output_flat1 = vector.bitcast %updated1 : vector<8x4xf32> to vector<32xf32>
-        %output_partial1 = vector.dotf %output_flat1, %query_flat, %c0_f32 : vector<32xf32>, vector<32xf32>, f32
+        %output_partial0, %output_partial1 = func.call @gdn_window_dot_pair(%output_flat0, %output_flat1, %query_flat) : (vector<32xf32>, vector<32xf32>, vector<32xf32>) -> (f32, f32)
+        %output_peer2_0, %output_valid2_0 = kernel.subgroup.shuffle<xor> %output_partial0, %shuffle2, %shuffle_width : f32, i32, i32
+        %output2_0 = scalar.addf %output_partial0, %output_peer2_0 : f32
+        %output_peer1_0, %output_valid1_0 = kernel.subgroup.shuffle<xor> %output2_0, %shuffle1, %shuffle_width : f32, i32, i32
+        %result0 = scalar.addf %output2_0, %output_peer1_0 : f32
         %output_peer2_1, %output_valid2_1 = kernel.subgroup.shuffle<xor> %output_partial1, %shuffle2, %shuffle_width : f32, i32, i32
         %output2_1 = scalar.addf %output_partial1, %output_peer2_1 : f32
         %output_peer1_1, %output_valid1_1 = kernel.subgroup.shuffle<xor> %output2_1, %shuffle1, %shuffle_width : f32, i32, i32

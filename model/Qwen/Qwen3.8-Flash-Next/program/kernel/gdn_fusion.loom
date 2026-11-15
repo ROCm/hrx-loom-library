@@ -237,8 +237,11 @@ func.def inline @gdn_register_contract(%capacity: index, %first: index, %end: in
   %initial = vector.splatf 0.0 : vector<16x8xf32>
   %result = scf.for %iteration = [%c0 to %c40 step %c1](%accumulators = %initial : vector<16x8xf32>) -> (vector<16x8xf32>) pipeline(%c2) {
     %first_block = index.mul %iteration, %c2 : index
-    %weight_initial = vector.splatf 0.0 : vector<2x32xf16>
-    %owned_weights = scf.for %within = [%c0 to %c2 step %c1](%weight_packets = %weight_initial : vector<2x32xf16>) -> (vector<2x32xf16>) unroll schedule(linear) {
+    // Read ahead in the encoded representation. Expanding a future stage
+    // doubles its weight payload while the current accumulators are live.
+    %code_initial = vector.splati 0 : vector<2x32xi8>
+    %scale_initial = vector.splatf 0.0 : vector<2xf16>
+    %weight_codes, %weight_scales = scf.for %within = [%c0 to %c2 step %c1](%code_packets = %code_initial : vector<2x32xi8>, %scale_packets = %scale_initial : vector<2xf16>) -> (vector<2x32xi8>, vector<2xf16>) unroll schedule(linear) {
       %block = index.add %first_block, %within : index
       %block_row = index.madd %block, %c4, %within_group : index
       %scale_delta = index.scale %block_row, %scale_bytes : index, offset -> offset
@@ -247,13 +250,11 @@ func.def inline @gdn_register_contract(%capacity: index, %first: index, %end: in
       %code_origin = index.add %code_plane, %code_delta : offset
       %codes_view = buffer.view %weight[%code_origin] : buffer -> view<32xi8>
       %codes = vector.load %codes_view[%c0] : view<32xi8> -> vector<32xi8>
-      %half_codes = vector.sitofp %codes : vector<32xi8> to vector<32xf16>
       %scale_view = buffer.view %weight[%scale_origin] : buffer -> view<1xf16>
       %scale = view.load %scale_view[%c0] : view<1xf16> -> f16
-      %scales = vector.splat %scale : vector<32xf16>
-      %values = vector.mulf %half_codes, %scales : vector<32xf16>
-      %updated = vector.insert %values into %weight_packets[%within] : vector<32xf16>, vector<2x32xf16>
-      scf.yield %updated : vector<2x32xf16>
+      %updated_codes = vector.insert %codes into %code_packets[%within] : vector<32xi8>, vector<2x32xi8>
+      %updated_scales = vector.insert %scale into %scale_packets[%within] : f16, vector<2xf16>
+      scf.yield %updated_codes, %updated_scales : vector<2x32xi8>, vector<2xf16>
     }
     %block = index.add %first_block, %input_block : index
     %input_block_origin = index.scale %block, %input_block_bytes : index, offset -> offset
@@ -266,7 +267,11 @@ func.def inline @gdn_register_contract(%capacity: index, %first: index, %end: in
     vector.store %halves, %stage_view[%input_token, %input_k] : vector<32xf16>, view<128x72xf16>
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
     %next_stage = scf.for %within = [%c0 to %c2 step %c1](%stage_accumulators = %accumulators : vector<16x8xf32>) -> (vector<16x8xf32>) unroll schedule(linear) {
-      %own = vector.extract %owned_weights[%within] : vector<2x32xf16> -> vector<32xf16>
+      %codes = vector.extract %weight_codes[%within] : vector<2x32xi8> -> vector<32xi8>
+      %scale = vector.extract %weight_scales[%within] : vector<2xf16> -> f16
+      %half_codes = vector.sitofp %codes : vector<32xi8> to vector<32xf16>
+      %scales = vector.splat %scale : vector<32xf16>
+      %own = vector.mulf %half_codes, %scales : vector<32xf16>
       // Replicate each half-wave's sixteen channels for the wave32 MMA
       // operand layout without staging the prepared weights through LDS.
       %peer, %unused = kernel.subgroup.shuffle<xor> %own, %exchange, %width : vector<32xf16>, i32, i32

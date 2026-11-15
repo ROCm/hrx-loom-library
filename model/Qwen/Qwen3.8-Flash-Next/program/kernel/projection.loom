@@ -12,6 +12,8 @@ func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
 func.decl @flash_next_q8_batch_partial(%width: index, %group_size: index, %batch_size: index, %first: index, %end: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (vector<[%group_size]xf32>)
 
+func.decl @flash_next_q8_channel4_partial(%width: index, %group_size: index, %batch_size: index, %first: index, %end: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (vector<[%group_size]xf32>)
+
 // Larger reserved cohorts reuse each decoded block across eight tokens.
 func.def pure inline @flash_next_q8_dot_batch_size(%capacity: index) -> (index) {
   %c4 = index.constant 4 : index
@@ -38,7 +40,7 @@ kernel.def target(@flash_next_projection_wave32) @flash_next_linear_q8(%workload
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %batches, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%input_width: index, %output_width: index, %span_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
+} launch(%split_scales: i1, %input_width: index, %output_width: index, %span_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
   %span, %input, %weight, %output = buffer.assume.noalias %span_arg, %input_arg, %weight_arg, %output_arg : buffer, buffer, buffer, buffer
   %inputs = index.assume %input_width [range(%input_width, 32, 10240), multiple_of(%input_width, 32)] : index
   %outputs = index.assume %output_width [range(%output_width, 4, 262144), multiple_of(%output_width, 4)] : index
@@ -59,7 +61,13 @@ kernel.def target(@flash_next_projection_wave32) @flash_next_linear_q8(%workload
     %row = index.madd %group, %c4, %wave : index
     %valid = index.cmp ult, %row, %outputs : index
     scf.if %valid {
-      %partial = func.call @flash_next_q8_batch_partial(%inputs, %batch_size, %batch_size, %first, %end, %row, %lane, %stride, %input, %weight) : (index, index, index, index, index, index, index, index, buffer, buffer) -> (vector<[%batch_size]xf32>)
+      %partial = scf.if %split_scales -> (vector<[%batch_size]xf32>) {
+        %packed = func.call @flash_next_q8_channel4_partial(%inputs, %batch_size, %batch_size, %first, %end, %row, %lane, %stride, %input, %weight) : (index, index, index, index, index, index, index, index, buffer, buffer) -> (vector<[%batch_size]xf32>)
+        scf.yield %packed : vector<[%batch_size]xf32>
+      } else {
+        %raw = func.call @flash_next_q8_batch_partial(%inputs, %batch_size, %batch_size, %first, %end, %row, %lane, %stride, %input, %weight) : (index, index, index, index, index, index, index, index, buffer, buffer) -> (vector<[%batch_size]xf32>)
+        scf.yield %raw : vector<[%batch_size]xf32>
+      }
       %sums = kernel.subgroup.reduce<addf> %partial : vector<[%batch_size]xf32>
       %leader = index.cmp eq, %lane, %c0 : index
       scf.if %leader {
