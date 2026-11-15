@@ -13,6 +13,15 @@ Each source documents its layouts, rounding, aliasing, and target requirements.
 A concrete fragment implementation cannot be made portable merely by changing
 its target flag.
 
+The paired Q5_K/F16 entry consumes two weight banks and publishes SwiGLU
+directly. Its configuration supplies capacity, K/N, channel interleaving, and
+a positive worker budget. Execution receives the live row count and operands;
+zero live rows preserve output even when the capacity grid is nonempty.
+Workers traverse 256-row/128-channel tiles, retaining the same 64 KiB shared
+allocation across tiles. The shared motif owns operand staging and arithmetic;
+the kernel owns the wave32 ABI and launch policy. Raw and channel-eight weights
+need no persistent expanded representation.
+
 `q6_k_f32_panel.loom` exposes overwrite and residual projections for up to
 32 live F32 rows. Configuration receives the sampled live count, K/N, and a
 positive worker budget; execution receives the device count buffer, K/N, and

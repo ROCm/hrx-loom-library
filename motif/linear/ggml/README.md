@@ -65,6 +65,24 @@ These are reusable Loom schedules, qualified for correctness through the
 packed-byte semantics, addressing, and numerical results; they do not establish
 a throughput comparison against another implementation.
 
+## Paired Q5_K matrices with F16 storage
+
+`q5_k_f16_pair.loom` contracts two projections and publishes their SwiGLU
+combination without intermediate global gate/up matrices. A 256-row by
+128-channel output tile stages K64 activations and both weight panels in
+64 KiB of workgroup memory. Encoded packets are read ahead; each original
+K256 header is retained across four contractions. Reconstructed coefficients
+round to F16, matrix products accumulate in F32, and the fused result rounds
+once to F16. Raw and channel-eight records share this arithmetic.
+
+The tile accepts explicit origins. The traversal uses a caller-bounded worker
+grid and groups output panels to retain a useful weight working set. It visits
+only live rows, masks partial tiles, and retires shared readers before reusing
+storage. The concrete [paired kernel](../../../kernel/ggml/linear/q5_k_f16_pair.loom)
+owns the count-buffer ABI, target binding, and capacity/budget calculation.
+The matrix fragments require the RDNA wave32 interpretation; changing the
+target flag does not supply a wave64 implementation.
+
 ## Q6_K register panels with F32 storage
 
 `q6_k_f32_panel.loom` shares a 512-element activation panel across 48 output
