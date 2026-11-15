@@ -1,0 +1,92 @@
+// The original subgroup arithmetic independently consumes every live row.
+// Both grids are bounded; repeated rows, empty work, and inactive tails are exact.
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+amdgpu.target<gfx11-generic> @gate_reference_wave32 {subgroup_size = 32}
+
+func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
+
+kernel.decl @gdn_gate() launch(%span: buffer, %raw: buffer, %z: buffer, %weight: buffer, %output: buffer)
+
+kernel.def target(@gate_reference_wave32) @original_gate() {
+  %heads = index.constant 48 : index
+  %tokens = config.get @flash_next.token_count : index
+  %lanes = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  %workers = index.min %tokens, %lanes : index
+  kernel.launch.config workgroups(%heads, %workers, %c1) workgroup_size(%lanes, %c1, %c1) : index
+} launch(%span_arg: buffer, %raw_arg: buffer, %z_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
+  %span, %raw, %z, %weight, %output = buffer.assume.noalias %span_arg, %raw_arg, %z_arg, %weight_arg, %output_arg : buffer, buffer, buffer, buffer, buffer
+  %capacity = config.get @flash_next.token_count : index
+  %end = func.call @flash_next_token_count(%span, %capacity) : (buffer, index) -> (index)
+  %first = kernel.workgroup.id<y> : index
+  %step = kernel.workgroup.count<y> : index
+  scf.for %token = [%first to %end step %step] {
+    %head = kernel.workgroup.id<x> : index
+    %lane = kernel.subgroup.lane.id : index
+    %c4 = index.constant 4 : index
+    %width = index.constant 128 : index
+    %origin = index.constant 0 : offset
+    %component = index.mul %lane, %c4 : index
+    %channel = index.madd %head, %width, %component : index
+    %raw_view = buffer.view %raw[%origin] : buffer -> view<[%capacity]x6144xbf16>
+    %z_view = buffer.view %z[%origin] : buffer -> view<[%capacity]x6144xbf16>
+    %weight_view = buffer.view %weight[%origin] : buffer -> view<128xf32>
+    %output_view = buffer.view %output[%origin] : buffer -> view<[%capacity]x6144xbf16>
+    %packed_raw = vector.load %raw_view[%token, %channel] : view<[%capacity]x6144xbf16> -> vector<4xbf16>
+    %packed_z = vector.load %z_view[%token, %channel] : view<[%capacity]x6144xbf16> -> vector<4xbf16>
+    %values = vector.extf %packed_raw : vector<4xbf16> to vector<4xf32>
+    %z_values = vector.extf %packed_z : vector<4xbf16> to vector<4xf32>
+    %weights = vector.load %weight_view[%component] : view<128xf32> -> vector<4xf32>
+    %c0 = scalar.constant 0.0 : f32
+    %inverse_width = scalar.constant 0.0078125 : f32
+    %epsilon = scalar.constant 9.9999999999999995e-07 : f32
+    %squares = vector.mulf %values, %values : vector<4xf32>
+    %partial = vector.reduce<addf> %squares, %c0 : vector<4xf32>, f32
+    %sum = kernel.subgroup.reduce<addf> %partial : f32
+    %mean = scalar.mulf %sum, %inverse_width : f32
+    %biased = scalar.addf %mean, %epsilon : f32
+    %inverse = scalar.rsqrtf<afn> %biased : f32
+    %inverses = vector.splat %inverse : vector<4xf32>
+    %unit = vector.mulf %values, %inverses : vector<4xf32>
+    %scaled = vector.mulf %unit, %weights : vector<4xf32>
+    %negative = vector.negf %z_values : vector<4xf32>
+    %exponential = vector.expf<afn> %negative : vector<4xf32>
+    %c1v = vector.splatf 1.0 : vector<4xf32>
+    %denominator = vector.addf %c1v, %exponential : vector<4xf32>
+    %gated = vector.divf %scaled, %denominator : vector<4xf32>
+    %packed = vector.fptrunc %gated : vector<4xf32> to vector<4xbf16>
+    vector.store %packed, %output_view[%token, %channel] : vector<4xbf16>, view<[%capacity]x6144xbf16>
+  }
+  kernel.return
+}
+
+kernel.def @fixture() {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%count: index, %span: buffer) {
+  %word = index.cast %count : index to i32
+  %origin = index.constant 0 : offset
+  %header = buffer.view %span[%origin] : buffer -> view<3xi32>
+  view.store %word, %header[0] : i32, view<3xi32>
+  kernel.return
+}
+
+check.case public @gate_rows {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %count = check.param.choice values([0, 1, 17, 257, 513]) name("active") : index
+  %span = check.generate.fill value(0) : tensor<3xi32>
+  kernel.launch @fixture(%count, %span) : (index, tensor<3xi32>)
+  %seed = check.literal value(711261) : i64
+  %raw = check.generate.random.uniform seed(%seed) range(-3.0 to 3.0) : tensor<513x6144xbf16>
+  %z = check.generate.random.uniform seed(%seed) range(-7.0 to 7.0) : tensor<513x6144xbf16>
+  %weight = check.generate.random.uniform seed(%seed) range(0.10000000000000001 to 2.0) : tensor<128xf32>
+  %output = check.generate.fill value(17.0) : tensor<513x6144xbf16>
+  %expected = check.generate.fill value(17.0) : tensor<513x6144xbf16>
+  kernel.launch @original_gate(%span, %raw, %z, %weight, %expected) : (tensor<3xi32>, tensor<513x6144xbf16>, tensor<513x6144xbf16>, tensor<128xf32>, tensor<513x6144xbf16>)
+  kernel.launch @gdn_gate(%span, %raw, %z, %weight, %output) : (tensor<3xi32>, tensor<513x6144xbf16>, tensor<513x6144xbf16>, tensor<128xf32>, tensor<513x6144xbf16>)
+  check.expect.bitwise actual(%output) expected(%expected) : tensor<513x6144xbf16>
+  check.return
+}
+
+check.benchmark<@gate_rows> @gate_rows_benchmark
