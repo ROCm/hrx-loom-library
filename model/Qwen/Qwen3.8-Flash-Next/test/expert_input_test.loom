@@ -1,0 +1,60 @@
+// Expert inputs preserve BF16-to-F16 rounding, use the sampled live extent,
+// and leave inactive storage untouched across empty, partial, and looped grids.
+
+kernel.decl @expert_input_half(%enabled: i1) launch(%input: buffer, %epoch: buffer, %output: buffer)
+
+command.def @prepare() launch(%span: buffer, %input: buffer, %output: buffer) {
+  %enabled = scalar.constant true : i1
+  kernel.launch @expert_input_half[%enabled](%input, %span, %output) : [i1](buffer, buffer, buffer)
+  command.return
+}
+
+func.def @reference(%span: buffer, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %span[%origin] : buffer -> view<3xi32>
+  %word = view.load %header[0] : view<3xi32> -> i32
+  %count_value = index.cast %word : i32 to index
+  %count = index.assume %count_value [range(%count_value, 0, 1029)] : index
+  %c0 = index.constant 0 : index
+  %c16 = index.constant 16 : index
+  %width = index.constant 2560 : index
+  %elements = index.mul %count, %width : index
+  %source = buffer.view %input[%origin] : buffer -> view<2634240xbf16>
+  %target = buffer.view %output[%origin] : buffer -> view<2634240xf16>
+  scf.for %position = [%c0 to %elements step %c16] {
+    %values = vector.load %source[%position] : view<2634240xbf16> -> vector<16xbf16>
+    %wide = vector.extf %values : vector<16xbf16> to vector<16xf32>
+    %half = vector.fptrunc %wide : vector<16xf32> to vector<16xf16>
+    vector.store %half, %target[%position] : vector<16xf16>, view<2634240xf16>
+  }
+  func.return
+}
+
+func.def @fixture(%trial: index, %span: buffer) -> (index) {
+  %counts = vector.constanti [0, 13, 1027] : vector<3xi32>
+  %trial_index = index.assume %trial [range(%trial, 0, 2)] : index
+  %word = vector.extract %counts[%trial_index] : vector<3xi32> -> i32
+  %count = index.cast %word : i32 to index
+  %origin = index.constant 0 : offset
+  %header = buffer.view %span[%origin] : buffer -> view<3xi32>
+  view.store %word, %header[0] : i32, view<3xi32>
+  func.return %count : index
+}
+
+check.scenario public @prepared_input {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[3](%trial: index, %entropy: check.entropy) {
+    %span = check.generate.fill value(0) : tensor<3xi32>
+    %count = check.generate<@fixture>(%trial, %span) : (index, tensor<3xi32>) -> (index)
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-5.0 to 5.0) : tensor<1029x2560xbf16>
+    %output = check.generate.fill value(17.0) : tensor<1029x2560xf16>
+    check.compare<@prepare, @reference>(%span, %input, %output) : (tensor<3xi32>, tensor<1029x2560xbf16>, tensor<1029x2560xf16>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<1029x2560xf16>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<1029x2560xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@prepared_input> @prepared_input_benchmark

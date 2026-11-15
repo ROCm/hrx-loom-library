@@ -4,7 +4,7 @@
 // Q4_K/Q5_K retain a K256 quantization block, including its common header.
 // Q8 fills the same bank with four independent K32 blocks.
 // Decode physical coefficients to F16 once per shared panel. F32 matrix
-// accumulators span the full reduction. The 2K QK schedule shares one F16
+// accumulators span the full reduction. Large QK cohorts share one F16
 // conversion across all routed consumers; other schedules read BF16 input.
 // One masked activation refill overlaps computation of the current window.
 
@@ -411,7 +411,7 @@ func.def public inline @expert_block_gate(%q8: i1, %q5: i1, %input_arg: buffer, 
 func.def public pure inline @expert_gate_input_is_prepacked() -> (i1) {
   %capacity = config.get @flash_next.token_count : index
   %selected = index.constant 2048 : index
-  %enabled = index.cmp eq, %capacity, %selected : index
+  %enabled = index.cmp uge, %capacity, %selected : index
   func.return %enabled : i1
 }
 
@@ -429,7 +429,11 @@ kernel.def target(@expert_operand_wave32) @expert_input_half(%neural_enabled: i1
   %rounded = index.add %elements, %rounding : index
   %groups = index.div %rounded, %span : index
   %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
+  %execution_units = target.execution.unit.count : index
+  %groups_per_unit = index.constant 8 : index
+  %group_budget = index.mul %execution_units, %groups_per_unit : index
+  %workers = index.min %groups, %group_budget : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
   kernel.launch.config workgroups(%active_groups, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
 } launch(%input_arg: buffer, %epoch_arg: buffer, %output_arg: buffer) {
   %input, %epoch, %output = buffer.assume.noalias %input_arg, %epoch_arg, %output_arg : buffer, buffer, buffer
@@ -444,9 +448,10 @@ kernel.def target(@expert_operand_wave32) @expert_input_half(%neural_enabled: i1
   %group = kernel.workgroup.id<x> : index
   %thread = kernel.workitem.id<x> : index
   %local = index.mul %thread, %c8 : index
-  %base = index.madd %group, %span, %local : index
-  %active = index.cmp ult, %base, %live_elements : index
-  scf.if %active {
+  %begin = index.madd %group, %span, %local : index
+  %groups = kernel.workgroup.count<x> : index
+  %step = index.mul %groups, %span : index
+  scf.for %base = [%begin to %live_elements step %step] {
     %input_view = buffer.view %input[%c0_offset] : buffer -> view<[%elements]xbf16>
     %output_view = buffer.view %output[%c0_offset] : buffer -> view<[%elements]xf16>
     %packet = vector.load %input_view[%base] : view<[%elements]xbf16> -> vector<8xbf16>
