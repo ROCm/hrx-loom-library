@@ -21,9 +21,9 @@ kernel.decl @qwen38_gdn_conv_prepare_prefill_parallel_read_only(%token_count: in
 
 kernel.decl @qwen38_gdn_conv_prepare_prefill_read_only(%token_count: index) launch(%token_count_data: buffer, %l2_epsilon: f32, %qkv_input: buffer, %conv_weight: buffer, %conv_history: buffer, %qkv_silu: buffer, %qk_inverse_norm: buffer)
 
-kernel.decl @qwen38_gdn_norm_gate_f16_prefill(%dispatch_token_count: index) launch(%token_count: index, %rms_epsilon: f32, %raw_output: buffer, %norm_weight: buffer, %z: buffer, %output: buffer)
+kernel.decl @qwen38_gdn_norm_gate_f16_prefill(%live_rows: index) launch(%token_capacity: index, %control: buffer, %rms_epsilon: f32, %raw_output: buffer, %norm_weight: buffer, %z: buffer, %output: buffer)
 
-kernel.decl @qwen38_gdn_norm_gate_prefill(%dispatch_token_count: index) launch(%token_count: index, %rms_epsilon: f32, %raw_output: buffer, %norm_weight: buffer, %z: buffer, %output: buffer)
+kernel.decl @qwen38_gdn_norm_gate_prefill(%live_rows: index) launch(%token_capacity: index, %control: buffer, %rms_epsilon: f32, %raw_output: buffer, %norm_weight: buffer, %z: buffer, %output: buffer)
 
 kernel.decl @qwen38_gdn_recurrent_prefill_x4(%token_count: index) launch(%token_count_data: buffer, %qkv_silu: buffer, %qk_inverse_norm: buffer, %alpha: buffer, %beta: buffer, %ssm_a: buffer, %dt_bias: buffer, %state: buffer, %raw_output: buffer)
 
@@ -31,19 +31,50 @@ kernel.decl @qwen38_gdn_recurrent_prefill_x4_read_only(%token_count: index) laun
 
 kernel.decl @qwen38_gdn_snapshot_history() launch(%history: buffer, %snapshot: buffer)
 
-// Numerical checks for gdn prefill.
-// Production kernels come from the model library; independent reference
-// kernels and fixture data belong only to this test root.
-check.case public @qwen38_gdn_norm_gate_f16_known_case {
-  %token_count = check.literal value(1) : index
+// For constant x=0.5 and weight=1, RMSNorm(x)*SiLU(0.25) is
+// 0.14054384413404236 in F64, or 0.1405029296875 after F16 rounding.
+// The inactive capacity tail retains its sentinel in both representations.
+kernel.def @gdn_norm_gate_expected(%live_rows: index) {
+  %rows = index.assume %live_rows [range(%live_rows, 0, 129)] : index
+  %unit = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%rows, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%output: buffer, %output_f16: buffer) {
+  %origin = index.constant 0 : offset
+  %row_value = kernel.workgroup.id<x> : index
+  %row = index.assume %row_value [range(%row_value, 0, 128)] : index
+  %lane = kernel.workitem.id<x> : index
+  %full = buffer.view %output[%origin] : buffer -> view<130x6144xf32>
+  %half = buffer.view %output_f16[%origin] : buffer -> view<130x6144xf16>
+  %value = scalar.constant 0.14054384413404236 : f32
+  %value_f16 = scalar.constant 0.1405029296875 : f16
+  %step = index.constant 128 : index
+  %channels = index.constant 6144 : index
+  scf.for %channel = [%lane to %channels step %step] {
+    view.store %value, %full[%row, %channel] : f32, view<130x6144xf32>
+    view.store %value_f16, %half[%row, %channel] : f16, view<130x6144xf16>
+  }
+  kernel.return
+}
+
+check.case public @qwen38_gdn_norm_gate_known_case {
+  %live_rows = check.param.choice values([0, 1, 129]) name("live_rows") : index
+  %capacity = check.literal value(130) : index
+  %count = check.generate.fill value(0) : tensor<1xi32>
   %epsilon = check.literal value(9.9999999999999995e-07) : f32
-  %raw_output = check.generate.fill value(0.5) : tensor<1x6144xf32>
+  %raw_output = check.generate.fill value(0.5) : tensor<130x6144xf32>
   %norm_weight = check.generate.fill value(1.0) : tensor<128xf32>
-  %z = check.generate.fill value(0.25) : tensor<1x6144xf32>
-  %output = check.generate.fill value(0.0) : tensor<1x6144xf16>
-  %expected = check.generate.fill value(0.1405029296875) : tensor<1x6144xf16>
-  kernel.launch @qwen38_gdn_norm_gate_f16_prefill[%token_count](%token_count, %epsilon, %raw_output, %norm_weight, %z, %output) : [index](index, f32, tensor<1x6144xf32>, tensor<128xf32>, tensor<1x6144xf32>, tensor<1x6144xf16>)
-  check.expect.approximate actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<1x6144xf16>, tensor<1x6144xf16>
+  %z = check.generate.fill value(0.25) : tensor<130x6144xf32>
+  %output = check.generate.fill value(-99.0) : tensor<130x6144xf32>
+  %output_f16 = check.generate.fill value(-99.0) : tensor<130x6144xf16>
+  %expected = check.generate.fill value(-99.0) : tensor<130x6144xf32>
+  %expected_f16 = check.generate.fill value(-99.0) : tensor<130x6144xf16>
+  kernel.launch @qwen38_gdn_prefill_store_token_count(%live_rows, %count) : (index, tensor<1xi32>)
+  kernel.launch @gdn_norm_gate_expected[%live_rows](%expected, %expected_f16) : [index](tensor<130x6144xf32>, tensor<130x6144xf16>)
+  kernel.launch @qwen38_gdn_norm_gate_prefill[%live_rows](%capacity, %count, %epsilon, %raw_output, %norm_weight, %z, %output) : [index](index, tensor<1xi32>, f32, tensor<130x6144xf32>, tensor<128xf32>, tensor<130x6144xf32>, tensor<130x6144xf32>)
+  kernel.launch @qwen38_gdn_norm_gate_f16_prefill[%live_rows](%capacity, %count, %epsilon, %raw_output, %norm_weight, %z, %output_f16) : [index](index, tensor<1xi32>, f32, tensor<130x6144xf32>, tensor<128xf32>, tensor<130x6144xf32>, tensor<130x6144xf16>)
+  check.expect.approximate actual(%output) expected(%expected) atol(1.0000000000000001e-07) rtol(0.0) nan(same) : tensor<130x6144xf32>, tensor<130x6144xf32>
+  check.expect.bitwise actual(%output_f16) expected(%expected_f16) : tensor<130x6144xf16>
   check.return
 }
 
@@ -155,13 +186,13 @@ check.case public @qwen38_gdn_prefill_benchmark_case {
   kernel.launch @qwen38_gdn_prefill_store_token_count(%token_count, %token_count_data) : (index, tensor<1xi32>)
   kernel.launch @qwen38_gdn_conv_prepare_prefill[%token_count](%token_count_data, %l2_epsilon, %qkv_input, %conv_weight, %conv_history, %qkv_silu, %qk_inverse_norm) : [index](tensor<1xi32>, f32, tensor<[%token_count]x10240xf32>, tensor<40960xf32>, tensor<30720xf32>, tensor<[%token_count]x10240xf32>, tensor<[%token_count]x32xf32>)
   kernel.launch @qwen38_gdn_recurrent_prefill_x4[%token_count](%token_count_data, %qkv_silu, %qk_inverse_norm, %alpha, %beta, %ssm_a, %dt_bias, %state, %raw_output) : [index](tensor<1xi32>, tensor<[%token_count]x10240xf32>, tensor<[%token_count]x32xf32>, tensor<[%token_count]x48xf32>, tensor<[%token_count]x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<786432xf32>, tensor<[%token_count]x6144xf32>)
-  kernel.launch @qwen38_gdn_norm_gate_prefill[%token_count](%token_count, %rms_epsilon, %raw_output, %norm_weight, %z, %output) : [index](index, f32, tensor<[%token_count]x6144xf32>, tensor<128xf32>, tensor<[%token_count]x6144xf32>, tensor<[%token_count]x6144xf32>)
+  kernel.launch @qwen38_gdn_norm_gate_prefill[%token_count](%token_count, %token_count_data, %rms_epsilon, %raw_output, %norm_weight, %z, %output) : [index](index, tensor<1xi32>, f32, tensor<[%token_count]x6144xf32>, tensor<128xf32>, tensor<[%token_count]x6144xf32>, tensor<[%token_count]x6144xf32>)
   check.return
 }
 
 check.benchmark<@qwen38_gdn_prefill_benchmark_case> @qwen38_gdn_prefill_1 {token_count = 1}
 
-check.benchmark<@qwen38_gdn_norm_gate_f16_known_case> @qwen38_gdn_norm_gate_f16_known
+check.benchmark<@qwen38_gdn_norm_gate_known_case> @qwen38_gdn_norm_gate_known {live_rows = 129}
 
 check.benchmark<@qwen38_gdn_prefill_benchmark_case> @qwen38_gdn_prefill_32 {token_count = 32}
 
