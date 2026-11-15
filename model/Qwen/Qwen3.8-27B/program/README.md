@@ -34,6 +34,16 @@ replacing its bytes, preserving the packed footprint. `dflash_weights.loom`
 selects draft preparation. These policies are auxiliary compiler inputs in
 both representations; checkpoints stay outside the build payload graph.
 
+Wide prefill composes the shared paired-Q5 gate/up kernel and Q6 residual
+projection. Their matrix tiles reuse decoded weights across 256 token rows;
+the Q5 pair publishes the fused SiLU product directly as F16, which the Q6
+down projection consumes before adding its F32 result to the residual. The
+Gated DeltaNet output projection also consumes producer-rounded F16 values.
+These shared kernels own format decoding, panel tails, and bounded workers;
+the model owns their shapes and the choice of narrower schedules for small
+cohorts. Both raw Q6 and prepared channel-eight Q5 retain their checkpoint
+representations, with no additional weight copy at execution time.
+
 ## Output-head execution scope
 
 Activation packing, the Q6_K vocabulary contraction, and partial winner
