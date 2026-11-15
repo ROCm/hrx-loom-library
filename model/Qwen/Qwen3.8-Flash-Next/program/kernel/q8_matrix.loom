@@ -26,16 +26,16 @@ template.def<@flash_next.q8_contract> device @flash_next_q8_contract(%capacity: 
 
 template.decl @tensor.matrix.store_bf16_wave32(%remaining_rows: index, %outputs: index, %fragment_row: index, %result_column: index, %result: vector<8xf32>, %output_view: view<[%remaining_rows]x[%outputs]xbf16>)
 
-template.decl @flash_next.q8_tile(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+template.decl @flash_next.q8_tile(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
-template.decl @flash_next.q8_tile_stage(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %use_stage64: i1, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+template.decl @flash_next.q8_tile_stage(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %use_stage64: i1, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 // Dense Q8 publication rounds the contracted F32 tile once to BF16. The caller
 // launches ceil(outputs/tile_columns) by ceil(capacity/tile_rows) workgroups
 // of wave_rows*wave_columns*32 threads. Exact SSA geometry specializes before
 // fragment lowering; the immutable epoch header supplies the live row extent.
 // Operands and output are disjoint. Empty workgroups perform no memory access.
-template.def<@flash_next.q8_tile_stage> device @flash_next_q8_tiled_stage(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %use_stage64: i1, %span_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
+template.def<@flash_next.q8_tile_stage> device @flash_next_q8_tiled_stage(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %use_stage64: i1, %span_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
   %span, %input, %weight, %output = buffer.assume.noalias %span_arg, %input_arg, %weight_arg, %output_arg : buffer, buffer, buffer, buffer
   %inputs = index.assume %input_width [range(%input_width, 32, 10240), multiple_of(%input_width, 32)] : index
   %outputs = index.assume %output_width [range(%output_width, 4, 262144), multiple_of(%output_width, 4)] : index
@@ -75,7 +75,6 @@ template.def<@flash_next.q8_tile_stage> device @flash_next_q8_tiled_stage(%capac
     %blocks = index.div %inputs, %block_width : index
     %row_bytes = index.scale %blocks, %block_bytes : index, offset -> offset
     %weight_origin = index.constant 0 : offset
-    %split_scales = scalar.constant false : i1
     %result_tile = scf.if %use_stage64 -> (vector<[%fragment_count]x8xf32>) {
       %stage_tile = template.apply<@ggml.q8_0_f16.contract_k64>(%capacity, %inputs, %outputs, %c1, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %fragment_count, %first, %end, %channel_base, %split_scales, %row_bytes, %weight_origin, %input, %weight) : (index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%fragment_count]x8xf32>)
       scf.yield %stage_tile : vector<[%fragment_count]x8xf32>
@@ -96,50 +95,50 @@ template.def<@flash_next.q8_tile_stage> device @flash_next_q8_tiled_stage(%capac
   template.return
 }
 
-template.def<@flash_next.q8_tile> device @flash_next_q8_tiled(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
+template.def<@flash_next.q8_tile> device @flash_next_q8_tiled(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
   %threshold = index.constant 4096 : index
   %use_stage64 = index.cmp uge, %capacity, %threshold : index
-  template.apply<@flash_next.q8_tile_stage>(%capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %use_stage64, %span_arg, %input_arg, %weight_arg, %output_arg) : (index, index, index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
+  template.apply<@flash_next.q8_tile_stage>(%split_scales, %capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %use_stage64, %span_arg, %input_arg, %weight_arg, %output_arg) : (i1, index, index, index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
   template.return
 }
 
 // Schedule predicates are the public specialization contract. A kernel
 // launch class retains these exact values without inspecting the body.
 // Geometry and reduction width select the shared contraction and staging body.
-template.decl @flash_next.q8_schedule(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+template.decl @flash_next.q8_schedule(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
-template.def<@flash_next.q8_schedule> device @flash_next_q8_16x64_waves_1x4(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 16), eq(%tile_columns, 64), eq(%wave_rows, 1), eq(%wave_columns, 4), eq(%pipeline_depth, 1)] {
-  template.apply<@flash_next.q8_tile>(%capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
+template.def<@flash_next.q8_schedule> device @flash_next_q8_16x64_waves_1x4(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 16), eq(%tile_columns, 64), eq(%wave_rows, 1), eq(%wave_columns, 4), eq(%pipeline_depth, 1)] {
+  template.apply<@flash_next.q8_tile>(%split_scales, %capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (i1, index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
   template.return
 }
 
-template.def<@flash_next.q8_schedule> device @flash_next_q8_32x64_waves_2x2(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 32), eq(%tile_columns, 64), eq(%wave_rows, 2), eq(%wave_columns, 2), eq(%pipeline_depth, 1)] {
-  template.apply<@flash_next.q8_tile>(%capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
+template.def<@flash_next.q8_schedule> device @flash_next_q8_32x64_waves_2x2(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 32), eq(%tile_columns, 64), eq(%wave_rows, 2), eq(%wave_columns, 2), eq(%pipeline_depth, 1)] {
+  template.apply<@flash_next.q8_tile>(%split_scales, %capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (i1, index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
   template.return
 }
 
-template.def<@flash_next.q8_schedule> device @flash_next_q8_32x32_waves_2x2(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 32), eq(%tile_columns, 32), eq(%wave_rows, 2), eq(%wave_columns, 2), eq(%pipeline_depth, 1)] {
-  template.apply<@flash_next.q8_tile>(%capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
+template.def<@flash_next.q8_schedule> device @flash_next_q8_32x32_waves_2x2(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 32), eq(%tile_columns, 32), eq(%wave_rows, 2), eq(%wave_columns, 2), eq(%pipeline_depth, 1)] {
+  template.apply<@flash_next.q8_tile>(%split_scales, %capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (i1, index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
   template.return
 }
 
-template.def<@flash_next.q8_schedule> device @flash_next_q8_64x64_waves_2x2(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 64), eq(%tile_columns, 64), eq(%wave_rows, 2), eq(%wave_columns, 2), eq(%pipeline_depth, 1)] {
-  template.apply<@flash_next.q8_tile>(%capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
+template.def<@flash_next.q8_schedule> device @flash_next_q8_64x64_waves_2x2(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 64), eq(%tile_columns, 64), eq(%wave_rows, 2), eq(%wave_columns, 2), eq(%pipeline_depth, 1)] {
+  template.apply<@flash_next.q8_tile>(%split_scales, %capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (i1, index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
   template.return
 }
 
-template.def<@flash_next.q8_schedule> device @flash_next_q8_64x64_waves_4x2(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 64), eq(%tile_columns, 64), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 1)] {
-  template.apply<@flash_next.q8_tile>(%capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
+template.def<@flash_next.q8_schedule> device @flash_next_q8_64x64_waves_4x2(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 64), eq(%tile_columns, 64), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 1)] {
+  template.apply<@flash_next.q8_tile>(%split_scales, %capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (i1, index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
   template.return
 }
 
-template.def<@flash_next.q8_schedule> device @flash_next_q8_128x128_waves_4x2(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 128), eq(%tile_columns, 128), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 1)] {
-  template.apply<@flash_next.q8_tile>(%capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
+template.def<@flash_next.q8_schedule> device @flash_next_q8_128x128_waves_4x2(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 128), eq(%tile_columns, 128), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 1)] {
+  template.apply<@flash_next.q8_tile>(%split_scales, %capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (i1, index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
   template.return
 }
 
-template.def<@flash_next.q8_schedule> device @flash_next_q8_128x128_read_ahead(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 128), eq(%tile_columns, 128), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 2)] {
-  template.apply<@flash_next.q8_tile>(%capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
+template.def<@flash_next.q8_schedule> device @flash_next_q8_128x128_read_ahead(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [eq(%tile_rows, 128), eq(%tile_columns, 128), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 2)] {
+  template.apply<@flash_next.q8_tile>(%split_scales, %capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %span, %input, %weight, %output) : (i1, index, index, index, index, index, index, index, index, buffer, buffer, buffer, buffer)
   template.return
 }
 
@@ -147,8 +146,8 @@ template.def<@flash_next.q8_schedule> device @flash_next_q8_128x128_read_ahead(%
 // Paired K32 blocks share one K64 stage, halving publication barriers while
 // retaining next-stage operand loads in registers. Coefficients and inputs
 // round to F16 before F32 accumulation; no global conversion plane is needed.
-template.def<@flash_next.q8_schedule> device priority(20) @flash_next_q8_128x128_long_reduction(%capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [ge(%capacity, 256), ge(%input_width, 2560), ge(%output_width, 2560), eq(%tile_rows, 128), eq(%tile_columns, 128), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 2)] {
+template.def<@flash_next.q8_schedule> device priority(20) @flash_next_q8_128x128_long_reduction(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) where [ge(%capacity, 256), ge(%input_width, 2560), ge(%output_width, 2560), eq(%tile_rows, 128), eq(%tile_columns, 128), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 2)] {
   %use_stage64 = scalar.constant true : i1
-  template.apply<@flash_next.q8_tile_stage>(%capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %use_stage64, %span, %input, %weight, %output) : (index, index, index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
+  template.apply<@flash_next.q8_tile_stage>(%split_scales, %capacity, %input_width, %output_width, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %use_stage64, %span, %input, %weight, %output) : (i1, index, index, index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
   template.return
 }

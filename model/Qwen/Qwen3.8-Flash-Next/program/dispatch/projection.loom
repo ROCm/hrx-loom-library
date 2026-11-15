@@ -2,7 +2,7 @@
 // The prepared stage supplies capacities and parameter bindings; these
 // commands own intermediate buffers and ordered device launches.
 
-template.decl @flash_next.project_dense_q8(%workload_count: index, %inputs: index, %outputs: index, %blocks: index, %span: buffer, %input: buffer, %weight: view<[%outputs]x[%blocks]x34xi8>, %output: buffer)
+template.decl @flash_next.project_dense_q8(%split_scales: i1, %workload_count: index, %inputs: index, %outputs: index, %blocks: index, %span: buffer, %input: buffer, %weight: view<[%outputs]x[%blocks]x34xi8>, %output: buffer)
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
@@ -14,7 +14,7 @@ kernel.decl @flash_next_project_qkv(%configured_output_width: index) launch(%out
 
 kernel.decl @gdn_project_alpha_beta() launch(%span_arg: buffer, %input_arg: buffer, %alpha_weight_arg: buffer, %beta_weight_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer)
 
-// QKV uses the prepared code/scale planes; other projections keep GGUF order.
+// GDN QKV, gate, and output projections share prepared code/scale planes.
 // These projections surround the packed state command. Input
 // and output have the model's hidden width; state/history advance only through
 // the active span. Scratch activation publications remain BF16 except for the
@@ -39,7 +39,8 @@ command.def public @flash_next_gdn_attention(%workload_count: index, %layer: ind
   %z_weight_block_size = index.constant 32 : index
   %z_weight_blocks = index.div %hidden, %z_weight_block_size : index
   %z_weight_shaped = view.refine %z_weight : view<6144x80x34xi8> -> view<[%value_width]x[%z_weight_blocks]x34xi8>
-  template.apply<@flash_next.project_dense_q8>(%workload_count, %hidden, %value_width, %z_weight_blocks, %span, %input, %z_weight_shaped, %z) : (index, index, index, index, buffer, buffer, view<[%value_width]x[%z_weight_blocks]x34xi8>, buffer)
+  %dense_weight_layout0 = scalar.constant true : i1
+  template.apply<@flash_next.project_dense_q8>(%dense_weight_layout0, %workload_count, %hidden, %value_width, %z_weight_blocks, %span, %input, %z_weight_shaped, %z) : (i1, index, index, index, index, buffer, buffer, view<[%value_width]x[%z_weight_blocks]x34xi8>, buffer)
   kernel.launch @gdn_project_alpha_beta(%span, %input, %alpha_weight, %beta_weight, %alpha, %beta) : (buffer, buffer, view<48x2560xf32>, view<48x2560xf32>, buffer, buffer)
   // Large epochs keep raw QKV in LDS except for compact session/tile halos.
   // Small epochs and sparse speculative replay retain their wave bodies.
@@ -58,6 +59,7 @@ command.def public @flash_next_gdn_attention(%workload_count: index, %layer: ind
   %output_weight_block_size = index.constant 32 : index
   %output_weight_blocks = index.div %value_width, %output_weight_block_size : index
   %output_weight_shaped = view.refine %output_weight : view<2560x192x34xi8> -> view<[%hidden]x[%output_weight_blocks]x34xi8>
-  template.apply<@flash_next.project_dense_q8>(%workload_count, %value_width, %hidden, %output_weight_blocks, %span, %gated, %output_weight_shaped, %output) : (index, index, index, index, buffer, buffer, view<[%hidden]x[%output_weight_blocks]x34xi8>, buffer)
+  %dense_weight_layout1 = scalar.constant true : i1
+  template.apply<@flash_next.project_dense_q8>(%dense_weight_layout1, %workload_count, %value_width, %hidden, %output_weight_blocks, %span, %gated, %output_weight_shaped, %output) : (i1, index, index, index, index, buffer, buffer, view<[%hidden]x[%output_weight_blocks]x34xi8>, buffer)
   command.return
 }

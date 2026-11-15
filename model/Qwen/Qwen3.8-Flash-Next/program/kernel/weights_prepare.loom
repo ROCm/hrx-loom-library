@@ -1,17 +1,17 @@
-// Four K2560 rows occupy 10,880 bytes in either representation. One workgroup
+// Four Q8 rows retain their exact original byte extent. One workgroup
 // captures that entire disjoint range before publishing its permutation:
-//   [80 blocks x 4 channels x f16 scale]
-//   [80 blocks x 4 channels x 32 i8 codes]
+//   [K/32 blocks x 4 channels x f16 scale]
+//   [K/32 blocks x 4 channels x 32 i8 codes]
 // No peer can still need this group's original bytes when it starts writing.
 // The loader orders consumers after preparation and reloads before reactivation.
-kernel.def @flash_next_prepare_qkv_channels(%output_width: index) {
+kernel.def @flash_next_prepare_q8_channels(%input_width: index, %output_width: index) {
   %outputs = index.assume %output_width [range(%output_width, 4, 262144), multiple_of(%output_width, 4)] : index
   %c4 = index.constant 4 : index
   %groups = index.div %outputs, %c4 : index
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%weight: buffer) {
+} launch(%input_width: index, %weight: buffer) {
   %group = kernel.workgroup.id<x> : index
   %workitem = kernel.workitem.id<x> : index
   %c0 = index.constant 0 : index
@@ -21,7 +21,7 @@ kernel.def @flash_next_prepare_qkv_channels(%output_width: index) {
   %c17 = index.constant 17 : index
   %c64 = index.constant 64 : index
   %c256 = index.constant 256 : index
-  %inputs = index.constant 2560 : index
+  %inputs = index.assume %input_width [range(%input_width, 32, 6144), multiple_of(%input_width, 32)] : index
   %c32 = index.constant 32 : index
   %blocks = index.div %inputs, %c32 : index
   %scale_words = index.mul %blocks, %c4 : index
@@ -51,7 +51,10 @@ kernel.def @flash_next_prepare_qkv_channels(%output_width: index) {
       scf.yield %target_word : index
     }
     %value = view.load %view[%word] : view<[%group_words]xi16> -> i16
-    view.store %value, %staged[%target] : i16, view<[%group_words]xi16>
+    // Both scale and code destinations remain within the same four-row group.
+    %last_word = index.sub %group_words, %c1 : index
+    %destination = index.assume %target [range(%target, 0, %last_word)] : index
+    view.store %value, %staged[%destination] : i16, view<[%group_words]xi16>
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   scf.for %packet = [%workitem to %row_words step %c256] {

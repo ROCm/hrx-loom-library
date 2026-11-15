@@ -19,10 +19,16 @@ share the target's storage.
 Preparation declares the stage catalog and immutable capacities. Packed
 epochs carry the live token count, spans, row ownership, page IDs, and
 recurrent frontiers. `weights.loom` is an explicit auxiliary compiler input:
-it selects the in-place preparation command for the 36 GDN QKV tensors.
-Each disjoint four-channel group is read into workgroup storage before its
-codes and scales replace the original bytes. Other weights retain their
-GGUF representation. Reactivation loads original checkpoint bytes before
+it configures one in-place preparation command for the QKV, gate, and output
+matrices in all 36 GDN layers. Each disjoint four-channel group is read into
+workgroup storage before publishing contiguous scale and code planes. The
+original F16 scales and I8 codes keep their exact bytes and total extent;
+preparation adds no persistent copy or numerical conversion.
+
+The GDN projection commands carry the prepared-layout fact through both dot
+and matrix selection. Other dense callers explicitly retain their original
+GGUF layout. This makes storage a property of the bound tensor rather than a
+guess from its shape. Reactivation loads original checkpoint bytes before
 preparing them again.
 
 ## Execution and retained state

@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-kernel.decl @flash_next_linear_q8(%workload_count: index, %configured_output_width: index) launch(%input_width: index, %output_width: index, %epoch: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @flash_next_linear_q8(%workload_count: index, %configured_output_width: index) launch(%split_scales: i1, %input_width: index, %output_width: index, %epoch: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 func.decl @flash_next_q8_fixture(%count: index, %inputs: index, %outputs: index, %epoch: buffer, %input: buffer, %weight: buffer)
 
@@ -40,7 +40,8 @@ check.scenario public @packed_q8_projection configure[6](%configuration: index, 
     check.generate<@flash_next_q8_fixture>(%count, %inputs, %outputs, %epoch, %input, %weight) : (index, index, index, tensor<3xi32>, tensor<19x[%inputs]xbf16>, tensor<[%outputs]x[%blocks]x34xi8>) -> ()
     %output = check.generate.fill value(-17.0) : tensor<19x[%outputs]xbf16>
     %capacity = check.literal value(19) : index
-    check.compare<@flash_next_linear_q8, @flash_next_q8_reference>[%capacity, %outputs](%inputs, %outputs, %epoch, %input, %weight, %output) : [index, index](index, index, tensor<3xi32>, tensor<19x[%inputs]xbf16>, tensor<[%outputs]x[%blocks]x34xi8>, tensor<19x[%outputs]xbf16>) -> () {
+    %raw_weights = check.literal value(false) : i1
+    check.compare<@flash_next_linear_q8, @raw_reference>[%capacity, %outputs](%raw_weights, %inputs, %outputs, %epoch, %input, %weight, %output) : [index, index](i1, index, index, tensor<3xi32>, tensor<19x[%inputs]xbf16>, tensor<[%outputs]x[%blocks]x34xi8>, tensor<19x[%outputs]xbf16>) -> () {
       check.expect.approximate actual(%output) expected(%output) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<19x[%outputs]xbf16>, tensor<19x[%outputs]xbf16>
     }
   }
@@ -99,9 +100,11 @@ check.case public @batch_independent_reduction {
   %single = check.generate.fill value(-17.0) : tensor<19x4xbf16>
   %batched = check.generate.fill value(-17.0) : tensor<19x4xbf16>
   kernel.launch @cancellation_fixture(%c1, %epoch, %input, %weight) : (index, tensor<3xi32>, tensor<19x416xbf16>, tensor<4x13x34xi8>)
-  kernel.launch @flash_next_linear_q8[%c1, %outputs](%inputs, %outputs, %epoch, %input, %weight, %single) : [index, index](index, index, tensor<3xi32>, tensor<19x416xbf16>, tensor<4x13x34xi8>, tensor<19x4xbf16>)
+  %raw_weights0 = check.literal value(false) : i1
+  kernel.launch @flash_next_linear_q8[%c1, %outputs](%raw_weights0, %inputs, %outputs, %epoch, %input, %weight, %single) : [index, index](i1, index, index, tensor<3xi32>, tensor<19x416xbf16>, tensor<4x13x34xi8>, tensor<19x4xbf16>)
   kernel.launch @cancellation_fixture(%count, %epoch, %input, %weight) : (index, tensor<3xi32>, tensor<19x416xbf16>, tensor<4x13x34xi8>)
-  kernel.launch @flash_next_linear_q8[%count, %outputs](%inputs, %outputs, %epoch, %input, %weight, %batched) : [index, index](index, index, tensor<3xi32>, tensor<19x416xbf16>, tensor<4x13x34xi8>, tensor<19x4xbf16>)
+  %raw_weights1 = check.literal value(false) : i1
+  kernel.launch @flash_next_linear_q8[%count, %outputs](%raw_weights1, %inputs, %outputs, %epoch, %input, %weight, %batched) : [index, index](i1, index, index, tensor<3xi32>, tensor<19x416xbf16>, tensor<4x13x34xi8>, tensor<19x4xbf16>)
   %single_first = check.tensor.view %single offset(0) : tensor<19x4xbf16> -> tensor<1x4xbf16>
   %batched_first = check.tensor.view %batched offset(0) : tensor<19x4xbf16> -> tensor<1x4xbf16>
   check.expect.bitwise actual(%batched_first) expected(%single_first) : tensor<1x4xbf16>
@@ -111,3 +114,42 @@ check.case public @batch_independent_reduction {
 check.benchmark<@packed_q8_projection> @packed_q8_projection_benchmark
 
 check.benchmark<@batch_independent_reduction> @batch_independent_reduction_benchmark
+
+func.def @raw_reference(%split_scales: i1, %inputs: index, %outputs: index, %epoch: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  func.call @flash_next_q8_reference(%inputs, %outputs, %epoch, %input, %weight, %output) : (index, index, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+kernel.decl @flash_next_prepare_q8_channels(%configured_inputs: index, %configured_outputs: index) launch(%input_width: index, %weight: buffer)
+
+kernel.def @prepared_fixture() {
+  %one = index.constant 1 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%one, %one, %one) : index
+} launch(%count: index, %inputs: index, %outputs: index, %epoch: buffer, %input: buffer, %weight: buffer) {
+  func.call @flash_next_q8_fixture(%count, %inputs, %outputs, %epoch, %input, %weight) : (index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+check.case public @prepared_dense_dot {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %inputs = check.param.choice values([2560, 6144]) name("width") : index
+  %outputs = check.literal value(4) : index
+  %count = check.param.choice values([1, 7, 19]) name("active") : index
+  %capacity = check.literal value(19) : index
+  %seed = check.literal value(7151) : i64
+  %epoch = check.generate.fill value(0) : tensor<3xi32>
+  %input = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<19x6144xbf16>
+  %weight = check.generate.random.uniform seed(%seed) range(-127 to 127) : tensor<4x192x34xi8>
+  kernel.launch @prepared_fixture(%count, %inputs, %outputs, %epoch, %input, %weight) : (index, index, index, tensor<3xi32>, tensor<19x6144xbf16>, tensor<4x192x34xi8>)
+  %expected = check.generate.fill value(-17.0) : tensor<19x4xbf16>
+  %output = check.generate.fill value(-17.0) : tensor<19x4xbf16>
+  %raw = check.literal value(false) : i1
+  %packed = check.literal value(true) : i1
+  kernel.launch @flash_next_linear_q8[%capacity, %outputs](%raw, %inputs, %outputs, %epoch, %input, %weight, %expected) : [index, index](i1, index, index, tensor<3xi32>, tensor<19x6144xbf16>, tensor<4x192x34xi8>, tensor<19x4xbf16>)
+  kernel.launch @flash_next_prepare_q8_channels[%inputs, %outputs](%inputs, %weight) : [index, index](index, tensor<4x192x34xi8>)
+  kernel.launch @flash_next_linear_q8[%capacity, %outputs](%packed, %inputs, %outputs, %epoch, %input, %weight, %output) : [index, index](i1, index, index, tensor<3xi32>, tensor<19x6144xbf16>, tensor<4x192x34xi8>, tensor<19x4xbf16>)
+  check.expect.bitwise actual(%output) expected(%expected) : tensor<19x4xbf16>
+  check.return
+}
+
+check.benchmark<@prepared_dense_dot> @prepared_dense_dot_benchmark
