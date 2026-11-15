@@ -4,10 +4,10 @@
 // Exercise grouped row-tile traversal on the GPU. The command program binds
 // the caller's exact grid and group policy, as in a projection composition;
 // the independent VM oracle reads the same inputs from guarded test storage.
-// The 18 configurations cover singleton/oversized groups, every remainder of
+// The configurations cover singleton/oversized groups, every remainder of
 // an eight-row group, multiple groups, model grids, and the maximum grid.
 
-template.decl @projection.linear_tiled_coordinates(%row_tiles: index, %output_tiles: index, %group_size: index) -> (index, index)
+template.decl @projection.linear_tiled_coordinates(%flat: index, %row_tiles: index, %output_tiles: index, %group_size: index) -> (index, index)
 
 func.decl @coordinate_storage_size(%rows: index, %columns: index) -> (index)
 
@@ -18,12 +18,12 @@ func.decl @coordinate_grid_reference(%storage: buffer)
 template.decl @coordinate_grid(%configuration: index) -> (index, index, index)
 
 template.def<@coordinate_grid> @coordinate_grid_values(%configuration: index) -> (index, index, index) {
-  %row_counts = vector.constanti [1, 1, 2, 3, 5, 8, 9, 10, 11, 12, 13, 14, 15, 17, 33, 66, 72, 1024] : vector<18xi32>
-  %column_counts = vector.constanti [1, 3, 1, 5, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 4, 24, 96, 256] : vector<18xi32>
-  %group_sizes = vector.constanti [1, 8, 1, 2, 3, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8] : vector<18xi32>
-  %row_word = vector.extract %row_counts[%configuration] : vector<18xi32> -> i32
-  %column_word = vector.extract %column_counts[%configuration] : vector<18xi32> -> i32
-  %group_word = vector.extract %group_sizes[%configuration] : vector<18xi32> -> i32
+  %row_counts = vector.constanti [1, 1, 2, 3, 5, 8, 9, 10, 11, 12, 13, 14, 15, 17, 33, 66, 72, 1024, 128, 129, 256] : vector<21xi32>
+  %column_counts = vector.constanti [1, 3, 1, 5, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 4, 24, 96, 256, 40, 40, 40] : vector<21xi32>
+  %group_sizes = vector.constanti [1, 8, 1, 2, 3, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 32, 32, 32] : vector<21xi32>
+  %row_word = vector.extract %row_counts[%configuration] : vector<21xi32> -> i32
+  %column_word = vector.extract %column_counts[%configuration] : vector<21xi32> -> i32
+  %group_word = vector.extract %group_sizes[%configuration] : vector<21xi32> -> i32
   %rows = index.cast %row_word : i32 to index
   %columns = index.cast %column_word : i32 to index
   %group = index.cast %group_word : i32 to index
@@ -37,22 +37,30 @@ func.def @generate_coordinate_grid(%configuration: index) -> (index, index, inde
 
 kernel.def @apply_grid(%rows: index, %columns: index) {
   %unit = index.constant 1 : index
-  kernel.launch.config workgroups(%rows, %columns, %unit) workgroup_size(%unit, %unit, %unit) : index
-} launch(%rows: index, %columns: index, %group: index, %storage: buffer) {
-  %row, %column = template.apply<@projection.linear_tiled_coordinates>(%rows, %columns, %group) : (index, index, index) -> (index, index)
-  %payload = index.constant 80 : offset
-  %row_id = kernel.workgroup.id<x> : index
-  %column_id = kernel.workgroup.id<y> : index
-  // The launch grid is exactly rows x columns.
-  %physical_row = index.assume %row_id [ge(%row_id, 0), lt(%row_id, %rows)] : index
-  %physical_column = index.assume %column_id [ge(%column_id, 0), lt(%column_id, %columns)] : index
-  %position = index.madd %physical_column, %rows, %physical_row : index
+  %threads = index.constant 128 : index
+  %rounding = index.constant 127 : index
   %count = index.mul %rows, %columns : index
-  %row_value = index.cast %row : index to i32
-  %column_value = index.cast %column : index to i32
+  %rounded = index.add %count, %rounding : index
+  %groups = index.div %rounded, %threads : index
+  %workers = index.min %groups, %threads : index
+  kernel.launch.config workgroups(%workers, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%rows: index, %columns: index, %group: index, %storage: buffer) {
+  %payload = index.constant 80 : offset
+  %worker = kernel.workgroup.id<x> : index
+  %thread = kernel.workitem.id<x> : index
+  %threads = kernel.workgroup.size<x> : index
+  %workers = kernel.workgroup.count<x> : index
+  %first = index.madd %worker, %threads, %thread : index
+  %step = index.mul %workers, %threads : index
+  %count = index.mul %rows, %columns : index
   %view = buffer.view %storage[%payload] : buffer -> view<[%count]x2xi32>
-  view.store %row_value, %view[%position, 0] : i32, view<[%count]x2xi32>
-  view.store %column_value, %view[%position, 1] : i32, view<[%count]x2xi32>
+  scf.for %position = [%first to %count step %step] {
+    %row, %column = template.apply<@projection.linear_tiled_coordinates>(%position, %rows, %columns, %group) : (index, index, index, index) -> (index, index)
+    %row_value = index.cast %row : index to i32
+    %column_value = index.cast %column : index to i32
+    view.store %row_value, %view[%position, 0] : i32, view<[%count]x2xi32>
+    view.store %column_value, %view[%position, 1] : i32, view<[%count]x2xi32>
+  }
   kernel.return
 }
 
@@ -62,7 +70,7 @@ command.def @coordinate_program(%configuration: index) launch(%storage: buffer) 
   command.return
 }
 
-check.scenario public @grouped_grid configure[18](%configuration: index, %configuration_entropy: check.entropy) {
+check.scenario public @grouped_grid configure[21](%configuration: index, %configuration_entropy: check.entropy) {
   check.trial[1](%trial: index, %entropy: check.entropy) {
     %rows, %columns, %group = check.generate<@generate_coordinate_grid>(%configuration) : (index) -> (index, index, index)
     %storage_count = check.generate<@coordinate_storage_size>(%rows, %columns) : (index, index) -> (index)
