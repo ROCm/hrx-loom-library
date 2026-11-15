@@ -22,6 +22,13 @@ allocation across tiles. The shared motif owns operand staging and arithmetic;
 the kernel owns the wave32 ABI and launch policy. Raw and channel-eight weights
 need no persistent expanded representation.
 
+`q6_k_f16_matrix.loom` exposes overwrite and in-place residual projections
+for F16 input rows, raw Q6_K weights, and F32 output. Its 256-row/256-channel
+matrix schedule uses the same capacity/budget ABI as paired Q5, with 64 KiB
+of worker-local staging and a bounded grid. The independent scalar oracle
+rounds reconstructed weights to F16 before its F64 dot; scenarios cover both
+publication modes, live/capacity differences, tails, and worker reuse.
+
 `q6_k_f32_panel.loom` exposes overwrite and residual projections for up to
 32 live F32 rows. Configuration receives the sampled live count, K/N, and a
 positive worker budget; execution receives the device count buffer, K/N, and

@@ -3,6 +3,8 @@
 // Q4_K/Q5_K decode byte fields in logical groups with I64 signed products
 // and F64 affine scaling, or explicit F32 rounding for serial matrix sums.
 // Q6_K decodes logical elements and accumulates in F64 before one F32 rounding.
+// Its matrix contract first rounds reconstructed weights to F16 and reads
+// F16 activations; scalar and integer-dot contracts retain their own carriers.
 // Input constructors supply signed payloads,
 // finite signed/zero block factors, and consistent Q8_1 sum headers.
 // Uniform constructors have nonzero analytical results for larger workloads.
@@ -439,7 +441,7 @@ func.def @initialize_q6(%uniform: i1, %quantized: i1, %tokens: index, %inputs: i
   func.return
 }
 
-func.def @q6_reference(%quantized: i1, %tokens: index, %inputs: index, %outputs: index, %input_base: offset, %weight_base: offset, %output_base: offset, %input: buffer, %weight: buffer, %output: buffer) {
+func.def @q6_reference(%quantized: i1, %matrix_operands: i1, %tokens: index, %inputs: index, %outputs: index, %input_base: offset, %weight_base: offset, %output_base: offset, %input: buffer, %weight: buffer, %output: buffer) {
   %begin = index.constant 0 : index
   %unit = index.constant 1 : index
   %nibbles = index.constant 2 : index
@@ -516,7 +518,14 @@ func.def @q6_reference(%quantized: i1, %tokens: index, %inputs: index, %outputs:
         %scale_float = scalar.sitofp %scale_byte : i8 to f64
         %factor = scalar.extf %factor_half : f16 to f64
         %weight_scaled = scalar.mulf %code_float, %scale_float : f64
-        %weight_value = scalar.mulf %weight_scaled, %factor : f64
+        %decoded = scalar.mulf %weight_scaled, %factor : f64
+        %weight_value = scf.if %matrix_operands -> (f64) {
+          %half = scalar.fptrunc %decoded : f64 to f16
+          %rounded = scalar.extf %half : f16 to f64
+          scf.yield %rounded : f64
+        } else {
+          scf.yield %decoded : f64
+        }
         %activation = scf.if %quantized -> (f64) {
           %group = index.div %element, %group_values : index
           %record = index.div %group, %groups_per_record : index
@@ -535,9 +544,17 @@ func.def @q6_reference(%quantized: i1, %tokens: index, %inputs: index, %outputs:
           %value = scalar.mulf %scale, %code : f64
           scf.yield %value : f64
         } else {
-          %values = buffer.view %input[%input_base] : buffer -> view<[%tokens]x[%inputs]xf32>
-          %single = view.load %values[%row, %element] : view<[%tokens]x[%inputs]xf32> -> f32
-          %value = scalar.extf %single : f32 to f64
+          %value = scf.if %matrix_operands -> (f64) {
+            %values = buffer.view %input[%input_base] : buffer -> view<[%tokens]x[%inputs]xf16>
+            %half = view.load %values[%row, %element] : view<[%tokens]x[%inputs]xf16> -> f16
+            %wide = scalar.extf %half : f16 to f64
+            scf.yield %wide : f64
+          } else {
+            %values = buffer.view %input[%input_base] : buffer -> view<[%tokens]x[%inputs]xf32>
+            %single = view.load %values[%row, %element] : view<[%tokens]x[%inputs]xf32> -> f32
+            %wide = scalar.extf %single : f32 to f64
+            scf.yield %wide : f64
+          }
           scf.yield %value : f64
         }
         %product = scalar.mulf %weight_value, %activation : f64
@@ -554,14 +571,26 @@ func.def @q6_reference(%quantized: i1, %tokens: index, %inputs: index, %outputs:
 func.def @q6_f32_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
   %quantized = scalar.constant false : i1
   %origin = index.constant 0 : offset
-  func.call @q6_reference(%quantized, %tokens, %inputs, %outputs, %origin, %origin, %origin, %input, %weight, %output) : (i1, index, index, index, offset, offset, offset, buffer, buffer, buffer)
+  %matrix_operands = scalar.constant false : i1
+  func.call @q6_reference(%quantized, %matrix_operands, %tokens, %inputs, %outputs, %origin, %origin, %origin, %input, %weight, %output) : (i1, i1, index, index, index, offset, offset, offset, buffer, buffer, buffer)
   func.return
 }
 
 func.def @q6_q8_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
   %quantized = scalar.constant true : i1
   %origin = index.constant 0 : offset
-  func.call @q6_reference(%quantized, %tokens, %inputs, %outputs, %origin, %origin, %origin, %input, %weight, %output) : (i1, index, index, index, offset, offset, offset, buffer, buffer, buffer)
+  %matrix_operands = scalar.constant false : i1
+  func.call @q6_reference(%quantized, %matrix_operands, %tokens, %inputs, %outputs, %origin, %origin, %origin, %input, %weight, %output) : (i1, i1, index, index, index, offset, offset, offset, buffer, buffer, buffer)
+  func.return
+}
+
+// Matrix operands round reconstructed coefficients to F16 before the dot.
+// The reference otherwise retains scalar byte decoding and F64 accumulation.
+func.def @q6_f16_reference(%tokens: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %quantized = scalar.constant false : i1
+  %matrix_operands = scalar.constant true : i1
+  %origin = index.constant 0 : offset
+  func.call @q6_reference(%quantized, %matrix_operands, %tokens, %inputs, %outputs, %origin, %origin, %origin, %input, %weight, %output) : (i1, i1, index, index, index, offset, offset, offset, buffer, buffer, buffer)
   func.return
 }
 
