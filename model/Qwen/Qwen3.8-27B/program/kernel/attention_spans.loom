@@ -3,6 +3,12 @@
 // placement. Query normalization, rotary coordinates, and cache addressing
 // consume the shared span/row contracts.
 
+func.decl @qwen38_span_count(%epoch: buffer) -> (index)
+
+func.decl @qwen38_span_token_count(%epoch: buffer, %control_origin: offset) -> (index)
+
+func.decl pure @qwen38_span_workers(%token_extent: index, %span_capacity: index, %heads: index, %budget: index) -> (index, index)
+
 func.decl @qwen38_span_active(%epoch: buffer, %span: index) -> (i1)
 
 func.decl @qwen38_span_binding(%epoch: buffer, %span: index) -> (offset, index, index)
@@ -25,45 +31,70 @@ config.decl @qwen38.attention.pool_capacity : %value: index where [range(%value,
 
 // Dense projections use compact token rows; normalization and RoPE use the
 // span's absolute position without changing that compact output placement.
-kernel.def export("qwen38_attention_query_prepare_spans") @qwen38_attention_query_prepare_spans(%token_capacity: index, %span_capacity: index) {
-  %tokens = index.assume %token_capacity [range(%token_capacity, 1, 512)] : index
+kernel.def export("qwen38_attention_query_prepare_spans") @qwen38_attention_query_prepare_spans(%token_extent: index, %span_capacity: index) {
+  %tokens = index.assume %token_extent [range(%token_extent, 0, 512)] : index
   %spans = index.assume %span_capacity [range(%span_capacity, 1, 2147483647)] : index
   %heads = index.constant 24 : index
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%heads, %tokens, %spans) workgroup_size(%threads, %c1, %c1) : index
+  %units = target.execution.unit.count : index
+  // Queue enough short row tasks to hide latency while keeping the complete
+  // grid below 10,000 groups on larger deployments.
+  %unit_limit = index.constant 156 : index
+  %queued_groups_per_unit = index.constant 64 : index
+  %bounded_units = index.min %units, %unit_limit : index
+  %target_limit = index.mul %bounded_units, %queued_groups_per_unit : index
+  %row_workers, %span_workers = func.call pure @qwen38_span_workers(%tokens, %spans, %heads, %target_limit) : (index, index, index, index) -> (index, index)
+  kernel.launch.config workgroups(%heads, %row_workers, %span_workers) workgroup_size(%threads, %c1, %c1) : index
 } launch(%mixed_inputs: index, %epoch: buffer, %epsilon: f32, %projection: buffer, %weight: buffer, %query: buffer, %gate: buffer, %input_tokens: buffer) {
-  %span = kernel.workgroup.id<z> : index
-  %active = func.call @qwen38_span_active(%epoch, %span) : (buffer, index) -> (i1)
-  scf.if %active {
+  %first_span = kernel.workgroup.id<z> : index
+  %span_step = kernel.workgroup.count<z> : index
+  %first_token = kernel.workgroup.id<y> : index
+  %token_step = kernel.workgroup.count<y> : index
+  %span_count = func.call @qwen38_span_count(%epoch) : (buffer) -> (index)
+  scf.for %span = [%first_span to %span_count step %span_step] {
     %head_value = kernel.workgroup.id<x> : index
     %head = index.assume %head_value [range(%head_value, 0, 23)] : index
-    %token = kernel.workgroup.id<y> : index
     %lane_value = kernel.workitem.id<x> : index
     %lane = index.assume %lane_value [range(%lane_value, 0, 255)] : index
     %control_origin, %token_begin, %row = func.call @qwen38_span_binding(%epoch, %span) : (buffer, index) -> (offset, index, index)
     %source_position = func.call @qwen38_span_source_position(%epoch, %span) : (buffer, index) -> (i32)
-    template.apply<@qwen38.attention.query_prepare>(%head, %token, %lane, %epoch, %epsilon, %projection, %weight, %query, %gate, %source_position, %control_origin, %token_begin, %mixed_inputs, %input_tokens) : (index, index, index, buffer, f32, buffer, buffer, buffer, buffer, i32, offset, index, index, buffer)
+    %token_count = func.call @qwen38_span_token_count(%epoch, %control_origin) : (buffer, offset) -> (index)
+    scf.for %token = [%first_token to %token_count step %token_step] {
+      template.apply<@qwen38.attention.query_prepare>(%head, %token, %lane, %epoch, %epsilon, %projection, %weight, %query, %gate, %source_position, %control_origin, %token_begin, %mixed_inputs, %input_tokens) : (index, index, index, buffer, f32, buffer, buffer, buffer, buffer, i32, offset, index, index, buffer)
+      // Rotary partners must finish reading scratch before the next row reuses it.
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    }
   }
   kernel.return
 }
 
 // Each span publishes only its own session's appended K/V range. Completion
 // precedes attention reads through the command's ordinary dispatch dependency.
-kernel.def export("qwen38_attention_kv_prepare_spans") @qwen38_attention_kv_prepare_spans(%token_capacity: index, %span_capacity: index) {
-  %tokens = index.assume %token_capacity [range(%token_capacity, 1, 512)] : index
+kernel.def export("qwen38_attention_kv_prepare_spans") @qwen38_attention_kv_prepare_spans(%token_extent: index, %span_capacity: index) {
+  %tokens = index.assume %token_extent [range(%token_extent, 0, 512)] : index
   %spans = index.assume %span_capacity [range(%span_capacity, 1, 2147483647)] : index
   %heads = index.constant 4 : index
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%heads, %tokens, %spans) workgroup_size(%threads, %c1, %c1) : index
+  %units = target.execution.unit.count : index
+  // Queue enough short row tasks to hide latency while keeping the complete
+  // grid below 10,000 groups on larger deployments.
+  %unit_limit = index.constant 156 : index
+  %queued_groups_per_unit = index.constant 64 : index
+  %bounded_units = index.min %units, %unit_limit : index
+  %target_limit = index.mul %bounded_units, %queued_groups_per_unit : index
+  %row_workers, %span_workers = func.call pure @qwen38_span_workers(%tokens, %spans, %heads, %target_limit) : (index, index, index, index) -> (index, index)
+  kernel.launch.config workgroups(%heads, %row_workers, %span_workers) workgroup_size(%threads, %c1, %c1) : index
 } launch(%mixed_inputs: index, %epoch: buffer, %rows: buffer, %layer_origin: offset, %epsilon: f32, %key_projection: buffer, %value_projection: buffer, %weight: buffer, %state: buffer, %input_tokens: buffer) {
-  %span = kernel.workgroup.id<z> : index
-  %active = func.call @qwen38_span_active(%epoch, %span) : (buffer, index) -> (i1)
-  scf.if %active {
+  %first_span = kernel.workgroup.id<z> : index
+  %span_step = kernel.workgroup.count<z> : index
+  %first_token = kernel.workgroup.id<y> : index
+  %token_step = kernel.workgroup.count<y> : index
+  %span_count = func.call @qwen38_span_count(%epoch) : (buffer) -> (index)
+  scf.for %span = [%first_span to %span_count step %span_step] {
     %head_value = kernel.workgroup.id<x> : index
     %head = index.assume %head_value [range(%head_value, 0, 3)] : index
-    %token = kernel.workgroup.id<y> : index
     %lane_value = kernel.workitem.id<x> : index
     %lane = index.assume %lane_value [range(%lane_value, 0, 255)] : index
     %control_origin, %token_begin, %row = func.call @qwen38_span_binding(%epoch, %span) : (buffer, index) -> (offset, index, index)
@@ -78,7 +109,11 @@ kernel.def export("qwen38_attention_kv_prepare_spans") @qwen38_attention_kv_prep
     %cache_row_bytes = index.constant 2048 : offset
     %cache_bytes = index.scale %cache_capacity, %cache_row_bytes : index, offset -> offset
     %value_origin = index.add %key_origin, %cache_bytes : offset
-    template.apply<@qwen38.attention.kv_prepare>(%logical_capacity, %head, %token, %lane, %epoch, %epsilon, %key_projection, %value_projection, %weight, %state, %state, %source_position, %control_origin, %token_begin, %key_origin, %value_origin, %rows, %map_origin, %pool_capacity, %mixed_inputs, %input_tokens) : (index, index, index, index, buffer, f32, buffer, buffer, buffer, buffer, buffer, i32, offset, index, offset, offset, buffer, offset, index, index, buffer)
+    %token_count = func.call @qwen38_span_token_count(%epoch, %control_origin) : (buffer, offset) -> (index)
+    scf.for %token = [%first_token to %token_count step %token_step] {
+      template.apply<@qwen38.attention.kv_prepare>(%logical_capacity, %head, %token, %lane, %epoch, %epsilon, %key_projection, %value_projection, %weight, %state, %state, %source_position, %control_origin, %token_begin, %key_origin, %value_origin, %rows, %map_origin, %pool_capacity, %mixed_inputs, %input_tokens) : (index, index, index, index, buffer, f32, buffer, buffer, buffer, buffer, buffer, i32, offset, index, offset, offset, buffer, offset, index, index, buffer)
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    }
   }
   kernel.return
 }

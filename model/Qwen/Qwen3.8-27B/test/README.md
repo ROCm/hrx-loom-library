@@ -19,6 +19,14 @@ input immutability are checked independently. The split projection also checks
 each published K interval independently before checking the reduced output,
 including the shorter final partition and disabled launches.
 
+The Q6 composition scenarios retain a 32-row command specialization while the
+device header supplies 0, 16, 17, or 32 live rows. They exercise the RDNA
+register-panel/matrix crossover and the other targets' matrix providers. The
+model owns padded activation and residual storage, so these checks compare
+the complete live prefix and allocation guards. Shared GGML panel scenarios
+separately own exact-sized storage, inactive-row preservation, and numerical
+tail coverage.
+
 Attention precision scenarios call the public prefill command and the split
 command followed by its real reducer. A fixture-specific F64 reference uses
 separable value rows to check every output without reproducing the matrix

@@ -56,6 +56,30 @@ These are reusable Loom schedules, qualified for correctness through the
 packed-byte semantics, addressing, and numerical results; they do not establish
 a throughput comparison against another implementation.
 
+## Q6_K register panels with F32 storage
+
+`q6_k_f32_panel.loom` shares a 512-element activation panel across 48 output
+channels and retains decoded weight codes across 16 activation rows. A
+256-thread worker uses 40 KiB of shared memory for activations and registers
+for codes, scales, and row accumulators. Each K panel needs a publication
+barrier and a retirement barrier; weight decoding and row contractions need
+no intermediate shared-memory exchange. The row reduction distributes the
+sixteen results across logical 32-lane groups using subgroup shuffles.
+
+Inputs, products, and accumulation remain F32. The packed format accessors
+supply exact six-bit codes and F32 scale pairs without rounding reconstructed
+weights or creating an expanded weight tensor. This is a separate arithmetic
+and reuse strategy from a matrix-instruction schedule, not a new quantization.
+
+The tile entry accepts explicit row/channel origins. The traversal entry
+assigns tiles to the caller's bounded worker grid and reuses each worker's
+storage. Both overwrite and residual publication mask live rows and channels;
+an odd final 256-element K block also masks missing activation and weight
+reads. Buffers need no padding. The public
+[`panel kernels`](../../../kernel/ggml/linear/q6_k_f32_panel.loom) own the
+sampled-count ABI and worker budget, while a model owns selection between
+this schedule and its other projection implementations.
+
 ## Q8_0 panels with BF16 storage
 
 `q8_0_bf16_matrix.loom` retains a tile of F32 accumulator fragments for a

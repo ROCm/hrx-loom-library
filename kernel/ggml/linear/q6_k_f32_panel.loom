@@ -1,0 +1,51 @@
+// Bounded-worker Q6_K projections with F32 input, arithmetic, and output.
+//
+// Configuration: (live_rows, input_size, output_size, worker_budget), index.
+// Execution: (row_count, input_size, output_size, input, weight, output).
+// row_count contains one I32 equal to the sampled live_rows workload until
+// dispatch completion. Zero rows produce a zero-sized grid. K is 256..32768,
+// divisible by 256; N is 1..262144; live rows are 0..32. The positive worker
+// budget is caller-owned deployment policy, at most 10000 workgroups.
+//
+// Inputs and outputs are contiguous live_rows*K and live_rows*N F32 values;
+// raw weights occupy N*(K/256)*210 bytes. No padded rows or channels are needed.
+// Buffers are disjoint; the residual entry adds into output in place. The
+// 256-thread worker supports complete 32- or 64-lane subgroups and reuses 40 KiB
+// workgroup storage across assigned 16-row/48-channel tiles. The shared motif
+// owns packed decoding, tail masking, register reuse, and publication.
+
+func.decl @ggml_linear_q6k_f32_panels(%add_residual: i1, %rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl pure @ggml_linear_q6k_f32_panel_grid(%rows: index, %outputs: index, %budget: index) -> (index)
+
+func.def inline @dispatch_panels(%add_residual: i1, %row_count: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %counts = buffer.view %row_count[%origin] : buffer -> view<1xi32>
+  %count32 = view.load %counts[0] : view<1xi32> -> i32
+  %count = index.cast %count32 : i32 to index
+  %rows = index.assume %count [range(%count, 0, 32)] : index
+  func.call @ggml_linear_q6k_f32_panels(%add_residual, %rows, %inputs, %outputs, %input, %weight, %output) : (i1, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+kernel.def export("ggml_linear_q6k_f32_panel") @ggml_linear_q6k_f32_panel(%rows: index, %inputs: index, %outputs: index, %worker_budget: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %groups = func.call pure @ggml_linear_q6k_f32_panel_grid(%rows, %outputs, %worker_budget) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%row_count: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %add_residual = scalar.constant false : i1
+  func.call @dispatch_panels(%add_residual, %row_count, %inputs, %outputs, %input, %weight, %output) : (i1, buffer, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def export("ggml_linear_q6k_f32_panel_residual") @ggml_linear_q6k_f32_panel_residual(%rows: index, %inputs: index, %outputs: index, %worker_budget: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %groups = func.call pure @ggml_linear_q6k_f32_panel_grid(%rows, %outputs, %worker_budget) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%row_count: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %add_residual = scalar.constant true : i1
+  func.call @dispatch_panels(%add_residual, %row_count, %inputs, %outputs, %input, %weight, %output) : (i1, buffer, index, index, buffer, buffer, buffer)
+  kernel.return
+}

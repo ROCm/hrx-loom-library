@@ -7,6 +7,10 @@ config.decl @qwen38.attention.cache_capacity : %value: index where [range(%value
 
 config.decl @qwen38.attention.pool_capacity : %value: index where [range(%value, 0, 2147483584), multiple_of(%value, 64)]
 
+func.decl @qwen38_span_count(%epoch: buffer) -> (index)
+
+func.decl pure @qwen38_span_workers(%token_extent: index, %span_capacity: index, %heads: index, %budget: index) -> (index, index)
+
 func.decl @qwen38_span_active(%epoch: buffer, %span: index) -> (i1)
 
 func.decl @qwen38_span_binding(%epoch: buffer, %span: index) -> (offset, index, index)
@@ -160,11 +164,20 @@ kernel.def target(@dflash_wave32) @qwen38_dflash_context_prepare(%tokens: index,
   %heads = index.constant 8 : index
   %threads = index.constant 64 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%tokens, %heads, %spans) workgroup_size(%threads, %c1, %c1) : index
+  %units = target.execution.unit.count : index
+  %unit_limit = index.constant 156 : index
+  %queued_groups_per_unit = index.constant 64 : index
+  %bounded_units = index.min %units, %unit_limit : index
+  %budget = index.mul %bounded_units, %queued_groups_per_unit : index
+  %row_workers, %span_workers = func.call pure @qwen38_span_workers(%tokens, %spans, %heads, %budget) : (index, index, index, index) -> (index, index)
+  kernel.launch.config workgroups(%row_workers, %heads, %span_workers) workgroup_size(%threads, %c1, %c1) : index
 } launch(%capacity: index, %epoch: buffer, %rows: buffer, %layer_origin: offset, %key: buffer, %value: buffer, %weight: buffer, %cache: buffer) {
-  %span = kernel.workgroup.id<z> : index
-  %active = func.call @qwen38_span_active(%epoch, %span) : (buffer, index) -> (i1)
-  scf.if %active {
+  %first_span = kernel.workgroup.id<z> : index
+  %span_step = kernel.workgroup.count<z> : index
+  %first_row = kernel.workgroup.id<x> : index
+  %row_step = kernel.workgroup.count<x> : index
+  %span_count = func.call @qwen38_span_count(%epoch) : (buffer) -> (index)
+  scf.for %span = [%first_span to %span_count step %span_step] {
     %control_origin, %begin, %row = func.call @qwen38_span_binding(%epoch, %span) : (buffer, index) -> (offset, index, index)
     %control = buffer.view %epoch[%control_origin] : buffer -> view<6xi32>
     %count_word = view.load %control[0] : view<6xi32> -> i32
@@ -173,9 +186,7 @@ kernel.def target(@dflash_wave32) @qwen38_dflash_context_prepare(%tokens: index,
     %count = index.cast %count_word : i32 to index
     %position = index.cast %position_word : i32 to index
     %source_position = index.cast %source_position_word : i32 to index
-    %relative = kernel.workgroup.id<x> : index
-    %valid = index.cmp ult, %relative, %count : index
-    scf.if %valid {
+    scf.for %relative = [%first_row to %count step %row_step] {
       %token_value = index.add %begin, %relative : index
       %token = index.assume %token_value [ge(%token_value, 0), lt(%token_value, %capacity)] : index
       %absolute = index.add %position, %relative : index

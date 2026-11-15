@@ -782,32 +782,64 @@ template.def<@qwen38.gdn_norm_gate_prefill.body> device @qwen38_gdn_norm_gate_pr
   template.return
 }
 
-kernel.def export("qwen38_gdn_norm_gate_prefill") @qwen38_gdn_norm_gate_prefill(%token_count: index) {
-  %bounded_token_count = index.assume %token_count [range(%token_count, 1, 512)] : index
+// The workload is the saved live prefix; storage capacity remains independent.
+// Workers must not read the capacity tail that this epoch did not produce.
+// Four queued rows per head and execution unit hide short-task latency; at most
+// 128 rows (6,144 groups across all heads) are queued before workers stride.
+kernel.def export("qwen38_gdn_norm_gate_prefill") @qwen38_gdn_norm_gate_prefill(%live_rows: index) {
+  %rows = index.assume %live_rows [range(%live_rows, 0, 512)] : index
   %unit = index.constant 1 : index
   %value_head_count = index.constant 48 : index
   %workgroup_size = index.constant 128 : index
-  kernel.launch.config workgroups(%value_head_count, %bounded_token_count, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
-} launch(%token_count: index, %rms_epsilon: f32, %raw_output: buffer, %norm_weight: buffer, %z: buffer, %output: buffer) {
+  %units = target.execution.unit.count : index
+  %queued_unit_limit = index.constant 32 : index
+  %rows_per_unit = index.constant 4 : index
+  %queued_units = index.min %units, %queued_unit_limit : index
+  %row_budget = index.mul %queued_units, %rows_per_unit : index
+  %row_workers = index.min %rows, %row_budget : index
+  kernel.launch.config workgroups(%value_head_count, %row_workers, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%token_capacity: index, %control: buffer, %rms_epsilon: f32, %raw_output: buffer, %norm_weight: buffer, %z: buffer, %output: buffer) {
   %head = kernel.workgroup.id<x> : index
-  %token = kernel.workgroup.id<y> : index
+  %first_token = kernel.workgroup.id<y> : index
+  %row_step = kernel.workgroup.count<y> : index
+  %origin = index.constant 0 : offset
+  %counts = buffer.view %control[%origin] : buffer -> view<1xi32>
+  %count_word = view.load %counts[0] : view<1xi32> -> i32
+  %count_value = index.cast %count_word : i32 to index
+  %token_count = index.assume %count_value [ge(%count_value, 0), le(%count_value, %token_capacity)] : index
   %lane = kernel.workitem.id<x> : index
   %output_is_f16 = scalar.constant false : i1
-  template.apply<@qwen38.gdn_norm_gate_prefill.body>(%output_is_f16, %head, %token, %lane, %token_count, %rms_epsilon, %raw_output, %norm_weight, %z, %output) : (i1, index, index, index, index, f32, buffer, buffer, buffer, buffer)
+  scf.for %token = [%first_token to %token_count step %row_step] {
+    template.apply<@qwen38.gdn_norm_gate_prefill.body>(%output_is_f16, %head, %token, %lane, %token_capacity, %rms_epsilon, %raw_output, %norm_weight, %z, %output) : (i1, index, index, index, index, f32, buffer, buffer, buffer, buffer)
+  }
   kernel.return
 }
 
-kernel.def export("qwen38_gdn_norm_gate_f16_prefill") @qwen38_gdn_norm_gate_f16_prefill(%token_count: index) {
-  %bounded_token_count = index.assume %token_count [range(%token_count, 1, 512)] : index
+kernel.def export("qwen38_gdn_norm_gate_f16_prefill") @qwen38_gdn_norm_gate_f16_prefill(%live_rows: index) {
+  %rows = index.assume %live_rows [range(%live_rows, 0, 512)] : index
   %unit = index.constant 1 : index
   %value_head_count = index.constant 48 : index
   %workgroup_size = index.constant 128 : index
-  kernel.launch.config workgroups(%value_head_count, %bounded_token_count, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
-} launch(%token_count: index, %rms_epsilon: f32, %raw_output: buffer, %norm_weight: buffer, %z: buffer, %output: buffer) {
+  %units = target.execution.unit.count : index
+  %queued_unit_limit = index.constant 32 : index
+  %rows_per_unit = index.constant 4 : index
+  %queued_units = index.min %units, %queued_unit_limit : index
+  %row_budget = index.mul %queued_units, %rows_per_unit : index
+  %row_workers = index.min %rows, %row_budget : index
+  kernel.launch.config workgroups(%value_head_count, %row_workers, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%token_capacity: index, %control: buffer, %rms_epsilon: f32, %raw_output: buffer, %norm_weight: buffer, %z: buffer, %output: buffer) {
   %head = kernel.workgroup.id<x> : index
-  %token = kernel.workgroup.id<y> : index
+  %first_token = kernel.workgroup.id<y> : index
+  %row_step = kernel.workgroup.count<y> : index
+  %origin = index.constant 0 : offset
+  %counts = buffer.view %control[%origin] : buffer -> view<1xi32>
+  %count_word = view.load %counts[0] : view<1xi32> -> i32
+  %count_value = index.cast %count_word : i32 to index
+  %token_count = index.assume %count_value [ge(%count_value, 0), le(%count_value, %token_capacity)] : index
   %lane = kernel.workitem.id<x> : index
   %output_is_f16 = scalar.constant true : i1
-  template.apply<@qwen38.gdn_norm_gate_prefill.body>(%output_is_f16, %head, %token, %lane, %token_count, %rms_epsilon, %raw_output, %norm_weight, %z, %output) : (i1, index, index, index, index, f32, buffer, buffer, buffer, buffer)
+  scf.for %token = [%first_token to %token_count step %row_step] {
+    template.apply<@qwen38.gdn_norm_gate_prefill.body>(%output_is_f16, %head, %token, %lane, %token_capacity, %rms_epsilon, %raw_output, %norm_weight, %z, %output) : (i1, index, index, index, index, f32, buffer, buffer, buffer, buffer)
+  }
   kernel.return
 }
