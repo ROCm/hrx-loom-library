@@ -6,6 +6,20 @@ kernel.decl @qwen38_dflash_context_prepare(%tokens: index, %spans: index) launch
 
 kernel.decl @qwen38_dflash_attention(%tokens: index, %spans: index) launch(%capacity: index, %epoch: buffer, %rows: buffer, %layer_origin: offset, %query: buffer, %block_cache: buffer, %context: buffer, %output: buffer)
 
+// The production warm path sizes its grid from the device-resident epoch,
+// independently of the activation allocation capacity.
+command.def @context_from_epoch() launch(%epoch: buffer, %rows: buffer, %key: buffer, %value: buffer, %weight: buffer, %cache: buffer) {
+  %capacity = index.constant 16 : index
+  %spans = index.constant 64 : index
+  %layer_origin = index.constant 4096 : offset
+  %origin = index.constant 0 : offset
+  %header = buffer.view %epoch[%origin] : buffer -> view<1xi32>
+  %extent_word = view.load %header[0] : view<1xi32> -> i32
+  %extent = index.cast %extent_word : i32 to index
+  kernel.launch @qwen38_dflash_context_prepare[%extent, %spans](%capacity, %epoch, %rows, %layer_origin, %key, %value, %weight, %cache) : [index, index](index, buffer, buffer, offset, buffer, buffer, buffer, buffer)
+  command.return
+}
+
 // One live descriptor uses the second half of the packed activation storage
 // and resident row one. The second dispatch span has poisoned metadata. Page
 // zero and page 65 are guards; the other pages follow a fixed permutation.
@@ -134,7 +148,8 @@ func.def @query_reference(%capacity: index, %epoch: buffer, %input: buffer, %wei
 // The fixture's page permutation is evaluated directly instead of calling the
 // production map helper. All bytes outside the accepted three-token range keep
 // their sentinels, including the five rejected tokens in the packed block.
-func.def @context_reference(%capacity: index, %epoch: buffer, %rows: buffer, %layer_origin: offset, %key: buffer, %value: buffer, %weight: buffer, %cache: buffer) {
+func.def @context_reference(%epoch: buffer, %rows: buffer, %key: buffer, %value: buffer, %weight: buffer, %cache: buffer) {
+  %capacity = index.constant 16 : index
   %origin = index.constant 0 : offset
   %key_origin = index.constant 4352 : offset
   %value_origin = index.constant 8655104 : offset
@@ -235,12 +250,8 @@ check.scenario public @query_rotary {
 check.scenario public @accepted_context {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   check.trial[1](%trial: index, %entropy: check.entropy) {
-    %capacity = check.literal value(16) : index
-    // Force multiple accepted rows through each descriptor worker.
-    %spans = check.literal value(64) : index
     %position = check.literal value(67) : index
     %count = check.literal value(3) : index
-    %layer_origin = check.literal value(4096) : offset
     %epoch = check.generate.fill value(-99) : tensor<15xi32>
     %rows = check.generate.fill value(-1) : tensor<148xi32>
     check.generate<@dflash_fixture>(%position, %count, %epoch, %rows) : (index, index, tensor<15xi32>, tensor<148xi32>) -> ()
@@ -248,7 +259,7 @@ check.scenario public @accepted_context {
     %value = check.generate.iota offset(-0.25) step(0.001) period(499) : tensor<16x8x128xf32>
     %weight = check.generate.iota offset(0.75) step(0.001) : tensor<128xf32>
     %cache = check.generate.fill value(-9.0) : tensor<8652928xf16>
-    check.compare<@qwen38_dflash_context_prepare, @context_reference>[%capacity, %spans](%capacity, %epoch, %rows, %layer_origin, %key, %value, %weight, %cache) : [index, index](index, tensor<15xi32>, tensor<148xi32>, offset, tensor<16x8x128xf32>, tensor<16x8x128xf32>, tensor<128xf32>, tensor<8652928xf16>) -> () {
+    check.compare<@context_from_epoch, @context_reference>(%epoch, %rows, %key, %value, %weight, %cache) : (tensor<15xi32>, tensor<148xi32>, tensor<16x8x128xf32>, tensor<16x8x128xf32>, tensor<128xf32>, tensor<8652928xf16>) -> () {
       check.expect.approximate actual(%cache) expected(%cache) atol(0.001) rtol(0.001) nan(different) : tensor<8652928xf16>, tensor<8652928xf16>
     }
   }
