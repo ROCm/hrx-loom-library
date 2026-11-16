@@ -13,8 +13,9 @@
 // Producers retain complete blocks in several useful shapes. These entry
 // points keep the numerical and storage contract common while matching that
 // ownership directly: one lane may own all 32 values, four adjacent lanes may
-// own eight contiguous values each, or 32 adjacent lanes may each own one
-// value from four independent blocks.
+// own eight contiguous values each, 32 adjacent lanes may each own one value
+// from one block, or 32 adjacent lanes may each own one value from four
+// independent blocks.
 
 // Publishes one complete block retained by the calling lane.
 func.def public inline @ggml_q8_1_planar_publish_block32(%row_count0: index, %row0: index, %block_count0: index, %block0: index, %values: vector<32xf32>, %output: buffer) {
@@ -93,6 +94,42 @@ func.def public inline @ggml_q8_1_planar_publish_packet8_cluster4(%row_count0: i
     %half_scale = scalar.fptrunc %scale : f32 to f16
     %stored_scale = scalar.extf %half_scale : f16 to f32
     %metadata_values = vector.from_elements %stored_scale, %sum_float : vector<2xf32>
+    %row_elements = index.mul %block_count, %elements_per_block : index
+    %row_bytes = index.cast %row_elements : index to offset
+    %metadata_origin = index.scale %row_count, %row_bytes : index, offset -> offset
+    %metadata = buffer.view %output[%metadata_origin] : buffer -> view<[%row_count]x[%block_count]x2xf32>
+    vector.store %metadata_values, %metadata[%row, %block, %begin] : vector<2xf32>, view<[%row_count]x[%block_count]x2xf32>
+  }
+  func.return
+}
+
+// Publishes one value from each lane in an aligned 32-lane cluster. All lanes
+// pass the same row and block; lane_in_block is 0..31.
+func.def public inline @ggml_q8_1_planar_publish_value_cluster32(%row_count0: index, %row0: index, %block_count0: index, %block0: index, %lane_in_block0: index, %value: f32, %output: buffer) {
+  %row_count, %row, %block_count, %block, %lane_in_block = index.assume %row_count0, %row0, %block_count0, %block0, %lane_in_block0 [range(%row_count0, 1, 8192), lt(%row0, %row_count0), range(%block_count0, 1, 8192), lt(%block0, %block_count0), range(%lane_in_block0, 0, 31)] : index, index, index, index, index
+  %c0_offset = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %elements_per_block = index.constant 32 : index
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c127_f32 = scalar.constant 127.0 : f32
+  %absolute = scalar.absf %value : f32
+  %maximum = kernel.subgroup.reduce<maxnumf> %absolute {cluster_size = 32} : f32
+  %scale = scalar.divf %maximum, %c127_f32 : f32
+  %nonzero = scalar.cmpf one, %maximum, %c0_f32 : f32
+  %scaled = scalar.divf %value, %scale : f32
+  %rounded = scalar.roundf %scaled : f32
+  %selected = scf.select %nonzero, %rounded, %c0_f32 : f32
+  %code = scalar.fptosi %selected : f32 to i8
+  %payload = buffer.view %output[%c0_offset] : buffer -> view<[%row_count]x[%block_count]x32xi8>
+  view.store %code, %payload[%row, %block, %lane_in_block] : i8, view<[%row_count]x[%block_count]x32xi8>
+  %wide_code = scalar.extsi %code : i8 to i32
+  %sum_integer = kernel.subgroup.reduce<addi> %wide_code {cluster_size = 32} : i32
+  %leader = index.cmp eq, %lane_in_block, %begin : index
+  scf.if %leader {
+    %sum = scalar.sitofp %sum_integer : i32 to f32
+    %half_scale = scalar.fptrunc %scale : f32 to f16
+    %stored_scale = scalar.extf %half_scale : f16 to f32
+    %metadata_values = vector.from_elements %stored_scale, %sum : vector<2xf32>
     %row_elements = index.mul %block_count, %elements_per_block : index
     %row_bytes = index.cast %row_elements : index to offset
     %metadata_origin = index.scale %row_count, %row_bytes : index, offset -> offset
