@@ -1,0 +1,184 @@
+// Accepted-token vocabulary for Qwen3.8 draft heads. Each caller-owned record
+// occupies 22,784 bytes: three I32 header words (rare count, latest miss + 1,
+// previous miss + 1), one padding word, 4,680 bitmap words, and 991 rare IDs
+// at byte 18,736. The final 84 bytes are padding. Position zero initializes
+// only the header and bitmap; the rare count bounds every table read.
+//
+// Prefix IDs [0,98304) and controls [248044,248077) are always present. Other
+// accepted IDs enter in first-use order until the table fills; an overflow ID
+// remains unknown and continues to contribute miss pressure. The caller owns
+// one writer per request and retains the whole record across forks/checkpoints.
+// All IDs are validated tokenizer IDs [0,248077), never physical head padding.
+// Input layout and extent are explicit; ordinary and media records use the
+// same token accessor. No allocation, request identity, or global config is
+// owned here. A proposal observes a completed accepted-history publication.
+
+func.decl @qwen38_input_token(%mixed: index, %capacity: index, %inputs: buffer, %input: index) -> (i32)
+
+// This checkpoint's added control-token interval includes chat, tool, thinking,
+// coding, and multimodal markers. Physical vocabulary padding is not an ID.
+func.def pure inline @qwen38_draft_vocabulary_common(%id: index) -> (i1) {
+  %prefix = index.constant 98304 : index
+  %controls = index.constant 248044 : index
+  %frequent = index.cmp ult, %id, %prefix : index
+  %control = index.cmp uge, %id, %controls : index
+  %common = scalar.ori %frequent, %control : i1
+  func.return %common : i1
+}
+
+func.def inline @qwen38_draft_vocabulary_known(%carry: buffer, %record: offset, %id: index) -> (i1) {
+  %common = func.call pure @qwen38_draft_vocabulary_common(%id) : (index) -> (i1)
+  %known = scf.if %common -> (i1) {
+    %yes = scalar.constant true : i1
+    scf.yield %yes : i1
+  } else {
+    %prefix = index.constant 98304 : index
+    %bits = index.constant 32 : index
+    %header_bytes = index.constant 16 : offset
+    %bitmap_origin = index.add %record, %header_bytes : offset
+    %bitmap = buffer.view %carry[%bitmap_origin] : buffer -> view<4680xi32>
+    %relative = index.sub %id, %prefix : index
+    %word_value = index.div %relative, %bits : index
+    %word = index.assume %word_value [range(%word_value, 0, 4679)] : index
+    %bit = index.rem %relative, %bits : index
+    %shift = index.cast %bit : index to i32
+    %c1_i32 = scalar.constant 1 : i32
+    %c0_i32 = scalar.constant 0 : i32
+    %mask = scalar.shli %c1_i32, %shift : i32
+    %stored = view.load %bitmap[%word] : view<4680xi32> -> i32
+    %present = scalar.andi %stored, %mask : i32
+    %known = scalar.cmpi ne, %present, %c0_i32 : i32
+    scf.yield %known : i1
+  }
+  func.return %known : i1
+}
+
+template.decl @qwen38.draft_vocabulary.update(%mixed: index, %capacity: index, %position: index, %begin: index, %length: index, %record: offset, %ids: buffer, %carry: buffer)
+
+// The final carry publisher invokes this for accepted target inputs only.
+// Each request has one writer, preserving first-use order across chunking and
+// batching. Rejected proposals never reach this boundary. Fresh rows initialize
+// the membership bitmap; unused table entries and padding remain untouched.
+template.def<@qwen38.draft_vocabulary.update> device @qwen38_draft_vocabulary_update(%mixed: index, %capacity: index, %position: index, %begin: index, %length: index, %record: offset, %ids: buffer, %carry: buffer) {
+  %header_bytes = index.constant 16 : offset
+  %table_delta = index.constant 18736 : offset
+  %bitmap_origin = index.add %record, %header_bytes : offset
+  %table_origin = index.add %record, %table_delta : offset
+  %header = buffer.view %carry[%record] : buffer -> view<3xi32>
+  %bitmap = buffer.view %carry[%bitmap_origin] : buffer -> view<4680xi32>
+  %table = buffer.view %carry[%table_origin] : buffer -> view<991xi32>
+  %thread = kernel.workitem.id<x> : index
+  %threads = kernel.workgroup.size<x> : index
+  %c0_index = index.constant 0 : index
+  %c1_index = index.constant 1 : index
+  %bitmap_words = index.constant 4680 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %yes = scalar.constant true : i1
+  %leader = index.cmp eq, %thread, %c0_index : index
+  %fresh = index.cmp eq, %position, %c0_index : index
+  scf.if %fresh {
+    scf.for %word = [%thread to %bitmap_words step %threads] {
+      view.store %c0_i32, %bitmap[%word] : i32, view<4680xi32>
+    }
+    scf.if %leader {
+      view.store %c0_i32, %header[0] : i32, view<3xi32>
+      view.store %c0_i32, %header[1] : i32, view<3xi32>
+      view.store %c0_i32, %header[2] : i32, view<3xi32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  }
+  scf.if %leader {
+    %prefix = index.constant 98304 : index
+    %bits = index.constant 32 : index
+    %table_capacity = scalar.constant 991 : i32
+    scf.for %relative = [%c0_index to %length step %c1_index] {
+      %input_value = index.add %begin, %relative : index
+      %input = index.assume %input_value [ge(%input_value, 0), lt(%input_value, %capacity)] : index
+      %id_word = func.call @qwen38_input_token(%mixed, %capacity, %ids, %input) : (index, index, buffer, index) -> (i32)
+      %id_value = index.cast %id_word : i32 to index
+      %id = index.assume %id_value [range(%id_value, 0, 248076)] : index
+      %known = func.call @qwen38_draft_vocabulary_known(%carry, %record, %id) : (buffer, offset, index) -> (i1)
+      %unknown = scalar.xori %known, %yes : i1
+      scf.if %unknown {
+        %absolute = index.add %position, %relative : index
+        %encoded = index.add %absolute, %c1_index : index
+        %miss = index.cast %encoded : index to i32
+        %latest = view.load %header[1] : view<3xi32> -> i32
+        view.store %latest, %header[2] : i32, view<3xi32>
+        view.store %miss, %header[1] : i32, view<3xi32>
+        %count = view.load %header[0] : view<3xi32> -> i32
+        %room = scalar.cmpi ult, %count, %table_capacity : i32
+        scf.if %room {
+          %slot_value = index.cast %count : i32 to index
+          %slot = index.assume %slot_value [range(%slot_value, 0, 990)] : index
+          view.store %id_word, %table[%slot] : i32, view<991xi32>
+          %next = scalar.addi %count, %c1_i32 : i32
+          view.store %next, %header[0] : i32, view<3xi32>
+          %key = index.sub %id, %prefix : index
+          %word_value = index.div %key, %bits : index
+          %word = index.assume %word_value [range(%word_value, 0, 4679)] : index
+          %bit = index.rem %key, %bits : index
+          %shift = index.cast %bit : index to i32
+          %mask = scalar.shli %c1_i32, %shift : i32
+          %prior = view.load %bitmap[%word] : view<4680xi32> -> i32
+          %updated = scalar.ori %prior, %mask : i32
+          view.store %updated, %bitmap[%word] : i32, view<4680xi32>
+        }
+      }
+    }
+  }
+  template.return
+}
+
+// Full-head pressure is based on committed positions, not proposal attempts.
+// Unknown anchors or two misses in the preceding 32-token window require the
+// full vocabulary. The composition may union this choice across a row cohort.
+func.def public inline @qwen38_draft_vocabulary_full(%carry: buffer, %record: offset, %position: index, %anchor: index) -> (i1) {
+  %header = buffer.view %carry[%record] : buffer -> view<3xi32>
+  %prior_word = view.load %header[2] : view<3xi32> -> i32
+  %prior = index.cast %prior_word : i32 to index
+  %c0 = index.constant 0 : index
+  %window = index.constant 32 : index
+  %none = index.cmp eq, %prior, %c0 : index
+  %end = index.add %prior, %window : index
+  %old = index.cmp ule, %end, %position : index
+  %quiet = scalar.ori %none, %old : i1
+  %known = func.call @qwen38_draft_vocabulary_known(%carry, %record, %anchor) : (buffer, offset, index) -> (i1)
+  %subset = scalar.andi %known, %quiet : i1
+  %yes = scalar.constant true : i1
+  %full = scalar.xori %subset, %yes : i1
+  func.return %full : i1
+}
+
+// Prefix and controls map monotonically to canonical token IDs. Rare IDs are
+// visited in first-use order, but sampling resolves ties by canonical ID.
+func.def public inline @qwen38_draft_vocabulary_id(%column: index, %full: i1, %carry: buffer, %record: offset) -> (index) {
+  %prefix = index.constant 98304 : index
+  %common_count = index.constant 98337 : index
+  %control_first = index.constant 248044 : index
+  %frequent = index.cmp ult, %column, %prefix : index
+  %direct = scalar.ori %full, %frequent : i1
+  %id = scf.if %direct -> (index) {
+    scf.yield %column : index
+  } else {
+    %control = index.cmp ult, %column, %common_count : index
+    %id = scf.if %control -> (index) {
+      %relative = index.sub %column, %prefix : index
+      %id = index.add %control_first, %relative : index
+      scf.yield %id : index
+    } else {
+      %table_delta = index.constant 18736 : offset
+      %table_origin = index.add %record, %table_delta : offset
+      %table = buffer.view %carry[%table_origin] : buffer -> view<991xi32>
+      %slot_value = index.sub %column, %common_count : index
+      %slot = index.assume %slot_value [range(%slot_value, 0, 990)] : index
+      %word = view.load %table[%slot] : view<991xi32> -> i32
+      %id = index.cast %word : i32 to index
+      scf.yield %id : index
+    }
+    scf.yield %id : index
+  }
+  %bounded = index.assume %id [range(%id, 0, 248076)] : index
+  func.return %bounded : index
+}

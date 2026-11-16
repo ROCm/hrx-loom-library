@@ -16,3 +16,9 @@ every token coordinate and wide byte offset with independent I64 arithmetic.
 It crosses the 16-bit page boundary, 128M token positions, and the last complete
 native-index page without allocating a cache payload of those sizes. Model
 attention checks separately exercise cache reads and writes through this lookup.
+
+Vocabulary checks construct the expected rare interval and miss positions
+independently of the publisher. Ordinary and media input records share empty,
+partial, and saturated histories; whole/chunked publication, overflow, token
+lookup, untouched slots, and storage guards are checked at this owner. Model
+checks cover only their retained-owner and cohort-plan composition.
