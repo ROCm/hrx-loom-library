@@ -27,6 +27,12 @@ The selected width specializes convolution, bidirectional attention, candidate
 selection, and private storage together. Shorter blocks reduce proposal and
 verification work without changing the target's acceptance rule.
 
+RDNA proposals containing four or eight neural positions use shared raw
+Q4_K/Q6_K register panels. Each decoded weight serves the complete row bank
+before retirement, reducing inactive matrix lanes at those sizes. Model
+composition selects that schedule from the prepared shape; changing the
+proposal length during a response remains a separate serving-policy concern.
+
 ## Link and parameter boundaries
 
 `config` owns model defaults and concrete matrix target bindings. `kernel:numerics`

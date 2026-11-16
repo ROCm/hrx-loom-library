@@ -38,6 +38,15 @@ crossover. Other targets retain their matrix providers. The enclosing command
 samples the live count once and forwards it through the layers, allowing all
 indirect launch counts to share one device producer.
 
+Four/eight-row DFlash projections bind the shared Q4_K and Q6_K F32 panel
+templates to 512-workitem wave64 kernels. Every raw weight packet serves the
+complete row bank, and K1024 activation panels serve 64 Q4 or 48 Q6 channels.
+The same Q6 bank handles eight-row target down projections. Four-row target
+down projections retain their separate channel distribution. The launch
+adapter caps queued work at eight groups per execution unit; channel traversal,
+tail masking, and arithmetic remain in the shared motifs. Native command
+selection preserves the other targets' matrix and cohort providers.
+
 Wide RDNA gate/up prefill calls the shared paired Q5_K/F16 kernel directly.
 Its 256-token/128-channel tile retains K64 activations and both projections in
 64 KiB of workgroup memory, then publishes SwiGLU without intermediate global
