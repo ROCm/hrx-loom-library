@@ -1,0 +1,251 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Gated DeltaNet state ownership for ordinary and speculative epochs. Four
+// adjacent lanes retain one state column across its complete token span.
+// A target-sized worker grid strides span/column coordinates; it never
+// multiplies the unbounded span count by the number of column tiles.
+// Immutable readers and exclusive writers come from the epoch's row table.
+// Verification publishes known spans only; accepted replay uses the same
+// traversal with the producer's compacted span descriptors.
+
+func.decl @qwen38_gdn_key_head_for_value_head(%head: index) -> (index)
+
+func.decl @qwen38_span_count(%epoch: buffer) -> (index)
+
+func.decl @qwen38_span_binding(%epoch: buffer, %span: index) -> (offset, index, index)
+
+func.decl @qwen38_row_gdn_binding(%epoch: buffer, %control_origin: offset, %rows: buffer, %row: index, %layer_origin: offset) -> (offset, offset, i1)
+
+func.decl @qwen38_span_speculative(%epoch: buffer, %span: index) -> (i1)
+
+template.decl @gated_delta.update_128(%prior: vector<32xf32>, %query: vector<32xf32>, %key: vector<32xf32>, %value: f32, %decay: f32, %update_gate: f32) -> (vector<32xf32>, f32)
+
+template.decl @qwen38.gdn_recurrent_columns.body(%publish_state: i1, %head: index, %column: index, %lane: index, %control: buffer, %qkv: buffer, %inverse_norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer, %control_origin: offset, %token_begin: index, %state_origin: offset, %next_state_origin: offset)
+
+// Resident column recurrence. A four-lane cluster owns one 128-key
+// state column; each lane carries 32 contiguous keys across the token span.
+// A 128-thread workgroup owns 32 columns. State is [span, head, column, key],
+// convolved input is [span, token, Q(2048)|K(2048)|V(6144)], and inverse norms
+// are [span, token, head, Q|K]. The control origin names the live token count.
+// The update is the model's delta rule, evaluated in F32 with ordinary native
+// reassociation and contraction. Only the owning lane publishes each output.
+template.def<@qwen38.gdn_recurrent_columns.body> device @qwen38_gdn_recurrent_columns_body(%publish_state: i1, %head: index, %column: index, %lane: index, %control: buffer, %qkv: buffer, %inverse_norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer, %control_origin: offset, %token_begin: index, %state_origin: offset, %next_state_origin: offset) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %keys_per_lane = index.constant 32 : index
+  %head_width = index.constant 128 : index
+  %query_channels = index.constant 2048 : index
+  %value_channel_base = index.constant 4096 : index
+  %key_begin = index.mul %lane, %keys_per_lane : index
+  %qkv_row_bytes = index.constant 40960 : offset
+  %norm_row_bytes = index.constant 128 : offset
+  %gate_row_bytes = index.constant 192 : offset
+  %output_row_bytes = index.constant 24576 : offset
+  %origin = index.constant 0 : offset
+  %qkv_origin = index.scale %token_begin, %qkv_row_bytes : index, offset -> offset
+  %norm_origin = index.scale %token_begin, %norm_row_bytes : index, offset -> offset
+  %gate_origin = index.scale %token_begin, %gate_row_bytes : index, offset -> offset
+  %output_origin = index.scale %token_begin, %output_row_bytes : index, offset -> offset
+  %control_view = buffer.view %control[%control_origin] : buffer -> view<1xi32>
+  %live_i32 = view.load %control_view[%c0] : view<1xi32> -> i32
+  %live_value = index.cast %live_i32 : i32 to index
+  %live = index.assume %live_value [range(%live_value, 1, 512)] : index
+  %qkv_view = buffer.view %qkv[%qkv_origin] : buffer -> view<[%live]x10240xf32>
+  %norm_view = buffer.view %inverse_norm[%norm_origin] : buffer -> view<[%live]x32xf32>
+  %alpha_view = buffer.view %alpha[%gate_origin] : buffer -> view<[%live]x48xf32>
+  %beta_view = buffer.view %beta[%gate_origin] : buffer -> view<[%live]x48xf32>
+  %a_view = buffer.view %a[%origin] : buffer -> view<48xf32>
+  %bias_view = buffer.view %bias[%origin] : buffer -> view<48xf32>
+  %state_view = buffer.view %state[%state_origin] : buffer -> view<48x128x128xf32>
+  %output_view = buffer.view %output[%output_origin] : buffer -> view<[%live]x6144xf32>
+  %key_head = func.call @qwen38_gdn_key_head_for_value_head(%head) : (index) -> (index)
+  %head_query_begin = index.mul %key_head, %head_width : index
+  %query_begin = index.add %head_query_begin, %key_begin : index
+  %key_channel = index.add %query_begin, %query_channels : index
+  %head_output_begin = index.mul %head, %head_width : index
+  %output_column = index.add %head_output_begin, %column : index
+  %value_channel = index.add %value_channel_base, %output_column : index
+  %query_norm = index.mul %key_head, %c2 : index
+  %key_norm = index.add %query_norm, %c1 : index
+  %decay_weight = view.load %a_view[%head] : view<48xf32> -> f32
+  %decay_bias = view.load %bias_view[%head] : view<48xf32> -> f32
+  %initial = vector.load %state_view[%head, %column, %key_begin] : view<48x128x128xf32> -> vector<32xf32>
+  %final = scf.for %token = [%c0 to %live step %c1](%prior = %initial : vector<32xf32>) -> (vector<32xf32>) {
+    %query_scale = view.load %norm_view[%token, %query_norm] : view<[%live]x32xf32> -> f32
+    %key_scale = view.load %norm_view[%token, %key_norm] : view<[%live]x32xf32> -> f32
+    %query_raw = vector.load %qkv_view[%token, %query_begin] : view<[%live]x10240xf32> -> vector<32xf32>
+    %key_raw = vector.load %qkv_view[%token, %key_channel] : view<[%live]x10240xf32> -> vector<32xf32>
+    %query_scale_vector = vector.splat %query_scale : vector<32xf32>
+    %key_scale_vector = vector.splat %key_scale : vector<32xf32>
+    %query = vector.mulf<nnan|ninf|nsz> %query_raw, %query_scale_vector : vector<32xf32>
+    %key = vector.mulf<nnan|ninf|nsz> %key_raw, %key_scale_vector : vector<32xf32>
+    %alpha_value = view.load %alpha_view[%token, %head] : view<[%live]x48xf32> -> f32
+    %biased = scalar.addf %alpha_value, %decay_bias : f32
+    %positive = scalar.softplusf<afn> %biased : f32
+    %exponent = scalar.mulf %positive, %decay_weight : f32
+    %decay = scalar.expf<afn> %exponent : f32
+    %value = view.load %qkv_view[%token, %value_channel] : view<[%live]x10240xf32> -> f32
+    %beta_value = view.load %beta_view[%token, %head] : view<[%live]x48xf32> -> f32
+    %update_weight = scalar.logisticf<afn> %beta_value : f32
+    %updated, %output_sum = template.apply<@gated_delta.update_128>(%prior, %query, %key, %value, %decay, %update_weight) : (vector<32xf32>, vector<32xf32>, vector<32xf32>, f32, f32, f32) -> (vector<32xf32>, f32)
+    %leader = index.cmp eq, %lane, %c0 : index
+    scf.if %leader {
+      %scale = scalar.constant 0.088388347648318447 : f32
+      %result = scalar.mulf<nnan|ninf|nsz> %output_sum, %scale : f32
+      view.store %result, %output_view[%token, %output_column] : f32, view<[%live]x6144xf32>
+    }
+    scf.yield %updated : vector<32xf32>
+  }
+  scf.if %publish_state {
+    %next_state = buffer.view %state[%next_state_origin] : buffer -> view<48x128x128xf32>
+    vector.store %final, %next_state[%head, %column, %key_begin] : vector<32xf32>, view<48x128x128xf32>
+  }
+  template.return
+}
+
+kernel.def export("qwen38_gdn_recurrent_prefill") @qwen38_gdn_recurrent_prefill(%token_count: index) {
+  %bounded_token_count = index.assume %token_count [range(%token_count, 1, 512)] : index
+  %unit = index.constant 1 : index
+  %value_head_count = index.constant 48 : index
+  %column_tile_count = index.constant 4 : index
+  %workgroup_size = index.constant 128 : index
+  kernel.launch.config workgroups(%value_head_count, %column_tile_count, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%token_count_data: buffer, %qkv_silu: buffer, %qk_inverse_norm: buffer, %alpha: buffer, %beta: buffer, %ssm_a: buffer, %dt_bias: buffer, %state: buffer, %raw_output: buffer) {
+  %value_head0 = kernel.workgroup.id<x> : index
+  %value_head = index.assume %value_head0 [range(%value_head0, 0, 47)] : index
+  %column_tile0 = kernel.workgroup.id<y> : index
+  %thread = kernel.workitem.id<x> : index
+  %columns_per_group = index.constant 32 : index
+  %lanes_per_column = index.constant 4 : index
+  %column_begin = index.mul %column_tile0, %columns_per_group : index
+  %local_column = index.div %thread, %lanes_per_column : index
+  %column_tile = index.add %column_begin, %local_column : index
+  %lane = index.rem %thread, %lanes_per_column : index
+  %publish_state = scalar.constant true : i1
+  %origin = index.constant 0 : offset
+  %token_begin = index.constant 0 : index
+  template.apply<@qwen38.gdn_recurrent_columns.body>(%publish_state, %value_head, %column_tile, %lane, %token_count_data, %qkv_silu, %qk_inverse_norm, %alpha, %beta, %ssm_a, %dt_bias, %state, %raw_output, %origin, %token_begin, %origin, %origin) : (i1, index, index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, offset, index, offset, offset)
+  kernel.return
+}
+
+kernel.def export("qwen38_gdn_recurrent_prefill_read_only") @qwen38_gdn_recurrent_prefill_read_only(%token_count: index) {
+  %bounded_token_count = index.assume %token_count [range(%token_count, 1, 512)] : index
+  %unit = index.constant 1 : index
+  %value_head_count = index.constant 48 : index
+  %column_tile_count = index.constant 4 : index
+  %workgroup_size = index.constant 128 : index
+  kernel.launch.config workgroups(%value_head_count, %column_tile_count, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%token_count_data: buffer, %qkv_silu: buffer, %qk_inverse_norm: buffer, %alpha: buffer, %beta: buffer, %ssm_a: buffer, %dt_bias: buffer, %state: buffer, %raw_output: buffer) {
+  %value_head0 = kernel.workgroup.id<x> : index
+  %value_head = index.assume %value_head0 [range(%value_head0, 0, 47)] : index
+  %column_tile0 = kernel.workgroup.id<y> : index
+  %thread = kernel.workitem.id<x> : index
+  %columns_per_group = index.constant 32 : index
+  %lanes_per_column = index.constant 4 : index
+  %column_begin = index.mul %column_tile0, %columns_per_group : index
+  %local_column = index.div %thread, %lanes_per_column : index
+  %column_tile = index.add %column_begin, %local_column : index
+  %lane = index.rem %thread, %lanes_per_column : index
+  %publish_state = scalar.constant false : i1
+  %origin = index.constant 0 : offset
+  %token_begin = index.constant 0 : index
+  template.apply<@qwen38.gdn_recurrent_columns.body>(%publish_state, %value_head, %column_tile, %lane, %token_count_data, %qkv_silu, %qk_inverse_norm, %alpha, %beta, %ssm_a, %dt_bias, %state, %raw_output, %origin, %token_begin, %origin, %origin) : (i1, index, index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, offset, index, offset, offset)
+  kernel.return
+}
+
+// Clamp the span capacity before multiplying, so every valid I32 capacity
+// produces a bounded grid without overflowing the logical tile count.
+func.def pure inline @qwen38_gdn_recurrent_workgroups(%capacity: index) -> (index) {
+  %spans = index.assume %capacity [range(%capacity, 1, 2147483647)] : index
+  %work_per_span = index.constant 192 : index
+  %units = target.execution.unit.count : index
+  %groups_per_unit = index.constant 4 : index
+  %budget = index.mul %units, %groups_per_unit : index
+  %rounding = index.constant 191 : index
+  %rounded_budget = index.add %budget, %rounding : index
+  %budget_spans = index.div %rounded_budget, %work_per_span : index
+  %active_spans = index.min %spans, %budget_spans : index
+  %work = index.mul %active_spans, %work_per_span : index
+  %groups = index.min %work, %budget : index
+  func.return %groups : index
+}
+
+template.decl @qwen38.gdn_recurrent_spans.body(%verify_speculative: i1, %epoch: buffer, %rows: buffer, %layer_origin: offset, %qkv: buffer, %inverse_norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer)
+
+// verify_speculative specializes the publication rule. It does not change
+// arithmetic, reader selection, or ownership of any state column.
+template.def<@qwen38.gdn_recurrent_spans.body> device @qwen38_gdn_recurrent_spans_body(%verify_speculative: i1, %epoch: buffer, %rows: buffer, %layer_origin: offset, %qkv: buffer, %inverse_norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer) {
+  %first_work = kernel.workgroup.id<x> : index
+  %work_stride = kernel.workgroup.count<x> : index
+  %columns_per_head = index.constant 4 : index
+  %work_per_span = index.constant 192 : index
+  %span_count = func.call @qwen38_span_count(%epoch) : (buffer) -> (index)
+  %first_span = index.div %first_work, %work_per_span : index
+  %first_tile = index.rem %first_work, %work_per_span : index
+  %stride_spans = index.div %work_stride, %work_per_span : index
+  %stride_tiles = index.rem %work_stride, %work_per_span : index
+  %terminal_span, %terminal_tile = scf.while(%span_before = %first_span : index, %tile_before = %first_tile : index) -> (index, index) {
+    %active = index.cmp ult, %span_before, %span_count : index
+    scf.condition %active, %span_before, %tile_before : i1, index, index
+  } do(%span: index, %within_span: index) {
+    %head_value = index.div %within_span, %columns_per_head : index
+    %head = index.assume %head_value [range(%head_value, 0, 47)] : index
+    %column_value = index.rem %within_span, %columns_per_head : index
+    %thread = kernel.workitem.id<x> : index
+    %columns_per_group = index.constant 32 : index
+    %lanes_per_column = index.constant 4 : index
+    %column_begin = index.mul %column_value, %columns_per_group : index
+    %local_column = index.div %thread, %lanes_per_column : index
+    %column = index.add %column_begin, %local_column : index
+    %lane = index.rem %thread, %lanes_per_column : index
+    %control_origin, %token_begin, %row = func.call @qwen38_span_binding(%epoch, %span) : (buffer, index) -> (offset, index, index)
+    %state_origin, %next_state_origin, %first_advance = func.call @qwen38_row_gdn_binding(%epoch, %control_origin, %rows, %row, %layer_origin) : (buffer, offset, buffer, index, offset) -> (offset, offset, i1)
+    %publish = scf.if %verify_speculative -> (i1) {
+      %speculative = func.call @qwen38_span_speculative(%epoch, %span) : (buffer, index) -> (i1)
+      %true = scalar.constant true : i1
+      %known = scalar.xori %speculative, %true : i1
+      scf.yield %known : i1
+    } else {
+      %true = scalar.constant true : i1
+      scf.yield %true : i1
+    }
+    %reader_origin = scf.select %first_advance, %state_origin, %next_state_origin : offset
+    template.apply<@qwen38.gdn_recurrent_columns.body>(%publish, %head, %column, %lane, %epoch, %qkv, %inverse_norm, %alpha, %beta, %a, %bias, %state, %output, %control_origin, %token_begin, %reader_origin, %next_state_origin) : (i1, index, index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, offset, index, offset, offset)
+    // Carry the tile coordinate separately: span_count * work_per_span can
+    // overflow even though every valid span coordinate fits in an index.
+    %tile_sum = index.add %within_span, %stride_tiles : index
+    %carry = index.div %tile_sum, %work_per_span : index
+    %next_tile = index.rem %tile_sum, %work_per_span : index
+    %advance = index.add %stride_spans, %carry : index
+    // Saturating at the terminal span also avoids overflow on the last step.
+    %remaining = index.sub %span_count, %span : index
+    %bounded_advance = index.min %advance, %remaining : index
+    %next_span = index.add %span, %bounded_advance : index
+    scf.yield %next_span, %next_tile : index, index
+  }
+  template.return
+}
+
+kernel.def export("qwen38_gdn_recurrent_spans") @qwen38_gdn_recurrent_spans(%span_capacity: index) {
+  %groups = func.call pure @qwen38_gdn_recurrent_workgroups(%span_capacity) : (index) -> (index)
+  %threads = index.constant 128 : index
+  %unit = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%epoch: buffer, %rows: buffer, %layer_origin: offset, %qkv: buffer, %inverse_norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer) {
+  %verify_speculative = scalar.constant false : i1
+  template.apply<@qwen38.gdn_recurrent_spans.body>(%verify_speculative, %epoch, %rows, %layer_origin, %qkv, %inverse_norm, %alpha, %beta, %a, %bias, %state, %output) : (i1, buffer, buffer, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def export("qwen38_gdn_recurrent_verify_spans") @qwen38_gdn_recurrent_verify_spans(%span_capacity: index) {
+  %groups = func.call pure @qwen38_gdn_recurrent_workgroups(%span_capacity) : (index) -> (index)
+  %threads = index.constant 128 : index
+  %unit = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%epoch: buffer, %rows: buffer, %layer_origin: offset, %qkv: buffer, %inverse_norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer) {
+  %verify_speculative = scalar.constant true : i1
+  template.apply<@qwen38.gdn_recurrent_spans.body>(%verify_speculative, %epoch, %rows, %layer_origin, %qkv, %inverse_norm, %alpha, %beta, %a, %bias, %state, %output) : (i1, buffer, buffer, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}

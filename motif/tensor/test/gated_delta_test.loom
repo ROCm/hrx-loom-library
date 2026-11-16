@@ -1,0 +1,181 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Eight independent columns exercise every four-lane cluster in a wave.
+// A serial F64 recurrence carries state independently of the device's vector
+// partition and reduction tree. Decay/update endpoints cover reset and hold;
+// a near-one decay exposes accumulated error across a retained token span.
+// Inputs keep key norm below one, so the delta update is nonexpansive. The
+// 1e-5 absolute budget covers F32 dot/update rounding over at most 64 steps,
+// while remaining much smaller than one BF16 ULP at unit magnitude.
+
+template.decl @gated_delta.update_128(%prior: vector<32xf32>, %query: vector<32xf32>, %key: vector<32xf32>, %value: f32, %decay: f32, %update_gate: f32) -> (vector<32xf32>, f32)
+
+// This wrapper supplies only storage and traversal. Model adapters own their
+// normalization, nonlinear gates, state origins, and publication contracts.
+kernel.def @gated_delta_columns() {
+  %unit = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%parameters: buffer, %query: buffer, %key: buffer, %value: buffer, %state: buffer, %output: buffer) {
+  %tokens, %decay, %update_gate = func.call @gated_delta_parameters(%parameters) : (buffer) -> (index, f32, f32)
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %cluster_size = index.constant 4 : index
+  %fragment_keys = index.constant 32 : index
+  %thread = kernel.workitem.id<x> : index
+  %column = index.div %thread, %cluster_size : index
+  %lane = index.rem %thread, %cluster_size : index
+  %begin = index.mul %lane, %fragment_keys : index
+  %queries = buffer.view %query[%origin] : buffer -> view<[%tokens]x128xf32>
+  %keys = buffer.view %key[%origin] : buffer -> view<[%tokens]x128xf32>
+  %values = buffer.view %value[%origin] : buffer -> view<[%tokens]x8xf32>
+  %states = buffer.view %state[%origin] : buffer -> view<8x128xf32>
+  %outputs = buffer.view %output[%origin] : buffer -> view<[%tokens]x8xf32>
+  %initial = vector.load %states[%column, %begin] : view<8x128xf32> -> vector<32xf32>
+  %final = scf.for %token = [%c0 to %tokens step %unit](%prior = %initial : vector<32xf32>) -> (vector<32xf32>) {
+    %query_fragment = vector.load %queries[%token, %begin] : view<[%tokens]x128xf32> -> vector<32xf32>
+    %key_fragment = vector.load %keys[%token, %begin] : view<[%tokens]x128xf32> -> vector<32xf32>
+    %value_scalar = view.load %values[%token, %column] : view<[%tokens]x8xf32> -> f32
+    %updated, %result = template.apply<@gated_delta.update_128>(%prior, %query_fragment, %key_fragment, %value_scalar, %decay, %update_gate) : (vector<32xf32>, vector<32xf32>, vector<32xf32>, f32, f32, f32) -> (vector<32xf32>, f32)
+    %leader = index.cmp eq, %lane, %c0 : index
+    scf.if %leader {
+      view.store %result, %outputs[%token, %column] : f32, view<[%tokens]x8xf32>
+    }
+    scf.yield %updated : vector<32xf32>
+  }
+  vector.store %final, %states[%column, %begin] : vector<32xf32>, view<8x128xf32>
+  kernel.return
+}
+
+command.def @gated_delta_program() launch(%parameters: buffer, %query: buffer, %key: buffer, %value: buffer, %state: buffer, %output: buffer) {
+  kernel.launch @gated_delta_columns(%parameters, %query, %key, %value, %state, %output) : (buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+func.def inline @gated_delta_parameters(%parameters: buffer) -> (index, f32, f32) {
+  %origin = index.constant 0 : offset
+  %words = buffer.view %parameters[%origin] : buffer -> view<3xi32>
+  %token_word = view.load %words[0] : view<3xi32> -> i32
+  %decay_word = view.load %words[1] : view<3xi32> -> i32
+  %gate_word = view.load %words[2] : view<3xi32> -> i32
+  %token_value = index.cast %token_word : i32 to index
+  %tokens = index.assume %token_value [range(%token_value, 1, 64)] : index
+  %decay = scalar.bitcast %decay_word : i32 to f32
+  %gate = scalar.bitcast %gate_word : i32 to f32
+  func.return %tokens, %decay, %gate : index, f32, f32
+}
+
+func.def @gated_delta_reference(%parameters: buffer, %query: buffer, %key: buffer, %value: buffer, %state: buffer, %output: buffer) {
+  %tokens, %decay, %update_gate = func.call @gated_delta_parameters(%parameters) : (buffer) -> (index, f32, f32)
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %columns = index.constant 8 : index
+  %key_count = index.constant 128 : index
+  %queries = buffer.view %query[%origin] : buffer -> view<[%tokens]x128xf32>
+  %keys = buffer.view %key[%origin] : buffer -> view<[%tokens]x128xf32>
+  %values = buffer.view %value[%origin] : buffer -> view<[%tokens]x8xf32>
+  %states = buffer.view %state[%origin] : buffer -> view<8x128xf32>
+  %outputs = buffer.view %output[%origin] : buffer -> view<[%tokens]x8xf32>
+  %column_bytes = index.constant 1024 : offset
+  %column_storage = buffer.alloca<private> align(8) %column_bytes : buffer
+  %column_state = buffer.view %column_storage[%origin] : buffer -> view<128xf64>
+  %decay_wide = scalar.extf %decay : f32 to f64
+  %gate_wide = scalar.extf %update_gate : f32 to f64
+  %zero_wide = scalar.constant 0.0 : f64
+  scf.for %column = [%c0 to %columns step %unit] {
+    scf.for %channel = [%c0 to %key_count step %unit] {
+      %initial = view.load %states[%column, %channel] : view<8x128xf32> -> f32
+      %wide = scalar.extf %initial : f32 to f64
+      view.store %wide, %column_state[%channel] : f64, view<128xf64>
+    }
+    scf.for %token = [%c0 to %tokens step %unit] {
+      %prediction = scf.for %channel = [%c0 to %key_count step %unit](%sum = %zero_wide : f64) -> (f64) {
+        %prior = view.load %column_state[%channel] : view<128xf64> -> f64
+        %decayed = scalar.mulf %prior, %decay_wide : f64
+        view.store %decayed, %column_state[%channel] : f64, view<128xf64>
+        %key_scalar = view.load %keys[%token, %channel] : view<[%tokens]x128xf32> -> f32
+        %key_wide = scalar.extf %key_scalar : f32 to f64
+        %product = scalar.mulf %key_wide, %decayed : f64
+        %next = scalar.addf %sum, %product : f64
+        scf.yield %next : f64
+      }
+      %value_scalar = view.load %values[%token, %column] : view<[%tokens]x8xf32> -> f32
+      %value_wide = scalar.extf %value_scalar : f32 to f64
+      %residual = scalar.subf %value_wide, %prediction : f64
+      %delta = scalar.mulf %residual, %gate_wide : f64
+      %result = scf.for %channel = [%c0 to %key_count step %unit](%sum = %zero_wide : f64) -> (f64) {
+        %decayed = view.load %column_state[%channel] : view<128xf64> -> f64
+        %key_scalar = view.load %keys[%token, %channel] : view<[%tokens]x128xf32> -> f32
+        %key_wide = scalar.extf %key_scalar : f32 to f64
+        %correction = scalar.mulf %key_wide, %delta : f64
+        %updated = scalar.addf %decayed, %correction : f64
+        view.store %updated, %column_state[%channel] : f64, view<128xf64>
+        %query_scalar = view.load %queries[%token, %channel] : view<[%tokens]x128xf32> -> f32
+        %query_wide = scalar.extf %query_scalar : f32 to f64
+        %product = scalar.mulf %query_wide, %updated : f64
+        %next = scalar.addf %sum, %product : f64
+        scf.yield %next : f64
+      }
+      %rounded = scalar.fptrunc %result : f64 to f32
+      view.store %rounded, %outputs[%token, %column] : f32, view<[%tokens]x8xf32>
+    }
+    scf.for %channel = [%c0 to %key_count step %unit] {
+      %wide = view.load %column_state[%channel] : view<128xf64> -> f64
+      %rounded = scalar.fptrunc %wide : f64 to f32
+      view.store %rounded, %states[%column, %channel] : f32, view<8x128xf32>
+    }
+  }
+  func.return
+}
+
+func.def @gated_delta_workload(%workload: index, %parameters: buffer) -> (index) {
+  %single = index.constant 1 : index
+  %block = index.constant 7 : index
+  %span = index.constant 64 : index
+  %c0 = scalar.constant 0.0 : f32
+  %c1 = scalar.constant 1.0 : f32
+  %ordinary_decay = scalar.constant 0.9375 : f32
+  %near_one = scalar.constant 0.99999988079071045 : f32
+  %ordinary_gate = scalar.constant 0.375 : f32
+  %tokens, %decay, %gate = scf.lookup %workload {
+    0 = (%single, %c0, %c1),
+    1 = (%block, %c1, %c0),
+    2 = (%single, %ordinary_decay, %ordinary_gate),
+    3 = (%block, %ordinary_decay, %ordinary_gate)
+  } default(%span, %near_one, %ordinary_gate) : index, f32, f32
+  %origin = index.constant 0 : offset
+  %words = buffer.view %parameters[%origin] : buffer -> view<3xi32>
+  %token_word = index.cast %tokens : index to i32
+  %decay_word = scalar.bitcast %decay : f32 to i32
+  %gate_word = scalar.bitcast %gate : f32 to i32
+  view.store %token_word, %words[0] : i32, view<3xi32>
+  view.store %decay_word, %words[1] : i32, view<3xi32>
+  view.store %gate_word, %words[2] : i32, view<3xi32>
+  func.return %tokens : index
+}
+
+check.scenario public @gated_delta_recurrence {
+  check.trial[5](%workload: index, %entropy: check.entropy) {
+    %parameters = check.generate.fill value(0) : tensor<3xi32>
+    %tokens = check.generate<@gated_delta_workload>(%workload, %parameters) : (index, tensor<3xi32>) -> (index)
+    %query = check.generate.iota offset(-0.125) step(0.001953125) period(127) : tensor<[%tokens]x128xf32>
+    %key = check.generate.iota offset(-0.0625) step(0.0009765625) period(127) : tensor<[%tokens]x128xf32>
+    %value = check.generate.iota offset(-0.5) step(0.03125) period(31) : tensor<[%tokens]x8xf32>
+    %state = check.generate.iota offset(-0.03125) step(0.00048828125) period(127) : tensor<8x128xf32>
+    %output = check.generate.fill value(-99.0) : tensor<[%tokens]x8xf32>
+    check.compare<@gated_delta_program, @gated_delta_reference>(%parameters, %query, %key, %value, %state, %output) : (tensor<3xi32>, tensor<[%tokens]x128xf32>, tensor<[%tokens]x128xf32>, tensor<[%tokens]x8xf32>, tensor<8x128xf32>, tensor<[%tokens]x8xf32>) -> () {
+      check.expect.approximate actual(%state) expected(%state) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<8x128xf32>, tensor<8x128xf32>
+      check.expect.approximate actual(%output) expected(%output) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(same) : tensor<[%tokens]x8xf32>, tensor<[%tokens]x8xf32>
+      check.expect.bitwise actual(%parameters) expected(%parameters) : tensor<3xi32>
+      check.expect.bitwise actual(%query) expected(%query) : tensor<[%tokens]x128xf32>
+      check.expect.bitwise actual(%key) expected(%key) : tensor<[%tokens]x128xf32>
+      check.expect.bitwise actual(%value) expected(%value) : tensor<[%tokens]x8xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@gated_delta_recurrence> @gated_delta_workloads
