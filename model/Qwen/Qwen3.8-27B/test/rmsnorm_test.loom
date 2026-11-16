@@ -8,6 +8,8 @@ kernel.decl @qwen38_rmsnorm_q8_1_x4_f32_decode() launch(%epsilon: f32, %input: b
 
 kernel.decl @ggml_quantize_q8_1_x4_f32(%configured_token_count: index, %configured_input_size: index) launch(%token_count: index, %input_size: index, %input: buffer, %output: buffer)
 
+command.decl @qwen38_dispatch_rmsnorm_q8_1_x4_f32_decode(%epsilon: f32) launch(%input: buffer, %weight: buffer, %output_f32: buffer, %output_q8: buffer)
+
 kernel.decl @qwen38_mtp_rmsnorm_concat_embedding_f32_prefill(%row_capacity: index) launch(%rows: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer)
 
 kernel.decl @qwen38_mtp_rmsnorm_concat_hidden_f32_prefill(%row_capacity: index) launch(%rows: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer)
@@ -301,6 +303,44 @@ check.case public @decode_q8_exact {
   check.expect.bitwise actual(%actual_f32_suffix) expected(%expected_f32_guard) : tensor<4xf32>
   check.expect.bitwise actual(%actual_q8_prefix) expected(%expected_q8_guard) : tensor<4xi32>
   check.expect.bitwise actual(%actual_q8_suffix) expected(%expected_q8_guard) : tensor<4xi32>
+  check.return
+}
+
+func.def @decode_q8_zero_expected(%input: buffer, %weight: buffer, %output_f32: buffer, %output_q8: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %f32_count = index.constant 5120 : index
+  %q8_count = index.constant 1440 : index
+  %origin = index.constant 0 : offset
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c0_i32 = scalar.constant 0 : i32
+  %f32_view = buffer.view %output_f32[%origin] : buffer -> view<5120xf32>
+  %q8_view = buffer.view %output_q8[%origin] : buffer -> view<1440xi32>
+  scf.for %i = [%c0 to %f32_count step %c1] {
+    view.store %c0_f32, %f32_view[%i] : f32, view<5120xf32>
+  }
+  scf.for %i = [%c0 to %q8_count step %c1] {
+    view.store %c0_i32, %q8_view[%i] : i32, view<1440xi32>
+  }
+  func.return
+}
+
+// The command provider is the production selection boundary: native targets
+// retain two dispatches while SPIR-V selects the fused kernel. The direct
+// high-magnitude case above owns arithmetic equivalence; this case proves that
+// both selected command programs publish the exact zero representations.
+check.scenario public @decode_q8_dispatch_exact {
+  %epsilon = check.literal value(9.9999999999999995e-07) : f32
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input = check.generate.fill value(0.0) : tensor<5120xf32>
+    %weight = check.generate.iota offset(-1.0) step(0.00390625) period(512) : tensor<5120xf32>
+    %output_f32 = check.generate.fill value(-99.0) : tensor<5120xf32>
+    %output_q8 = check.generate.fill value(-99) : tensor<1440xi32>
+    check.compare<@qwen38_dispatch_rmsnorm_q8_1_x4_f32_decode, @decode_q8_zero_expected>[%epsilon](%input, %weight, %output_f32, %output_q8) : [f32](tensor<5120xf32>, tensor<5120xf32>, tensor<5120xf32>, tensor<1440xi32>) -> () {
+      check.expect.approximate actual(%output_f32) expected(%output_f32) atol(0.0) rtol(0.0) nan(different) : tensor<5120xf32>, tensor<5120xf32>
+      check.expect.bitwise actual(%output_q8) expected(%output_q8) : tensor<1440xi32>
+    }
+  }
   check.return
 }
 

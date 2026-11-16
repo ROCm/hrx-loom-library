@@ -5,9 +5,41 @@
 
 target.decl @qwen38_execution
 
+target.decl @qwen38_spirv
+
 amdgpu.target<gfx11-generic> @qwen38_dispatch_rdna
 
 amdgpu.target<gfx9-4-generic> @qwen38_dispatch_cdna
+
+kernel.decl @ggml_quantize_q8_1_x4_f32(%token_count: index, %input_size: index) launch(%token_count_argument: index, %input_size_argument: index, %input: buffer, %output: buffer)
+
+kernel.decl @qwen38_rmsnorm_f32_decode() launch(%epsilon: f32, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_rmsnorm_q8_1_x4_f32_decode() launch(%epsilon: f32, %input: buffer, %weight: buffer, %output_f32: buffer, %output_q8: buffer)
+
+template.decl @qwen38.dispatch.rmsnorm_q8_1_x4_f32.decode(%epsilon: f32, %input: buffer, %weight: buffer, %output_f32: buffer, %output_q8: buffer)
+
+// Native targets retain separate dispatches: keeping the Q8 publisher small
+// avoids the register-pressure and latency cost of inlining it into RMSNorm.
+template.def<@qwen38.dispatch.rmsnorm_q8_1_x4_f32.decode> priority(-1) @qwen38_dispatch_rmsnorm_q8_1_x4_f32_decode_separate(%epsilon: f32, %input: buffer, %weight: buffer, %output_f32: buffer, %output_q8: buffer) {
+  %token_count = index.constant 1 : index
+  %input_size = index.constant 5120 : index
+  kernel.launch @qwen38_rmsnorm_f32_decode(%epsilon, %input, %weight, %output_f32) : (f32, buffer, buffer, buffer)
+  kernel.launch @ggml_quantize_q8_1_x4_f32[%token_count, %input_size](%token_count, %input_size, %output_f32, %output_q8) : [index, index](index, index, buffer, buffer)
+  template.return
+}
+
+// SPIR-V saves a global-memory pass and one dispatch while its retained
+// numeric helper prevents the fused kernel from cloning the Q8 arithmetic.
+template.def<@qwen38.dispatch.rmsnorm_q8_1_x4_f32.decode> target(@qwen38_spirv) @qwen38_dispatch_rmsnorm_q8_1_x4_f32_decode_spirv(%epsilon: f32, %input: buffer, %weight: buffer, %output_f32: buffer, %output_q8: buffer) {
+  kernel.launch @qwen38_rmsnorm_q8_1_x4_f32_decode(%epsilon, %input, %weight, %output_f32, %output_q8) : (f32, buffer, buffer, buffer, buffer)
+  template.return
+}
+
+command.def public target(@qwen38_execution) @qwen38_dispatch_rmsnorm_q8_1_x4_f32_decode(%epsilon: f32) launch(%input: buffer, %weight: buffer, %output_f32: buffer, %output_q8: buffer) {
+  template.apply<@qwen38.dispatch.rmsnorm_q8_1_x4_f32.decode>(%epsilon, %input, %weight, %output_f32, %output_q8) : (f32, buffer, buffer, buffer, buffer)
+  command.return
+}
 
 template.decl @qwen38.prefill.projection_schedule(%tokens: index) -> (index)
 
