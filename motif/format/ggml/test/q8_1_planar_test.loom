@@ -1,0 +1,234 @@
+// Exact planar Q8_1 publication from each supported retained-value topology.
+// A scalar reference independently computes every code and metadata field.
+// Whole-storage comparisons cover guards, multi-row addressing, zero blocks,
+// signed values, F16 scale rounding, and immutable inputs.
+
+func.decl @ggml_q8_1_planar_publish_block32(%row_count: index, %row: index, %block_count: index, %block: index, %values: vector<32xf32>, %output: buffer)
+
+func.decl @ggml_q8_1_planar_publish_packet8_cluster4(%row_count: index, %row: index, %block_count: index, %block: index, %lane_in_block: index, %values: vector<8xf32>, %output: buffer)
+
+func.decl @ggml_q8_1_planar_publish_columns4_cluster32(%row_count: index, %row: index, %block_count: index, %first_block: index, %lane_in_block: index, %values: vector<4xf32>, %output: buffer)
+
+func.def @round_away(%value: f32) -> (i32) {
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %cneg1_i32 = scalar.constant -1 : i32
+  %c0_f32 = scalar.constant 0.0 : f32
+  %half = scalar.constant 0.5 : f32
+  %integer = scalar.fptosi %value : f32 to i32
+  %whole = scalar.sitofp %integer : i32 to f32
+  %fraction = scalar.subf %value, %whole : f32
+  %distance = scalar.absf %fraction : f32
+  %increment = scalar.cmpf oge, %distance, %half : f32
+  %negative = scalar.cmpf olt, %value, %c0_f32 : f32
+  %direction = scf.select %negative, %cneg1_i32, %c1_i32 : i32
+  %adjustment = scf.select %increment, %direction, %c0_i32 : i32
+  %rounded = scalar.addi %integer, %adjustment : i32
+  func.return %rounded : i32
+}
+
+func.def @initialize_directed(%configuration: index, %input: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %block_count = index.constant 8 : index
+  %elements_per_block = index.constant 32 : index
+  %element_count = index.constant 512 : index
+  %c1 = index.constant 1 : index
+  %last_block = index.constant 7 : index
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c1_f32 = scalar.constant 1.0 : f32
+  %cneg1_f32 = scalar.constant -1.0 : f32
+  %c0_offset = index.constant 0 : offset
+  %input_view = buffer.view %input[%c0_offset] : buffer -> view<2x8x32xf32>
+  scf.for %element = [%begin to %element_count step %step] {
+    %row_stride = index.mul %block_count, %elements_per_block : index
+    %row = index.div %element, %row_stride : index
+    %within_row = index.rem %element, %row_stride : index
+    %block = index.div %within_row, %elements_per_block : index
+    %lane = index.rem %within_row, %elements_per_block : index
+    %value = scf.switch %configuration -> (f32) {
+      case 0 {
+        scf.yield %c0_f32 : f32
+      }
+      case 1 {
+        scf.yield %c1_f32 : f32
+      }
+      case 2 {
+        scf.yield %cneg1_f32 : f32
+      }
+      default {
+        %scales = vector.constantf [1.0, 0.00390625, 256.0, 2.0, 1.00048828125, 5.9604644775390625e-08, 65504.0, 32768.0] : vector<8xf32>
+        %scale = vector.extract %scales[%block] : vector<8xf32> -> f32
+        %c11 = index.constant 11 : index
+        %c37 = index.constant 37 : index
+        %c251 = index.constant 251 : index
+        %c125 = scalar.constant 125 : i32
+        %phase = index.mul %block, %c11 : index
+        %sequence = index.madd %lane, %c37, %phase : index
+        %reduced = index.rem %sequence, %c251 : index
+        %word = index.cast %reduced : index to i32
+        %code0 = scalar.subi %word, %c125 : i32
+        %c127 = scalar.constant 127 : i32
+        %negative_peak = scalar.constant -127 : i32
+        %first = index.cmp eq, %lane, %begin : index
+        %second = index.cmp eq, %lane, %c1 : index
+        %code1 = scf.select %second, %negative_peak, %code0 : i32
+        %code = scf.select %first, %c127, %code1 : i32
+        %floating = scalar.sitofp %code : i32 to f32
+        %scaled = scalar.mulf %floating, %scale : f32
+        %zero_block = index.cmp eq, %block, %last_block : index
+        %second_row = index.cmp eq, %row, %c1 : index
+        %inactive = scalar.andi %zero_block, %second_row : i1
+        %selected = scf.select %inactive, %c0_f32, %scaled : f32
+        scf.yield %selected : f32
+      }
+    }
+    view.store %value, %input_view[%row, %block, %lane] : f32, view<2x8x32xf32>
+  }
+  func.return
+}
+
+func.def @reference_block(%row: index, %block: index, %input: buffer, %output: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %row_count = index.constant 2 : index
+  %block_count = index.constant 8 : index
+  %elements_per_block = index.constant 32 : index
+  %c0_offset = index.constant 0 : offset
+  %c0_i32 = scalar.constant 0 : i32
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c127_f32 = scalar.constant 127.0 : f32
+  %input_view = buffer.view %input[%c0_offset] : buffer -> view<2x8x32xf32>
+  %maximum = scf.for %lane = [%begin to %elements_per_block step %step](%peak = %c0_f32 : f32) -> (f32) {
+    %value = view.load %input_view[%row, %block, %lane] : view<2x8x32xf32> -> f32
+    %absolute = scalar.absf %value : f32
+    %next = scalar.maxnumf %peak, %absolute : f32
+    scf.yield %next : f32
+  }
+  %scale = scalar.divf %maximum, %c127_f32 : f32
+  %nonzero = scalar.cmpf one, %maximum, %c0_f32 : f32
+  %payload = buffer.view %output[%c0_offset] : buffer -> view<2x8x32xi8>
+  %sum = scf.for %lane = [%begin to %elements_per_block step %step](%total = %c0_i32 : i32) -> (i32) {
+    %value = view.load %input_view[%row, %block, %lane] : view<2x8x32xf32> -> f32
+    %scaled = scalar.divf %value, %scale : f32
+    %selected = scf.select %nonzero, %scaled, %c0_f32 : f32
+    %rounded = func.call @round_away(%selected) : (f32) -> (i32)
+    %code = scalar.trunci %rounded : i32 to i8
+    view.store %code, %payload[%row, %block, %lane] : i8, view<2x8x32xi8>
+    %next = scalar.addi %total, %rounded : i32
+    scf.yield %next : i32
+  }
+  %half_scale = scalar.fptrunc %scale : f32 to f16
+  %stored_scale = scalar.extf %half_scale : f16 to f32
+  %sum_float = scalar.sitofp %sum : i32 to f32
+  %metadata_values = vector.from_elements %stored_scale, %sum_float : vector<2xf32>
+  %row_elements = index.mul %block_count, %elements_per_block : index
+  %row_bytes = index.cast %row_elements : index to offset
+  %metadata_origin = index.scale %row_count, %row_bytes : index, offset -> offset
+  %metadata = buffer.view %output[%metadata_origin] : buffer -> view<2x8x2xf32>
+  vector.store %metadata_values, %metadata[%row, %block, %begin] : vector<2xf32>, view<2x8x2xf32>
+  func.return
+}
+
+kernel.def @publish_topology_kernel(%topology: index) {
+  %row_count = index.constant 2 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%c1, %row_count, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%topology_argument: index, %input: buffer, %output: buffer) {
+  %topology = index.assume %topology_argument [range(%topology_argument, 0, 2)] : index
+  %row_count = index.constant 2 : index
+  %block_count = index.constant 8 : index
+  %blocks_per_group = index.constant 4 : index
+  %packet_width = index.constant 8 : index
+  %begin = index.constant 0 : index
+  %row = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %c0_offset = index.constant 0 : offset
+  %input_view = buffer.view %input[%c0_offset] : buffer -> view<2x8x32xf32>
+  scf.switch %topology {
+    case 0 {
+      %active = index.cmp ult, %lane, %block_count : index
+      scf.if %active {
+        %block = index.assume %lane [range(%lane, 0, 7)] : index
+        %values = vector.load %input_view[%row, %block, %begin] : view<2x8x32xf32> -> vector<32xf32>
+        func.call @ggml_q8_1_planar_publish_block32(%row_count, %row, %block_count, %block, %values, %output) : (index, index, index, index, vector<32xf32>, buffer)
+      }
+    }
+    case 1 {
+      %block = index.div %lane, %blocks_per_group : index
+      %lane_in_block = index.rem %lane, %blocks_per_group : index
+      %column = index.mul %lane_in_block, %packet_width : index
+      %values = vector.load %input_view[%row, %block, %column] : view<2x8x32xf32> -> vector<8xf32>
+      func.call @ggml_q8_1_planar_publish_packet8_cluster4(%row_count, %row, %block_count, %block, %lane_in_block, %values, %output) : (index, index, index, index, index, vector<8xf32>, buffer)
+    }
+    default {
+      %block1 = index.constant 1 : index
+      %block2 = index.constant 2 : index
+      %block3 = index.constant 3 : index
+      %block4 = index.constant 4 : index
+      %block5 = index.constant 5 : index
+      %block6 = index.constant 6 : index
+      %block7 = index.constant 7 : index
+      %value0 = view.load %input_view[%row, %begin, %lane] : view<2x8x32xf32> -> f32
+      %value1 = view.load %input_view[%row, %block1, %lane] : view<2x8x32xf32> -> f32
+      %value2 = view.load %input_view[%row, %block2, %lane] : view<2x8x32xf32> -> f32
+      %value3 = view.load %input_view[%row, %block3, %lane] : view<2x8x32xf32> -> f32
+      %values0 = vector.from_elements %value0, %value1, %value2, %value3 : vector<4xf32>
+      func.call @ggml_q8_1_planar_publish_columns4_cluster32(%row_count, %row, %block_count, %begin, %lane, %values0, %output) : (index, index, index, index, index, vector<4xf32>, buffer)
+      %value4 = view.load %input_view[%row, %block4, %lane] : view<2x8x32xf32> -> f32
+      %value5 = view.load %input_view[%row, %block5, %lane] : view<2x8x32xf32> -> f32
+      %value6 = view.load %input_view[%row, %block6, %lane] : view<2x8x32xf32> -> f32
+      %value7 = view.load %input_view[%row, %block7, %lane] : view<2x8x32xf32> -> f32
+      %values1 = vector.from_elements %value4, %value5, %value6, %value7 : vector<4xf32>
+      func.call @ggml_q8_1_planar_publish_columns4_cluster32(%row_count, %row, %block_count, %block4, %lane, %values1, %output) : (index, index, index, index, index, vector<4xf32>, buffer)
+    }
+  }
+  kernel.return
+}
+
+command.def @publish_topology(%topology: index) launch(%input: buffer, %output: buffer) {
+  kernel.launch @publish_topology_kernel[%topology](%topology, %input, %output) : [index](index, buffer, buffer)
+  command.return
+}
+
+func.def @publish_reference(%input: buffer, %output: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %row_count = index.constant 2 : index
+  %block_count = index.constant 8 : index
+  scf.for %row = [%begin to %row_count step %step] {
+    scf.for %block = [%begin to %block_count step %step] {
+      func.call @reference_block(%row, %block, %input, %output) : (index, index, buffer, buffer)
+    }
+  }
+  func.return
+}
+
+check.scenario public @directed configure[3](%topology: index, %configuration_entropy: check.entropy) {
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %input_storage = check.generate.fill value(123.25) : tensor<520xf32>
+    %input = check.tensor.view %input_storage offset(16) : tensor<520xf32> -> tensor<512xf32>
+    check.generate<@initialize_directed>(%trial, %input) : (index, tensor<512xf32>) -> ()
+    %output_storage = check.generate.fill value(-99) : tensor<168xi32>
+    %output = check.tensor.view %output_storage offset(16) : tensor<168xi32> -> tensor<160xi32>
+    check.compare<@publish_topology, @publish_reference>[%topology](%input, %output) : [index](tensor<512xf32>, tensor<160xi32>) -> () {
+      check.expect.bitwise actual(%output_storage) expected(%output_storage) : tensor<168xi32>
+      check.expect.bitwise actual(%input_storage) expected(%input_storage) : tensor<520xf32>
+    }
+  }
+  check.return
+}
+
+check.scenario public @random configure[3](%topology: index, %configuration_entropy: check.entropy) {
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-1000.0 to 1000.0) : tensor<512xf32>
+    %output = check.generate.fill value(-99) : tensor<160xi32>
+    check.compare<@publish_topology, @publish_reference>[%topology](%input, %output) : [index](tensor<512xf32>, tensor<160xi32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<160xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<512xf32>
+    }
+  }
+  check.return
+}
