@@ -29,6 +29,7 @@ _DIGEST = re.compile(r"[0-9a-f]{64}")
 _NUMBER = r"(?:0|[1-9][0-9]*)"
 _VERSION = re.compile(rf"{_NUMBER}\.{_NUMBER}\.{_NUMBER}(?:(?:a|b|rc){_NUMBER})?")
 _WHEEL = re.compile(r"hrx_loom-(?P<version>[^/]+)-py3-none-manylinux_2_39_x86_64\.whl")
+_RELEASE_PAGE_SIZE = 100
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,35 @@ def _get_optional(url: str, token: str) -> Any | None:
         if error.code == 404:
             return None
         raise
+
+
+def _get_optional_release(api: str, tag: str, token: str) -> Any | None:
+    """Finds a public or draft release with the exact tag."""
+    encoded_tag = urllib.parse.quote(tag, safe="")
+    document = _get_optional(f"{api}/releases/tags/{encoded_tag}", token)
+    if document is not None:
+        return document
+
+    # GitHub's release-by-tag endpoint does not expose drafts. The authenticated
+    # release listing does, so walk it when publication may be resuming a draft.
+    page_number = 1
+    while True:
+        page = _get_optional(
+            f"{api}/releases?per_page={_RELEASE_PAGE_SIZE}&page={page_number}",
+            token,
+        )
+        if not isinstance(page, list) or any(
+            not isinstance(release, dict) for release in page
+        ):
+            raise ValueError("GitHub returned an invalid release listing")
+        matches = [release for release in page if release.get("tag_name") == tag]
+        if len(matches) > 1:
+            raise ValueError("GitHub returned duplicate releases for one tag")
+        if matches:
+            return matches[0]
+        if len(page) < _RELEASE_PAGE_SIZE:
+            return None
+        page_number += 1
 
 
 def _gh(*arguments: str) -> None:
@@ -230,9 +260,9 @@ def publish(
     if not loom_fetch.is_file():
         raise ValueError("library publication requires the installed loom-fetch")
 
-    tag = urllib.parse.quote(identity.tag, safe="")
     api = f"https://api.github.com/repos/{repository}"
-    tag_url = f"{api}/git/ref/tags/{tag}"
+    encoded_tag = urllib.parse.quote(identity.tag, safe="")
+    tag_url = f"{api}/git/ref/tags/{encoded_tag}"
     tag_document = _get_optional(tag_url, token)
     if tag_document is None:
         _gh(
@@ -248,8 +278,7 @@ def publish(
         tag_document = _get_optional(tag_url, token)
     _validate_tag(tag_document, commit)
 
-    release_url = f"{api}/releases/tags/{tag}"
-    release_document = _get_optional(release_url, token)
+    release_document = _get_optional_release(api, identity.tag, token)
     created = release_document is None
     if created:
         options = ["--prerelease", "--latest=false"] if identity.prerelease else []
@@ -267,7 +296,7 @@ def publish(
             release_body(identity),
             *options,
         )
-        release_document = _get_optional(release_url, token)
+        release_document = _get_optional_release(api, identity.tag, token)
 
     release_id, draft = _validate_library_release(release_document, identity)
     if created and not draft:
@@ -277,7 +306,7 @@ def publish(
 
     if draft:
         _gh("release", "edit", identity.tag, "--repo", repository, "--draft=false")
-        published = _get_optional(release_url, token)
+        published = _get_optional_release(api, identity.tag, token)
         published_id, published_draft = _validate_library_release(published, identity)
         if published_id != release_id or published_draft:
             raise ValueError("library release did not reach its immutable public state")

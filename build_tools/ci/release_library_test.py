@@ -132,6 +132,12 @@ class ReleaseLibraryTest(unittest.TestCase):
                 side_effect=[
                     None,
                     self.tag_document(),
+                ],
+            ),
+            patch.object(
+                release_library,
+                "_get_optional_release",
+                side_effect=[
                     None,
                     self.library_release_document(draft=True, immutable=False),
                     self.library_release_document(),
@@ -162,8 +168,12 @@ class ReleaseLibraryTest(unittest.TestCase):
             patch.object(
                 release_library,
                 "_get_optional",
+                return_value=self.tag_document(),
+            ),
+            patch.object(
+                release_library,
+                "_get_optional_release",
                 side_effect=[
-                    self.tag_document(),
                     self.library_release_document(draft=True, immutable=False),
                     self.library_release_document(),
                 ],
@@ -188,10 +198,12 @@ class ReleaseLibraryTest(unittest.TestCase):
             patch.object(
                 release_library,
                 "_get_optional",
-                side_effect=[
-                    self.tag_document(),
-                    self.library_release_document(),
-                ],
+                return_value=self.tag_document(),
+            ),
+            patch.object(
+                release_library,
+                "_get_optional_release",
+                return_value=self.library_release_document(),
             ),
             patch.object(release_library, "_gh") as gh,
             patch.object(
@@ -211,6 +223,12 @@ class ReleaseLibraryTest(unittest.TestCase):
                 side_effect=[
                     None,
                     self.tag_document(),
+                ],
+            ),
+            patch.object(
+                release_library,
+                "_get_optional_release",
+                side_effect=[
                     None,
                     self.library_release_document(draft=True, immutable=False),
                 ],
@@ -257,7 +275,16 @@ class ReleaseLibraryTest(unittest.TestCase):
         for responses in conflicts:
             with (
                 self.subTest(responses=responses),
-                patch.object(release_library, "_get_optional", side_effect=responses),
+                patch.object(
+                    release_library,
+                    "_get_optional",
+                    return_value=responses[0],
+                ),
+                patch.object(
+                    release_library,
+                    "_get_optional_release",
+                    side_effect=responses[1:],
+                ),
                 patch.object(release_library, "_gh") as gh,
                 patch.object(release_library, "_read_catalog") as read_catalog,
             ):
@@ -265,6 +292,32 @@ class ReleaseLibraryTest(unittest.TestCase):
                     self.publish()
                 gh.assert_not_called()
                 read_catalog.assert_not_called()
+
+    def test_release_lookup_falls_back_to_paginated_drafts(self):
+        first_page = [
+            {"tag_name": f"v0.0.{index}"}
+            for index in range(release_library._RELEASE_PAGE_SIZE)
+        ]
+        draft = self.library_release_document(draft=True, immutable=False)
+        api = "https://api.github.com/repos/fixture/library"
+        with patch.object(
+            release_library,
+            "_get_optional",
+            side_effect=[None, first_page, [draft]],
+        ) as get_optional:
+            self.assertIs(
+                release_library._get_optional_release(
+                    api, self.identity.tag, "token"
+                ),
+                draft,
+            )
+        self.assertEqual(get_optional.call_count, 3)
+        self.assertEqual(
+            get_optional.call_args_list[0].args[0],
+            f"{api}/releases/tags/{self.identity.tag}",
+        )
+        self.assertTrue(get_optional.call_args_list[1].args[0].endswith("&page=1"))
+        self.assertTrue(get_optional.call_args_list[2].args[0].endswith("&page=2"))
 
     def test_only_http_404_means_absence(self):
         for code in (404, 401, 403, 429, 500):
