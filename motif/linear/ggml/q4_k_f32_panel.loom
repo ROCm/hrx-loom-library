@@ -1,0 +1,214 @@
+// Four/eight-row Q4_K register panels with F32 activations and results.
+//
+// The caller supplies 512 workitems in complete 32- or 64-lane subgroups,
+// a constant row bank of four or eight, and a bounded worker population.
+// Sixteen logical 32-lane groups share K1024 activations across 64 output
+// channels. Each decoded weight packet serves every row before it is retired.
+// Inputs and outputs contain exactly rows*K and rows*N F32 values; weights
+// contain N*(K/256)*144 raw bytes. K is 256..32768, divisible by 256;
+// N is 1..262144. All three buffers are disjoint. K and channel tails are
+// masked before global access; every lane participates in both panel barriers.
+// Workgroup storage is 4352 bytes per row, reused across K and channel tiles.
+// No expanded weights or rounded activation carrier is created.
+// Four-float packets use XOR-rotated staging; a separate activation-sum
+// plane supplies the affine minimum correction without rescanning inputs.
+
+func.decl @ggml_q4_k_load_chunk16(%weight: buffer, %row_origin: offset, %block: index, %group: index, %half: index) -> (vector<16xi8>, f32, f32)
+
+template.decl @ggml.q4k.f32.small_panel.tile(%rows: index, %channel_tile: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+template.def<@ggml.q4k.f32.small_panel.tile> @contract(%rows: index, %channel_tile: index, %inputs0: index, %outputs0: index, %input: buffer, %weight: buffer, %output: buffer) where [range(%rows, 4, 8), multiple_of(%rows, 4)] {
+  %inputs = index.assume %inputs0 [range(%inputs0, 256, 32768), multiple_of(%inputs0, 256)] : index
+  %outputs = index.assume %outputs0 [range(%outputs0, 1, 262144)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %channels = index.constant 4 : index
+  %slots = index.mul %rows, %channels : index
+  %c16 = index.constant 16 : index
+  %width = index.constant 32 : index
+  %subblocks = index.constant 64 : index
+  %block_values = index.constant 256 : index
+  %panel_values = index.constant 1024 : index
+  %group_channels = index.constant 64 : index
+  %origin = index.constant 0 : offset
+  %block_bytes = index.constant 144 : offset
+  %row_stage_bytes = index.constant 4352 : offset
+  %stage_bytes = index.scale %rows, %row_stage_bytes : index, offset -> offset
+  %thread = kernel.workitem.id<x> : index
+  %lane = index.rem %thread, %width : index
+  %logical_group = index.div %thread, %width : index
+  %tile_channel = index.mul %channel_tile, %group_channels : index
+  %channel_origin = index.madd %logical_group, %channels, %tile_channel : index
+  %blocks = index.div %inputs, %block_values : index
+  %packets = index.div %inputs, %c16 : index
+  %row_bytes = index.scale %blocks, %block_bytes : index, offset -> offset
+  %input_noalias, %weight_noalias, %output_noalias = buffer.assume.noalias %input, %weight, %output : buffer, buffer, buffer
+  %activations = buffer.view %input_noalias[%origin] : buffer -> view<[%rows]x[%packets]x16xf32>
+  %results = buffer.view %output_noalias[%origin] : buffer -> view<[%rows]x[%outputs]xf32>
+  %stage = buffer.alloca<workgroup> align(16) %stage_bytes : buffer
+  %staged = buffer.view %stage[%origin] : buffer -> view<[%rows]x64x4x4xf32>
+  %row_value_bytes = index.constant 4096 : offset
+  %sums_origin = index.scale %rows, %row_value_bytes : index, offset -> offset
+  %staged_sums = buffer.view %stage[%sums_origin] : buffer -> view<[%rows]x64xf32>
+  %inactive_values = vector.splatf 0.0 : vector<16xf32>
+  %zero_codes = vector.splatf 0.0 : vector<64xf32>
+  %zero_scales = vector.splatf 0.0 : vector<4xf32>
+  %initial = vector.splatf 0.0 : vector<[%slots]xf32>
+  %final = scf.for %panel = [%c0 to %inputs step %panel_values](%partial = %initial : vector<[%slots]xf32>) -> (vector<[%slots]xf32>) {
+    %subblock_origin = index.div %panel, %c16 : index
+    %row = index.div %thread, %subblocks : index
+    %subblock = index.rem %thread, %subblocks : index
+    %packet = index.add %subblock_origin, %subblock : index
+    %valid_column = index.cmp ult, %packet, %packets : index
+    %valid_row = index.cmp ult, %row, %rows : index
+    %valid_load = scalar.andi %valid_column, %valid_row : i1
+    %values = scf.if %valid_load -> (vector<16xf32>) {
+      %loaded = vector.load %activations[%row, %packet, %c0] : view<[%rows]x[%packets]x16xf32> -> vector<16xf32>
+      scf.yield %loaded : vector<16xf32>
+    } else {
+      scf.yield %inactive_values : vector<16xf32>
+    }
+    scf.if %valid_row {
+      %half_subblock = index.div %subblock, %c2 : index
+      %stage_rotation = index.rem %half_subblock, %c4 : index
+      scf.for %packet = [%c0 to %c4 step %c1] unroll {
+        %element = index.mul %packet, %c4 : index
+        %value = vector.slice %values[%element] : vector<16xf32> -> vector<4xf32>
+        %destination = index.xori %packet, %stage_rotation : index
+        vector.store %value, %staged[%row, %subblock, %destination, %c0] : vector<4xf32>, view<[%rows]x64x4x4xf32>
+      }
+      %sum_zero = scalar.constant 0.0 : f32
+      %input_sum = scf.for %element = [%c0 to %c16 step %c1](%sum = %sum_zero : f32) -> (f32) unroll {
+        %value = vector.extract %values[%element] : vector<16xf32> -> f32
+        %next = scalar.addf %sum, %value : f32
+        scf.yield %next : f32
+      }
+      view.store %input_sum, %staged_sums[%row, %subblock] : f32, view<[%rows]x64xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %next_partial = scf.for %tile = [%c0 to %c2 step %c1](%bank = %partial : vector<[%slots]xf32>) -> (vector<[%slots]xf32>) {
+      %stage_slot = index.madd %tile, %width, %lane : index
+      %subblock = index.add %subblock_origin, %stage_slot : index
+      %block = index.div %subblock, %c16 : index
+      %within = index.rem %subblock, %c16 : index
+      %quant_group = index.div %within, %c2 : index
+      %side = index.rem %within, %c2 : index
+      %valid_block = index.cmp ult, %block, %blocks : index
+      %codes, %scales, %minima = scf.for %channel_slot = [%c0 to %channels step %c1](%code_bank = %zero_codes : vector<64xf32>, %scale_bank = %zero_scales : vector<4xf32>, %minimum_bank = %zero_scales : vector<4xf32>) -> (vector<64xf32>, vector<4xf32>, vector<4xf32>) unroll {
+        %channel = index.add %channel_origin, %channel_slot : index
+        %valid_channel = index.cmp ult, %channel, %outputs : index
+        %valid = scalar.andi %valid_channel, %valid_block : i1
+        %next_codes, %next_scales, %next_minima = scf.if %valid -> (vector<64xf32>, vector<4xf32>, vector<4xf32>) {
+          %weight_row_origin = index.scale %channel, %row_bytes : index, offset -> offset
+          %bytes, %scale, %minimum = func.call @ggml_q4_k_load_chunk16(%weight_noalias, %weight_row_origin, %block, %quant_group, %side) : (buffer, offset, index, index, index) -> (vector<16xi8>, f32, f32)
+          %values = vector.uitofp %bytes : vector<16xi8> to vector<16xf32>
+          %new_scales = vector.insert %scale into %scale_bank[%channel_slot] : f32, vector<4xf32>
+          %new_minima = vector.insert %minimum into %minimum_bank[%channel_slot] : f32, vector<4xf32>
+          %base = index.mul %channel_slot, %c16 : index
+          %decoded = scf.for %element = [%c0 to %c16 step %c1](%code_bank = %code_bank : vector<64xf32>) -> (vector<64xf32>) unroll {
+            %slot = index.add %base, %element : index
+            %value = vector.extract %values[%element] : vector<16xf32> -> f32
+            %inserted = vector.insert %value into %code_bank[%slot] : f32, vector<64xf32>
+            scf.yield %inserted : vector<64xf32>
+          }
+          scf.yield %decoded, %new_scales, %new_minima : vector<64xf32>, vector<4xf32>, vector<4xf32>
+        } else {
+          scf.yield %code_bank, %scale_bank, %minimum_bank : vector<64xf32>, vector<4xf32>, vector<4xf32>
+        }
+        scf.yield %next_codes, %next_scales, %next_minima : vector<64xf32>, vector<4xf32>, vector<4xf32>
+      }
+      %updated = scf.for %row = [%c0 to %rows step %c1](%bank = %bank : vector<[%slots]xf32>) -> (vector<[%slots]xf32>) unroll {
+        %half_slot = index.div %stage_slot, %c2 : index
+        %rotation = index.rem %half_slot, %c4 : index
+        %values = scf.for %packet = [%c0 to %c4 step %c1](%values = %inactive_values : vector<16xf32>) -> (vector<16xf32>) unroll {
+          %source = index.xori %packet, %rotation : index
+          %loaded = vector.load %staged[%row, %stage_slot, %source, %c0] : view<[%rows]x64x4x4xf32> -> vector<4xf32>
+          %base = index.mul %packet, %c4 : index
+          %next_values = scf.for %element = [%c0 to %c4 step %c1](%values = %values : vector<16xf32>) -> (vector<16xf32>) unroll {
+            %value = vector.extract %loaded[%element] : vector<4xf32> -> f32
+            %slot = index.add %base, %element : index
+            %next = vector.insert %value into %values[%slot] : f32, vector<16xf32>
+            scf.yield %next : vector<16xf32>
+          }
+          scf.yield %next_values : vector<16xf32>
+        }
+        %activation_sum = view.load %staged_sums[%row, %stage_slot] : view<[%rows]x64xf32> -> f32
+        %next_row = scf.for %channel_slot = [%c0 to %channels step %c1](%bank = %bank : vector<[%slots]xf32>) -> (vector<[%slots]xf32>) unroll {
+          %start = scalar.constant 0.0 : f32
+          %code_origin = index.mul %channel_slot, %c16 : index
+          %dot = scf.for %element = [%c0 to %c16 step %c1](%dot = %start : f32) -> (f32) unroll {
+            %slot = index.add %code_origin, %element : index
+            %code = vector.extract %codes[%slot] : vector<64xf32> -> f32
+            %value = vector.extract %values[%element] : vector<16xf32> -> f32
+            %next = scalar.fmaf %code, %value, %dot : f32
+            scf.yield %next : f32
+          }
+          %scale = vector.extract %scales[%channel_slot] : vector<4xf32> -> f32
+          %minimum = vector.extract %minima[%channel_slot] : vector<4xf32> -> f32
+          %positive = scalar.mulf %dot, %scale : f32
+          %negative = scalar.mulf %activation_sum, %minimum : f32
+          %contribution = scalar.subf %positive, %negative : f32
+          %slot = index.madd %channel_slot, %rows, %row : index
+          %old = vector.extract %bank[%slot] : vector<[%slots]xf32> -> f32
+          %sum = scalar.addf %old, %contribution : f32
+          %inserted = vector.insert %sum into %bank[%slot] : f32, vector<[%slots]xf32>
+          scf.yield %inserted : vector<[%slots]xf32>
+        }
+        scf.yield %next_row : vector<[%slots]xf32>
+      }
+      scf.yield %updated : vector<[%slots]xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %next_partial : vector<[%slots]xf32>
+  }
+  %leader = index.cmp eq, %lane, %c0 : index
+  %shuffle_width = scalar.constant 32 : i32
+  scf.for %channel_slot = [%c0 to %channels step %c1] unroll {
+    %channel = index.add %channel_origin, %channel_slot : index
+    %valid_channel = index.cmp ult, %channel, %outputs : index
+    %write = scalar.andi %leader, %valid_channel : i1
+    scf.for %row = [%c0 to %rows step %c1] unroll {
+      %slot = index.madd %channel_slot, %rows, %row : index
+      %value = vector.extract %final[%slot] : vector<[%slots]xf32> -> f32
+      %s16 = scalar.constant 16 : i32
+      %s8 = scalar.constant 8 : i32
+      %s4 = scalar.constant 4 : i32
+      %s2 = scalar.constant 2 : i32
+      %s1 = scalar.constant 1 : i32
+      %p16, %v16 = kernel.subgroup.shuffle<xor> %value, %s16, %shuffle_width : f32, i32, i32
+      %a16 = scalar.addf %value, %p16 : f32
+      %p8, %v8 = kernel.subgroup.shuffle<xor> %a16, %s8, %shuffle_width : f32, i32, i32
+      %a8 = scalar.addf %a16, %p8 : f32
+      %p4, %v4 = kernel.subgroup.shuffle<xor> %a8, %s4, %shuffle_width : f32, i32, i32
+      %a4 = scalar.addf %a8, %p4 : f32
+      %p2, %v2 = kernel.subgroup.shuffle<xor> %a4, %s2, %shuffle_width : f32, i32, i32
+      %a2 = scalar.addf %a4, %p2 : f32
+      %p1, %v1 = kernel.subgroup.shuffle<xor> %a2, %s1, %shuffle_width : f32, i32, i32
+      %sum = scalar.addf %a2, %p1 : f32
+      scf.if %write {
+        view.store %sum, %results[%row, %channel] : f32, view<[%rows]x[%outputs]xf32>
+      }
+    }
+  }
+  template.return
+}
+
+template.decl @ggml.q4k.f32.small_panels(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+// Workers reuse the activation allocation across their assigned channel tiles.
+// The final K-panel barrier retires readers before the next tile starts staging.
+template.def<@ggml.q4k.f32.small_panels> @traverse(%rows: index, %inputs: index, %outputs0: index, %input: buffer, %weight: buffer, %output: buffer) where [range(%rows, 4, 8), multiple_of(%rows, 4)] {
+  %outputs = index.assume %outputs0 [range(%outputs0, 1, 262144)] : index
+  %channels = index.constant 64 : index
+  %padding = index.constant 63 : index
+  %padded = index.add %outputs, %padding : index
+  %tiles = index.div %padded, %channels : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
+  scf.for %tile = [%worker to %tiles step %workers] {
+    template.apply<@ggml.q4k.f32.small_panel.tile>(%rows, %tile, %inputs, %outputs, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  }
+  template.return
+}

@@ -45,6 +45,15 @@ reduction, and tile traversal with one or two workers. Its separately selected
 and an exact analytical check, without adding large allocations or reference
 contractions to the ordinary test run.
 
+The Q4_K and Q6_K F32 panel files also expose four/eight-row entries with
+configuration `(K, N, worker_budget)` and execution `(K, N, input, weight,
+output)`. Their row bank is part of the entry's contract, without a device
+count buffer. The 512-workitem workers share K1024 activation panels across
+64 Q4 or 48 Q6 output channels, then stride through further channel tiles.
+They accept exact-sized buffers, mask tails, and retain F32 arithmetic. One
+shared scenario family checks both formats and row banks against independent
+byte decoding with F64 accumulation, including repeated worker assignments.
+
 The Q6_K/Q8_1 x4 panel entries bound their grid with a positive workgroup budget
 supplied by the caller. Groups stride through output tiles instead of growing
 the grid with the vocabulary. M1/M2/M3/M4 retain four channel panels, M8 retains

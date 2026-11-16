@@ -100,6 +100,22 @@ single-tile specialization while larger assignments reuse worker storage.
 The concrete wave32 kernel owns count-buffer sampling and target selection;
 empty prefixes and both tile tails require no padded global operands.
 
+## Small-row register panels with F32 storage
+
+The Q4_K and Q6_K F32 panel motifs also provide four/eight-row banks. A
+512-thread worker stages K1024 activations once for 64 Q4 or 48 Q6 output
+channels. Decoded weights serve every row in registers. The Q4 schedule uses
+XOR-rotated four-float packets and stored activation sums for its affine
+correction; Q6 uses a padded 20-float pitch. Workgroup storage is 17/34 KiB for
+Q4 and 20/40 KiB for Q6, depending on the row bank. All arithmetic remains F32.
+
+The kernel entries fix the row bank while K, N, and the admitted worker budget
+remain arguments. Workers traverse channel tiles, including exact-sized tails,
+without expanding parameters or creating an activation carrier. This schedule
+supplies a small-cohort alternative to matrix instructions whose larger row
+tiles leave most lanes inactive. The sixteen-row Q6 schedule below retains its
+different row reduction and thread geometry.
+
 ## Q6_K register panels with F32 storage
 
 `q6_k_f32_panel.loom` shares a 512-element activation panel across 48 output

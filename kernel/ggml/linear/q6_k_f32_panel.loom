@@ -49,3 +49,45 @@ kernel.def export("ggml_linear_q6k_f32_panel_residual") @ggml_linear_q6k_f32_pan
   func.call @dispatch_panels(%add_residual, %row_count, %inputs, %outputs, %input, %weight, %output) : (i1, buffer, index, index, buffer, buffer, buffer)
   kernel.return
 }
+
+// Four/eight-row Q6_K F32 panels. Configuration is (K, N, worker_budget);
+// execution is (K, N, input, weight, output). The selected entry fixes the row
+// bank; the shared motif owns contraction, channel traversal, and tail masking.
+// K is 256..32768, divisible by 256; N is 1..262144. A positive caller-owned
+// worker budget is clamped to useful tiles, with at most 10000 workgroups.
+// Buffers are disjoint, exact-sized rows*K and rows*N F32 arrays and
+// N*(K/256)*210 raw weight bytes. Each worker contains 512 workitems.
+template.decl @ggml.q6k.f32.small_panels(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.def pure inline @q6_small_panel_grid(%outputs0: index, %budget0: index) -> (index) {
+  %outputs = index.assume %outputs0 [range(%outputs0, 1, 262144)] : index
+  %budget = index.assume %budget0 [range(%budget0, 1, 10000)] : index
+  %channels = index.constant 48 : index
+  %padding = index.constant 47 : index
+  %padded = index.add %outputs, %padding : index
+  %tiles = index.div %padded, %channels : index
+  %groups = index.min %tiles, %budget : index
+  func.return %groups : index
+}
+
+kernel.def export("ggml_linear_q6k_f32_panel_m4") @ggml_linear_q6k_f32_panel_m4(%inputs: index, %outputs: index, %worker_budget: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 512 : index
+  %groups = func.call pure @q6_small_panel_grid(%outputs, %worker_budget) : (index, index) -> (index)
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = index.constant 4 : index
+  template.apply<@ggml.q6k.f32.small_panels>(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def export("ggml_linear_q6k_f32_panel_m8") @ggml_linear_q6k_f32_panel_m8(%inputs: index, %outputs: index, %worker_budget: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 512 : index
+  %groups = func.call pure @q6_small_panel_grid(%outputs, %worker_budget) : (index, index) -> (index)
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = index.constant 8 : index
+  template.apply<@ggml.q6k.f32.small_panels>(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
