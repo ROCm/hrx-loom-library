@@ -1,0 +1,256 @@
+// Independent byte-level reference for row-scaled F16 GGML matrix tiles.
+//
+// Format is 4, 5, or 6 for raw Q4_K, Q5_K, or Q6_K rows. Each encoded
+// coefficient is reconstructed from scalar bytes, rounded through the same
+// F16 multiply/add sequence used to publish matrix operands, and accumulated
+// with F16 activations in F64 before one F32 publication. The caller's row
+// inverse is then applied in F32. This source has no production-format or
+// contraction dependency.
+
+func.def @scaled_f16_matrix64_dot(%format0: index, %rows: index, %inputs: index, %row: index, %channel: index, %input: buffer, %weight: buffer) -> (f32) {
+  %format = index.assume %format0 [range(%format0, 4, 6)] : index
+  %bounded_row = index.assume %row [lt(%row, %rows)] : index
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %c1_i32 = scalar.constant 1 : i32
+  %c3_i32 = scalar.constant 3 : i32
+  %c15_i32 = scalar.constant 15 : i32
+  %c63_i32 = scalar.constant 63 : i32
+  %shift2_i32 = scalar.constant 2 : i32
+  %shift4_i32 = scalar.constant 4 : i32
+  %shift6_i32 = scalar.constant 6 : i32
+  %q4_bytes = index.constant 144 : offset
+  %q5_bytes = index.constant 176 : offset
+  %q6_bytes = index.constant 210 : offset
+  %header_bytes = index.constant 4 : offset
+  %q4_payload_bytes = index.constant 16 : offset
+  %q5_payload_bytes = index.constant 48 : offset
+  %q6_high_bytes = index.constant 128 : offset
+  %q6_scale_bytes = index.constant 192 : offset
+  %q6_factor_bytes = index.constant 208 : offset
+  %is_q5 = index.cmp eq, %format, %c5 : index
+  %is_q6 = index.cmp eq, %format, %c6 : index
+  %affine_block_bytes = scf.select %is_q5, %q5_bytes, %q4_bytes : offset
+  %block_bytes = scf.select %is_q6, %q6_bytes, %affine_block_bytes : offset
+  %blocks = index.div %inputs, %c256 : index
+  %channel_block = index.mul %channel, %blocks : index
+  %activations = buffer.view %input[%origin] : buffer -> view<[%rows]x[%inputs]xf16>
+  %c0_f64 = scalar.constant 0.0 : f64
+  %sum = scf.for %element = [%c0 to %inputs step %c1](%running = %c0_f64 : f64) -> (f64) {
+    %bounded_element = index.assume %element [lt(%element, %inputs)] : index
+    %block = index.div %element, %c256 : index
+    %within = index.rem %element, %c256 : index
+    %physical_block = index.add %channel_block, %block : index
+    %block_offset = index.scale %physical_block, %block_bytes : index, offset -> offset
+    %coefficient = scf.if %is_q6 -> (f16) {
+      %half = index.div %within, %c128 : index
+      %in_half = index.rem %within, %c128 : index
+      %quadrant = index.div %in_half, %c32 : index
+      %position = index.rem %within, %c32 : index
+      %side = index.rem %quadrant, %c2 : index
+      %nibble = index.div %quadrant, %c2 : index
+      %low_half = index.mul %half, %c64 : index
+      %low_side = index.madd %side, %c32, %low_half : index
+      %low_index = index.add %low_side, %position : index
+      %high_index = index.madd %half, %c32, %position : index
+      %scale_index = index.div %within, %c16 : index
+      %high_origin = index.add %block_offset, %q6_high_bytes : offset
+      %scale_origin = index.add %block_offset, %q6_scale_bytes : offset
+      %factor_origin = index.add %block_offset, %q6_factor_bytes : offset
+      %low_view = buffer.view %weight[%block_offset] : buffer -> view<128xi8>
+      %high_view = buffer.view %weight[%high_origin] : buffer -> view<64xi8>
+      %scale_view = buffer.view %weight[%scale_origin] : buffer -> view<16xi8>
+      %factor_view = buffer.view %weight[%factor_origin] : buffer -> view<1xf16>
+      %low_byte = view.load %low_view[%low_index] : view<128xi8> -> i8
+      %high_byte = view.load %high_view[%high_index] : view<64xi8> -> i8
+      %scale_byte = view.load %scale_view[%scale_index] : view<16xi8> -> i8
+      %factor_half = view.load %factor_view[0] : view<1xf16> -> f16
+      %low_integer = scalar.extui %low_byte : i8 to i32
+      %high_integer = scalar.extui %high_byte : i8 to i32
+      %nibble_integer = index.cast %nibble : index to i32
+      %quadrant_integer = index.cast %quadrant : index to i32
+      %low_shift = scalar.muli %nibble_integer, %shift4_i32 : i32
+      %high_shift = scalar.muli %quadrant_integer, %shift2_i32 : i32
+      %shifted_low = scalar.shrui %low_integer, %low_shift : i32
+      %shifted_high = scalar.shrui %high_integer, %high_shift : i32
+      %low_bits = scalar.andi %shifted_low, %c15_i32 : i32
+      %high_bits = scalar.andi %shifted_high, %c3_i32 : i32
+      %positioned_high = scalar.shli %high_bits, %shift4_i32 : i32
+      %biased_code = scalar.ori %low_bits, %positioned_high : i32
+      %code_float = scalar.uitofp %biased_code : i32 to f32
+      %code_half = scalar.fptrunc %code_float : f32 to f16
+      %factor = scalar.extf %factor_half : f16 to f32
+      %group_scale = scalar.sitofp %scale_byte : i8 to f32
+      %scale = scalar.mulf %factor, %group_scale : f32
+      %bias = scalar.constant -32.0 : f32
+      %offset = scalar.mulf %scale, %bias : f32
+      %scale_half = scalar.fptrunc %scale : f32 to f16
+      %offset_half = scalar.fptrunc %offset : f32 to f16
+      %scaled = scalar.mulf %code_half, %scale_half : f16
+      %value = scalar.addf %scaled, %offset_half : f16
+      scf.yield %value : f16
+    } else {
+      %group = index.div %within, %c32 : index
+      %position = index.rem %within, %c32 : index
+      %page = index.div %group, %c2 : index
+      %nibble = index.rem %group, %c2 : index
+      %payload_bytes = scf.select %is_q5, %q5_payload_bytes, %q4_payload_bytes : offset
+      %metadata_origin = index.add %block_offset, %header_bytes : offset
+      %payload_origin = index.add %block_offset, %payload_bytes : offset
+      %high_origin = index.add %block_offset, %q4_payload_bytes : offset
+      %header = buffer.view %weight[%block_offset] : buffer -> view<2xf16>
+      %metadata = buffer.view %weight[%metadata_origin] : buffer -> view<12xi8>
+      %payload = buffer.view %weight[%payload_origin] : buffer -> view<128xi8>
+      %high = buffer.view %weight[%high_origin] : buffer -> view<32xi8>
+      %scale_factor_half = view.load %header[0] : view<2xf16> -> f16
+      %minimum_factor_half = view.load %header[1] : view<2xf16> -> f16
+      %direct = index.cmp ult, %group, %c4 : index
+      %scale_code, %minimum_code = scf.if %direct -> (i32, i32) {
+        %minimum_index = index.add %group, %c4 : index
+        %scale_byte = view.load %metadata[%group] : view<12xi8> -> i8
+        %minimum_byte = view.load %metadata[%minimum_index] : view<12xi8> -> i8
+        %scale_integer = scalar.extui %scale_byte : i8 to i32
+        %minimum_integer = scalar.extui %minimum_byte : i8 to i32
+        %scale_value = scalar.andi %scale_integer, %c63_i32 : i32
+        %minimum_value = scalar.andi %minimum_integer, %c63_i32 : i32
+        scf.yield %scale_value, %minimum_value : i32, i32
+      } else {
+        %low_index = index.add %group, %c4 : index
+        %high_index = index.sub %group, %c4 : index
+        %packed_byte = view.load %metadata[%low_index] : view<12xi8> -> i8
+        %scale_high_byte = view.load %metadata[%high_index] : view<12xi8> -> i8
+        %minimum_high_byte = view.load %metadata[%group] : view<12xi8> -> i8
+        %packed = scalar.extui %packed_byte : i8 to i32
+        %scale_upper = scalar.extui %scale_high_byte : i8 to i32
+        %minimum_upper = scalar.extui %minimum_high_byte : i8 to i32
+        %scale_low = scalar.andi %packed, %c15_i32 : i32
+        %minimum_low = scalar.shrui %packed, %shift4_i32 : i32
+        %scale_bits = scalar.shrui %scale_upper, %shift6_i32 : i32
+        %minimum_bits = scalar.shrui %minimum_upper, %shift6_i32 : i32
+        %scale_high = scalar.shli %scale_bits, %shift4_i32 : i32
+        %minimum_high = scalar.shli %minimum_bits, %shift4_i32 : i32
+        %scale_value = scalar.ori %scale_low, %scale_high : i32
+        %minimum_value = scalar.ori %minimum_low, %minimum_high : i32
+        scf.yield %scale_value, %minimum_value : i32, i32
+      }
+      %code_index = index.madd %page, %c32, %position : index
+      %code_byte = view.load %payload[%code_index] : view<128xi8> -> i8
+      %code_integer = scalar.extui %code_byte : i8 to i32
+      %nibble_integer = index.cast %nibble : index to i32
+      %nibble_shift = scalar.muli %nibble_integer, %shift4_i32 : i32
+      %shifted = scalar.shrui %code_integer, %nibble_shift : i32
+      %low_code = scalar.andi %shifted, %c15_i32 : i32
+      %code = scf.if %is_q5 -> (i32) {
+        %high_byte = view.load %high[%position] : view<32xi8> -> i8
+        %high_integer = scalar.extui %high_byte : i8 to i32
+        %high_shift = index.cast %group : index to i32
+        %selected = scalar.shrui %high_integer, %high_shift : i32
+        %bit = scalar.andi %selected, %c1_i32 : i32
+        %high_code = scalar.shli %bit, %shift4_i32 : i32
+        %combined = scalar.ori %low_code, %high_code : i32
+        scf.yield %combined : i32
+      } else {
+        scf.yield %low_code : i32
+      }
+      %scale_factor = scalar.extf %scale_factor_half : f16 to f32
+      %minimum_factor = scalar.extf %minimum_factor_half : f16 to f32
+      %scale_code_float = scalar.uitofp %scale_code : i32 to f32
+      %minimum_code_float = scalar.uitofp %minimum_code : i32 to f32
+      %scale = scalar.mulf %scale_factor, %scale_code_float : f32
+      %minimum = scalar.mulf %minimum_factor, %minimum_code_float : f32
+      %code_float = scalar.uitofp %code : i32 to f32
+      %code_half = scalar.fptrunc %code_float : f32 to f16
+      %scale_half = scalar.fptrunc %scale : f32 to f16
+      %negative_minimum = scalar.negf %minimum : f32
+      %minimum_half = scalar.fptrunc %negative_minimum : f32 to f16
+      %scaled = scalar.mulf %code_half, %scale_half : f16
+      %value = scalar.addf %scaled, %minimum_half : f16
+      scf.yield %value : f16
+    }
+    %activation_half = view.load %activations[%bounded_row, %bounded_element] : view<[%rows]x[%inputs]xf16> -> f16
+    %activation = scalar.extf %activation_half : f16 to f64
+    %weight_value = scalar.extf %coefficient : f16 to f64
+    %product = scalar.mulf %activation, %weight_value : f64
+    %next = scalar.addf %running, %product : f64
+    scf.yield %next : f64
+  }
+  %result = scalar.fptrunc %sum : f64 to f32
+  func.return %result : f32
+}
+
+func.def @scaled_f16_matrix64_tile_live(%rows: index, %row: index, %scales: buffer) -> (i1) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c64 = index.constant 64 : index
+  %tile = index.div %row, %c64 : index
+  %tile_row = index.mul %tile, %c64 : index
+  %scale_view = buffer.view %scales[%origin] : buffer -> view<[%rows]x2xf32>
+  %c0_f32 = scalar.constant 0.0 : f32
+  %maximum = scf.for %offset = [%c0 to %c64 step %c1](%current = %c0_f32 : f32) -> (f32) {
+    %scale_row = index.add %tile_row, %offset : index
+    %bounded_scale_row = index.assume %scale_row [lt(%scale_row, %rows)] : index
+    %value = view.load %scale_view[%bounded_scale_row, %c0] : view<[%rows]x2xf32> -> f32
+    %absolute = scalar.absf %value : f32
+    %next = scalar.maxnumf %current, %absolute : f32
+    scf.yield %next : f32
+  }
+  %live = scalar.cmpf one, %maximum, %c0_f32 : f32
+  func.return %live : i1
+}
+
+func.def @scaled_f16_matrix64_reference(%format: index, %rows: index, %inputs: index, %outputs: index, %input: buffer, %scales: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %scale_view = buffer.view %scales[%origin] : buffer -> view<[%rows]x2xf32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%outputs]xf32>
+  scf.for %row = [%c0 to %rows step %c1] {
+    %live = func.call @scaled_f16_matrix64_tile_live(%rows, %row, %scales) : (index, index, buffer) -> (i1)
+    scf.if %live {
+      %inverse = view.load %scale_view[%row, %c1] : view<[%rows]x2xf32> -> f32
+      scf.for %channel = [%c0 to %outputs step %c1] {
+        %dot = func.call @scaled_f16_matrix64_dot(%format, %rows, %inputs, %row, %channel, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (f32)
+        %value = scalar.mulf %dot, %inverse : f32
+        view.store %value, %output_view[%row, %channel] : f32, view<[%rows]x[%outputs]xf32>
+      }
+    }
+  }
+  func.return
+}
+
+func.def @scaled_f16_matrix64_swiglu_reference(%rows: index, %inputs: index, %outputs: index, %input: buffer, %scales: buffer, %gate: buffer, %up: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %q4 = index.constant 4 : index
+  %scale_view = buffer.view %scales[%origin] : buffer -> view<[%rows]x2xf32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%outputs]xf32>
+  scf.for %row = [%c0 to %rows step %c1] {
+    %live = func.call @scaled_f16_matrix64_tile_live(%rows, %row, %scales) : (index, index, buffer) -> (i1)
+    scf.if %live {
+      %inverse = view.load %scale_view[%row, %c1] : view<[%rows]x2xf32> -> f32
+      scf.for %channel = [%c0 to %outputs step %c1] {
+        %gate_dot = func.call @scaled_f16_matrix64_dot(%q4, %rows, %inputs, %row, %channel, %input, %gate) : (index, index, index, index, index, buffer, buffer) -> (f32)
+        %up_dot = func.call @scaled_f16_matrix64_dot(%q4, %rows, %inputs, %row, %channel, %input, %up) : (index, index, index, index, index, buffer, buffer) -> (f32)
+        %gate_value = scalar.mulf %gate_dot, %inverse : f32
+        %up_value = scalar.mulf %up_dot, %inverse : f32
+        %activated = scalar.siluf<afn> %gate_value : f32
+        %value = scalar.mulf %activated, %up_value : f32
+        view.store %value, %output_view[%row, %channel] : f32, view<[%rows]x[%outputs]xf32>
+      }
+    }
+  }
+  func.return
+}
