@@ -7,6 +7,8 @@ func.decl @ggml_q8_1_planar_publish_block32(%row_count: index, %row: index, %blo
 
 func.decl @ggml_q8_1_planar_publish_packet8_cluster4(%row_count: index, %row: index, %block_count: index, %block: index, %lane_in_block: index, %values: vector<8xf32>, %output: buffer)
 
+func.decl @ggml_q8_1_planar_publish_value_cluster32(%row_count: index, %row: index, %block_count: index, %block: index, %lane_in_block: index, %value: f32, %output: buffer)
+
 func.decl @ggml_q8_1_planar_publish_columns4_cluster32(%row_count: index, %row: index, %block_count: index, %first_block: index, %lane_in_block: index, %values: vector<4xf32>, %output: buffer)
 
 func.def @round_away(%value: f32) -> (i32) {
@@ -136,12 +138,13 @@ kernel.def @publish_topology_kernel(%topology: index) {
   %threads = index.constant 32 : index
   kernel.launch.config workgroups(%c1, %row_count, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%topology_argument: index, %input: buffer, %output: buffer) {
-  %topology = index.assume %topology_argument [range(%topology_argument, 0, 2)] : index
+  %topology = index.assume %topology_argument [range(%topology_argument, 0, 3)] : index
   %row_count = index.constant 2 : index
   %block_count = index.constant 8 : index
   %blocks_per_group = index.constant 4 : index
   %packet_width = index.constant 8 : index
   %begin = index.constant 0 : index
+  %step = index.constant 1 : index
   %row = kernel.workgroup.id<y> : index
   %lane = kernel.workitem.id<x> : index
   %c0_offset = index.constant 0 : offset
@@ -161,6 +164,12 @@ kernel.def @publish_topology_kernel(%topology: index) {
       %column = index.mul %lane_in_block, %packet_width : index
       %values = vector.load %input_view[%row, %block, %column] : view<2x8x32xf32> -> vector<8xf32>
       func.call @ggml_q8_1_planar_publish_packet8_cluster4(%row_count, %row, %block_count, %block, %lane_in_block, %values, %output) : (index, index, index, index, index, vector<8xf32>, buffer)
+    }
+    case 2 {
+      scf.for %block = [%begin to %block_count step %step] {
+        %value = view.load %input_view[%row, %block, %lane] : view<2x8x32xf32> -> f32
+        func.call @ggml_q8_1_planar_publish_value_cluster32(%row_count, %row, %block_count, %block, %lane, %value, %output) : (index, index, index, index, index, f32, buffer)
+      }
     }
     default {
       %block1 = index.constant 1 : index
@@ -205,7 +214,7 @@ func.def @publish_reference(%input: buffer, %output: buffer) {
   func.return
 }
 
-check.scenario public @directed configure[3](%topology: index, %configuration_entropy: check.entropy) {
+check.scenario public @directed configure[4](%topology: index, %configuration_entropy: check.entropy) {
   check.trial[4](%trial: index, %entropy: check.entropy) {
     %input_storage = check.generate.fill value(123.25) : tensor<520xf32>
     %input = check.tensor.view %input_storage offset(16) : tensor<520xf32> -> tensor<512xf32>
@@ -220,7 +229,7 @@ check.scenario public @directed configure[3](%topology: index, %configuration_en
   check.return
 }
 
-check.scenario public @random configure[3](%topology: index, %configuration_entropy: check.entropy) {
+check.scenario public @random configure[4](%topology: index, %configuration_entropy: check.entropy) {
   check.trial[4](%trial: index, %entropy: check.entropy) {
     %seed = check.entropy.read %entropy[0] : check.entropy -> i64
     %input = check.generate.random.uniform seed(%seed) range(-1000.0 to 1000.0) : tensor<512xf32>
