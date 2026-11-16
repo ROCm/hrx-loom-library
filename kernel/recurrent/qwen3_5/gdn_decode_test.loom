@@ -1,0 +1,274 @@
+// Single-token Qwen3.5 GDN preparation against a sequential F64 oracle.
+// Family configurations cover 16/32/48/64 value heads. State cases cover
+// fresh, aliased continuation, forked continuation, and inactive work while
+// complete arena and guarded output storage expose ownership mistakes.
+
+kernel.decl @qwen35_gdn_decode_prepare(%configured_value_heads: index) launch(%value_heads: index, %span_capacity: index, %layer: index, %metadata: buffer, %info: buffer, %origins: buffer, %arena: buffer, %qkv: buffer, %weight: buffer, %output: buffer, %inverse: buffer)
+
+// Configurations 0..7 are: V16 fresh, V16 carried, V16 forked, V32 carried,
+// V48 fresh, V64 carried, V16 inactive, and V16 layer-three forked.
+func.def pure @qwen35_gdn_decode_geometry(%configuration: index) -> (index, index, index, index, index, index, index, i32, i64, i32) {
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c4096 = index.constant 4096 : index
+  %state_elements_per_head = index.constant 16384 : index
+  %is_v32 = index.cmp eq, %configuration, %c3 : index
+  %is_v48 = index.cmp eq, %configuration, %c4 : index
+  %is_v64 = index.cmp eq, %configuration, %c5 : index
+  %v48_or_v64 = scf.select %is_v64, %c64, %c48 : index
+  %v32_or_larger = scf.select %is_v48, %c48, %v48_or_v64 : index
+  %larger = scalar.ori %is_v48, %is_v64 : i1
+  %v32_or_v16 = scf.select %is_v32, %c32, %c16 : index
+  %value_heads = scf.select %larger, %v32_or_larger, %v32_or_v16 : index
+  %value_channels = index.mul %value_heads, %c128 : index
+  %channels = index.add %c4096, %value_channels : index
+  %state_elements = index.mul %value_heads, %state_elements_per_head : index
+  %history_elements = index.mul %channels, %c3 : index
+  %layer_elements = index.add %state_elements, %history_elements : index
+  %layered = index.cmp eq, %configuration, %c7 : index
+  %forked_base = index.cmp eq, %configuration, %c2 : index
+  %forked = scalar.ori %forked_base, %layered : i1
+  %c1 = index.constant 1 : index
+  %slots = scf.select %forked, %c2, %c1 : index
+  %layer_count = scf.select %layered, %c4, %c1 : index
+  %layer = scf.select %layered, %c3, %c0 : index
+  %slot_elements = index.mul %layer_elements, %layer_count : index
+  %arena_elements = index.mul %slot_elements, %slots : index
+  %weight_elements = index.mul %channels, %c4 : index
+  %output_elements = index.add %channels, %c8 : index
+  %fresh16 = index.cmp eq, %configuration, %c0 : index
+  %fresh48 = index.cmp eq, %configuration, %c4 : index
+  %fresh = scalar.ori %fresh16, %fresh48 : i1
+  %start_index = scf.select %fresh, %c0, %c1 : index
+  %start = index.cast %start_index : index to i32
+  %writer_index = scf.select %forked, %slot_elements, %c0 : index
+  %writer_elements = index.cast %writer_index : index to i64
+  %element_bytes = scalar.constant 4 : i64
+  %writer = scalar.muli %writer_elements, %element_bytes : i64
+  %inactive = index.cmp eq, %configuration, %c6 : index
+  %true = scalar.constant true : i1
+  %live = scalar.xori %inactive, %true : i1
+  %live32 = scalar.extui %live : i1 to i32
+  func.return %value_heads, %layer, %channels, %layer_elements, %arena_elements, %weight_elements, %output_elements, %start, %writer, %live32 : index, index, index, index, index, index, index, i32, i64, i32
+}
+
+func.def @qwen35_gdn_decode_fixture(%start: i32, %writer: i64, %live: i32, %metadata: buffer, %info: buffer, %origins: buffer) {
+  %origin = index.constant 0 : offset
+  %zero32 = scalar.constant 0 : i32
+  %zero64 = scalar.constant 0 : i64
+  %one32 = scalar.constant 1 : i32
+  %fork = scalar.extui %start : i32 to i64
+  %metadata_values = buffer.view %metadata[%origin] : buffer -> view<13xi32>
+  %info_values = buffer.view %info[%origin] : buffer -> view<4xi32>
+  %origin_values = buffer.view %origins[%origin] : buffer -> view<5xi64>
+  view.store %one32, %metadata_values[0] : i32, view<13xi32>
+  view.store %one32, %metadata_values[4] : i32, view<13xi32>
+  view.store %start, %metadata_values[5] : i32, view<13xi32>
+  view.store %zero32, %metadata_values[7] : i32, view<13xi32>
+  view.store %zero32, %metadata_values[8] : i32, view<13xi32>
+  view.store %live, %info_values[2] : i32, view<4xi32>
+  view.store %zero32, %info_values[3] : i32, view<4xi32>
+  view.store %zero64, %origin_values[0] : i64, view<5xi64>
+  view.store %writer, %origin_values[1] : i64, view<5xi64>
+  view.store %fork, %origin_values[3] : i64, view<5xi64>
+  func.return
+}
+
+command.def @qwen35_gdn_decode(%configuration: index) launch(%metadata: buffer, %info: buffer, %origins: buffer, %arena: buffer, %qkv: buffer, %weight: buffer, %output: buffer, %inverse: buffer) {
+  %value_heads, %layer, %channels, %layer_elements, %arena_elements, %weight_elements, %output_elements, %start, %writer, %live = func.call pure @qwen35_gdn_decode_geometry(%configuration) : (index) -> (index, index, index, index, index, index, index, i32, i64, i32)
+  %span_capacity = index.constant 1 : index
+  kernel.launch @qwen35_gdn_decode_prepare[%value_heads](%value_heads, %span_capacity, %layer, %metadata, %info, %origins, %arena, %qkv, %weight, %output, %inverse) : [index](index, index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+// This reference deliberately does not share packet helpers, convolution
+// arithmetic, or reduction structure with the device kernel. It widens each
+// convolution and norm reduction to F64 and computes SiLU from exp/div.
+func.def @qwen35_gdn_decode_reference(%metadata: buffer, %info: buffer, %origins: buffer, %arena: buffer, %qkv: buffer, %weight: buffer, %output: buffer, %inverse: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c128 = index.constant 128 : index
+  %c2048 = index.constant 2048 : index
+  %c4096 = index.constant 4096 : index
+  %metadata_values = buffer.view %metadata[%origin] : buffer -> view<13xi32>
+  %info_values = buffer.view %info[%origin] : buffer -> view<4xi32>
+  %origin_values = buffer.view %origins[%origin] : buffer -> view<5xi64>
+  %live32 = view.load %info_values[2] : view<4xi32> -> i32
+  %zero32 = scalar.constant 0 : i32
+  %live = scalar.cmpi ne, %live32, %zero32 : i32
+  scf.if %live {
+    %start = view.load %metadata_values[5] : view<13xi32> -> i32
+    %read64 = view.load %origin_values[0] : view<5xi64> -> i64
+    %write64 = view.load %origin_values[1] : view<5xi64> -> i64
+    %fork64 = view.load %origin_values[3] : view<5xi64> -> i64
+    %start64 = scalar.extui %start : i32 to i64
+    %at_fork = scalar.cmpi eq, %start64, %fork64 : i64
+    %reader64 = scf.select %at_fork, %read64, %write64 : i64
+    %reader_bound = scalar.assume %reader64 [range(%reader64, 0, 9223372036854775807)] : i64
+    %writer_bound = scalar.assume %write64 [range(%write64, 0, 9223372036854775807)] : i64
+    %reader_base = index.cast %reader_bound : i64 to offset
+    %writer_base = index.cast %writer_bound : i64 to offset
+    %qkv_bytes = buffer.length %qkv
+    %qkv_byte_count = index.cast %qkv_bytes : offset to index
+    %element_count = index.constant 4 : index
+    %channels = index.div %qkv_byte_count, %element_count : index
+    %qkv_values = buffer.view %qkv[%origin] : buffer -> view<[%channels]xf32>
+    %weight_values = buffer.view %weight[%origin] : buffer -> view<[%channels]x4xf32>
+    %output_values = buffer.view %output[%origin] : buffer -> view<[%channels]xf32>
+    %history_elements = index.mul %channels, %c3 : index
+    %value_channels = index.sub %channels, %c4096 : index
+    %value_heads = index.div %value_channels, %c128 : index
+    %state_elements_per_head = index.constant 16384 : index
+    %state_elements = index.mul %value_heads, %state_elements_per_head : index
+    %layer_elements = index.add %state_elements, %history_elements : index
+    %arena_bytes = buffer.length %arena
+    %arena_byte_count = index.cast %arena_bytes : offset to index
+    %actual_arena_elements = index.div %arena_byte_count, %element_count : index
+    %forked = scalar.cmpi ne, %write64, %read64 : i64
+    %slots = scf.select %forked, %c2, %c1 : index
+    %slot_elements = index.div %actual_arena_elements, %slots : index
+    %layer_count = index.div %slot_elements, %layer_elements : index
+    %layer = index.sub %layer_count, %c1 : index
+    %element_bytes = index.constant 4 : offset
+    %layer_element_offset = index.mul %layer, %layer_elements : index
+    %layer_byte_offset = index.scale %layer_element_offset, %element_bytes : index, offset -> offset
+    %reader = index.add %reader_base, %layer_byte_offset : offset
+    %writer = index.add %writer_base, %layer_byte_offset : offset
+    %history_origin = index.scale %state_elements, %element_bytes : index, offset -> offset
+    %history_read = index.add %reader, %history_origin : offset
+    %history_write = index.add %writer, %history_origin : offset
+    %old_history = buffer.view %arena[%history_read] : buffer -> view<3x[%channels]xf32>
+    %new_history = buffer.view %arena[%history_write] : buffer -> view<3x[%channels]xf32>
+    %fresh = scalar.cmpi eq, %start, %zero32 : i32
+    %zero64f = scalar.constant 0.0 : f64
+    %one64f = scalar.constant 1.0 : f64
+    scf.for %channel = [%c0 to %channels step %c1] {
+      %history0, %history1, %history2 = scf.if %fresh -> (f32, f32, f32) {
+        %c0f = scalar.constant 0.0 : f32
+        scf.yield %c0f, %c0f, %c0f : f32, f32, f32
+      } else {
+        %old0 = view.load %old_history[0, %channel] : view<3x[%channels]xf32> -> f32
+        %old1 = view.load %old_history[1, %channel] : view<3x[%channels]xf32> -> f32
+        %old2 = view.load %old_history[2, %channel] : view<3x[%channels]xf32> -> f32
+        scf.yield %old0, %old1, %old2 : f32, f32, f32
+      }
+      %current = view.load %qkv_values[%channel] : view<[%channels]xf32> -> f32
+      %weight0 = view.load %weight_values[%channel, 0] : view<[%channels]x4xf32> -> f32
+      %weight1 = view.load %weight_values[%channel, 1] : view<[%channels]x4xf32> -> f32
+      %weight2 = view.load %weight_values[%channel, 2] : view<[%channels]x4xf32> -> f32
+      %weight3 = view.load %weight_values[%channel, 3] : view<[%channels]x4xf32> -> f32
+      %history064 = scalar.extf %history0 : f32 to f64
+      %history164 = scalar.extf %history1 : f32 to f64
+      %history264 = scalar.extf %history2 : f32 to f64
+      %current64 = scalar.extf %current : f32 to f64
+      %weight064 = scalar.extf %weight0 : f32 to f64
+      %weight164 = scalar.extf %weight1 : f32 to f64
+      %weight264 = scalar.extf %weight2 : f32 to f64
+      %weight364 = scalar.extf %weight3 : f32 to f64
+      %product0 = scalar.mulf %weight064, %history064 : f64
+      %sum0 = scalar.addf %product0, %zero64f : f64
+      %product1 = scalar.mulf %weight164, %history164 : f64
+      %sum1 = scalar.addf %product1, %sum0 : f64
+      %product2 = scalar.mulf %weight264, %history264 : f64
+      %sum2 = scalar.addf %product2, %sum1 : f64
+      %product3 = scalar.mulf %weight364, %current64 : f64
+      %convolved = scalar.addf %product3, %sum2 : f64
+      %negative = scalar.negf %convolved : f64
+      %exponential = scalar.expf %negative : f64
+      %denominator = scalar.addf %one64f, %exponential : f64
+      %sigmoid = scalar.divf %one64f, %denominator : f64
+      %activated64 = scalar.mulf %convolved, %sigmoid : f64
+      %activated = scalar.fptrunc %activated64 : f64 to f32
+      view.store %activated, %output_values[%channel] : f32, view<[%channels]xf32>
+      view.store %history1, %new_history[0, %channel] : f32, view<3x[%channels]xf32>
+      view.store %history2, %new_history[1, %channel] : f32, view<3x[%channels]xf32>
+      view.store %current, %new_history[2, %channel] : f32, view<3x[%channels]xf32>
+    }
+    %inverse_values = buffer.view %inverse[%origin] : buffer -> view<32xf32>
+    %epsilon = scalar.constant 9.9999999747524271e-07 : f64
+    scf.for %head_index = [%c0 to %c32 step %c1] {
+      %is_query = index.cmp ult, %head_index, %c16 : index
+      %key_head = index.sub %head_index, %c16 : index
+      %head_value = scf.select %is_query, %head_index, %key_head : index
+      %head = index.assume %head_value [range(%head_value, 0, 15)] : index
+      %head_base = index.mul %head, %c128 : index
+      %type_base = scf.select %is_query, %c0, %c2048 : index
+      %channel_base = index.add %type_base, %head_base : index
+      %sum = scf.for %dimension = [%c0 to %c128 step %c1](%prior = %zero64f : f64) -> (f64) {
+        %channel_value = index.add %channel_base, %dimension : index
+        %channel = index.assume %channel_value [range(%channel_value, 0, 4095), lt(%channel_value, %channels)] : index
+        %value = view.load %output_values[%channel] : view<[%channels]xf32> -> f32
+        %wide = scalar.extf %value : f32 to f64
+        %square = scalar.mulf %wide, %wide : f64
+        %next = scalar.addf %prior, %square : f64
+        scf.yield %next : f64
+      }
+      %stable = scalar.addf %sum, %epsilon : f64
+      %root = scalar.sqrtf %stable : f64
+      %inverse64 = scalar.divf %one64f, %root : f64
+      %inverse32 = scalar.fptrunc %inverse64 : f64 to f32
+      %query_slot = index.mul %head, %c2 : index
+      %key_slot = index.add %query_slot, %c1 : index
+      %slot_value = scf.select %is_query, %query_slot, %key_slot : index
+      %slot = index.assume %slot_value [range(%slot_value, 0, 31)] : index
+      view.store %inverse32, %inverse_values[%slot] : f32, view<32xf32>
+    }
+  }
+  func.return
+}
+
+check.scenario public @qwen35_gdn_decode_cases configure[8](%configuration: index, %configuration_entropy: check.entropy) {
+  check.trial[3](%trial: index, %entropy: check.entropy) {
+    %value_heads, %layer, %channels, %layer_elements, %arena_elements, %weight_elements, %output_elements, %start, %writer, %live = check.generate<@qwen35_gdn_decode_geometry>(%configuration) : (index) -> (index, index, index, index, index, index, index, i32, i64, i32)
+    %metadata = check.generate.fill value(0) : tensor<13xi32>
+    %info = check.generate.fill value(0) : tensor<4xi32>
+    %origins = check.generate.fill value(0) : tensor<5xi64>
+    check.generate<@qwen35_gdn_decode_fixture>(%start, %writer, %live, %metadata, %info, %origins) : (i32, i64, i32, tensor<13xi32>, tensor<4xi32>, tensor<5xi64>) -> ()
+    %arena_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[2] : check.entropy -> i64
+    %arena = check.generate.random.uniform seed(%arena_seed) range(-0.5 to 0.5) : tensor<[%arena_elements]xf32>
+    %qkv = check.generate.random.uniform seed(%input_seed) range(-0.5 to 0.5) : tensor<[%channels]xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-0.25 to 0.25) : tensor<[%weight_elements]xf32>
+    %output_storage = check.generate.fill value(-99.0) : tensor<[%output_elements]xf32>
+    %output = check.tensor.view %output_storage offset(16) : tensor<[%output_elements]xf32> -> tensor<[%channels]xf32>
+    %output_prefix = check.tensor.view %output_storage offset(0) : tensor<[%output_elements]xf32> -> tensor<4xf32>
+    %inverse_storage = check.generate.fill value(-77.0) : tensor<40xf32>
+    %inverse = check.tensor.view %inverse_storage offset(16) : tensor<40xf32> -> tensor<32xf32>
+    %inverse_prefix = check.tensor.view %inverse_storage offset(0) : tensor<40xf32> -> tensor<4xf32>
+    %inverse_suffix = check.tensor.view %inverse_storage offset(144) : tensor<40xf32> -> tensor<4xf32>
+    check.compare<@qwen35_gdn_decode, @qwen35_gdn_decode_reference>[%configuration](%metadata, %info, %origins, %arena, %qkv, %weight, %output, %inverse) : [index](tensor<13xi32>, tensor<4xi32>, tensor<5xi64>, tensor<[%arena_elements]xf32>, tensor<[%channels]xf32>, tensor<[%weight_elements]xf32>, tensor<[%channels]xf32>, tensor<32xf32>) -> () {
+      check.expect.bitwise actual(%arena) expected(%arena) : tensor<[%arena_elements]xf32>
+      check.expect.approximate actual(%output_storage) expected(%output_storage) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<[%output_elements]xf32>, tensor<[%output_elements]xf32>
+      check.expect.approximate actual(%inverse_storage) expected(%inverse_storage) atol(0.0001) rtol(0.0001) nan(different) : tensor<40xf32>, tensor<40xf32>
+      check.expect.bitwise actual(%output_prefix) expected(%output_prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%inverse_prefix) expected(%inverse_prefix) : tensor<4xf32>
+      check.expect.bitwise actual(%inverse_suffix) expected(%inverse_suffix) : tensor<4xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<13xi32>
+      check.expect.bitwise actual(%info) expected(%info) : tensor<4xi32>
+      check.expect.bitwise actual(%origins) expected(%origins) : tensor<5xi64>
+      check.expect.bitwise actual(%qkv) expected(%qkv) : tensor<[%channels]xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<[%weight_elements]xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@qwen35_gdn_decode_cases> @qwen35_gdn_decode_family
