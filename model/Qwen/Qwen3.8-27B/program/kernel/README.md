@@ -83,8 +83,10 @@ proposals from advancing committed history.
 The output head and predictors preserve request-owned policy and accepted carry.
 
 The output-head contraction lives in the shared Q6_K/Q8_1 x4 panel kernel
-family. Its model-local leaf adds only the device-controlled live-prefix
-contract. Greedy and sampled partial selection receive explicit logical
+family. Its model-local leaf adds device-controlled live rows and vocabulary
+extent. The rare/control table uses the same packed-block arithmetic while
+sharing each selected weight row across an owner's proposal positions.
+Greedy and sampled partial selection receive explicit logical
 row/tile coordinates, allowing their groups to stride under the composition's
 budget while preserving tie-breaking, excluded tokens, and output ownership.
 

@@ -74,13 +74,28 @@ Native AOT compilation requires a deployment profile carrying the count; an
 architecture name alone does not specify device capacity. Four groups per unit
 is the head's launch policy, not a claim about exact kernel residency.
 
-The proposal-prefix projection shares each weight pass across up to 32 rows,
+The proposal vocabulary projection shares each weight pass across up to 32 rows,
 including an exact row specialization for the final short cohort. It preserves
 complete inactive cohorts and computes every initialized row of a partially
 live cohort; selection consumes only the live prefix. The shared motif owns
 the accumulator bank and matching launch geometry, while the model owns the
 control record and row partition. Ordinary target projection uses the same
 numerical body through its fixed-row entries.
+
+DFlash candidates normally score a 98,304-token prefix, all 33 control tokens,
+and up to 991 rare IDs learned from accepted target inputs. Each request retains
+its membership bitmap, first-use table, and recent miss positions in a
+22,784-byte carry record. The shared sequence motif owns that representation;
+the service's existing checkpoint, fork, growth, and retirement paths preserve
+its lifetime. Fresh publication initializes the header and bitmap without
+clearing unused table entries.
+
+An unknown anchor or two misses in the preceding 32 committed positions selects
+the full vocabulary. One full-head request selects a shared full pass for the
+cohort. Otherwise, a small table projection reuses each raw Q6 row across that
+request's draft positions. Selection compares canonical token IDs, including
+ties, and excludes physical head padding. This reduces proposal work; target
+weights, target sampling, and speculative verification remain unchanged.
 
 ## Image input
 

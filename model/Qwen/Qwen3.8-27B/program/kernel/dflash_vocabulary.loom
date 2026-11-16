@@ -1,0 +1,168 @@
+// DFlash vocabulary projection over accepted request history. One common
+// prefix/full projection shares target Q6_K weights across up to 32 proposal
+// rows. A small owner-specific table reuses each raw Q6 row across that owner's
+// draft positions. Only target-accepted inputs update the retained record.
+// No parameter expansion, host observation, or additional count dispatch occurs.
+
+config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]
+
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
+config.decl @runner.qwen38.verification_width : %value: index where [range(%value, 2, 8)]
+
+func.decl @qwen38_span_active(%epoch: buffer, %span: index) -> (i1)
+
+func.decl @qwen38_span_binding(%epoch: buffer, %span: index) -> (offset, index, index)
+
+func.decl pure @qwen38_output_workgroup_budget() -> (index)
+
+func.decl @qwen38_draft_vocabulary_id(%column: index, %full: i1, %carry: buffer, %record: offset) -> (index)
+
+func.decl @ggml_q6k_q8_1_x4_block_lane(%weight: buffer, %weight_row: offset, %input: buffer, %input_row: offset, %block: index, %lane: index) -> (f32)
+
+template.decl @qwen38.draft_vocabulary.update(%mixed: index, %capacity: index, %position: index, %begin: index, %length: index, %record: offset, %ids: buffer, %carry: buffer)
+
+// A 256-byte-aligned record is retained by the native carry/checkpoint owner.
+func.def public pure inline @qwen38_dflash_vocabulary_record(%owner: index) -> (offset) {
+  %stride = index.constant 22784 : offset
+  %row = index.scale %owner, %stride : index, offset -> offset
+  func.return %row : offset
+}
+
+func.def public inline @qwen38_dflash_vocabulary_table_id(%column: index, %carry: buffer, %record: offset) -> (index) {
+  %prefix = index.constant 98304 : index
+  %logical = index.add %prefix, %column : index
+  %subset = scalar.constant false : i1
+  %id = func.call @qwen38_draft_vocabulary_id(%logical, %subset, %carry, %record) : (index, i1, buffer, offset) -> (index)
+  func.return %id : index
+}
+
+kernel.def @qwen38_dflash_vocabulary_update(%spans: index) {
+  %c1 = index.constant 1 : index
+  %budget = func.call pure @qwen38_output_workgroup_budget() : () -> (index)
+  %groups = index.min %spans, %budget : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%spans: index, %epoch: buffer, %tokens: buffer, %carry: buffer) {
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
+  %capacity = config.get @qwen38.packet_capacity : index
+  %mixed = config.get @runner.qwen38.mixed_inputs : index
+  scf.for %span = [%worker to %spans step %workers] {
+    %active = func.call @qwen38_span_active(%epoch, %span) : (buffer, index) -> (i1)
+    scf.if %active {
+      %origin, %begin, %owner = func.call @qwen38_span_binding(%epoch, %span) : (buffer, index) -> (offset, index, index)
+      %descriptor = buffer.view %epoch[%origin] : buffer -> view<6xi32>
+      %count_word = view.load %descriptor[0] : view<6xi32> -> i32
+      %position_word = view.load %descriptor[1] : view<6xi32> -> i32
+      %count = index.cast %count_word : i32 to index
+      %position = index.cast %position_word : i32 to index
+      %record = func.call pure @qwen38_dflash_vocabulary_record(%owner) : (index) -> (offset)
+      template.apply<@qwen38.draft_vocabulary.update>(%mixed, %capacity, %position, %begin, %count, %record, %tokens, %carry) : (index, index, index, index, index, offset, buffer, buffer)
+    }
+  }
+  kernel.return
+}
+
+// Eight groups per owner visit its small live table. Q6 bytes are decoded once
+// per channel and shared across every draft position; no weight packing occurs.
+kernel.def @qwen38_dflash_vocabulary_table(%spans: index) {
+  %groups = index.constant 8 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %spans, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%spans: index, %draft: buffer, %control: buffer, %carry: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %control[%origin] : buffer -> view<4xi32>
+  %live_word = view.load %header[1] : view<4xi32> -> i32
+  %mode = view.load %header[3] : view<4xi32> -> i32
+  %c0_i32 = scalar.constant 0 : i32
+  %small = scalar.cmpi eq, %mode, %c0_i32 : i32
+  %live = index.cast %live_word : i32 to index
+  %span = kernel.workgroup.id<y> : index
+  %present = index.cmp ult, %span, %live : index
+  %active = scalar.andi %small, %present : i1
+  scf.if %active {
+    %descriptor_origin, %unused_begin, %owner = func.call @qwen38_span_binding(%draft, %span) : (buffer, index) -> (offset, index, index)
+    %record = func.call pure @qwen38_dflash_vocabulary_record(%owner) : (index) -> (offset)
+    %record_header = buffer.view %carry[%record] : buffer -> view<3xi32>
+    %rare_word = view.load %record_header[0] : view<3xi32> -> i32
+    %rare_value = index.cast %rare_word : i32 to index
+    %rare = index.assume %rare_value [range(%rare_value, 0, 991)] : index
+    %controls = index.constant 33 : index
+    %columns = index.add %rare, %controls : index
+    %width = config.get @runner.qwen38.verification_width : index
+    %c0 = index.constant 0 : index
+    %c1 = index.constant 1 : index
+    %c2 = index.constant 2 : index
+    %c8 = index.constant 8 : index
+    %c16 = index.constant 16 : index
+    %padding = index.constant 15 : index
+    %blocks = index.constant 20 : index
+    %cluster_width = index.constant 32 : index
+    %rows = index.sub %width, %c1 : index
+    %row_begin = index.mul %span, %rows : index
+    %input_stride = index.constant 5760 : offset
+    %output_stride = index.constant 4096 : offset
+    %weight_stride = index.constant 4200 : offset
+    %input_base = index.scale %row_begin, %input_stride : index, offset -> offset
+    %output_base = index.scale %row_begin, %output_stride : index, offset -> offset
+    %view = buffer.view %output[%output_base] : buffer -> view<[%rows]x1024xf32>
+    %thread = kernel.workitem.id<x> : index
+    %cluster = index.div %thread, %cluster_width : index
+    %lane = index.rem %thread, %cluster_width : index
+    %leader = index.cmp eq, %lane, %c0 : index
+    %group = kernel.workgroup.id<x> : index
+    %rounded = index.add %columns, %padding : index
+    %tiles = index.div %rounded, %c16 : index
+    %slots = index.mul %rows, %c2 : index
+    %identity = vector.splatf 0.0 : vector<[%slots]xf32>
+    scf.for %tile = [%group to %tiles step %c8] {
+      %tile_begin = index.mul %tile, %c16 : index
+      %first = index.add %tile_begin, %cluster : index
+      %partials = scf.for %block = [%c0 to %blocks step %c1](%bank = %identity : vector<[%slots]xf32>) -> (vector<[%slots]xf32>) {
+        %updated = scf.for %panel = [%c0 to %c2 step %c1](%bank = %bank : vector<[%slots]xf32>) -> (vector<[%slots]xf32>) unroll schedule(recurrence) {
+          %panel_begin = index.mul %panel, %c8 : index
+          %column = index.add %first, %panel_begin : index
+          %valid = index.cmp ult, %column, %columns : index
+          %next = scf.if %valid -> (vector<[%slots]xf32>) {
+            %id = func.call @qwen38_dflash_vocabulary_table_id(%column, %carry, %record) : (index, buffer, offset) -> (index)
+            %weight_origin = index.scale %id, %weight_stride : index, offset -> offset
+            %panel_slots = index.mul %panel, %rows : index
+            %result = scf.for %row = [%c0 to %rows step %c1](%bank = %bank : vector<[%slots]xf32>) -> (vector<[%slots]xf32>) unroll schedule(recurrence) {
+              %input_relative = index.scale %row, %input_stride : index, offset -> offset
+              %input_origin = index.add %input_base, %input_relative : offset
+              %slot = index.add %panel_slots, %row : index
+              %contribution = func.call @ggml_q6k_q8_1_x4_block_lane(%weight, %weight_origin, %input, %input_origin, %block, %lane) : (buffer, offset, buffer, offset, index, index) -> (f32)
+              %prior = vector.extract %bank[%slot] : vector<[%slots]xf32> -> f32
+              %sum = scalar.addf<reassoc|nnan|ninf|nsz> %prior, %contribution : f32
+              %result = vector.insert %sum into %bank[%slot] : f32, vector<[%slots]xf32>
+              scf.yield %result : vector<[%slots]xf32>
+            }
+            scf.yield %result : vector<[%slots]xf32>
+          } else {
+            scf.yield %bank : vector<[%slots]xf32>
+          }
+          scf.yield %next : vector<[%slots]xf32>
+        }
+        scf.yield %updated : vector<[%slots]xf32>
+      }
+      scf.for %panel = [%c0 to %c2 step %c1] unroll {
+        %panel_begin = index.mul %panel, %c8 : index
+        %column = index.add %first, %panel_begin : index
+        %valid = index.cmp ult, %column, %columns : index
+        %write = scalar.andi %valid, %leader : i1
+        %panel_slots = index.mul %panel, %rows : index
+        scf.for %row = [%c0 to %rows step %c1] unroll {
+          %slot = index.add %panel_slots, %row : index
+          %partial = vector.extract %partials[%slot] : vector<[%slots]xf32> -> f32
+          %sum = kernel.subgroup.reduce<addf> %partial {cluster_size = 32} : f32
+          scf.if %write {
+            view.store %sum, %view[%row, %column] : f32, view<[%rows]x1024xf32>
+          }
+        }
+      }
+    }
+  }
+  kernel.return
+}

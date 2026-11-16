@@ -1,28 +1,33 @@
-// Device-controlled live-prefix wrapper over the shared Q6_K/Q8_1 panel body.
-// K, N, and the positive workgroup budget are workload values. The first I32
-// control word is the live row count; row_begin names this cohort of 1..32
-// specialized rows. The producer initializes every reserved activation row.
-// Wholly inactive cohorts leave output untouched. A partially live cohort
-// computes the entire cohort, and downstream consumers use the same live prefix.
+// Device-controlled vocabulary projection over the shared Q6_K/Q8_1 panels.
+// Geometry and the worker budget are workload values; live rows and full versus
+// prefix selection remain device data. Both views borrow one output allocation
+// with their respective dense strides. The producer initializes reserved input
+// rows, and downstream selection consumes only the live prefix.
 
 func.decl pure @ggml_q6k_q8_1_x4_panel_grid(%rows: index, %outputs: index, %workgroup_budget: index) -> (index)
 
 template.decl @ggml.q6k.q8_1_x4.panels.body(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
 
-kernel.def @qwen38_output_projection_q6k_prefix(%rows: index, %inputs: index, %output_size: index, %workgroup_budget: index) {
-  %groups = func.call pure @ggml_q6k_q8_1_x4_panel_grid(%rows, %output_size, %workgroup_budget) : (index, index, index) -> (index)
+kernel.def @qwen38_dflash_vocabulary_head(%rows: index, %inputs: index, %full_columns: index, %prefix_columns: index, %budget: index) {
+  %groups = func.call pure @ggml_q6k_q8_1_x4_panel_grid(%rows, %full_columns, %budget) : (index, index, index) -> (index)
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%rows: index, %row_begin: index, %inputs: index, %outputs: index, %control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+} launch(%rows: index, %row_begin: index, %inputs: index, %full_columns: index, %prefix_columns: index, %control: buffer, %input: buffer, %weight: buffer, %full_output: buffer, %prefix_output: buffer) {
   %origin = index.constant 0 : offset
-  %metadata = buffer.assume.memory_space<constant> %control : buffer
-  %header = buffer.view %metadata[%origin] : buffer -> view<1xi32>
-  %count_word = view.load %header[0] : view<1xi32> -> i32
+  %header = buffer.view %control[%origin] : buffer -> view<4xi32>
+  %count_word = view.load %header[0] : view<4xi32> -> i32
   %count = index.cast %count_word : i32 to index
   %active = index.cmp ult, %row_begin, %count : index
+  %mode = view.load %header[3] : view<4xi32> -> i32
+  %c0_i32 = scalar.constant 0 : i32
+  %full = scalar.cmpi ne, %mode, %c0_i32 : i32
   scf.if %active {
-    template.apply<@ggml.q6k.q8_1_x4.panels.body>(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+    scf.if %full {
+      template.apply<@ggml.q6k.q8_1_x4.panels.body>(%rows, %inputs, %full_columns, %input, %weight, %full_output) : (index, index, index, buffer, buffer, buffer)
+    } else {
+      template.apply<@ggml.q6k.q8_1_x4.panels.body>(%rows, %inputs, %prefix_columns, %input, %weight, %prefix_output) : (index, index, index, buffer, buffer, buffer)
+    }
   }
   kernel.return
 }
