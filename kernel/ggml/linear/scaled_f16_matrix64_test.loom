@@ -1,0 +1,223 @@
+// Complete correctness coverage for the subgroup-32 64x64 GGML schedules.
+//
+// Q4_K, Q5_K, and Q6_K projections are compared against an independent
+// scalar byte decoder. Cases cover live and dead row tiles plus a 128x128
+// launch spanning four workgroups. The fused Q4_K path separately checks both
+// weight streams and its SiLU epilogue. Guarded output storage and immutable
+// inputs make partial publication and accidental mutation visible.
+
+kernel.decl @ggml_linear_q4k_scaled_f16_matrix64(%rows: index, %outputs: index) launch(%launch_rows: index, %inputs: index, %launch_outputs: index, %input: buffer, %scales: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q4k_scaled_f16_matrix64_swiglu(%rows: index, %outputs: index) launch(%launch_rows: index, %inputs: index, %launch_outputs: index, %input: buffer, %scales: buffer, %gate: buffer, %up: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q5k_scaled_f16_matrix64(%rows: index, %outputs: index) launch(%launch_rows: index, %inputs: index, %launch_outputs: index, %input: buffer, %scales: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q6k_scaled_f16_matrix64(%rows: index, %outputs: index) launch(%launch_rows: index, %inputs: index, %launch_outputs: index, %input: buffer, %scales: buffer, %weight: buffer, %output: buffer)
+
+func.decl @initialize_affine(%uniform: i1, %fifth_bit: i1, %rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
+
+func.decl @initialize_q6(%uniform: i1, %quantized: i1, %rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
+
+func.decl @scaled_f16_matrix64_reference(%format: index, %rows: index, %inputs: index, %outputs: index, %input: buffer, %scales: buffer, %weight: buffer, %output: buffer)
+
+func.decl @scaled_f16_matrix64_swiglu_reference(%rows: index, %inputs: index, %outputs: index, %input: buffer, %scales: buffer, %gate: buffer, %up: buffer, %output: buffer)
+
+func.def pure @scaled_matrix_geometry(%configuration: index) -> (index, index, index, index, index, index, i1) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c8 = index.constant 8 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c144 = index.constant 144 : index
+  %c176 = index.constant 176 : index
+  %c210 = index.constant 210 : index
+  %c256 = index.constant 256 : index
+  %c512 = index.constant 512 : index
+  %true = scalar.constant true : i1
+  %q5_live = index.cmp eq, %configuration, %c1 : index
+  %q6_live = index.cmp eq, %configuration, %c2 : index
+  %q4_dead = index.cmp eq, %configuration, %c3 : index
+  %q5_dead = index.cmp eq, %configuration, %c4 : index
+  %q6_dead = index.cmp eq, %configuration, %c5 : index
+  %large = index.cmp eq, %configuration, %c6 : index
+  %q5 = scalar.ori %q5_live, %q5_dead : i1
+  %q6 = scalar.ori %q6_live, %q6_dead : i1
+  %dead45 = scalar.ori %q4_dead, %q5_dead : i1
+  %dead = scalar.ori %dead45, %q6_dead : i1
+  %live = scalar.xori %dead, %true : i1
+  %affine_format = scf.select %q5, %c5, %c4 : index
+  %format = scf.select %q6, %c6, %affine_format : index
+  %rows = scf.select %large, %c128, %c64 : index
+  %outputs = scf.select %large, %c128, %c64 : index
+  %affine_bytes = scf.select %q5, %c176, %c144 : index
+  %block_bytes = scf.select %q6, %c210, %affine_bytes : index
+  %blocks = index.div %c512, %c256 : index
+  %records = index.mul %outputs, %blocks : index
+  %weight_bytes = index.mul %records, %block_bytes : index
+  %elements = index.mul %rows, %outputs : index
+  %storage_count = index.add %elements, %c8 : index
+  func.return %format, %rows, %c512, %outputs, %weight_bytes, %storage_count, %live : index, index, index, index, index, index, i1
+}
+
+func.def @initialize_scaled_matrix_scales(%live: i1, %rows: index, %scales: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c1_f32 = scalar.constant 1.0 : f32
+  %half = scalar.constant 0.5 : f32
+  %c0_f32 = scalar.constant 0.0 : f32
+  %tile_scale = scf.select %live, %c1_f32, %c0_f32 : f32
+  %values = buffer.view %scales[%origin] : buffer -> view<[%rows]x2xf32>
+  scf.for %row = [%c0 to %rows step %c1] {
+    %parity = index.rem %row, %c2 : index
+    %odd = index.cmp ne, %parity, %c0 : index
+    %inverse = scf.select %odd, %half, %c1_f32 : f32
+    view.store %tile_scale, %values[%row, %c0] : f32, view<[%rows]x2xf32>
+    view.store %inverse, %values[%row, %c1] : f32, view<[%rows]x2xf32>
+  }
+  func.return
+}
+
+func.def @set_scaled_matrix_shape(%format: index, %rows: index, %inputs: index, %outputs: index, %shape: buffer) {
+  %origin = index.constant 0 : offset
+  %format_word = index.cast %format : index to i32
+  %rows_word = index.cast %rows : index to i32
+  %inputs_word = index.cast %inputs : index to i32
+  %outputs_word = index.cast %outputs : index to i32
+  %values = buffer.view %shape[%origin] : buffer -> view<4xi32>
+  view.store %format_word, %values[0] : i32, view<4xi32>
+  view.store %rows_word, %values[1] : i32, view<4xi32>
+  view.store %inputs_word, %values[2] : i32, view<4xi32>
+  view.store %outputs_word, %values[3] : i32, view<4xi32>
+  func.return
+}
+
+// The shared initializers repair format metadata after random byte generation.
+// Passing zero rows to the affine initializer intentionally leaves the F16
+// activation matrix untouched while still initializing every weight block.
+func.def @initialize_scaled_matrix_weight(%format: index, %rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer) {
+  %c0 = index.constant 0 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %false = scalar.constant false : i1
+  %q5 = index.cmp eq, %format, %c5 : index
+  %q6 = index.cmp eq, %format, %c6 : index
+  scf.if %q6 {
+    func.call @initialize_q6(%false, %false, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, buffer, buffer)
+  } else {
+    func.call @initialize_affine(%false, %q5, %c0, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, buffer, buffer)
+  }
+  func.return
+}
+
+command.def @scaled_matrix_project(%configuration: index) launch(%shape: buffer, %input: buffer, %scales: buffer, %weight: buffer, %output: buffer) {
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %format, %rows, %inputs, %outputs, %weight_bytes, %storage_count, %live = func.call pure @scaled_matrix_geometry(%configuration) : (index) -> (index, index, index, index, index, index, i1)
+  %q4 = index.cmp eq, %format, %c4 : index
+  %q5 = index.cmp eq, %format, %c5 : index
+  scf.if %q4 {
+    kernel.launch @ggml_linear_q4k_scaled_f16_matrix64[%rows, %outputs](%rows, %inputs, %outputs, %input, %scales, %weight, %output) : [index, index](index, index, index, buffer, buffer, buffer, buffer)
+  } else {
+    scf.if %q5 {
+      kernel.launch @ggml_linear_q5k_scaled_f16_matrix64[%rows, %outputs](%rows, %inputs, %outputs, %input, %scales, %weight, %output) : [index, index](index, index, index, buffer, buffer, buffer, buffer)
+    } else {
+      kernel.launch @ggml_linear_q6k_scaled_f16_matrix64[%rows, %outputs](%rows, %inputs, %outputs, %input, %scales, %weight, %output) : [index, index](index, index, index, buffer, buffer, buffer, buffer)
+    }
+  }
+  command.return
+}
+
+func.def @scaled_matrix_reference(%shape: buffer, %input: buffer, %scales: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %values = buffer.view %shape[%origin] : buffer -> view<4xi32>
+  %format_word = view.load %values[0] : view<4xi32> -> i32
+  %rows_word = view.load %values[1] : view<4xi32> -> i32
+  %inputs_word = view.load %values[2] : view<4xi32> -> i32
+  %outputs_word = view.load %values[3] : view<4xi32> -> i32
+  %format = index.cast %format_word : i32 to index
+  %rows = index.cast %rows_word : i32 to index
+  %inputs = index.cast %inputs_word : i32 to index
+  %outputs = index.cast %outputs_word : i32 to index
+  func.call @scaled_f16_matrix64_reference(%format, %rows, %inputs, %outputs, %input, %scales, %weight, %output) : (index, index, index, index, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @scaled_f16_matrix64_plain configure[7](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[2](%trial: index, %entropy: check.entropy) {
+    %format, %rows, %inputs, %outputs, %weight_bytes, %storage_count, %live = check.generate<@scaled_matrix_geometry>(%configuration) : (index) -> (index, index, index, index, index, index, i1)
+    %shape = check.generate.fill value(0) : tensor<4xi32>
+    check.generate<@set_scaled_matrix_shape>(%format, %rows, %inputs, %outputs, %shape) : (index, index, index, index, tensor<4xi32>) -> ()
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0 to 1.0) : tensor<[%rows]x[%inputs]xf16>
+    %scales = check.generate.fill value(-99.0) : tensor<[%rows]x2xf32>
+    check.generate<@initialize_scaled_matrix_scales>(%live, %rows, %scales) : (i1, index, tensor<[%rows]x2xf32>) -> ()
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<[%weight_bytes]xi8>
+    check.generate<@initialize_scaled_matrix_weight>(%format, %rows, %inputs, %outputs, %input, %weight) : (index, index, index, index, tensor<[%rows]x[%inputs]xf16>, tensor<[%weight_bytes]xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_count]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_count]xf32> -> tensor<[%rows]x[%outputs]xf32>
+    check.compare<@scaled_matrix_project, @scaled_matrix_reference>[%configuration](%shape, %input, %scales, %weight, %output) : [index](tensor<4xi32>, tensor<[%rows]x[%inputs]xf16>, tensor<[%rows]x2xf32>, tensor<[%weight_bytes]xi8>, tensor<[%rows]x[%outputs]xf32>) -> () {
+      check.expect.approximate actual(%storage) expected(%storage) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%storage_count]xf32>, tensor<[%storage_count]xf32>
+      check.expect.bitwise actual(%shape) expected(%shape) : tensor<4xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x[%inputs]xf16>
+      check.expect.bitwise actual(%scales) expected(%scales) : tensor<[%rows]x2xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<[%weight_bytes]xi8>
+    }
+  }
+  check.return
+}
+
+command.def @scaled_matrix_swiglu() launch(%input: buffer, %scales: buffer, %gate: buffer, %up: buffer, %output: buffer) {
+  %rows = index.constant 64 : index
+  %inputs = index.constant 512 : index
+  %outputs = index.constant 64 : index
+  kernel.launch @ggml_linear_q4k_scaled_f16_matrix64_swiglu[%rows, %outputs](%rows, %inputs, %outputs, %input, %scales, %gate, %up, %output) : [index, index](index, index, index, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+func.def @scaled_matrix_swiglu_reference(%input: buffer, %scales: buffer, %gate: buffer, %up: buffer, %output: buffer) {
+  %rows = index.constant 64 : index
+  %inputs = index.constant 512 : index
+  %outputs = index.constant 64 : index
+  func.call @scaled_f16_matrix64_swiglu_reference(%rows, %inputs, %outputs, %input, %scales, %gate, %up, %output) : (index, index, index, buffer, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @scaled_f16_matrix64_swiglu {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %rows = check.literal value(64) : index
+  %inputs = check.literal value(512) : index
+  %outputs = check.literal value(64) : index
+  %format = check.literal value(4) : index
+  %live = check.literal value(true) : i1
+  check.trial[3](%trial: index, %entropy: check.entropy) {
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %gate_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %up_seed = check.entropy.read %entropy[2] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%input_seed) range(-1.0 to 1.0) : tensor<64x512xf16>
+    %scales = check.generate.fill value(-99.0) : tensor<64x2xf32>
+    check.generate<@initialize_scaled_matrix_scales>(%live, %rows, %scales) : (i1, index, tensor<64x2xf32>) -> ()
+    %gate = check.generate.random.uniform seed(%gate_seed) range(-128 to 127) : tensor<18432xi8>
+    %up = check.generate.random.uniform seed(%up_seed) range(-128 to 127) : tensor<18432xi8>
+    check.generate<@initialize_scaled_matrix_weight>(%format, %rows, %inputs, %outputs, %input, %gate) : (index, index, index, index, tensor<64x512xf16>, tensor<18432xi8>) -> ()
+    check.generate<@initialize_scaled_matrix_weight>(%format, %rows, %inputs, %outputs, %input, %up) : (index, index, index, index, tensor<64x512xf16>, tensor<18432xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<4104xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<4104xf32> -> tensor<64x64xf32>
+    check.compare<@scaled_matrix_swiglu, @scaled_matrix_swiglu_reference>(%input, %scales, %gate, %up, %output) : (tensor<64x512xf16>, tensor<64x2xf32>, tensor<18432xi8>, tensor<18432xi8>, tensor<64x64xf32>) -> () {
+      check.expect.approximate actual(%storage) expected(%storage) atol(0.01) rtol(0.0001) nan(different) : tensor<4104xf32>, tensor<4104xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<64x512xf16>
+      check.expect.bitwise actual(%scales) expected(%scales) : tensor<64x2xf32>
+      check.expect.bitwise actual(%gate) expected(%gate) : tensor<18432xi8>
+      check.expect.bitwise actual(%up) expected(%up) : tensor<18432xi8>
+    }
+  }
+  check.return
+}
