@@ -7,6 +7,54 @@
 
 template.decl @normalization.rms_row_f32(%width: index, %threads: index, %input_origin: offset, %output_origin: offset, %output_f16: i1, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer)
 
+// Computes one weighted F32 result packet per retained input packet. Width is
+// a positive multiple of four times the thread count, and packet count is their
+// quotient. The input and weight buffers are nonaliasing, naturally aligned,
+// and large enough for the selected row. Callers own result publication.
+template.decl @normalization.rms_row_f32.values(%width: index, %threads: index, %packet_count: index, %input_origin: offset, %epsilon: f32, %input: buffer, %weight: buffer) -> (vector<[%packet_count]x4xf32>)
+
+template.def<@normalization.rms_row_f32.values> device @normalization_rms_row_f32_values(%width: index, %threads: index, %packet_count: index, %input_origin: offset, %epsilon: f32, %input: buffer, %weight: buffer) -> (vector<[%packet_count]x4xf32>) {
+  %thread_value = kernel.workitem.id<x> : index
+  %thread = index.assume %thread_value [ge(%thread_value, 0), lt(%thread_value, %threads)] : index
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %elements_per_vector = index.constant 4 : index
+  %origin = index.constant 0 : offset
+  %zero_float = scalar.constant 0.0 : f32
+  %empty = vector.splatf 0.0 : vector<[%packet_count]x4xf32>
+  %zero_sum = vector.splatf 0.0 : vector<4xf32>
+  %inputs = buffer.view %input[%input_origin] : buffer -> view<[%width]xf32>
+  %weights = buffer.view %weight[%origin] : buffer -> view<[%width]xf32>
+  %values, %sums = scf.for %packet = [%begin to %packet_count step %step](%bank = %empty : vector<[%packet_count]x4xf32>, %accumulator = %zero_sum : vector<4xf32>) -> (vector<[%packet_count]x4xf32>, vector<4xf32>) unroll {
+    %ordinal = index.madd %packet, %threads, %thread : index
+    %element = index.mul %ordinal, %elements_per_vector : index
+    %value = vector.load %inputs[%element] : view<[%width]xf32> -> vector<4xf32>
+    %next_bank = vector.insert %value into %bank[%packet] : vector<4xf32>, vector<[%packet_count]x4xf32>
+    %squares = vector.mulf<reassoc|nnan|ninf|nsz|contract> %value, %value : vector<4xf32>
+    %next_sum = vector.addf<reassoc|nnan|ninf|nsz> %accumulator, %squares : vector<4xf32>
+    scf.yield %next_bank, %next_sum : vector<[%packet_count]x4xf32>, vector<4xf32>
+  }
+  %thread_sum = vector.reduce<addf> %sums, %zero_float : vector<4xf32>, f32
+  %sum = kernel.workgroup.reduce<addf> %thread_sum : f32
+  %width_i32 = index.cast %width : index to i32
+  %width_float = scalar.uitofp %width_i32 : i32 to f32
+  %mean = scalar.divf<nnan|ninf|nsz|arcp> %sum, %width_float : f32
+  %biased_mean = scalar.addf<nnan|ninf|nsz> %mean, %epsilon : f32
+  %inverse = scalar.rsqrtf<nnan|ninf|nsz|afn> %biased_mean : f32
+  %inverse_vector = vector.splat %inverse : vector<4xf32>
+  %results = scf.for %packet = [%begin to %packet_count step %step](%bank = %empty : vector<[%packet_count]x4xf32>) -> (vector<[%packet_count]x4xf32>) unroll {
+    %ordinal = index.madd %packet, %threads, %thread : index
+    %element = index.mul %ordinal, %elements_per_vector : index
+    %value = vector.extract %values[%packet] : vector<[%packet_count]x4xf32> -> vector<4xf32>
+    %scale = vector.load %weights[%element] : view<[%width]xf32> -> vector<4xf32>
+    %normalized = vector.mulf<nnan|ninf|nsz> %value, %inverse_vector : vector<4xf32>
+    %result = vector.mulf<nnan|ninf|nsz> %normalized, %scale : vector<4xf32>
+    %next_bank = vector.insert %result into %bank[%packet] : vector<4xf32>, vector<[%packet_count]x4xf32>
+    scf.yield %next_bank : vector<[%packet_count]x4xf32>
+  }
+  template.return %results : vector<[%packet_count]x4xf32>
+}
+
 // One workgroup normalizes one F32 row with F32 weights. Width and thread count
 // specialize the retained register bank; width is a positive multiple of four
 // times the thread count. The caller supplies nonoverlapping buffers and row
@@ -21,37 +69,12 @@ template.def<@normalization.rms_row_f32> device @normalization_rms_row_f32(%widt
   %elements_per_vector = index.constant 4 : index
   %elements_per_packet = index.mul %threads, %elements_per_vector : index
   %packets = index.div %width, %elements_per_packet : index
-  %origin = index.constant 0 : offset
-  %zero_float = scalar.constant 0.0 : f32
-  %empty = vector.splatf 0.0 : vector<[%packets]x4xf32>
-  %zero_sum = vector.splatf 0.0 : vector<4xf32>
   %input_noalias, %weight_noalias, %output_noalias = buffer.assume.noalias %input, %weight, %output : buffer, buffer, buffer
-  %inputs = buffer.view %input_noalias[%input_origin] : buffer -> view<[%width]xf32>
-  %weights = buffer.view %weight_noalias[%origin] : buffer -> view<[%width]xf32>
-  %values, %sums = scf.for %packet = [%begin to %packets step %step](%bank = %empty : vector<[%packets]x4xf32>, %accumulator = %zero_sum : vector<4xf32>) -> (vector<[%packets]x4xf32>, vector<4xf32>) unroll {
-    %ordinal = index.madd %packet, %threads, %thread : index
-    %element = index.mul %ordinal, %elements_per_vector : index
-    %value = vector.load %inputs[%element] : view<[%width]xf32> -> vector<4xf32>
-    %next_bank = vector.insert %value into %bank[%packet] : vector<4xf32>, vector<[%packets]x4xf32>
-    %squares = vector.mulf<reassoc|nnan|ninf|nsz|contract> %value, %value : vector<4xf32>
-    %next_sum = vector.addf<reassoc|nnan|ninf|nsz> %accumulator, %squares : vector<4xf32>
-    scf.yield %next_bank, %next_sum : vector<[%packets]x4xf32>, vector<4xf32>
-  }
-  %thread_sum = vector.reduce<addf> %sums, %zero_float : vector<4xf32>, f32
-  %sum = kernel.workgroup.reduce<addf> %thread_sum : f32
-  %width_i32 = index.cast %width : index to i32
-  %width_float = scalar.uitofp %width_i32 : i32 to f32
-  %mean = scalar.divf<nnan|ninf|nsz|arcp> %sum, %width_float : f32
-  %biased_mean = scalar.addf<nnan|ninf|nsz> %mean, %epsilon : f32
-  %inverse = scalar.rsqrtf<nnan|ninf|nsz|afn> %biased_mean : f32
-  %inverse_vector = vector.splat %inverse : vector<4xf32>
+  %values = template.apply<@normalization.rms_row_f32.values>(%width, %threads, %packets, %input_origin, %epsilon, %input_noalias, %weight_noalias) : (index, index, index, offset, f32, buffer, buffer) -> (vector<[%packets]x4xf32>)
   scf.for %packet = [%begin to %packets step %step] unroll {
     %ordinal = index.madd %packet, %threads, %thread : index
     %element = index.mul %ordinal, %elements_per_vector : index
-    %value = vector.extract %values[%packet] : vector<[%packets]x4xf32> -> vector<4xf32>
-    %scale = vector.load %weights[%element] : view<[%width]xf32> -> vector<4xf32>
-    %normalized = vector.mulf<nnan|ninf|nsz> %value, %inverse_vector : vector<4xf32>
-    %result = vector.mulf<nnan|ninf|nsz> %normalized, %scale : vector<4xf32>
+    %result = vector.extract %values[%packet] : vector<[%packets]x4xf32> -> vector<4xf32>
     scf.if %output_f16 {
       %outputs = buffer.view %output_noalias[%output_origin] : buffer -> view<[%width]xf16>
       %rounded = vector.fptrunc %result : vector<4xf32> to vector<4xf16>
