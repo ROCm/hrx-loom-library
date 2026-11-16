@@ -63,8 +63,14 @@ numerators stay F32 through normalization or partial-state publication. The
 paired-query split path retains its native accumulator fragments across
 history tiles; its merge consumes the same F32 partial-state layout.
 
-Gated DeltaNet retains causal state within each span. Capture and
-accepted-prefix replay keep rejected proposals from advancing committed history.
+Gated DeltaNet retains each 128-key state column across its complete token
+span. Four adjacent lanes share a column and call the shared tensor delta-rule
+motif; the model owns normalization, decay, reader selection, and publication.
+Four workgroups per execution unit traverse the logical span/column tiles,
+keeping the grid bounded as concurrent requests increase. Span and tile
+coordinates advance separately, so large span capacities cannot overflow a
+flattened work count. Capture and accepted-prefix replay keep rejected
+proposals from advancing committed history.
 The output head and predictors preserve request-owned policy and accepted carry.
 
 The output-head contraction lives in the shared Q6_K/Q8_1 x4 panel kernel

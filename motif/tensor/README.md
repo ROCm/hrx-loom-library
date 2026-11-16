@@ -18,6 +18,11 @@ the composition leaf supplies the concrete binding. Storage and synchronization
 remain explicit, so linking a motif introduces no hidden allocation, dispatch,
 or model-wide configuration.
 
+The gated-delta update retains a 128-key state column in four adjacent lanes.
+It accepts normalized query/key fragments and explicit decay/update gates,
+returning the updated fragment and column output. Callers retain the state
+across their token loop and own loading, output scaling, and publication.
+
 The [test package](test/) owns independent oracles and bounded workloads.
 [Component authoring](../../docs/component-authoring.md) covers dependencies,
 source/test separation, and the shared verification workflow.

@@ -1,0 +1,30 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// One F32 gated-delta update for a 128-key state column. Four adjacent lanes
+// form an aligned cluster; each carries 32 consecutive keys. Every lane in
+// the cluster participates and supplies the same value and gates. Query/key
+// fragments already include their model-specific normalization. Decay and
+// update gates are finite, in [0, 1]. State remains in registers; composition
+// owns loading, token traversal, output scaling, and final state publication.
+// Returns each lane's next state fragment and the full unscaled column output.
+
+template.decl @gated_delta.update_128(%prior: vector<32xf32>, %query: vector<32xf32>, %key: vector<32xf32>, %value: f32, %decay: f32, %update_gate: f32) -> (vector<32xf32>, f32)
+
+template.def<@gated_delta.update_128> device @gated_delta_update_128(%prior: vector<32xf32>, %query: vector<32xf32>, %key: vector<32xf32>, %value: f32, %decay: f32, %update_gate: f32) -> (vector<32xf32>, f32) {
+  %c0 = scalar.constant 0.0 : f32
+  %decays = vector.splat %decay : vector<32xf32>
+  %decayed = vector.mulf<nnan|ninf|nsz> %prior, %decays : vector<32xf32>
+  %prediction_products = vector.mulf<reassoc|nnan|ninf|nsz|contract> %decayed, %key : vector<32xf32>
+  %prediction_partial = vector.reduce<addf, reassoc|nnan|ninf|nsz|contract> %prediction_products, %c0 : vector<32xf32>, f32
+  %prediction = kernel.subgroup.reduce<addf> %prediction_partial {cluster_size = 4} : f32
+  %residual = scalar.subf %value, %prediction : f32
+  %delta = scalar.mulf %residual, %update_gate : f32
+  %deltas = vector.splat %delta : vector<32xf32>
+  %correction = vector.mulf<reassoc|nnan|ninf|nsz|contract> %key, %deltas : vector<32xf32>
+  %updated = vector.addf<reassoc|nnan|ninf|nsz|contract> %decayed, %correction : vector<32xf32>
+  %output_products = vector.mulf<reassoc|nnan|ninf|nsz|contract> %updated, %query : vector<32xf32>
+  %output_partial = vector.reduce<addf, reassoc|nnan|ninf|nsz|contract> %output_products, %c0 : vector<32xf32>, f32
+  %output = kernel.subgroup.reduce<addf> %output_partial {cluster_size = 4} : f32
+  template.return %updated, %output : vector<32xf32>, f32
+}

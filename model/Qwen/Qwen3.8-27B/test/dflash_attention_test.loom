@@ -1,3 +1,10 @@
+config.decl @runner.qwen38.verification_width : %value: index where [range(%value, 2, 8)]
+
+func.def @tested_block_width() -> (index) {
+  %width = config.get @runner.qwen38.verification_width : index
+  func.return %width : index
+}
+
 kernel.decl @qwen38_dflash_query_prepare(%tokens: index, %spans: index) launch(%capacity: index, %epoch: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 kernel.decl @qwen38_dflash_block_prepare(%tokens: index, %spans: index) launch(%capacity: index, %epoch: buffer, %key: buffer, %value: buffer, %weight: buffer, %cache: buffer)
@@ -132,7 +139,8 @@ func.def @query_reference(%capacity: index, %epoch: buffer, %input: buffer, %wei
   %c8_2 = index.constant 8 : index
   %heads = index.constant 32 : index
   %width = index.constant 128 : index
-  scf.for %relative = [%c0 to %c8_2 step %c1_2] {
+  %block_length = config.get @runner.qwen38.verification_width : index
+  scf.for %relative = [%c0 to %block_length step %c1_2] {
     %token = index.add %relative, %c8_2 : index
     %absolute = index.add %position, %relative : index
     scf.for %head = [%c0 to %heads step %c1_2] {
@@ -204,11 +212,15 @@ func.def @window_reference(%capacity: index, %epoch: buffer, %rows: buffer, %lay
   %width = index.constant 128 : index
   %tail = index.constant 2047 : index
   %context_value = scalar.constant 0.25 : f64
-  %block_sum = scalar.constant 6.0 : f64
-  scf.for %relative = [%c0 to %c8_2 step %c1_2] {
+  %block_length = config.get @runner.qwen38.verification_width : index
+  %block_word = index.cast %block_length : index to i32
+  %block_float = scalar.uitofp %block_word : i32 to f64
+  %block_value = scalar.constant 0.75 : f64
+  %block_sum = scalar.mulf %block_float, %block_value : f64
+  scf.for %relative = [%c0 to %block_length step %c1_2] {
     %allowed = index.sub %tail, %relative : index
     %history = index.min %allowed, %position : index
-    %total = index.add %history, %c8_2 : index
+    %total = index.add %history, %block_length : index
     %history_word = index.cast %history : index to i32
     %total_word = index.cast %total : index to i32
     %history_f = scalar.uitofp %history_word : i32 to f64
@@ -233,7 +245,7 @@ check.scenario public @query_rotary {
     %capacity = check.literal value(16) : index
     %spans = check.literal value(2) : index
     %position = check.literal value(67) : index
-    %count = check.literal value(8) : index
+    %count = check.generate<@tested_block_width>() : () -> (index)
     %epoch = check.generate.fill value(-99) : tensor<15xi32>
     %rows = check.generate.fill value(-1) : tensor<148xi32>
     check.generate<@dflash_fixture>(%position, %count, %epoch, %rows) : (index, index, tensor<15xi32>, tensor<148xi32>) -> ()
@@ -317,11 +329,13 @@ func.def @attention_reference(%capacity: index, %epoch: buffer, %rows: buffer, %
   %c8_2 = index.constant 8 : index
   %heads = index.constant 32 : index
   %width = index.constant 128 : index
-  %visible = index.constant 75 : index
+  %block_length = config.get @runner.qwen38.verification_width : index
+  %history_length = index.constant 67 : index
+  %visible = index.add %history_length, %block_length : index
   %c0_0 = scalar.constant 0.0 : f64
   %negative = scalar.constant -inf : f64
   %scale = scalar.constant 0.088388347648318447 : f64
-  scf.for %relative = [%c0 to %c8_2 step %c1_2] {
+  scf.for %relative = [%c0 to %block_length step %c1_2] {
     %token = index.add %relative, %c8_2 : index
     scf.for %head = [%c0 to %heads step %c1_2] {
       %kv_head = index.div %head, %c4 : index
@@ -372,7 +386,7 @@ check.scenario public @scattered_attention {
     %capacity = check.literal value(16) : index
     %spans = check.literal value(2) : index
     %position = check.literal value(67) : index
-    %count = check.literal value(8) : index
+    %count = check.generate<@tested_block_width>() : () -> (index)
     %layer_origin = check.literal value(4096) : offset
     %epoch = check.generate.fill value(-99) : tensor<15xi32>
     %rows = check.generate.fill value(-1) : tensor<148xi32>
@@ -400,7 +414,7 @@ check.scenario public @window_attention {
     %capacity = check.literal value(16) : index
     %spans = check.literal value(2) : index
     %position = check.generate<@window_position>(%trial) : (index) -> (index)
-    %count = check.literal value(8) : index
+    %count = check.generate<@tested_block_width>() : () -> (index)
     %layer_origin = check.literal value(4096) : offset
     %epoch = check.generate.fill value(-99) : tensor<15xi32>
     %rows = check.generate.fill value(-1) : tensor<148xi32>
