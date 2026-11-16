@@ -22,7 +22,7 @@ kernel.decl @ggml_linear_q6k_q8_1_x4_panels_m8(%input_size: index, %output_size:
 
 kernel.decl @ggml_linear_q6k_q8_1_x4_panels_m32(%input_size: index, %output_size: index, %workgroup_budget: index) launch(%input_size_argument: index, %output_size_argument: index, %input: buffer, %weight: buffer, %output: buffer)
 
-kernel.decl @qwen38_output_projection_q6k_m8_prefix(%input_size: index, %output_size: index, %workgroup_budget: index) launch(%row_begin: index, %input_size_argument: index, %output_size_argument: index, %control: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @qwen38_output_projection_q6k_prefix(%rows: index, %input_size: index, %output_size: index, %workgroup_budget: index) launch(%rows_argument: index, %row_begin: index, %input_size_argument: index, %output_size_argument: index, %control: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 kernel.decl @qwen38_rmsnorm_f32_decode() launch(%epsilon: f32, %input: buffer, %weight: buffer, %output: buffer)
 
@@ -106,44 +106,31 @@ command.def public target(@qwen38_execution) @qwen38_output_projection_logits(%t
   command.return
 }
 
-// Device control supplies a live row prefix. Complete groups outside it leave
-// logits untouched. The final short group uses the canonical tail contraction;
-// downstream selection still consumes only live rows.
+// Device control supplies a live row prefix. Each cohort shares one weight
+// pass across up to 32 rows, with an exact accumulator bank for the final tail.
+// Wholly inactive cohorts leave logits untouched; selection consumes live rows.
 command.def public target(@qwen38_execution) @qwen38_output_projection_logits_prefix(%token_count: index) launch(%parameters: buffer, %control: buffer, %normalized: buffer, %logits: buffer) where [range(%token_count, 1, 512)] {
   %workgroup_budget = func.call pure @qwen38_output_workgroup_budget() : () -> (index)
   %c0 = index.constant 0 : index
-  %c1 = index.constant 1 : index
-  %c8 = index.constant 8 : index
+  %cohort_size = index.constant 32 : index
   %origin = index.constant 0 : offset
   %hidden_size = index.constant 5120 : index
-  %hidden_row_bytes = index.constant 20480 : offset
   %hidden_q8_row_bytes = index.constant 5760 : offset
   %logits_row_bytes = index.constant 993280 : offset
-  %groups = index.div %token_count, %c8 : index
   %vocabulary_size = index.constant 248320 : index
-  %full_rows = index.mul %groups, %c8 : index
-  %has_groups = index.cmp ne, %groups, %c0 : index
-  scf.if %has_groups {
-    %output_weight = command.parameter %parameters, "output.weight" : view<1042944000xi8>
-    %hidden_q8_bytes = index.scale %full_rows, %hidden_q8_row_bytes : index, offset -> offset
-    %normalized_q8 = buffer.alloca<global> align(256) %hidden_q8_bytes : buffer
-    %normalized_rows = buffer.view %normalized[%origin] : buffer -> view<[%full_rows]x5120xf32>
-    kernel.launch @ggml_quantize_q8_1_x4_f32_bounded[%full_rows, %hidden_size, %workgroup_budget](%full_rows, %hidden_size, %normalized_rows, %normalized_q8) : [index, index, index](index, index, view<[%full_rows]x5120xf32>, buffer)
-    scf.for %group = [%c0 to %groups step %c1] unroll {
-      %row = index.mul %group, %c8 : index
-      %input_origin = index.scale %row, %hidden_q8_row_bytes : index, offset -> offset
-      %logits_origin = index.scale %row, %logits_row_bytes : index, offset -> offset
-      %input_group = buffer.view %normalized_q8[%input_origin] : buffer -> view<8x5760xi8>
-      %logits_group = buffer.view %logits[%logits_origin] : buffer -> view<8x248320xf32>
-      kernel.launch @qwen38_output_projection_q6k_m8_prefix[%hidden_size, %vocabulary_size, %workgroup_budget](%row, %hidden_size, %vocabulary_size, %control, %input_group, %output_weight, %logits_group) : [index, index, index](index, index, index, buffer, view<8x5760xi8>, view<1042944000xi8>, view<8x248320xf32>)
-    }
-  }
-  %tail_rows = index.sub %token_count, %full_rows : index
-  %has_tail = index.cmp ne, %tail_rows, %c0 : index
-  scf.if %has_tail {
-    %normalized_origin = index.scale %full_rows, %hidden_row_bytes : index, offset -> offset
-    %logits_origin = index.scale %full_rows, %logits_row_bytes : index, offset -> offset
-    command.launch @qwen38_output_projection_logits[%tail_rows, %normalized_origin, %logits_origin](%parameters, %normalized, %logits) : [index, offset, offset](buffer, buffer, buffer)
+  %output_weight = command.parameter %parameters, "output.weight" : view<1042944000xi8>
+  %hidden_q8_bytes = index.scale %token_count, %hidden_q8_row_bytes : index, offset -> offset
+  %normalized_q8 = buffer.alloca<global> align(256) %hidden_q8_bytes : buffer
+  %normalized_rows = buffer.view %normalized[%origin] : buffer -> view<[%token_count]x5120xf32>
+  kernel.launch @ggml_quantize_q8_1_x4_f32_bounded[%token_count, %hidden_size, %workgroup_budget](%token_count, %hidden_size, %normalized_rows, %normalized_q8) : [index, index, index](index, index, view<[%token_count]x5120xf32>, buffer)
+  scf.for %row = [%c0 to %token_count step %cohort_size] unroll {
+    %remaining = index.sub %token_count, %row : index
+    %rows = index.min %remaining, %cohort_size : index
+    %input_origin = index.scale %row, %hidden_q8_row_bytes : index, offset -> offset
+    %logits_origin = index.scale %row, %logits_row_bytes : index, offset -> offset
+    %input_group = buffer.view %normalized_q8[%input_origin] : buffer -> view<[%rows]x5760xi8>
+    %logits_group = buffer.view %logits[%logits_origin] : buffer -> view<[%rows]x248320xf32>
+    kernel.launch @qwen38_output_projection_q6k_prefix[%rows, %hidden_size, %vocabulary_size, %workgroup_budget](%rows, %row, %hidden_size, %vocabulary_size, %control, %input_group, %output_weight, %logits_group) : [index, index, index, index](index, index, index, index, buffer, view<[%rows]x5760xi8>, view<1042944000xi8>, view<[%rows]x248320xf32>)
   }
   command.return
 }
