@@ -9,9 +9,69 @@ template.decl @normalization.rms_row_f32.values(%width: index, %threads: index, 
 
 template.decl @ggml.quantize_q8_1_x4.group_values(%publish_output: i1, %group_count: index, %cohort_count: index, %cohort: index, %group: index, %lane: index, %input_values: vector<4xf32>, %output: buffer)
 
+func.decl device @ggml_quantize_q8_1_x4_word_subgroup(%input_values: vector<4xf32>) -> (vector<1xi32>, f32, f32)
+
+target.decl @qwen38_spirv
+
+template.decl @qwen38.rms_q8.publish_group_values(%group_count: index, %cohort_count: index, %cohort: index, %group: index, %lane: index, %input_values: vector<4xf32>, %output: buffer)
+
+template.decl @qwen38.rms_q8.publish_group_values_subgroup(%group: index, %lane: index, %input_values: vector<4xf32>, %output: buffer)
+
 template.decl @qwen38.rmsnorm_f32.row(%input_row_count: index, %input_row: index, %output_origin: offset, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer)
 
 // Elementwise and normalization primitives shared by Qwen3.8 decode layers.
+// The default publisher remains fully inline. Retained calls are expensive on
+// native AMD targets, while the same boundary materially contracts SPIR-V.
+template.def<@qwen38.rms_q8.publish_group_values> device @qwen38_rms_q8_publish_group_values(%group_count: index, %cohort_count: index, %cohort: index, %group: index, %lane: index, %input_values: vector<4xf32>, %output: buffer) {
+  %publish_output = scalar.constant 1 : i1
+  template.apply<@ggml.quantize_q8_1_x4.group_values>(%publish_output, %group_count, %cohort_count, %cohort, %group, %lane, %input_values, %output) : (i1, index, index, index, index, index, vector<4xf32>, buffer)
+  template.return
+}
+
+template.def<@qwen38.rms_q8.publish_group_values> device target(@qwen38_spirv) requires [#target.subgroup.size<32>] priority(20) @qwen38_rms_q8_publish_group_values_spirv32(%group_count: index, %cohort_count: index, %cohort: index, %group: index, %lane: index, %input_values: vector<4xf32>, %output: buffer) {
+  template.apply<@qwen38.rms_q8.publish_group_values_subgroup>(%group, %lane, %input_values, %output) : (index, index, vector<4xf32>, buffer)
+  template.return
+}
+
+template.def<@qwen38.rms_q8.publish_group_values> device target(@qwen38_spirv) requires [#target.subgroup.size<64>] priority(20) @qwen38_rms_q8_publish_group_values_spirv64(%group_count: index, %cohort_count: index, %cohort: index, %group: index, %lane: index, %input_values: vector<4xf32>, %output: buffer) {
+  template.apply<@qwen38.rms_q8.publish_group_values_subgroup>(%group, %lane, %input_values, %output) : (index, index, vector<4xf32>, buffer)
+  template.return
+}
+
+template.def<@qwen38.rms_q8.publish_group_values_subgroup> device @qwen38_rms_q8_publish_group_values_subgroup(%group: index, %lane: index, %input_values: vector<4xf32>, %output: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c8 = index.constant 8 : index
+  %group_bytes = index.constant 144 : index
+  %payload_byte_add = index.constant 16 : index
+  %packed_word, %d, %s = func.call noinline @ggml_quantize_q8_1_x4_word_subgroup(%input_values) : (vector<4xf32>) -> (vector<1xi32>, f32, f32)
+  %block_in_group0 = index.div %lane, %c8 : index
+  %block_in_group = index.assume %block_in_group0 [range(%block_in_group0, 0, 3)] : index
+  %word_in_block0 = index.rem %lane, %c8 : index
+  %word_in_block = index.assume %word_in_block0 [range(%word_in_block0, 0, 7)] : index
+  %group_byte_index = index.mul %group, %group_bytes : index
+  %group_byte_offset = index.cast %group_byte_index : index to offset
+  %payload_byte_index = index.add %group_byte_index, %payload_byte_add : index
+  %payload_byte_offset = index.cast %payload_byte_index : index to offset
+  %group_ds = buffer.view %output[%group_byte_offset] : buffer -> view<8xf16>
+  %group_qs = buffer.view %output[%payload_byte_offset] : buffer -> view<32xi32>
+  %block_word_add = index.mul %block_in_group, %c8 : index
+  %packed_word_index0 = index.add %block_word_add, %word_in_block : index
+  %packed_word_index = index.assume %packed_word_index0 [range(%packed_word_index0, 0, 31)] : index
+  vector.store %packed_word, %group_qs[%packed_word_index] : vector<1xi32>, view<32xi32>
+  %publishes_metadata = index.cmp eq, %word_in_block, %c0 : index
+  scf.if %publishes_metadata {
+    %d_f16 = scalar.fptrunc %d : f32 to f16
+    %s_f16 = scalar.fptrunc %s : f32 to f16
+    %ds_index = index.mul %block_in_group, %c2 : index
+    view.store %d_f16, %group_ds[%ds_index] : f16, view<8xf16>
+    %s_index = index.add %ds_index, %c1 : index
+    view.store %s_f16, %group_ds[%s_index] : f16, view<8xf16>
+  }
+  template.return
+}
+
 // Quantized projections and attention/GDN state transitions remain in their
 // own files so command programs can select and compose them independently.
 // Normalizes one row from a row-major 5120-wide input. Decode provides its
@@ -61,7 +121,6 @@ kernel.def export("qwen38_rmsnorm_q8_1_x4_f32_decode") @qwen38_rmsnorm_q8_1_x4_f
   %begin = index.constant 0 : index
   %step = index.constant 1 : index
   %origin = index.constant 0 : offset
-  %publish_output = scalar.constant 1 : i1
   %lane = kernel.workitem.id<x> : index
   %cohort0 = index.div %lane, %lanes_per_cohort : index
   %cohort = index.assume %cohort0 [range(%cohort0, 0, 7)] : index
@@ -76,7 +135,7 @@ kernel.def export("qwen38_rmsnorm_q8_1_x4_f32_decode") @qwen38_rmsnorm_q8_1_x4_f
     %values = vector.extract %results[%packet] : vector<[%packet_count]x4xf32> -> vector<4xf32>
     vector.store %values, %output_view[%element] : vector<4xf32>, view<5120xf32>
     %group = index.madd %packet, %cohort_count, %cohort : index
-    template.apply<@ggml.quantize_q8_1_x4.group_values>(%publish_output, %group_count, %cohort_count, %cohort, %group, %cohort_lane, %values, %output_q8_noalias) : (i1, index, index, index, index, index, vector<4xf32>, buffer)
+    template.apply<@qwen38.rms_q8.publish_group_values>(%group_count, %cohort_count, %cohort, %group, %cohort_lane, %values, %output_q8_noalias) : (index, index, index, index, index, vector<4xf32>, buffer)
   }
   kernel.return
 }

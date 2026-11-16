@@ -146,6 +146,37 @@ func.def inline @ggml_q8_1_x4_block_sum_subgroup(%thread_sum: f32) -> (f32) {
   func.return %sum : f32
 }
 
+// Quantizes the four values owned by one lane when the target provides
+// subgroup shuffles. XOR reductions stay within each eight-lane Q8 block for
+// both 32- and 64-lane subgroups. A caller may retain this numeric helper to
+// publish several register-resident packets without cloning the reduction and
+// packing sequence or carrying destination storage across a call boundary.
+func.def public device @ggml_quantize_q8_1_x4_word_subgroup(%input_values: vector<4xf32>) -> (vector<1xi32>, f32, f32) {
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c1_f32 = scalar.constant 1.0 : f32
+  %c127 = scalar.constant 127.0 : f32
+  %absolute_values = vector.absf %input_values : vector<4xf32>
+  %thread_max = vector.reduce<maxnumf> %absolute_values, %c0_f32 : vector<4xf32>, f32
+  %amax = func.call @ggml_q8_1_x4_block_maximum_subgroup(%thread_max) : (f32) -> (f32)
+  %d = scalar.divf %amax, %c127 : f32
+  %d_nonzero = scalar.cmpf one, %d, %c0_f32 : f32
+  %d_inverse = scf.if %d_nonzero -> (f32) {
+    %inverse = scalar.divf %c1_f32, %d : f32
+    scf.yield %inverse : f32
+  } else {
+    scf.yield %c0_f32 : f32
+  }
+  %d_inverse_vector = vector.splat %d_inverse : vector<4xf32>
+  %scaled_values = vector.mulf %input_values, %d_inverse_vector : vector<4xf32>
+  %rounded_values = vector.roundf %scaled_values : vector<4xf32>
+  %quantized_values = vector.fptosi %rounded_values : vector<4xf32> to vector<4xi8>
+  %packed_word = vector.bitcast %quantized_values : vector<4xi8> to vector<1xi32>
+  %thread_sum = vector.reduce<addf> %rounded_values, %c0_f32 : vector<4xf32>, f32
+  %quantized_sum = func.call @ggml_q8_1_x4_block_sum_subgroup(%thread_sum) : (f32) -> (f32)
+  %s = scalar.mulf %quantized_sum, %d : f32
+  func.return %packed_word, %d, %s : vector<1xi32>, f32, f32
+}
+
 template.def<@ggml.quantize_q8_1_x4.block_maximum> device requires [#target.subgroup.size<32>] priority(20) @ggml_q8_1_x4_block_maximum_subgroup32(%cohort_count: index, %cohort: index, %block_in_group: index, %thread_maximum: f32) -> (f32) {
   %maximum = func.call @ggml_q8_1_x4_block_maximum_subgroup(%thread_maximum) : (f32) -> (f32)
   template.return %maximum : f32
