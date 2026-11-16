@@ -18,6 +18,10 @@
 
 template.decl @ggml.quantize_q8_1_x4.group_body(%publish_output: i1, %group_count: index, %group: index, %input: buffer, %output: buffer)
 
+template.decl @ggml.quantize_q8_1_x4.block_maximum(%block_in_group: index, %thread_maximum: f32) -> (f32)
+
+template.decl @ggml.quantize_q8_1_x4.block_sum(%block_in_group: index, %thread_sum: f32) -> (f32)
+
 // Loads one logical 32-element Q8_1 block from the four-way physical packing.
 // `row_byte_base` addresses the first x4 group for one activation row.
 func.def public inline @ggml_q8_1_x4_block(%q8_input: buffer, %row_byte_base: offset, %q8_block: index) -> (vector<32xi8>, f32, f32) {
@@ -108,11 +112,79 @@ func.def public inline @ggml_q8_1_x4_chunk16(%input: buffer, %row_origin: offset
   func.return %values, %scale, %sum : vector<16xi8>, f32, f32
 }
 
+// Reduces one value across each independent eight-lane Q8 block. Static
+// subgroup providers use three scalar XOR exchanges. The workgroup fallback
+// keeps the physical block identity in four vector banks for targets without
+// a known 32- or 64-lane subgroup.
+func.def inline @ggml_q8_1_x4_block_maximum_subgroup(%thread_maximum: f32) -> (f32) {
+  %c1_i32 = scalar.constant 1 : i32
+  %c2_i32 = scalar.constant 2 : i32
+  %c4_i32 = scalar.constant 4 : i32
+  %c8_i32 = scalar.constant 8 : i32
+  %xor1, %xor1_valid = kernel.subgroup.shuffle<xor> %thread_maximum, %c1_i32, %c8_i32 : f32, i32, i32
+  %maximum1 = scalar.maxnumf %thread_maximum, %xor1 : f32
+  %xor2, %xor2_valid = kernel.subgroup.shuffle<xor> %maximum1, %c2_i32, %c8_i32 : f32, i32, i32
+  %maximum2 = scalar.maxnumf %maximum1, %xor2 : f32
+  %xor4, %xor4_valid = kernel.subgroup.shuffle<xor> %maximum2, %c4_i32, %c8_i32 : f32, i32, i32
+  %maximum = scalar.maxnumf %maximum2, %xor4 : f32
+  func.return %maximum : f32
+}
+
+func.def inline @ggml_q8_1_x4_block_sum_subgroup(%thread_sum: f32) -> (f32) {
+  %c1_i32 = scalar.constant 1 : i32
+  %c2_i32 = scalar.constant 2 : i32
+  %c4_i32 = scalar.constant 4 : i32
+  %c8_i32 = scalar.constant 8 : i32
+  %xor1, %xor1_valid = kernel.subgroup.shuffle<xor> %thread_sum, %c1_i32, %c8_i32 : f32, i32, i32
+  %sum1 = scalar.addf %thread_sum, %xor1 : f32
+  %xor2, %xor2_valid = kernel.subgroup.shuffle<xor> %sum1, %c2_i32, %c8_i32 : f32, i32, i32
+  %sum2 = scalar.addf %sum1, %xor2 : f32
+  %xor4, %xor4_valid = kernel.subgroup.shuffle<xor> %sum2, %c4_i32, %c8_i32 : f32, i32, i32
+  %sum = scalar.addf %sum2, %xor4 : f32
+  func.return %sum : f32
+}
+
+template.def<@ggml.quantize_q8_1_x4.block_maximum> device requires [#target.subgroup.size<32>] priority(20) @ggml_q8_1_x4_block_maximum_subgroup32(%block_in_group: index, %thread_maximum: f32) -> (f32) {
+  %maximum = func.call @ggml_q8_1_x4_block_maximum_subgroup(%thread_maximum) : (f32) -> (f32)
+  template.return %maximum : f32
+}
+
+template.def<@ggml.quantize_q8_1_x4.block_maximum> device requires [#target.subgroup.size<64>] priority(20) @ggml_q8_1_x4_block_maximum_subgroup64(%block_in_group: index, %thread_maximum: f32) -> (f32) {
+  %maximum = func.call @ggml_q8_1_x4_block_maximum_subgroup(%thread_maximum) : (f32) -> (f32)
+  template.return %maximum : f32
+}
+
+template.def<@ggml.quantize_q8_1_x4.block_maximum> device priority(0) @ggml_q8_1_x4_block_maximum_workgroup(%block_in_group: index, %thread_maximum: f32) -> (f32) {
+  %c0_v4f32 = vector.splatf 0.0 : vector<4xf32>
+  %thread_bank = vector.insert %thread_maximum into %c0_v4f32[%block_in_group] : f32, vector<4xf32>
+  %maximum_bank = kernel.workgroup.reduce<maxnumf> %thread_bank : vector<4xf32>
+  %maximum = vector.extract %maximum_bank[%block_in_group] : vector<4xf32> -> f32
+  template.return %maximum : f32
+}
+
+template.def<@ggml.quantize_q8_1_x4.block_sum> device requires [#target.subgroup.size<32>] priority(20) @ggml_q8_1_x4_block_sum_subgroup32(%block_in_group: index, %thread_sum: f32) -> (f32) {
+  %sum = func.call @ggml_q8_1_x4_block_sum_subgroup(%thread_sum) : (f32) -> (f32)
+  template.return %sum : f32
+}
+
+template.def<@ggml.quantize_q8_1_x4.block_sum> device requires [#target.subgroup.size<64>] priority(20) @ggml_q8_1_x4_block_sum_subgroup64(%block_in_group: index, %thread_sum: f32) -> (f32) {
+  %sum = func.call @ggml_q8_1_x4_block_sum_subgroup(%thread_sum) : (f32) -> (f32)
+  template.return %sum : f32
+}
+
+template.def<@ggml.quantize_q8_1_x4.block_sum> device priority(0) @ggml_q8_1_x4_block_sum_workgroup(%block_in_group: index, %thread_sum: f32) -> (f32) {
+  %c0_v4f32 = vector.splatf 0.0 : vector<4xf32>
+  %thread_bank = vector.insert %thread_sum into %c0_v4f32[%block_in_group] : f32, vector<4xf32>
+  %sum_bank = kernel.workgroup.reduce<addf> %thread_bank : vector<4xf32>
+  %sum = vector.extract %sum_bank[%block_in_group] : vector<4xf32> -> f32
+  template.return %sum : f32
+}
+
 // Packs one explicit physical group. Callers provide the complete physical
 // group domain and an in-range ordinal, and guarantee that all 32 workitems
 // in the workgroup execute after all 128 source values are visible. The uniform
 // publication predicate suppresses only destination writes so every lane still
-// reaches the workgroup barriers.
+// participates in the cooperative reductions.
 template.def<@ggml.quantize_q8_1_x4.group_body> device @ggml_quantize_q8_1_x4_group_body(%publish_output: i1, %group_count0: index, %group0: index, %input: buffer, %output: buffer) {
   %group_count, %group = index.assume %group_count0, %group0 [range(%group_count0, 1, 524288), lt(%group0, %group_count0)] : index, index
   %lane = kernel.workitem.id<x> : index
@@ -125,8 +197,6 @@ template.def<@ggml.quantize_q8_1_x4.group_body> device @ggml_quantize_q8_1_x4_gr
   %c128 = index.constant 128 : index
   %group_bytes = index.constant 144 : index
   %payload_byte_add = index.constant 16 : index
-  %scratch_d_byte_add = index.constant 128 : offset
-  %scratch_bytes = index.constant 144 : offset
   %c0_f32 = scalar.constant 0.0 : f32
   %c1_f32 = scalar.constant 1.0 : f32
   %c127 = scalar.constant 127.0 : f32
@@ -147,21 +217,9 @@ template.def<@ggml.quantize_q8_1_x4.group_body> device @ggml_quantize_q8_1_x4_gr
   %input_values = vector.load %input_view[%input_index] : view<[%launched_element_count]xf32> -> vector<4xf32>
   %absolute_values = vector.absf %input_values : vector<4xf32>
   %thread_max = vector.reduce<maxnumf> %absolute_values, %c0_f32 : vector<4xf32>, f32
-  %scratch = buffer.alloca<workgroup> align(16) %scratch_bytes : buffer
-  %scratch_values = buffer.view %scratch[%c0_offset] : buffer -> view<32xf32>
-  %scratch_d = buffer.view %scratch[%scratch_d_byte_add] : buffer -> view<4xf32>
-  view.store %thread_max, %scratch_values[%lane] : f32, view<32xf32>
-  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %amax = template.apply<@ggml.quantize_q8_1_x4.block_maximum>(%block_in_group, %thread_max) : (index, f32) -> (f32)
+  %d = scalar.divf %amax, %c127 : f32
   %is_cohort_leader = index.cmp eq, %word_in_block, %c0 : index
-  scf.if %is_cohort_leader {
-    %cohort_base = index.mul %block_in_group, %c8 : index
-    %cohort_maxima = vector.load %scratch_values[%cohort_base] : view<32xf32> -> vector<8xf32>
-    %amax = vector.reduce<maxnumf> %cohort_maxima, %c0_f32 : vector<8xf32>, f32
-    %d = scalar.divf %amax, %c127 : f32
-    view.store %d, %scratch_d[%block_in_group] : f32, view<4xf32>
-  }
-  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-  %d = view.load %scratch_d[%block_in_group] : view<4xf32> -> f32
   %d_nonzero = scalar.cmpf one, %d, %c0_f32 : f32
   %d_inverse = scf.if %d_nonzero -> (f32) {
     %inverse = scalar.divf %c1_f32, %d : f32
@@ -186,13 +244,9 @@ template.def<@ggml.quantize_q8_1_x4.group_body> device @ggml_quantize_q8_1_x4_gr
     vector.store %packed_word, %group_qs[%packed_word_index] : vector<1xi32>, view<32xi32>
   }
   %thread_sum = vector.reduce<addf> %rounded_values, %c0_f32 : vector<4xf32>, f32
-  view.store %thread_sum, %scratch_values[%lane] : f32, view<32xf32>
-  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %quantized_sum = template.apply<@ggml.quantize_q8_1_x4.block_sum>(%block_in_group, %thread_sum) : (index, f32) -> (f32)
   %publishes_metadata = scalar.andi %is_cohort_leader, %publish_output : i1
   scf.if %publishes_metadata {
-    %cohort_base = index.mul %block_in_group, %c8 : index
-    %cohort_sums = vector.load %scratch_values[%cohort_base] : view<32xf32> -> vector<8xf32>
-    %quantized_sum = vector.reduce<addf> %cohort_sums, %c0_f32 : vector<8xf32>, f32
     %s = scalar.mulf %quantized_sum, %d : f32
     %d_f16 = scalar.fptrunc %d : f32 to f16
     %s_f16 = scalar.fptrunc %s : f32 to f16
