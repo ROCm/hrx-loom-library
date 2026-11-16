@@ -62,10 +62,13 @@ Native AOT compilation requires a deployment profile carrying the count; an
 architecture name alone does not specify device capacity. Four groups per unit
 is the head's launch policy, not a claim about exact kernel residency.
 
-The prefix projection preserves complete inactive cohorts and computes all
-eight rows of a partially live cohort. Caller-owned byte origins and the
-logical live prefix retain their existing meaning. The final short cohort
-uses the same shared projection entries as ordinary decode.
+The proposal-prefix projection shares each weight pass across up to 32 rows,
+including an exact row specialization for the final short cohort. It preserves
+complete inactive cohorts and computes every initialized row of a partially
+live cohort; selection consumes only the live prefix. The shared motif owns
+the accumulator bank and matching launch geometry, while the model owns the
+control record and row partition. Ordinary target projection uses the same
+numerical body through its fixed-row entries.
 
 ## Image input
 
