@@ -62,7 +62,12 @@ template.def<@ggml.q4k.f32.small_panel.tile> @contract(%rows: index, %channel_ti
     %subblock = index.rem %thread, %subblocks : index
     %packet = index.add %subblock_origin, %subblock : index
     %valid_column = index.cmp ult, %packet, %packets : index
-    %valid_row = index.cmp ult, %row, %rows : index
+    // A complete eight-row bank uses every lane; only a partial bank needs
+    // a row mask in addition to the K-tail mask.
+    %staging_rows = index.constant 8 : index
+    %full_rows = index.cmp eq, %rows, %staging_rows : index
+    %partial_row = index.cmp ult, %row, %rows : index
+    %valid_row = scalar.ori %full_rows, %partial_row : i1
     %valid_load = scalar.andi %valid_column, %valid_row : i1
     %values = scf.if %valid_load -> (vector<16xf32>) {
       %loaded = vector.load %activations[%row, %packet, %c0] : view<[%rows]x[%packets]x16xf32> -> vector<16xf32>
@@ -195,20 +200,38 @@ template.def<@ggml.q4k.f32.small_panel.tile> @contract(%rows: index, %channel_ti
   template.return
 }
 
-template.decl @ggml.q4k.f32.small_panels(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
-
-// Workers reuse the activation allocation across their assigned channel tiles.
-// The final K-panel barrier retires readers before the next tile starts staging.
-template.def<@ggml.q4k.f32.small_panels> @traverse(%rows: index, %inputs: index, %outputs0: index, %input: buffer, %weight: buffer, %output: buffer) where [range(%rows, 4, 8), multiple_of(%rows, 4)] {
+func.def public pure inline @ggml_q4k_f32_small_panel_grid(%outputs0: index, %budget0: index) -> (index) {
   %outputs = index.assume %outputs0 [range(%outputs0, 1, 262144)] : index
+  %budget = index.assume %budget0 [range(%budget0, 1, 10000)] : index
+  %channels = index.constant 64 : index
+  %padding = index.constant 63 : index
+  %padded = index.add %outputs, %padding : index
+  %tiles = index.div %padded, %channels : index
+  %groups = index.min %tiles, %budget : index
+  func.return %groups : index
+}
+
+template.decl @ggml.q4k.f32.small_panels(%rows: index, %inputs: index, %outputs: index, %budget: index, %input: buffer, %weight: buffer, %output: buffer)
+
+// The grid is min(channel tiles, budget). Retaining that budget lets a
+// specialized single-tile worker omit traversal and its loop-carried state.
+// Repeated tiles reuse the activation allocation; the final K-panel barrier
+// retires readers before the next tile starts staging.
+template.def<@ggml.q4k.f32.small_panels> @traverse(%rows: index, %inputs: index, %outputs0: index, %budget0: index, %input: buffer, %weight: buffer, %output: buffer) where [range(%rows, 4, 8), multiple_of(%rows, 4)] {
+  %outputs = index.assume %outputs0 [range(%outputs0, 1, 262144)] : index
+  %budget = index.assume %budget0 [range(%budget0, 1, 10000)] : index
   %channels = index.constant 64 : index
   %padding = index.constant 63 : index
   %padded = index.add %outputs, %padding : index
   %tiles = index.div %padded, %channels : index
   %worker = kernel.workgroup.id<x> : index
-  %workers = kernel.workgroup.count<x> : index
-  scf.for %tile = [%worker to %tiles step %workers] {
-    template.apply<@ggml.q4k.f32.small_panel.tile>(%rows, %tile, %inputs, %outputs, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  %direct = index.cmp ule, %tiles, %budget : index
+  scf.if %direct {
+    template.apply<@ggml.q4k.f32.small_panel.tile>(%rows, %worker, %inputs, %outputs, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  } else {
+    scf.for %tile = [%worker to %tiles step %budget] {
+      template.apply<@ggml.q4k.f32.small_panel.tile>(%rows, %tile, %inputs, %outputs, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+    }
   }
   template.return
 }
