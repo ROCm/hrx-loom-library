@@ -1,0 +1,220 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Single-token Qwen3.5 Gated DeltaNet convolution, history publication, and
+// query/key inverse-norm preparation.
+//
+// Configuration ABI: (value_heads: index). Qwen3.5 has 16 query heads,
+// 16 key heads, 128 channels per head, four F32 convolution taps, and 16, 32,
+// 48, or 64 value heads. Launch ABI: (value_heads, span_capacity, layer,
+// metadata, info, origins, arena, qkv, weight, output, inverse). The repeated
+// value-head count keeps the runtime storage contract explicit.
+//
+// `metadata` contains four I32 header words followed by `span_capacity`
+// nine-I32 span records; record fields 1 and 3 are the starting position and
+// retained row. The one-token `info` record uses fields 2 and 3 for liveness
+// and span index. Each retained row in `origins` has five I64 fields: source
+// state origin, destination state origin, two reserved fields around the fork
+// position in field 3, and one trailing reserved field. These compiler-owned
+// records are trusted producer state.
+//
+// Each layer stores value_heads*128*128 F32 recurrence elements followed by
+// three time-major F32 convolution-history rows. The source origin is selected
+// at the fork position and otherwise aliases the destination. Start position
+// zero reads zero history. Q, K, and V values are contiguous in that order;
+// output preserves the same layout. Inverse norms are interleaved [Q0,K0,...].
+
+// Resolve source, destination, and freshness for one retained row. The caller
+// supplies the byte offset of the selected layer within each state slot.
+func.def inline @qwen35_gdn_decode_slots(%origins: buffer, %row: index, %start32: i32, %layer_bytes: offset) -> (offset, offset, i1) {
+  %record_stride = index.constant 40 : offset
+  %bounded_row = index.assume %row [range(%row, 0, 2147483646)] : index
+  %record_offset = index.scale %bounded_row, %record_stride : index, offset -> offset
+  %records = buffer.view %origins[%record_offset] : buffer -> view<5xi64>
+  %read64 = view.load %records[0] : view<5xi64> -> i64
+  %write64 = view.load %records[1] : view<5xi64> -> i64
+  %fork64 = view.load %records[3] : view<5xi64> -> i64
+  %start64 = scalar.extui %start32 : i32 to i64
+  %at_fork = scalar.cmpi eq, %start64, %fork64 : i64
+  %reader64 = scf.select %at_fork, %read64, %write64 : i64
+  %reader_bound = scalar.assume %reader64 [range(%reader64, 0, 9223372036854775807)] : i64
+  %writer_bound = scalar.assume %write64 [range(%write64, 0, 9223372036854775807)] : i64
+  %reader_base = index.cast %reader_bound : i64 to offset
+  %writer_base = index.cast %writer_bound : i64 to offset
+  %reader = index.add %reader_base, %layer_bytes : offset
+  %writer = index.add %writer_base, %layer_bytes : offset
+  %zero32 = scalar.constant 0 : i32
+  %fresh = scalar.cmpi eq, %start32, %zero32 : i32
+  func.return %reader, %writer, %fresh : offset, offset, i1
+}
+
+// Read the start position and retained row for a trusted live token's span.
+func.def inline @qwen35_gdn_decode_span(%metadata: buffer, %span_capacity: index, %span: index) -> (i32, index) {
+  %packet_origin = index.constant 16 : offset
+  %bounded_span = index.assume %span [lt(%span, %span_capacity)] : index
+  %packets = buffer.view %metadata[%packet_origin] : buffer -> view<[%span_capacity]x9xi32>
+  %start32 = view.load %packets[%bounded_span, 1] : view<[%span_capacity]x9xi32> -> i32
+  %row32 = view.load %packets[%bounded_span, 3] : view<[%span_capacity]x9xi32> -> i32
+  %row_bound = scalar.assume %row32 [range(%row32, 0, 2147483646)] : i32
+  %row = index.cast %row_bound : i32 to index
+  func.return %start32, %row : i32, index
+}
+
+// Convolve, activate, and publish one channel and its shifted history.
+func.def inline @qwen35_gdn_decode_channel(%channels: index, %channel: index, %fresh: i1, %history_read: offset, %history_write: offset, %arena: buffer, %qkv: buffer, %weight: buffer, %output: buffer) -> (f32) {
+  %origin = index.constant 0 : offset
+  %token = index.constant 0 : index
+  %c0f = scalar.constant 0.0 : f32
+  %old_history = buffer.view %arena[%history_read] : buffer -> view<3x[%channels]xf32>
+  %new_history = buffer.view %arena[%history_write] : buffer -> view<3x[%channels]xf32>
+  %inputs = buffer.view %qkv[%origin] : buffer -> view<1x[%channels]xf32>
+  %outputs = buffer.view %output[%origin] : buffer -> view<1x[%channels]xf32>
+  %weights = buffer.view %weight[%origin] : buffer -> view<[%channels]x4xf32>
+  %history0, %history1, %history2 = scf.if %fresh -> (f32, f32, f32) {
+    scf.yield %c0f, %c0f, %c0f : f32, f32, f32
+  } else {
+    %old0 = view.load %old_history[0, %channel] : view<3x[%channels]xf32> -> f32
+    %old1 = view.load %old_history[1, %channel] : view<3x[%channels]xf32> -> f32
+    %old2 = view.load %old_history[2, %channel] : view<3x[%channels]xf32> -> f32
+    scf.yield %old0, %old1, %old2 : f32, f32, f32
+  }
+  %current = view.load %inputs[%token, %channel] : view<1x[%channels]xf32> -> f32
+  %weight0 = view.load %weights[%channel, 0] : view<[%channels]x4xf32> -> f32
+  %weight1 = view.load %weights[%channel, 1] : view<[%channels]x4xf32> -> f32
+  %weight2 = view.load %weights[%channel, 2] : view<[%channels]x4xf32> -> f32
+  %weight3 = view.load %weights[%channel, 3] : view<[%channels]x4xf32> -> f32
+  %product0 = scalar.mulf %weight0, %history0 : f32
+  %sum0 = scalar.addf %product0, %c0f : f32
+  %product1 = scalar.mulf %weight1, %history1 : f32
+  %sum1 = scalar.addf %product1, %sum0 : f32
+  %product2 = scalar.mulf %weight2, %history2 : f32
+  %sum2 = scalar.addf %product2, %sum1 : f32
+  %product3 = scalar.mulf %weight3, %current : f32
+  %convolved = scalar.addf %product3, %sum2 : f32
+  %sigmoid = scalar.logisticf<afn> %convolved : f32
+  %activated = scalar.mulf %convolved, %sigmoid : f32
+  view.store %activated, %outputs[%token, %channel] : f32, view<1x[%channels]xf32>
+  view.store %history1, %new_history[0, %channel] : f32, view<3x[%channels]xf32>
+  view.store %history2, %new_history[1, %channel] : f32, view<3x[%channels]xf32>
+  view.store %current, %new_history[2, %channel] : f32, view<3x[%channels]xf32>
+  func.return %activated : f32
+}
+
+kernel.def export("qwen35_gdn_decode_prepare") @qwen35_gdn_decode_prepare(%value_heads_arg: index) {
+  %value_heads = index.assume %value_heads_arg [range(%value_heads_arg, 16, 64), multiple_of(%value_heads_arg, 16)] : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %value_groups = index.mul %value_heads, %c4 : index
+  %groups_value = index.add %c32, %value_groups : index
+  %groups = index.assume %groups_value [range(%groups_value, 96, 288), multiple_of(%groups_value, 32)] : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%value_heads_arg: index, %span_capacity_arg: index, %layer_arg: index, %metadata: buffer, %info: buffer, %origins: buffer, %arena: buffer, %qkv: buffer, %weight: buffer, %output: buffer, %inverse: buffer) {
+  %value_heads = index.assume %value_heads_arg [range(%value_heads_arg, 16, 64), multiple_of(%value_heads_arg, 16)] : index
+  %span_capacity = index.assume %span_capacity_arg [range(%span_capacity_arg, 1, 8192)] : index
+  %layer = index.assume %layer_arg [range(%layer_arg, 0, 255)] : index
+  %group_value = kernel.workgroup.id<x> : index
+  %group_count = kernel.workgroup.count<x> : index
+  %group = index.assume %group_value [lt(%group_value, %group_count)] : index
+  %lane_value = kernel.workitem.id<x> : index
+  %lane = index.assume %lane_value [range(%lane_value, 0, 31)] : index
+  %origin = index.constant 0 : offset
+  %token = index.constant 0 : index
+  %zero32 = scalar.constant 0 : i32
+  %c0f = scalar.constant 0.0 : f32
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c96 = index.constant 96 : index
+  %c128 = index.constant 128 : index
+  %qk_channels = index.constant 4096 : index
+  %state_elements_per_head = index.constant 16384 : index
+  %value_channels = index.mul %value_heads, %c128 : index
+  %channels_value = index.add %qk_channels, %value_channels : index
+  %channels = index.assume %channels_value [range(%channels_value, 6144, 12288), multiple_of(%channels_value, 128)] : index
+  %state_elements = index.mul %value_heads, %state_elements_per_head : index
+  %element_bytes = index.constant 4 : offset
+  %history_origin = index.scale %state_elements, %element_bytes : index, offset -> offset
+  %history_elements = index.mul %channels, %c3 : index
+  %history_bytes = index.scale %history_elements, %element_bytes : index, offset -> offset
+  %layer_stride = index.add %history_origin, %history_bytes : offset
+  %layer_bytes = index.scale %layer, %layer_stride : index, offset -> offset
+  %token_info = buffer.view %info[%origin] : buffer -> view<4xi32>
+  %live32 = view.load %token_info[2] : view<4xi32> -> i32
+  %span32 = view.load %token_info[3] : view<4xi32> -> i32
+  %live = scalar.cmpi ne, %live32, %zero32 : i32
+  %is_query = index.cmp ult, %group, %c16 : index
+  %is_query_key = index.cmp ult, %group, %c32 : index
+  %square_sum, %norm_slot = scf.if %live -> (f32, index) {
+    %span_bound = scalar.assume %span32 [range(%span32, 0, 8191)] : i32
+    %span = index.cast %span_bound : i32 to index
+    %start32, %row = func.call @qwen35_gdn_decode_span(%metadata, %span_capacity, %span) : (buffer, index, index) -> (i32, index)
+    %reader, %writer, %fresh = func.call @qwen35_gdn_decode_slots(%origins, %row, %start32, %layer_bytes) : (buffer, index, i32, offset) -> (offset, offset, i1)
+    %history_read = index.add %reader, %history_origin : offset
+    %history_write = index.add %writer, %history_origin : offset
+    %local_sum, %local_slot = scf.if %is_query_key -> (f32, index) {
+      %head_value = index.rem %group, %c16 : index
+      %head = index.assume %head_value [range(%head_value, 0, 15)] : index
+      %head_base = index.mul %head, %c128 : index
+      %key_base = index.constant 2048 : index
+      %type_base = scf.select %is_query, %token, %key_base : index
+      %channel_base = index.add %type_base, %head_base : index
+      %channel0_value = index.add %channel_base, %lane : index
+      %channel0 = index.assume %channel0_value [range(%channel0_value, 0, 4095)] : index
+      %lane1 = index.add %lane, %c32 : index
+      %channel1_value = index.add %channel_base, %lane1 : index
+      %channel1 = index.assume %channel1_value [range(%channel1_value, 0, 4095)] : index
+      %lane2 = index.add %lane, %c64 : index
+      %channel2_value = index.add %channel_base, %lane2 : index
+      %channel2 = index.assume %channel2_value [range(%channel2_value, 0, 4095)] : index
+      %lane3 = index.add %lane, %c96 : index
+      %channel3_value = index.add %channel_base, %lane3 : index
+      %channel3 = index.assume %channel3_value [range(%channel3_value, 0, 4095)] : index
+      %value0 = func.call @qwen35_gdn_decode_channel(%channels, %channel0, %fresh, %history_read, %history_write, %arena, %qkv, %weight, %output) : (index, index, i1, offset, offset, buffer, buffer, buffer, buffer) -> (f32)
+      %value1 = func.call @qwen35_gdn_decode_channel(%channels, %channel1, %fresh, %history_read, %history_write, %arena, %qkv, %weight, %output) : (index, index, i1, offset, offset, buffer, buffer, buffer, buffer) -> (f32)
+      %value2 = func.call @qwen35_gdn_decode_channel(%channels, %channel2, %fresh, %history_read, %history_write, %arena, %qkv, %weight, %output) : (index, index, i1, offset, offset, buffer, buffer, buffer, buffer) -> (f32)
+      %value3 = func.call @qwen35_gdn_decode_channel(%channels, %channel3, %fresh, %history_read, %history_write, %arena, %qkv, %weight, %output) : (index, index, i1, offset, offset, buffer, buffer, buffer, buffer) -> (f32)
+      %square0 = scalar.mulf %value0, %value0 : f32
+      %sum0 = scalar.addf %square0, %c0f : f32
+      %square1 = scalar.mulf %value1, %value1 : f32
+      %sum1 = scalar.addf %square1, %sum0 : f32
+      %square2 = scalar.mulf %value2, %value2 : f32
+      %sum2 = scalar.addf %square2, %sum1 : f32
+      %square3 = scalar.mulf %value3, %value3 : f32
+      %sum3 = scalar.addf %square3, %sum2 : f32
+      %query_slot = index.mul %head, %c2 : index
+      %key_slot = index.add %query_slot, %c1 : index
+      %slot = scf.select %is_query, %query_slot, %key_slot : index
+      scf.yield %sum3, %slot : f32, index
+    } else {
+      %value_group_value = index.sub %group, %c32 : index
+      %value_groups = index.mul %value_heads, %c4 : index
+      %value_group = index.assume %value_group_value [ge(%value_group_value, 0), lt(%value_group_value, %value_groups)] : index
+      %value_channel = index.madd %value_group, %c32, %lane : index
+      %channel_value = index.add %qk_channels, %value_channel : index
+      %channel = index.assume %channel_value [ge(%channel_value, %qk_channels), lt(%channel_value, %channels)] : index
+      %value = func.call @qwen35_gdn_decode_channel(%channels, %channel, %fresh, %history_read, %history_write, %arena, %qkv, %weight, %output) : (index, index, i1, offset, offset, buffer, buffer, buffer, buffer) -> (f32)
+      scf.yield %c0f, %token : f32, index
+    }
+    scf.yield %local_sum, %local_slot : f32, index
+  } else {
+    scf.yield %c0f, %token : f32, index
+  }
+  scf.if %is_query_key {
+    %sum = kernel.subgroup.reduce<addf> %square_sum : f32
+    %leader = index.cmp eq, %lane, %token : index
+    %publish = scalar.andi %live, %leader : i1
+    scf.if %publish {
+      %epsilon = scalar.constant 9.9999999747524271e-07 : f32
+      %stable = scalar.addf %sum, %epsilon : f32
+      %inverse_value = scalar.rsqrtf<afn> %stable : f32
+      %inverse_values = buffer.view %inverse[%origin] : buffer -> view<32xf32>
+      view.store %inverse_value, %inverse_values[%norm_slot] : f32, view<32xf32>
+    }
+  }
+  kernel.return
+}
