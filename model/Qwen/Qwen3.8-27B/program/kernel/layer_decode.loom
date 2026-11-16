@@ -5,6 +5,10 @@
 
 template.decl @normalization.rms_row_f32(%width: index, %threads: index, %input_origin: offset, %output_origin: offset, %output_f16: i1, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer)
 
+template.decl @normalization.rms_row_f32.values(%width: index, %threads: index, %packet_count: index, %input_origin: offset, %epsilon: f32, %input: buffer, %weight: buffer) -> (vector<[%packet_count]x4xf32>)
+
+template.decl @ggml.quantize_q8_1_x4.group_values(%publish_output: i1, %group_count: index, %cohort_count: index, %cohort: index, %group: index, %lane: index, %input_values: vector<4xf32>, %output: buffer)
+
 template.decl @qwen38.rmsnorm_f32.row(%input_row_count: index, %input_row: index, %output_origin: offset, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer)
 
 // Elementwise and normalization primitives shared by Qwen3.8 decode layers.
@@ -34,6 +38,46 @@ kernel.def export("qwen38_rmsnorm_f32_decode") @qwen38_rmsnorm_f32_decode() {
   %c1 = index.constant 1 : index
   %origin = index.constant 0 : offset
   template.apply<@qwen38.rmsnorm_f32.row>(%c1, %c0, %origin, %epsilon, %input, %weight, %output) : (index, index, offset, f32, buffer, buffer, buffer)
+  kernel.return
+}
+
+// Normalizes one decode row and publishes both its ordinary F32 boundary and
+// canonical GGML Q8_1 x4 representation from the retained result packets.
+// Each adjacent 32-lane cohort owns one complete 128-value physical Q8 group;
+// five packets across eight cohorts cover the 5120-value row without another
+// global-memory read or dispatch.
+kernel.def export("qwen38_rmsnorm_q8_1_x4_f32_decode") @qwen38_rmsnorm_q8_1_x4_f32_decode() {
+  %unit = index.constant 1 : index
+  %workgroup_size = index.constant 256 : index
+  kernel.launch.config workgroups(%unit, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%epsilon: f32, %input: buffer, %weight: buffer, %output_f32: buffer, %output_q8: buffer) {
+  %width = index.constant 5120 : index
+  %threads = index.constant 256 : index
+  %packet_count = index.constant 5 : index
+  %cohort_count = index.constant 8 : index
+  %group_count = index.constant 40 : index
+  %lanes_per_cohort = index.constant 32 : index
+  %elements_per_vector = index.constant 4 : index
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %origin = index.constant 0 : offset
+  %publish_output = scalar.constant 1 : i1
+  %lane = kernel.workitem.id<x> : index
+  %cohort0 = index.div %lane, %lanes_per_cohort : index
+  %cohort = index.assume %cohort0 [range(%cohort0, 0, 7)] : index
+  %cohort_lane0 = index.rem %lane, %lanes_per_cohort : index
+  %cohort_lane = index.assume %cohort_lane0 [range(%cohort_lane0, 0, 31)] : index
+  %input_noalias, %weight_noalias, %output_f32_noalias, %output_q8_noalias = buffer.assume.noalias %input, %weight, %output_f32, %output_q8 : buffer, buffer, buffer, buffer
+  %results = template.apply<@normalization.rms_row_f32.values>(%width, %threads, %packet_count, %origin, %epsilon, %input_noalias, %weight_noalias) : (index, index, index, offset, f32, buffer, buffer) -> (vector<[%packet_count]x4xf32>)
+  %output_view = buffer.view %output_f32_noalias[%origin] : buffer -> view<5120xf32>
+  scf.for %packet = [%begin to %packet_count step %step] unroll {
+    %ordinal = index.madd %packet, %threads, %lane : index
+    %element = index.mul %ordinal, %elements_per_vector : index
+    %values = vector.extract %results[%packet] : vector<[%packet_count]x4xf32> -> vector<4xf32>
+    vector.store %values, %output_view[%element] : vector<4xf32>, view<5120xf32>
+    %group = index.madd %packet, %cohort_count, %cohort : index
+    template.apply<@ggml.quantize_q8_1_x4.group_values>(%publish_output, %group_count, %cohort_count, %cohort, %group, %cohort_lane, %values, %output_q8_noalias) : (i1, index, index, index, index, index, vector<4xf32>, buffer)
+  }
   kernel.return
 }
 
