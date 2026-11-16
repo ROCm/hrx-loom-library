@@ -30,12 +30,14 @@ first rounding weights to F16 or materializing an expanded tensor.
 
 The Q6_K/Q8_1 x4 panel template retains a row-by-panel accumulator bank around
 that same block decoder. Immutable weight packets serve the row cohort, and
-activation packets serve multiple output panels. The caller fixes the bank
-shape, provides 256-workitem groups, and chooses their population. Groups
+activation packets serve multiple output panels. The caller specializes a
+cohort of 1–32 rows, provides 256-workitem groups, and chooses their population.
+The motif derives its bounded accumulator bank and useful grid from that row
+count, so launch geometry and traversal share one shape contract. Groups
 stride over output tiles; partial tiles mask channels before loads and stores
 while keeping clustered reductions outside the divergent mask. K and N remain
 arguments, and the execution context supplies subgroup width. This template
-owns neither a launch-budget policy nor a concrete target record.
+does not choose the caller's worker budget or a concrete target record.
 
 Q8_0 contracts raw signed-byte records with Q8_1 x4 activations. Eight lanes
 own one 32-value block, so a subgroup advances four blocks on wave32 or eight

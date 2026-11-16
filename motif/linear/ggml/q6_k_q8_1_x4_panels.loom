@@ -3,11 +3,13 @@
 
 // Bounded Q6_K contractions over Q8_1 x4 row cohorts.
 //
-// The caller specializes rows (1..32) and panels (1..4), and supplies K
+// The caller specializes rows (1..32), and supplies K
 // (256..32768, divisible by 256), N (1..262144), and disjoint buffers:
 // rows*K/128*144 activation bytes, N*K/256*210 weight bytes, and rows*N F32
 // results. Each 256-workitem group contains eight logical 32-lane clusters
-// on a 32- or 64-lane subgroup. A cluster retains rows*panels accumulators;
+// on a 32- or 64-lane subgroup. Cohorts of 1..4 rows retain four output
+// panels, 5..8 retain two, and 9..32 retain one. This bounds each cluster's
+// accumulator bank while sharing weights across every row in the cohort;
 // decoded weights serve every row, and activations serve every output panel.
 // No expanded weights, scratch partials, or extra weight pass are required.
 //
@@ -19,12 +21,41 @@
 
 func.decl @ggml_q6k_q8_1_x4_block_lane(%weight: buffer, %weight_row_byte_base: offset, %q8_input: buffer, %q8_row_byte_base: offset, %q6_block: index, %lane: index) -> (f32)
 
-template.decl @ggml.q6k.q8_1_x4.panels.body(%row_count: index, %panel_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer)
+func.def pure inline @panel_count(%row_count: index) -> (index) {
+  %rows = index.assume %row_count [range(%row_count, 1, 32)] : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %small = index.cmp ule, %rows, %c4 : index
+  %medium = index.cmp ule, %rows, %c8 : index
+  %large_panels = scf.select %medium, %c2, %c1 : index
+  %panels = scf.select %small, %c4, %large_panels : index
+  func.return %panels : index
+}
 
-template.def<@ggml.q6k.q8_1_x4.panels.body> device @ggml_q6k_q8_1_x4_panels_body(%row_count: index, %panel_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer) {
+// Launch geometry and the contraction share the same accumulator-bank shape.
+// The caller supplies its admitted worker budget; this clamps to useful tiles.
+func.def public pure inline @ggml_q6k_q8_1_x4_panel_grid(%rows: index, %output_size: index, %workgroup_budget: index) -> (index) {
+  %outputs = index.assume %output_size [range(%output_size, 1, 262144)] : index
+  %budget = index.assume %workgroup_budget [range(%workgroup_budget, 1, 10000)] : index
+  %panels = func.call pure @panel_count(%rows) : (index) -> (index)
+  %c1 = index.constant 1 : index
+  %clusters = index.constant 8 : index
+  %tile_width = index.mul %panels, %clusters : index
+  %padding = index.sub %tile_width, %c1 : index
+  %padded_outputs = index.add %outputs, %padding : index
+  %tiles = index.div %padded_outputs, %tile_width : index
+  %groups = index.min %tiles, %budget : index
+  func.return %groups : index
+}
+
+template.decl @ggml.q6k.q8_1_x4.panels.body(%row_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer)
+
+template.def<@ggml.q6k.q8_1_x4.panels.body> device @ggml_q6k_q8_1_x4_panels_body(%row_count: index, %input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer) {
   %input_noalias, %weight_noalias, %output_noalias = buffer.assume.noalias %input, %weight, %output : buffer, buffer, buffer
   %rows = index.assume %row_count [range(%row_count, 1, 32)] : index
-  %panels = index.assume %panel_count [range(%panel_count, 1, 4)] : index
+  %panels = func.call pure @panel_count(%rows) : (index) -> (index)
   %inputs = index.assume %input_size [range(%input_size, 256, 32768), multiple_of(%input_size, 256)] : index
   %outputs = index.assume %output_size [range(%output_size, 1, 262144)] : index
   %group = kernel.workgroup.id<x> : index
