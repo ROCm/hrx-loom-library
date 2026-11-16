@@ -6,11 +6,15 @@ and frame normalization; it does not reuse the device reduction loop.
 membership, and EOF. Their benchmark declarations name these same bounded
 workloads without claiming measured performance.
 
+The model kernels omit authored targets and specialize for the selected device.
+The checked kernels have no GFX11-specific matrix layout or subgroup-width
+requirement; the AMDGPU execution profile owns device selection.
+
 `transcription_check.py` exercises current built model programs through the real
 HTTP server. Bazel supplies the card, acquisition lock, providers, checker,
 server, test helpers, and small PCM/reference files. The caller supplies runtime
 assets through `LOOM_MODEL_ASSETS`; full checkpoints never enter action inputs,
-runfiles, or retained test outputs. The three `transcription_*_test` targets use
+runfiles, or retained test outputs. The two `transcription_*_test` targets use
 normal Bazel caching. They are explicit `manual` targets because their runner
 needs provisioned assets and an AMDGPU device.
 The [developer workflow](../README.md) shows asset provisioning and full-service
