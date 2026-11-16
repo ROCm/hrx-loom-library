@@ -8,6 +8,13 @@ Shared [projection](../../../../kernel/ggml/linear/test/),
 reusable numerical and protocol contracts. Model tests add only the boundaries
 those packages cannot establish independently.
 
+DFlash publication scenarios cover all seven draft depths using the same
+scalar oracle. Three request slots expose partial-vector tails, while poisoned
+storage checks the exact reservation boundary. Empty, mixed, and generated
+cohorts check compact offsets independently of resident rows. Attention checks
+cover short, intermediate, and full blocks against the F64 reference, including
+the retained-context window boundary.
+
 The fixed-depth Q5 projection scenarios call the production commands and check
 them against a scalar-byte GGUF decoder with ordered F64 accumulation. Random
 packed fields, dyadic block scales, and signed unit activations make every F16

@@ -3,6 +3,8 @@
 // anchor tokens, and resident rows stay distinct. Selection rows and accepted
 // results preserve that correspondence.
 
+config.decl @runner.qwen38.verification_width : %value: index where [range(%value, 2, 8)]
+
 config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
 
 func.decl @qwen38_input_token(%mixed: index, %capacity: index, %inputs: buffer, %input: index) -> (i32)
@@ -28,8 +30,8 @@ kernel.def @qwen38_dflash_proposal_prepare() {
   %descriptor_origin = index.constant 12 : offset
   %packet_capacity = config.get @qwen38.packet_capacity : index
   %slots = config.get @runner.qwen38.span_capacity : index
-  %proposal_width = index.constant 8 : index
-  %capacity = index.mul %slots, %proposal_width : index
+  %verification_width = config.get @runner.qwen38.verification_width : index
+  %capacity = index.mul %slots, %verification_width : index
   %options_origin = func.call @qwen38_packet_options_origin(%packet_capacity) : (index) -> (offset)
   %input = buffer.assume.memory_space<constant> %epoch : buffer
   %header = buffer.view %input[%origin] : buffer -> view<3xi32>
@@ -44,14 +46,19 @@ kernel.def @qwen38_dflash_proposal_prepare() {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c4 = index.constant 4 : index
-  %c7 = index.constant 7 : index
-  %c8 = index.constant 8 : index
+  %draft_depth = index.sub %verification_width, %c1 : index
   %c0_2 = scalar.constant 0 : i32
-  %c8_2 = scalar.constant 8 : i32
+  %width_word = index.cast %verification_width : index to i32
   %generated_word = scalar.constant 2 : i32
   %masks = vector.splati 248070 : vector<4xi32>
-  scf.for %token = [%c0 to %capacity step %c4] {
+  %chunks = index.div %capacity, %c4 : index
+  %vector_end = index.mul %chunks, %c4 : index
+  scf.for %token = [%c0 to %vector_end step %c4] {
     vector.store %masks, %inputs[%token] : vector<4xi32>, view<[%capacity]xi32>
+  }
+  %mask = scalar.constant 248070 : i32
+  scf.for %token = [%vector_end to %capacity step %c1] {
+    view.store %mask, %inputs[%token] : i32, view<[%capacity]xi32>
   }
   scf.for %slot = [%c0 to %slots step %c1] {
     view.store %c0_2, %anchor_view[%slot] : i32, view<[%slots]xi32>
@@ -71,11 +78,11 @@ kernel.def @qwen38_dflash_proposal_prepare() {
       %begin_value = index.cast %begin_word : i32 to index
       %begin = index.assume %begin_value [ge(%begin_value, 0), lt(%begin_value, %packet_capacity)] : index
       %anchor = func.call @qwen38_input_token(%mixed_inputs, %packet_capacity, %target_tokens, %begin) : (index, index, buffer, index) -> (i32)
-      %draft_begin = index.mul %slot, %c8 : index
+      %draft_begin = index.mul %slot, %verification_width : index
       %draft_begin_word = index.cast %draft_begin : index to i32
-      %selection_begin = index.mul %slot, %c7 : index
+      %selection_begin = index.mul %slot, %draft_depth : index
       %selection_word = index.cast %selection_begin : index to i32
-      view.store %c8_2, %draft_spans[%slot, 0] : i32, view<[%slots]x6xi32>
+      view.store %width_word, %draft_spans[%slot, 0] : i32, view<[%slots]x6xi32>
       view.store %position, %draft_spans[%slot, 1] : i32, view<[%slots]x6xi32>
       view.store %draft_begin_word, %draft_spans[%slot, 2] : i32, view<[%slots]x6xi32>
       view.store %row, %draft_spans[%slot, 3] : i32, view<[%slots]x6xi32>
@@ -91,8 +98,8 @@ kernel.def @qwen38_dflash_proposal_prepare() {
     }
     scf.yield %next : index
   }
-  %token_count = index.mul %count, %c8 : index
-  %selection_count = index.mul %count, %c7 : index
+  %token_count = index.mul %count, %verification_width : index
+  %selection_count = index.mul %count, %draft_depth : index
   %count_word = index.cast %count : index to i32
   %token_word = index.cast %token_count : index to i32
   %selection_word = index.cast %selection_count : index to i32
@@ -108,10 +115,12 @@ kernel.def @qwen38_dflash_proposal_prepare() {
 // Remove the anchor activation from each independent block before the output
 // head. Padded rows are explicitly zero, never stale proposal storage.
 kernel.def @qwen38_dflash_selection_rows(%blocks: index) {
-  %c7 = index.constant 7 : index
+  %verification_width = config.get @runner.qwen38.verification_width : index
+  %anchor_count = index.constant 1 : index
+  %draft_depth = index.sub %verification_width, %anchor_count : index
   %c1 = index.constant 1 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%c7, %blocks, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%draft_depth, %blocks, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%blocks: index, %draft: buffer, %normalized: buffer, %output: buffer) {
   %block0 = kernel.workgroup.id<y> : index
   %block = index.assume %block0 [ge(%block0, 0), lt(%block0, %blocks)] : index
@@ -129,18 +138,20 @@ kernel.def @qwen38_dflash_selection_rows(%blocks: index) {
   %count_word = view.load %header[1] : view<3xi32> -> i32
   %count = index.cast %count_word : i32 to index
   %active = index.cmp ult, %block, %count : index
-  %input = buffer.view %normalized[%origin] : buffer -> view<[%blocks]x8x5120xf32>
-  %result = buffer.view %output[%origin] : buffer -> view<[%blocks]x7x5120xf32>
+  %verification_width = config.get @runner.qwen38.verification_width : index
+  %draft_depth = index.sub %verification_width, %c1 : index
+  %input = buffer.view %normalized[%origin] : buffer -> view<[%blocks]x[%verification_width]x5120xf32>
+  %result = buffer.view %output[%origin] : buffer -> view<[%blocks]x[%draft_depth]x5120xf32>
   %source_position = index.add %position, %c1 : index
   %c0_0 = vector.splatf 0.0 : vector<4xf32>
   scf.for %channel = [%first to %width step %stride] {
     %value = scf.if %active -> (vector<4xf32>) {
-      %value = vector.load %input[%block, %source_position, %channel] : view<[%blocks]x8x5120xf32> -> vector<4xf32>
+      %value = vector.load %input[%block, %source_position, %channel] : view<[%blocks]x[%verification_width]x5120xf32> -> vector<4xf32>
       scf.yield %value : vector<4xf32>
     } else {
       scf.yield %c0_0 : vector<4xf32>
     }
-    vector.store %value, %result[%block, %position, %channel] : vector<4xf32>, view<[%blocks]x7x5120xf32>
+    vector.store %value, %result[%block, %position, %channel] : vector<4xf32>, view<[%blocks]x[%draft_depth]x5120xf32>
   }
   kernel.return
 }
@@ -172,7 +183,7 @@ kernel.def @qwen38_dflash_proposal_publish() {
   %owner = index.cmp eq, %slot, %observation_owner : index
   scf.if %owner {
     %tokens = view.load %header[0] : view<3xi32> -> i32
-    %block = index.constant 8 : index
+    %block = config.get @runner.qwen38.verification_width : index
     %shape = index.mul %slots, %block : index
     %first_step = index.constant 0 : index
     func.call @qwen38_feedback_proposal(%results, %first_step, %tokens, %shape) : (buffer, index, i32, index)
@@ -180,17 +191,19 @@ kernel.def @qwen38_dflash_proposal_publish() {
   %active = index.cmp ult, %slot, %count : index
   scf.if %active {
     %mapping = buffer.view %origins[%origin] : buffer -> view<[%slots]xi32>
-    %predictions = buffer.view %proposals[%origin] : buffer -> view<[%count]x7xi32>
+    %verification_width = config.get @runner.qwen38.verification_width : index
+    %anchor_count = index.constant 1 : index
+    %draft_depth = index.sub %verification_width, %anchor_count : index
+    %predictions = buffer.view %proposals[%origin] : buffer -> view<[%count]x[%draft_depth]xi32>
 
     %begin_word = view.load %mapping[%slot] : view<[%slots]xi32> -> i32
     %begin_value = index.cast %begin_word : i32 to index
     %begin = index.assume %begin_value [ge(%begin_value, 0), lt(%begin_value, %capacity)] : index
     %c0 = index.constant 0 : index
     %c1 = index.constant 1 : index
-    %c7 = index.constant 7 : index
     %first = index.add %begin, %c1 : index
-    scf.for %position = [%c0 to %c7 step %c1] {
-      %token = view.load %predictions[%slot, %position] : view<[%count]x7xi32> -> i32
+    scf.for %position = [%c0 to %draft_depth step %c1] {
+      %token = view.load %predictions[%slot, %position] : view<[%count]x[%draft_depth]xi32> -> i32
       %destination = index.add %first, %position : index
       func.call @qwen38_input_store_token(%mixed_inputs, %capacity, %target_tokens, %destination, %token) : (index, index, buffer, index, i32)
     }

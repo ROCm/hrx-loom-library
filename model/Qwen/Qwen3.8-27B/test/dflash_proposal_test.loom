@@ -4,8 +4,21 @@ kernel.decl @qwen38_dflash_proposal_publish() launch(%draft: buffer, %origins: b
 
 kernel.decl @qwen38_dflash_selection_rows(%blocks: index) launch(%blocks_argument: index, %draft: buffer, %normalized: buffer, %output: buffer)
 
-// Sixteen mixed spans pack long known inputs and eight-token verification
-// spans. Reversed resident rows distinguish cache rows from compact slots.
+config.decl @runner.qwen38.verification_width : %value: index where [range(%value, 2, 8)]
+
+config.decl @runner.qwen38.span_capacity : %value: index where [range(%value, 1, 2147483647)]
+
+func.def @tested_block_shape() -> (index, index, index) {
+  %width = config.get @runner.qwen38.verification_width : index
+  %anchor_count = index.constant 1 : index
+  %depth = index.sub %width, %anchor_count : index
+  %slots = config.get @runner.qwen38.span_capacity : index
+  func.return %width, %depth, %slots : index, index, index
+}
+
+// Mixed spans combine known inputs with verification blocks. Reversed resident
+// rows distinguish cache rows from compact slots. The odd span capacity makes
+// short neural reservations exercise scalar tails; untouched storage is poison.
 func.def @dflash_epoch_fixture(%trial: index, %epoch: buffer) {
   %origin = index.constant 0 : offset
   %descriptor_origin = index.constant 12 : offset
@@ -16,19 +29,19 @@ func.def @dflash_epoch_fixture(%trial: index, %epoch: buffer) {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
-  %c16 = index.constant 16 : index
+  %slots = config.get @runner.qwen38.span_capacity : index
   %stride = index.constant 32 : index
-  %c8 = index.constant 8 : index
-  %last = index.constant 15 : index
+  %verification_width = config.get @runner.qwen38.verification_width : index
+  %last = index.sub %slots, %c1 : index
   %base = index.constant 100 : index
   %source_base = index.constant 23 : index
   %all = index.cmp eq, %trial, %c2 : index
   %mixed = index.cmp eq, %trial, %c1 : index
-  %n = scalar.constant 16 : i32
+  %n = index.cast %slots : index to i32
   %generated = scalar.constant 2 : i32
   %c0_2 = scalar.constant 0 : i32
   view.store %n, %header[1] : i32, view<3xi32>
-  %end = scf.for %i = [%c0 to %c16 step %c1](%begin = %c0 : index) -> (index) {
+  %end = scf.for %i = [%c0 to %slots step %c1](%begin = %c0 : index) -> (index) {
     %parity = index.rem %i, %c2 : index
     %odd = index.cmp eq, %parity, %c1 : index
     %some = scalar.andi %mixed, %odd : i1
@@ -36,7 +49,7 @@ func.def @dflash_epoch_fixture(%trial: index, %epoch: buffer) {
     %flag = index.cast %parity : index to i32
     %mode = scf.select %selected, %generated, %flag : i32
     %verification = scalar.cmpi ne, %mode, %c0_2 : i32
-    %extent = scf.select %verification, %c8, %stride : index
+    %extent = scf.select %verification, %verification_width, %stride : index
     %length = index.cast %extent : index to i32
     %row = index.sub %last, %i : index
     %position = index.add %base, %i : index
@@ -77,13 +90,13 @@ func.def @dflash_prepare_reference(%epoch: buffer, %target_tokens: buffer, %draf
   %selected = buffer.view %selection[%origin] : buffer -> view<3xi32>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
-  %c7 = index.constant 7 : index
-  %c8 = index.constant 8 : index
-  %slots = index.constant 64 : index
-  %capacity = index.constant 512 : index
+  %verification_width = config.get @runner.qwen38.verification_width : index
+  %draft_depth = index.sub %verification_width, %c1 : index
+  %slots = config.get @runner.qwen38.span_capacity : index
+  %capacity = index.mul %slots, %verification_width : index
   %c0_2 = scalar.constant 0 : i32
   %c2_2 = scalar.constant 2 : i32
-  %c8_2 = scalar.constant 8 : i32
+  %width_word = index.cast %verification_width : index to i32
   %mask = scalar.constant 248070 : i32
   scf.for %i = [%c0 to %capacity step %c1] {
     view.store %mask, %inputs[%i] : i32, view<512xi32>
@@ -106,11 +119,11 @@ func.def @dflash_prepare_reference(%epoch: buffer, %target_tokens: buffer, %draf
       %position = view.load %spans[%i, 1] : view<64x6xi32> -> i32
       %row = view.load %spans[%i, 3] : view<64x6xi32> -> i32
       %source_position = view.load %spans[%i, 4] : view<64x6xi32> -> i32
-      %begin = index.mul %count, %c8 : index
-      %output = index.mul %count, %c7 : index
+      %begin = index.mul %count, %verification_width : index
+      %output = index.mul %count, %draft_depth : index
       %begin_word = index.cast %begin : index to i32
       %output_word = index.cast %output : index to i32
-      view.store %c8_2, %out_spans[%count, 0] : i32, view<64x6xi32>
+      view.store %width_word, %out_spans[%count, 0] : i32, view<64x6xi32>
       view.store %position, %out_spans[%count, 1] : i32, view<64x6xi32>
       view.store %begin_word, %out_spans[%count, 2] : i32, view<64x6xi32>
       view.store %row, %out_spans[%count, 3] : i32, view<64x6xi32>
@@ -126,8 +139,8 @@ func.def @dflash_prepare_reference(%epoch: buffer, %target_tokens: buffer, %draf
     }
     scf.yield %next : index
   }
-  %token_count = index.mul %count, %c8 : index
-  %selection_count = index.mul %count, %c7 : index
+  %token_count = index.mul %count, %verification_width : index
+  %selection_count = index.mul %count, %draft_depth : index
   %count_word = index.cast %count : index to i32
   %token_word = index.cast %token_count : index to i32
   %selection_word = index.cast %selection_count : index to i32
@@ -147,29 +160,32 @@ func.def @dflash_publish_reference(%draft: buffer, %origins: buffer, %proposals:
   %count0 = index.cast %count_word : i32 to index
   %count = index.assume %count0 [range(%count0, 0, 64)] : index
   %mapping = buffer.view %origins[%origin] : buffer -> view<64xi32>
-  %predictions = buffer.view %proposals[%origin] : buffer -> view<64x7xi32>
   %tokens = buffer.view %target_tokens[%origin] : buffer -> view<512xi32>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
-  %c7 = index.constant 7 : index
+  %width = config.get @runner.qwen38.verification_width : index
+  %draft_depth = index.sub %width, %c1 : index
+  %predictions = buffer.view %proposals[%origin] : buffer -> view<64x[%draft_depth]xi32>
   %step_origin = index.constant 32 : offset
   %observations = buffer.view %results[%step_origin] : buffer -> view<8xi32>
   %c1_i32 = scalar.constant 1 : i32
-  %block = scalar.constant 8 : i32
+  %block = index.cast %width : index to i32
   %tokens_processed = scalar.muli %count_word, %block : i32
   view.store %c1_i32, %observations[0] : i32, view<8xi32>
   view.store %tokens_processed, %observations[1] : i32, view<8xi32>
   %shape_origin = index.constant 116 : offset
   %shape = buffer.view %results[%shape_origin] : buffer -> view<1xi32>
-  %capacity_word = scalar.constant 512 : i32
+  %slots = config.get @runner.qwen38.span_capacity : index
+  %slots_word = index.cast %slots : index to i32
+  %capacity_word = scalar.muli %slots_word, %block : i32
   view.store %capacity_word, %shape[0] : i32, view<1xi32>
   scf.for %i = [%c0 to %count step %c1] {
     %begin_word = view.load %mapping[%i] : view<64xi32> -> i32
     %begin0 = index.cast %begin_word : i32 to index
     %begin = index.assume %begin0 [range(%begin0, 0, 504)] : index
     %first = index.add %begin, %c1 : index
-    scf.for %j = [%c0 to %c7 step %c1] {
-      %token = view.load %predictions[%i, %j] : view<64x7xi32> -> i32
+    scf.for %j = [%c0 to %draft_depth step %c1] {
+      %token = view.load %predictions[%i, %j] : view<64x[%draft_depth]xi32> -> i32
       %destination = index.add %first, %j : index
       view.store %token, %tokens[%destination] : i32, view<512xi32>
     }
@@ -182,25 +198,26 @@ func.def @dflash_rows_reference(%blocks: index, %draft: buffer, %normalized: buf
   %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
   %count_word = view.load %header[1] : view<3xi32> -> i32
   %count = index.cast %count_word : i32 to index
-  %input = buffer.view %normalized[%origin] : buffer -> view<[%blocks]x8x5120xf32>
-  %result = buffer.view %output[%origin] : buffer -> view<[%blocks]x7x5120xf32>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
-  %c7 = index.constant 7 : index
+  %block_width = config.get @runner.qwen38.verification_width : index
+  %draft_depth = index.sub %block_width, %c1 : index
+  %input = buffer.view %normalized[%origin] : buffer -> view<[%blocks]x[%block_width]x5120xf32>
+  %result = buffer.view %output[%origin] : buffer -> view<[%blocks]x[%draft_depth]x5120xf32>
   %width = index.constant 5120 : index
   %c0_0 = scalar.constant 0.0 : f32
   scf.for %block = [%c0 to %blocks step %c1] {
     %active = index.cmp ult, %block, %count : index
-    scf.for %position = [%c0 to %c7 step %c1] {
+    scf.for %position = [%c0 to %draft_depth step %c1] {
       %source = index.add %position, %c1 : index
       scf.for %channel = [%c0 to %width step %c1] {
         %value = scf.if %active -> (f32) {
-          %value = view.load %input[%block, %source, %channel] : view<[%blocks]x8x5120xf32> -> f32
+          %value = view.load %input[%block, %source, %channel] : view<[%blocks]x[%block_width]x5120xf32> -> f32
           scf.yield %value : f32
         } else {
           scf.yield %c0_0 : f32
         }
-        view.store %value, %result[%block, %position, %channel] : f32, view<[%blocks]x7x5120xf32>
+        view.store %value, %result[%block, %position, %channel] : f32, view<[%blocks]x[%draft_depth]x5120xf32>
       }
     }
   }
@@ -239,9 +256,10 @@ check.scenario public @dflash_proposal_publication {
     %inputs = check.generate.fill value(-99) : tensor<512xi32>
     %selection = check.generate.fill value(-99) : tensor<3xi32>
     check.generate<@dflash_prepare_reference>(%epoch, %target, %draft, %origins, %anchors, %inputs, %selection) : (tensor<14346xi32>, tensor<512xi32>, tensor<387xi32>, tensor<64xi32>, tensor<64xi32>, tensor<512xi32>, tensor<3xi32>) -> ()
-    %proposals = check.generate.iota offset(10000) step(1) : tensor<64x7xi32>
+    %width, %depth, %blocks = check.generate<@tested_block_shape>() : () -> (index, index, index)
+    %proposals = check.generate.iota offset(10000) step(1) : tensor<64x[%depth]xi32>
     %observations = check.generate.fill value(-99) : tensor<30xi32>
-    check.compare<@qwen38_dflash_proposal_publish, @dflash_publish_reference>(%draft, %origins, %proposals, %target, %observations) : (tensor<387xi32>, tensor<64xi32>, tensor<64x7xi32>, tensor<512xi32>, tensor<30xi32>) -> () {
+    check.compare<@qwen38_dflash_proposal_publish, @dflash_publish_reference>(%draft, %origins, %proposals, %target, %observations) : (tensor<387xi32>, tensor<64xi32>, tensor<64x[%depth]xi32>, tensor<512xi32>, tensor<30xi32>) -> () {
       check.expect.bitwise actual(%observations) expected(%observations) : tensor<30xi32>
       check.expect.bitwise actual(%target) expected(%target) : tensor<512xi32>
     }
@@ -260,11 +278,11 @@ check.scenario public @dflash_proposal_rows {
     %inputs = check.generate.fill value(-99) : tensor<512xi32>
     %selection = check.generate.fill value(-99) : tensor<3xi32>
     check.generate<@dflash_prepare_reference>(%epoch, %target, %draft, %origins, %anchors, %inputs, %selection) : (tensor<14346xi32>, tensor<512xi32>, tensor<387xi32>, tensor<64xi32>, tensor<64xi32>, tensor<512xi32>, tensor<3xi32>) -> ()
-    %blocks = check.literal value(16) : index
-    %normalized = check.generate.iota offset(0.0) step(1.52587890625e-05) : tensor<16x8x5120xf32>
-    %compact = check.generate.fill value(-99.0) : tensor<16x7x5120xf32>
-    check.compare<@qwen38_dflash_selection_rows, @dflash_rows_reference>[%blocks](%blocks, %draft, %normalized, %compact) : [index](index, tensor<387xi32>, tensor<16x8x5120xf32>, tensor<16x7x5120xf32>) -> () {
-      check.expect.bitwise actual(%compact) expected(%compact) : tensor<16x7x5120xf32>
+    %width, %depth, %blocks = check.generate<@tested_block_shape>() : () -> (index, index, index)
+    %normalized = check.generate.iota offset(0.0) step(1.52587890625e-05) : tensor<[%blocks]x[%width]x5120xf32>
+    %compact = check.generate.fill value(-99.0) : tensor<[%blocks]x[%depth]x5120xf32>
+    check.compare<@qwen38_dflash_selection_rows, @dflash_rows_reference>[%blocks](%blocks, %draft, %normalized, %compact) : [index](index, tensor<387xi32>, tensor<[%blocks]x[%width]x5120xf32>, tensor<[%blocks]x[%depth]x5120xf32>) -> () {
+      check.expect.bitwise actual(%compact) expected(%compact) : tensor<[%blocks]x[%depth]x5120xf32>
     }
   }
   check.return

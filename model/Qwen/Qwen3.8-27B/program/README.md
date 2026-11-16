@@ -21,6 +21,12 @@ predictor catch-up. DFlash2 uses a separate parameter scope, five target-layer
 feature taps, and proposal-private K/V. Only accepted features reach its
 retained context. Both strategies remain parts of the text service.
 
+DFlash2 supports `draft_depth` from one through seven, with seven as the
+default. Each proposal contains one anchor plus that many predicted positions.
+The selected width specializes convolution, bidirectional attention, candidate
+selection, and private storage together. Shorter blocks reduce proposal and
+verification work without changing the target's acceptance rule.
+
 ## Link and parameter boundaries
 
 `config` owns model defaults and concrete matrix target bindings. `kernel:numerics`
