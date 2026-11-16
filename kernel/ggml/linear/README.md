@@ -13,6 +13,20 @@ Each source documents its layouts, rounding, aliasing, and target requirements.
 A concrete fragment implementation cannot be made portable merely by changing
 its target flag.
 
+The small Q5_K/F16 entries fix a physical 16- or 32-row F32 input bank.
+Configuration supplies an enabled bit, K/N, and channel interleaving; execution
+supplies K/N, interleaving, and disjoint input/weight/output buffers. Zero
+disables the dispatch. Every physical row is initialized, even when fewer rows
+contain live requests. A worker shares one encoded K256 weight block across
+all rows and keeps F32 accumulators across the full contraction. Its 64-channel
+tiles use at most 512 groups for the admitted N range. Raw and channel-eight
+storage share one implementation; the caller's stage shape selects the entry.
+
+The small scenario checks independent byte decoding, exact input preservation,
+output guards, tails, and F16 conversion. The manual `q5_k_f16_small_stress`
+scenario benchmarks complete projections with a nonzero analytical oracle;
+large allocations and scalar reference contractions stay out of normal CI.
+
 The paired Q5_K/F16 entry consumes two weight banks and publishes SwiGLU
 directly. Its configuration supplies capacity, K/N, channel interleaving, and
 a positive worker budget. Execution receives the live row count and operands;

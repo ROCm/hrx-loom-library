@@ -67,6 +67,24 @@ These are reusable Loom schedules, qualified for correctness through the
 packed-byte semantics, addressing, and numerical results; they do not establish
 a throughput comparison against another implementation.
 
+## Small Q5_K matrices with F32 storage
+
+`q5_k_f16_small.loom` contracts a complete 16- or 32-row input bank against
+64 output channels. F32 activations and reconstructed weights round to F16;
+native matrix products accumulate and publish F32. Encoded K256 records and
+their affine metadata are staged once, then reused across eight K32 slices
+and every input row. Padded 40-half pitches keep fragment staging distinct
+from packed weight storage. The final contraction barrier retires readers
+before the encoded slab becomes a subgroup output transpose.
+
+Physical rows, K/N, and channel interleaving are explicit caller facts. The
+motif owns the subgroup partition for wave32 and wave64. Each staged K32
+panel feeds two K16 matrix instructions on gfx9.4, gfx11, and gfx12, or one
+K32 instruction on gfx12.5; the kernel leaf binds that native shape. A 16-row
+bank needs 21,760 bytes of workgroup storage;
+32 rows need 23,040. It chooses neither live request counts nor a model policy.
+The concrete small-row kernels own zero-dispatch behavior and entry selection.
+
 ## Paired Q5_K matrices with F16 storage
 
 `q5_k_f16_pair.loom` contracts two projections and publishes their SwiGLU

@@ -1,0 +1,162 @@
+// Exact-sized F32 row banks exercise 16/32-row matrix ownership, original and
+// channel-eight Q5_K records, an output-channel tail, and disabled dispatch.
+// The independent byte decoder rounds coefficients to F16 and accumulates in
+// F64. Activations lie just above +/-1/16 and +/-3/16, exercising F32-to-F16
+// rounding. Rounded products lie on a 2^-15 lattice. Native matrix arithmetic
+// has its own intermediate precision; the absolute bound is half that lattice.
+// Guards use -1024, whose nearest distinct F32 neighbor is farther away than
+// the bound, so the whole-arena comparison preserves guards exactly. Immutable
+// operands are bitwise checked. Large timings use an analytical scenario.
+
+config.decl @q5_small_test.rows : %value: index where [range(%value, 16, 32), multiple_of(%value, 16)]
+
+config.decl @q5_small_test.channels : %value: index where [range(%value, 1, 8)]
+
+kernel.decl @ggml_linear_q5k_f16_small_m16(%enabled: index, %configured_inputs: index, %configured_outputs: index, %configured_channels: index) launch(%inputs: index, %outputs: index, %channels: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q5k_f16_small_m32(%enabled: index, %configured_inputs: index, %configured_outputs: index, %configured_channels: index) launch(%inputs: index, %outputs: index, %channels: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @q5_f16_reference_dot(%rows: index, %inputs: index, %outputs: index, %channels: index, %row: index, %channel: index, %input: buffer, %weight: buffer) -> (f64)
+
+func.def pure inline @geometry(%configuration: index) -> (index, index, index, index, index, index, index) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %block = index.constant 256 : index
+  %odd_blocks = index.constant 768 : index
+  %short_outputs = index.constant 48 : index
+  %long_outputs = index.constant 80 : index
+  %block_bytes = index.constant 176 : index
+  %guards = index.constant 8 : index
+  %rows = config.get @q5_small_test.rows : index
+  %channels = config.get @q5_small_test.channels : index
+  %inactive = index.cmp eq, %configuration, %c0 : index
+  %long = index.cmp eq, %configuration, %c2 : index
+  %enabled = scf.select %inactive, %c0, %c1 : index
+  %inputs = scf.select %long, %odd_blocks, %block : index
+  %outputs = scf.select %long, %long_outputs, %short_outputs : index
+  %blocks = index.div %inputs, %block : index
+  %records = index.mul %outputs, %blocks : index
+  %weight_bytes = index.mul %records, %block_bytes : index
+  %elements = index.mul %rows, %outputs : index
+  %storage = index.add %elements, %guards : index
+  func.return %enabled, %rows, %inputs, %outputs, %channels, %weight_bytes, %storage : index, index, index, index, index, index, index
+}
+
+func.def @initialize_q5_small_fixture(%enabled: index, %rows: index, %inputs: index, %outputs: index, %shape: buffer, %codes: buffer, %input: buffer, %weight: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %block = index.constant 256 : index
+  %block_bytes = index.constant 176 : offset
+  %scale = scalar.constant 0.0009765625 : f16
+  %minimum = scalar.constant 0.00048828125 : f16
+  %c2 = scalar.constant 2 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %unit = scalar.constant 0.0625 : f32
+  %rounding_offset = scalar.constant 7.62939453125e-06 : f32
+  %enabled_word = index.cast %enabled : index to i32
+  %input_word = index.cast %inputs : index to i32
+  %output_word = index.cast %outputs : index to i32
+  %dimensions = buffer.view %shape[%origin] : buffer -> view<3xi32>
+  view.store %enabled_word, %dimensions[0] : i32, view<3xi32>
+  view.store %input_word, %dimensions[1] : i32, view<3xi32>
+  view.store %output_word, %dimensions[2] : i32, view<3xi32>
+  %elements = index.mul %rows, %inputs : index
+  %source = buffer.view %codes[%origin] : buffer -> view<[%elements]xi8>
+  %activations = buffer.view %input[%origin] : buffer -> view<[%elements]xf32>
+  scf.for %element = [%c0 to %elements step %c1] {
+    %code = view.load %source[%element] : view<[%elements]xi8> -> i8
+    %word = scalar.extsi %code : i8 to i32
+    %even = scalar.muli %word, %c2 : i32
+    %odd = scalar.addi %even, %c1_i32 : i32
+    %value = scalar.sitofp %odd : i32 to f32
+    %scaled = scalar.mulf %value, %unit : f32
+    %rounded_input = scalar.addf %scaled, %rounding_offset : f32
+    view.store %rounded_input, %activations[%element] : f32, view<[%elements]xf32>
+  }
+  %blocks = index.div %inputs, %block : index
+  %records = index.mul %blocks, %outputs : index
+  scf.for %record = [%c0 to %records step %c1] {
+    %position = index.scale %record, %block_bytes : index, offset -> offset
+    %header = buffer.view %weight[%position] : buffer -> view<2xf16>
+    view.store %scale, %header[0] : f16, view<2xf16>
+    view.store %minimum, %header[1] : f16, view<2xf16>
+  }
+  func.return
+}
+
+command.def @project(%configuration: index) launch(%shape: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %enabled, %rows, %inputs, %outputs, %channels, %weight_bytes, %storage = func.call pure @geometry(%configuration) : (index) -> (index, index, index, index, index, index, index)
+  %c16 = index.constant 16 : index
+  %small = index.cmp eq, %rows, %c16 : index
+  scf.if %small {
+    kernel.launch @ggml_linear_q5k_f16_small_m16[%enabled, %inputs, %outputs, %channels](%inputs, %outputs, %channels, %input, %weight, %output) : [index, index, index, index](index, index, index, buffer, buffer, buffer)
+  } else {
+    kernel.launch @ggml_linear_q5k_f16_small_m32[%enabled, %inputs, %outputs, %channels](%inputs, %outputs, %channels, %input, %weight, %output) : [index, index, index, index](index, index, index, buffer, buffer, buffer)
+  }
+  command.return
+}
+
+func.def @reference(%shape: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %half_bytes = index.constant 2 : offset
+  %c0_i32 = scalar.constant 0 : i32
+  %dimensions = buffer.view %shape[%origin] : buffer -> view<3xi32>
+  %enabled = view.load %dimensions[0] : view<3xi32> -> i32
+  %active = scalar.cmpi ne, %enabled, %c0_i32 : i32
+  scf.if %active {
+    %input_word = view.load %dimensions[1] : view<3xi32> -> i32
+    %output_word = view.load %dimensions[2] : view<3xi32> -> i32
+    %inputs = index.cast %input_word : i32 to index
+    %outputs = index.cast %output_word : i32 to index
+    %rows = config.get @q5_small_test.rows : index
+    %channels = config.get @q5_small_test.channels : index
+    %elements = index.mul %rows, %inputs : index
+    %bytes = index.scale %elements, %half_bytes : index, offset -> offset
+    %rounded_input = buffer.alloca<private> align(16) %bytes : buffer
+    %source = buffer.view %input[%origin] : buffer -> view<[%elements]xf32>
+    %destination = buffer.view %rounded_input[%origin] : buffer -> view<[%elements]xf16>
+    scf.for %element = [%c0 to %elements step %c1] {
+      %value = view.load %source[%element] : view<[%elements]xf32> -> f32
+      %half = scalar.fptrunc %value : f32 to f16
+      view.store %half, %destination[%element] : f16, view<[%elements]xf16>
+    }
+    %results = buffer.view %output[%origin] : buffer -> view<[%rows]x[%outputs]xf32>
+    scf.for %row = [%c0 to %rows step %c1] {
+      scf.for %channel = [%c0 to %outputs step %c1] {
+        %sum = func.call @q5_f16_reference_dot(%rows, %inputs, %outputs, %channels, %row, %channel, %rounded_input, %weight) : (index, index, index, index, index, index, buffer, buffer) -> (f64)
+        %value = scalar.fptrunc %sum : f64 to f32
+        view.store %value, %results[%row, %channel] : f32, view<[%rows]x[%outputs]xf32>
+      }
+    }
+  }
+  func.return
+}
+
+check.scenario public @physical_row_panels configure[3](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {targets = ["gfx11-generic", "gfx9-4-generic", "gfx12-generic", "gfx1250"]}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %enabled, %rows, %inputs, %outputs, %channels, %weight_bytes, %storage_values = check.generate<@geometry>(%configuration) : (index) -> (index, index, index, index, index, index, index)
+    %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %weight_seed = check.entropy.read %entropy[1] : check.entropy -> i64
+    %codes = check.generate.random.uniform seed(%input_seed) range(-2 to 1) : tensor<[%rows]x[%inputs]xi8>
+    %input = check.generate.fill value(0.0) : tensor<[%rows]x[%inputs]xf32>
+    %weight = check.generate.random.uniform seed(%weight_seed) range(-128 to 127) : tensor<[%weight_bytes]xi8>
+    %shape = check.generate.fill value(0) : tensor<3xi32>
+    check.generate<@initialize_q5_small_fixture>(%enabled, %rows, %inputs, %outputs, %shape, %codes, %input, %weight) : (index, index, index, index, tensor<3xi32>, tensor<[%rows]x[%inputs]xi8>, tensor<[%rows]x[%inputs]xf32>, tensor<[%weight_bytes]xi8>) -> ()
+    %storage = check.generate.fill value(-1024.0) : tensor<[%storage_values]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_values]xf32> -> tensor<[%rows]x[%outputs]xf32>
+    check.compare<@project, @reference>[%configuration](%shape, %input, %weight, %output) : [index](tensor<3xi32>, tensor<[%rows]x[%inputs]xf32>, tensor<[%weight_bytes]xi8>, tensor<[%rows]x[%outputs]xf32>) -> () {
+      check.expect.approximate actual(%storage) expected(%storage) atol(1.52587890625e-05) rtol(0.0) nan(different) : tensor<[%storage_values]xf32>, tensor<[%storage_values]xf32>
+      check.expect.bitwise actual(%shape) expected(%shape) : tensor<3xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x[%inputs]xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<[%weight_bytes]xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@physical_row_panels> @small_matrix_shapes

@@ -1,0 +1,344 @@
+// Small Q5_K matrix contractions for one complete 16- or 32-row F32 panel.
+// K is a multiple of 256 in [256, 32768]; N is a multiple of 16 in
+// [16, 32768]. The caller supplies initialized rows, disjoint contiguous
+// input/output arrays, and raw (one channel) or channel-eight Q5_K records.
+// Activations and reconstructed weights round to F16; products accumulate
+// in F32 across K without resetting at quantization-block boundaries.
+//
+// Each worker owns 64 output channels. Encoded K256 records and metadata are
+// staged once, with decoded K32 panels shared across the complete row bank.
+// The encoded slab becomes the subgroup output transpose only after every
+// contraction reader retires. Subgroup widths 32 and 64 use the shared
+// matrix fragment contract; no concrete target or model configuration lives here.
+
+func.decl @ggml_q5_k_load_codes4(%weight: buffer, %block_origin: offset, %group: index, %packet: index) -> (vector<4xi8>)
+
+func.decl @ggml_q4_k_load_scale_minimum(%weight: buffer, %block_origin: offset, %group: index) -> (f32, f32)
+
+template.decl @tensor.matrix.f16_16x16x16.operand_elements() -> (index)
+
+// The staged panel is K32. A target with K32 matrix instructions consumes it
+// once; K16 instructions consume two adjacent fragments with the same F32
+// accumulator. The composition binds the wider native instruction family.
+target.decl @ggml_q5k_f16_small_wide_matrix
+
+template.decl @ggml.q5k.f16.small.matrix_shape() -> (index, index)
+
+template.def<@ggml.q5k.f16.small.matrix_shape> @ggml_linear_q5k_f16_small_matrix_shape() -> (index, index) {
+  %reduction = index.constant 16 : index
+  %operand_elements = template.apply<@tensor.matrix.f16_16x16x16.operand_elements>() : () -> (index)
+  template.return %reduction, %operand_elements : index, index
+}
+
+template.def<@ggml.q5k.f16.small.matrix_shape> target(@ggml_q5k_f16_small_wide_matrix) priority(1) @ggml_linear_q5k_f16_small_wide_matrix_shape() -> (index, index) {
+  %reduction = index.constant 32 : index
+  %elements = index.constant 512 : index
+  %subgroup_size = target.subgroup.size : index
+  %operand_elements = index.div %elements, %subgroup_size : index
+  template.return %reduction, %operand_elements : index, index
+}
+
+// Keep at most eight accumulator elements per lane. A 32-row panel splits
+// its row fragments across subgroups on wave32 and retains both on wave64.
+template.decl pure @ggml.q5k.f16.small.partition(%rows: index, %subgroup_size: index) -> (index, i1)
+
+template.def<@ggml.q5k.f16.small.partition> pure @ggml_linear_q5k_f16_small_partition(%rows: index, %subgroup_size: index) -> (index, i1) {
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %wide_wave = index.cmp uge, %subgroup_size, %c64 : index
+  %two_rows = index.cmp eq, %rows, %c32 : index
+  %two_fragments = scalar.andi %wide_wave, %two_rows : i1
+  %wide_subgroups = scf.select %wide_wave, %c4, %c8 : index
+  %subgroups = scf.select %two_rows, %wide_subgroups, %c4 : index
+  template.return %subgroups, %two_fragments : index, i1
+}
+
+template.decl @ggml.q5k.f16.small.contract(%rows: index, %inputs: index, %weight_channels: index, %complete_channels: i1, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+template.def<@ggml.q5k.f16.small.contract> device @ggml_linear_q5k_f16_small_contract(%rows_value: index, %inputs_value: index, %weight_channels_value: index, %complete_channels: i1, %output_size0: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %k, %operand_elements = template.apply<@ggml.q5k.f16.small.matrix_shape>() : () -> (index, index)
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c11 = index.constant 11 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c40 = index.constant 40 : index
+  %c64 = index.constant 64 : index
+  %c256 = index.constant 256 : index
+  %c512 = index.constant 512 : index
+  %c0_offset = index.constant 0 : offset
+  %weight_block_bytes = index.constant 176 : offset
+  %weight_stage_bytes = index.constant 5120 : offset
+  %tile_rows = index.assume %rows_value [range(%rows_value, 16, 32), multiple_of(%rows_value, 16)] : index
+  %activation_row_bytes = index.constant 80 : offset
+  %activation_stage_bytes = index.scale %tile_rows, %activation_row_bytes : index, offset -> offset
+  %metadata_stage_bytes = index.constant 4096 : offset
+  %subgroup_result_stage_bytes = index.constant 1024 : offset
+  %raw_stage_bytes = index.constant 11264 : offset
+  %raw_load_count = index.constant 704 : index
+  %subgroup_size = target.subgroup.size : index
+  %subgroups, %two_fragments = template.apply<@ggml.q5k.f16.small.partition>(%tile_rows, %subgroup_size) pure : (index, index) -> (index, i1)
+  %workgroup_size = index.mul %subgroups, %subgroup_size : index
+  %accumulator_size = index.div %c256, %subgroup_size : index
+  %raw_complete_rounds = index.div %raw_load_count, %workgroup_size : index
+  %raw_complete_count = index.mul %raw_complete_rounds, %workgroup_size : index
+  %weight_row_stride = index.div %workgroup_size, %c8 : index
+  %activation_row_stride = index.div %workgroup_size, %c16 : index
+  %zero_raw_packet = vector.splati 0 : vector<4xi32>
+  %c0_f16x4 = vector.splatf 0.0 : vector<4xf16>
+  %c0_f32x2 = vector.splatf 0.0 : vector<2xf32>
+  %zero_accumulator = vector.splatf 0.0 : vector<[%accumulator_size]xf32>
+  %m = index.constant 16 : index
+  %n = index.constant 16 : index
+  %token_count = index.assume %tile_rows [range(%tile_rows, 16, 32), multiple_of(%tile_rows, 16)] : index
+  %input_size = index.assume %inputs_value [range(%inputs_value, 256, 32768), multiple_of(%inputs_value, 256)] : index
+  %weight_channels = index.assume %weight_channels_value [range(%weight_channels_value, 1, 8)] : index
+  %output_size = index.assume %output_size0 [range(%output_size0, 16, 32768), multiple_of(%output_size0, 16)] : index
+  %last_input_pair_start = index.sub %input_size, %c1 : index
+  %quant_block_count = index.div %input_size, %c256 : index
+  %weight_group_count = index.div %output_size, %weight_channels : index
+  %channel_tile = kernel.workgroup.id<x> : index
+  %workitem0 = kernel.workitem.id<x> : index
+  %workitem = index.assume %workitem0 [ge(%workitem0, 0), lt(%workitem0, %workgroup_size)] : index
+  %subgroup0 = kernel.subgroup.id : index
+  %subgroup = index.assume %subgroup0 [ge(%subgroup0, 0), lt(%subgroup0, %subgroups)] : index
+  %lane = kernel.subgroup.lane.id : index
+  %channel_tile_base = index.mul %channel_tile, %c64 : index
+  %subgroup_column = index.rem %subgroup, %c4 : index
+  %subgroup_row = index.div %subgroup, %c4 : index
+  %subgroup_channel_add = index.mul %subgroup_column, %c16 : index
+  %subgroup_token_add = index.mul %subgroup_row, %c16 : index
+  %subgroup_channel_base = index.add %channel_tile_base, %subgroup_channel_add : index
+  %token_tile_base = index.constant 0 : index
+  %subgroup_token_base = index.add %token_tile_base, %subgroup_token_add : index
+  %input_noalias, %weight_noalias, %output_noalias = buffer.assume.noalias %input, %weight, %output : buffer, buffer, buffer
+  %input_view = buffer.view %input_noalias[%c0_offset] : buffer -> view<[%token_count]x[%input_size]xf32>
+  %output_view = buffer.view %output_noalias[%c0_offset] : buffer -> view<[%token_count]x[%output_size]xf32>
+  %weight_stage = buffer.alloca<workgroup> align(16) %weight_stage_bytes : buffer
+  %activation_stage = buffer.alloca<workgroup> align(16) %activation_stage_bytes : buffer
+  %metadata_stage = buffer.alloca<workgroup> align(16) %metadata_stage_bytes : buffer
+  // Canonical blocks feed both metadata and code decoding. The final
+  // contraction barrier retires readers before this becomes output staging.
+  %raw_stage = buffer.alloca<workgroup> align(16) %raw_stage_bytes : buffer
+  %raw_stage_view = buffer.view %raw_stage[%c0_offset] : buffer -> view<64x44xi32>
+  %raw_weight_view = buffer.view %weight_noalias[%c0_offset] : buffer -> view<[%weight_group_count]x[%quant_block_count]x[%weight_channels]x44xi32>
+  %weight_stage_view = buffer.view %weight_stage[%c0_offset] : buffer -> view<64x40xf16>
+  %activation_stage_physical_view = buffer.view %activation_stage[%c0_offset] : buffer -> view<[%tile_rows]x40xf16>
+  %metadata_stage_view = buffer.view %metadata_stage[%c0_offset] : buffer -> view<64x8x2xf32>
+  %weight_fragment_layout = encoding.layout.strided [1, %c40] : encoding<layout>
+  %weight_fragment_view = buffer.view %weight_stage[%c0_offset] : buffer -> view<32x64xf16, %weight_fragment_layout>
+  %activation_fragment_layout = encoding.layout.strided [%c40, 1] : encoding<layout>
+  %activation_fragment_view = buffer.view %activation_stage[%c0_offset] : buffer -> view<[%tile_rows]x32xf16, %activation_fragment_layout>
+  %subgroup_result_stage_offset = index.scale %subgroup, %subgroup_result_stage_bytes : index, offset -> offset
+  %result_fragment_view = buffer.view %raw_stage[%subgroup_result_stage_offset] : buffer -> view<16x16xf32>
+  %result_physical_view = buffer.view %raw_stage[%subgroup_result_stage_offset] : buffer -> view<16x16xf32>
+  %init0 = vector.fragment<init> %zero_accumulator shape [%m, %n] : vector<[%accumulator_size]xf32>
+  %init1 = vector.fragment<init> %zero_accumulator shape [%m, %n] : vector<[%accumulator_size]xf32>
+  %result0, %result1 = scf.for %quant_block = [%c0 to %quant_block_count step %c1](%block_acc0 = %init0 : vector<[%accumulator_size]xf32>, %block_acc1 = %init1 : vector<[%accumulator_size]xf32>) -> (vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>) pipeline(%c2) {
+    // Retire the partial round before acquiring the complete packet rounds.
+    %partial_task = index.add %workitem, %raw_complete_count : index
+    %partial_present = index.cmp ult, %partial_task, %raw_load_count : index
+    %partial_values = scf.if %partial_present -> (vector<4xi32>) {
+      %partial_row0 = index.div %partial_task, %c11 : index
+      %partial_row = index.assume %partial_row0 [range(%partial_row0, 0, 63)] : index
+      %partial_packet = index.rem %partial_task, %c11 : index
+      %partial_word = index.mul %partial_packet, %c4 : index
+      %partial_channel = index.add %channel_tile_base, %partial_row : index
+      %partial_in_range = index.cmp ult, %partial_channel, %output_size : index
+      %partial_valid = scalar.ori %complete_channels, %partial_in_range : i1
+      %partial_loaded_values = scf.if %partial_valid -> (vector<4xi32>) {
+        %partial_bounded_channel = index.assume %partial_channel [lt(%partial_channel, %output_size)] : index
+        %partial_group0 = index.div %partial_bounded_channel, %weight_channels : index
+        %partial_group = index.assume %partial_group0 [ge(%partial_group0, 0), lt(%partial_group0, %weight_group_count)] : index
+        %partial_within_group = index.rem %partial_bounded_channel, %weight_channels : index
+        %partial_loaded = vector.load %raw_weight_view[%partial_group, %quant_block, %partial_within_group, %partial_word] : view<[%weight_group_count]x[%quant_block_count]x[%weight_channels]x44xi32> -> vector<4xi32>
+        scf.yield %partial_loaded : vector<4xi32>
+      } else {
+        scf.yield %zero_raw_packet : vector<4xi32>
+      }
+      scf.yield %partial_loaded_values : vector<4xi32>
+    } else {
+      scf.yield %zero_raw_packet : vector<4xi32>
+    }
+    scf.if %partial_present {
+      %partial_row0 = index.div %partial_task, %c11 : index
+      %partial_row = index.assume %partial_row0 [range(%partial_row0, 0, 63)] : index
+      %partial_packet = index.rem %partial_task, %c11 : index
+      %partial_word = index.mul %partial_packet, %c4 : index
+      vector.store %partial_values, %raw_stage_view[%partial_row, %partial_word] : vector<4xi32>, view<64x44xi32>
+    }
+    scf.for %raw_offset = [%c0 to %raw_complete_count step %workgroup_size] unroll {
+      %raw_task = index.add %workitem, %raw_offset : index
+      %raw_row0 = index.div %raw_task, %c11 : index
+      %raw_row = index.assume %raw_row0 [range(%raw_row0, 0, 63)] : index
+      %raw_packet = index.rem %raw_task, %c11 : index
+      %raw_word = index.mul %raw_packet, %c4 : index
+      %raw_channel = index.add %channel_tile_base, %raw_row : index
+      %raw_in_range = index.cmp ult, %raw_channel, %output_size : index
+      %raw_valid = scalar.ori %complete_channels, %raw_in_range : i1
+      %raw_values = scf.if %raw_valid -> (vector<4xi32>) {
+        %bounded_channel = index.assume %raw_channel [lt(%raw_channel, %output_size)] : index
+        %raw_group0 = index.div %bounded_channel, %weight_channels : index
+        %raw_group = index.assume %raw_group0 [ge(%raw_group0, 0), lt(%raw_group0, %weight_group_count)] : index
+        %within_group = index.rem %bounded_channel, %weight_channels : index
+        %loaded = vector.load %raw_weight_view[%raw_group, %quant_block, %within_group, %raw_word] : view<[%weight_group_count]x[%quant_block_count]x[%weight_channels]x44xi32> -> vector<4xi32>
+        scf.yield %loaded : vector<4xi32>
+      } else {
+        scf.yield %zero_raw_packet : vector<4xi32>
+      }
+      vector.store %raw_values, %raw_stage_view[%raw_row, %raw_word] : vector<4xi32>, view<64x44xi32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.for %metadata_task_offset = [%c0 to %c512 step %workgroup_size] unroll {
+      %metadata_task0 = index.add %workitem, %metadata_task_offset : index
+      %metadata_task = index.assume %metadata_task0 [range(%metadata_task0, 0, 511)] : index
+      %metadata_group0 = index.rem %metadata_task, %c8 : index
+      %metadata_group = index.assume %metadata_group0 [range(%metadata_group0, 0, 7)] : index
+      %metadata_row0 = index.div %metadata_task, %c8 : index
+      %metadata_row = index.assume %metadata_row0 [range(%metadata_row0, 0, 63)] : index
+      %metadata_channel = index.add %channel_tile_base, %metadata_row : index
+      %metadata_in_range = index.cmp ult, %metadata_channel, %output_size : index
+      %valid_metadata_channel = scalar.ori %complete_channels, %metadata_in_range : i1
+      %metadata_pair = scf.if %valid_metadata_channel -> (vector<2xf32>) {
+        %metadata_block_byte_base = index.scale %metadata_row, %weight_block_bytes : index, offset -> offset
+        %d_scale, %dmin_scale = func.call @ggml_q4_k_load_scale_minimum(%raw_stage, %metadata_block_byte_base, %metadata_group) : (buffer, offset, index) -> (f32, f32)
+        %decoded_pair = vector.from_elements %d_scale, %dmin_scale : vector<2xf32>
+        scf.yield %decoded_pair : vector<2xf32>
+      } else {
+        scf.yield %c0_f32x2 : vector<2xf32>
+      }
+      vector.store %metadata_pair, %metadata_stage_view[%metadata_row, %metadata_group, %c0] : vector<2xf32>, view<64x8x2xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %block_result0, %block_result1 = scf.for %quant_group = [%c0 to %c8 step %c1](%acc0 = %block_acc0 : vector<[%accumulator_size]xf32>, %acc1 = %block_acc1 : vector<[%accumulator_size]xf32>) -> (vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>) unroll {
+      %block_k_base = index.mul %quant_block, %c256 : index
+      %group_k_add = index.mul %quant_group, %c32 : index
+      %k_origin = index.add %block_k_base, %group_k_add : index
+      %load_packet0 = index.rem %workitem, %c8 : index
+      %load_packet = index.assume %load_packet0 [range(%load_packet0, 0, 7)] : index
+      %load_k = index.mul %load_packet, %c4 : index
+      %load_row_base = index.div %workitem, %c8 : index
+      scf.for %load_row_offset = [%c0 to %c64 step %weight_row_stride] unroll {
+        %load_row0 = index.add %load_row_base, %load_row_offset : index
+        %load_row = index.assume %load_row0 [range(%load_row0, 0, 63)] : index
+        %channel = index.add %channel_tile_base, %load_row : index
+        %channel_in_range = index.cmp ult, %channel, %output_size : index
+        %valid_channel = scalar.ori %complete_channels, %channel_in_range : i1
+        %weight_values = scf.if %valid_channel -> (vector<4xf16>) {
+          %row_byte_base = index.scale %load_row, %weight_block_bytes : index, offset -> offset
+          %metadata_pair = vector.load %metadata_stage_view[%load_row, %quant_group, %c0] : view<64x8x2xf32> -> vector<2xf32>
+          %d_scale = vector.extract %metadata_pair[0] : vector<2xf32> -> f32
+          %dmin_scale = vector.extract %metadata_pair[1] : vector<2xf32> -> f32
+          %codes = func.call @ggml_q5_k_load_codes4(%raw_stage, %row_byte_base, %quant_group, %load_packet) : (buffer, offset, index, index) -> (vector<4xi8>)
+          %code_values = vector.uitofp %codes : vector<4xi8> to vector<4xf32>
+          %scales = vector.splat %d_scale : vector<4xf32>
+          %minimums = vector.splat %dmin_scale : vector<4xf32>
+          %scaled = vector.mulf %code_values, %scales : vector<4xf32>
+          %coefficients = vector.subf %scaled, %minimums : vector<4xf32>
+          %decoded = vector.fptrunc %coefficients : vector<4xf32> to vector<4xf16>
+          scf.yield %decoded : vector<4xf16>
+        } else {
+          scf.yield %c0_f16x4 : vector<4xf16>
+        }
+        vector.store %weight_values, %weight_stage_view[%load_row, %load_k] : vector<4xf16>, view<64x40xf16>
+      }
+      %activation_pair0 = index.rem %workitem, %c16 : index
+      %activation_pair = index.assume %activation_pair0 [range(%activation_pair0, 0, 15)] : index
+      %activation_k = index.mul %activation_pair, %c2 : index
+      %activation_row_base = index.div %workitem, %c16 : index
+      scf.for %activation_row_offset = [%c0 to %tile_rows step %activation_row_stride] unroll {
+        %activation_row0 = index.add %activation_row_base, %activation_row_offset : index
+        %activation_row = index.assume %activation_row0 [range(%activation_row0, 0, 31)] : index
+        %token0 = index.add %token_tile_base, %activation_row : index
+        %token, %input_token_count = index.assume %token0, %token_count [range(%token0, 0, 31), lt(%token0, %token_count)] : index, index
+        %input_k0 = index.add %k_origin, %activation_k : index
+        %input_k = index.assume %input_k0 [range(%input_k0, 0, 32766), multiple_of(%input_k0, 2), lt(%input_k0, %last_input_pair_start)] : index
+        %loaded = vector.load %input_view[%token, %input_k] : view<[%token_count]x[%input_size]xf32> -> vector<2xf32>
+        %activation_values = vector.fptrunc %loaded : vector<2xf32> to vector<2xf16>
+        vector.store %activation_values, %activation_stage_physical_view[%activation_row, %activation_k] : vector<2xf16>, view<[%tile_rows]x40xf16>
+      }
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+      %next0, %next1 = scf.for %matrix_offset = [%c0 to %c32 step %k](%matrix_acc0 = %acc0 : vector<[%accumulator_size]xf32>, %matrix_acc1 = %acc1 : vector<[%accumulator_size]xf32>) -> (vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>) unroll {
+        %lhs0 = vector.fragment.load<lhs> %activation_fragment_view[%subgroup_token_add, %matrix_offset] shape [%m, %k] : view<[%tile_rows]x32xf16, %activation_fragment_layout> -> vector<[%operand_elements]xf16>
+        %matrix_next0, %matrix_next1 = scf.if %two_fragments -> (vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>) {
+          %lhs1 = vector.fragment.load<lhs> %activation_fragment_view[%c16, %matrix_offset] shape [%m, %k] : view<[%tile_rows]x32xf16, %activation_fragment_layout> -> vector<[%operand_elements]xf16>
+          %rhs = vector.fragment.load<rhs> %weight_fragment_view[%matrix_offset, %subgroup_channel_add] shape [%k, %n] : view<32x64xf16, %weight_fragment_layout> -> vector<[%operand_elements]xf16>
+          %product0 = vector.mma %lhs0, %rhs, %matrix_acc0 : vector<[%operand_elements]xf16>, vector<[%operand_elements]xf16>, vector<[%accumulator_size]xf32>
+          %product1 = vector.mma %lhs1, %rhs, %matrix_acc1 : vector<[%operand_elements]xf16>, vector<[%operand_elements]xf16>, vector<[%accumulator_size]xf32>
+          scf.yield %product0, %product1 : vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>
+        } else {
+          %rhs = vector.fragment.load<rhs> %weight_fragment_view[%matrix_offset, %subgroup_channel_add] shape [%k, %n] : view<32x64xf16, %weight_fragment_layout> -> vector<[%operand_elements]xf16>
+          %product = vector.mma %lhs0, %rhs, %matrix_acc0 : vector<[%operand_elements]xf16>, vector<[%operand_elements]xf16>, vector<[%accumulator_size]xf32>
+          scf.yield %product, %matrix_acc1 : vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>
+        }
+        scf.yield %matrix_next0, %matrix_next1 : vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>
+      }
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+      scf.yield %next0, %next1 : vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>
+    }
+    scf.yield %block_result0, %block_result1 : vector<[%accumulator_size]xf32>, vector<[%accumulator_size]xf32>
+  }
+  %last_channel_packet_start = index.sub %output_size, %c3 : index
+  vector.fragment.store<result> %result0, %result_fragment_view[%c0, %c0] shape [%m, %n] : vector<[%accumulator_size]xf32>, view<16x16xf32>
+  kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+  scf.for %publish = [%lane to %c64 step %subgroup_size] unroll {
+    %row = index.div %publish, %c4 : index
+    %packet = index.rem %publish, %c4 : index
+    %column = index.mul %packet, %c4 : index
+    %token = index.add %subgroup_token_base, %row : index
+    %channel0 = index.add %subgroup_channel_base, %column : index
+    %writes_channel = index.cmp ult, %channel0, %last_channel_packet_start : index
+    scf.if %writes_channel {
+      %channel = index.assume %channel0 [range(%channel0, 0, 32767), lt(%channel0, %last_channel_packet_start)] : index
+      %values = vector.load %result_physical_view[%row, %column] : view<16x16xf32> -> vector<4xf32>
+      vector.store %values, %output_view[%token, %channel] : vector<4xf32>, view<[%token_count]x[%output_size]xf32>
+    }
+  }
+  scf.if %two_fragments {
+    kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+    vector.fragment.store<result> %result1, %result_fragment_view[%c0, %c0] shape [%m, %n] : vector<[%accumulator_size]xf32>, view<16x16xf32>
+    kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+    scf.for %publish = [%lane to %c64 step %subgroup_size] unroll {
+      %row = index.div %publish, %c4 : index
+      %packet = index.rem %publish, %c4 : index
+      %column = index.mul %packet, %c4 : index
+      %token_row = index.add %row, %c16 : index
+      %token = index.add %token_tile_base, %token_row : index
+      %channel0 = index.add %subgroup_channel_base, %column : index
+      %writes_channel = index.cmp ult, %channel0, %last_channel_packet_start : index
+      scf.if %writes_channel {
+        %channel = index.assume %channel0 [range(%channel0, 0, 32767), lt(%channel0, %last_channel_packet_start)] : index
+        %values = vector.load %result_physical_view[%row, %column] : view<16x16xf32> -> vector<4xf32>
+        vector.store %values, %output_view[%token, %channel] : vector<4xf32>, view<[%token_count]x[%output_size]xf32>
+      }
+    }
+  }
+  template.return
+}
+
+// Separate the full-channel body from the final partial tile, retaining the
+// complete-panel facts throughout staging without per-load tail predicates.
+template.decl @ggml.q5k.f16.small.tile(%rows: index, %inputs: index, %outputs: index, %weight_channels: index, %input: buffer, %weight: buffer, %output: buffer)
+
+template.def<@ggml.q5k.f16.small.tile> device @ggml_linear_q5k_f16_small_tile(%rows: index, %inputs: index, %outputs: index, %weight_channels: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %c1 = index.constant 1 : index
+  %channels_per_tile = index.constant 64 : index
+  %tile = kernel.workgroup.id<x> : index
+  %tile_end = index.add %tile, %c1 : index
+  %channel_end = index.mul %tile_end, %channels_per_tile : index
+  %complete = index.cmp ule, %channel_end, %outputs : index
+  %yes = scalar.constant true : i1
+  %no = scalar.constant false : i1
+  scf.if %complete {
+    template.apply<@ggml.q5k.f16.small.contract>(%rows, %inputs, %weight_channels, %yes, %outputs, %input, %weight, %output) : (index, index, index, i1, index, buffer, buffer, buffer)
+  } else {
+    template.apply<@ggml.q5k.f16.small.contract>(%rows, %inputs, %weight_channels, %no, %outputs, %input, %weight, %output) : (index, index, index, i1, index, buffer, buffer, buffer)
+  }
+  template.return
+}

@@ -1,0 +1,59 @@
+// Q5_K contraction over one complete 16- or 32-row F32 activation panel.
+// Entries fix physical rows at 16 or 32. Configuration is (enabled, K, N,
+// weight_channels); execution repeats K/N and layout with disjoint input,
+// weight, and F32 output.
+// Enabled is zero or one and belongs to the caller's launch-count observation.
+// Zero launches no work and touches no operands. Physical rows are initialized
+// storage, distinct from the live request count that enabled this projection.
+//
+// K is a multiple of 256 in [256, 32768], N a multiple of 16 in [16, 32768],
+// and weight_channels is one (raw) or eight (channel-interleaved Q5_K).
+// Input and decoded weights round to F16; accumulation and output remain F32.
+// Groups cover 64 channels each, at most 512 groups for the supported shape.
+// The shared motif owns staging, matrix fragments, and subgroup publication.
+
+amdgpu.target<gfx11-generic> @tensor_matrix_rdna3
+
+amdgpu.target<gfx12-5-generic> @ggml_q5k_f16_small_wide_matrix
+
+template.decl pure @ggml.q5k.f16.small.partition(%rows: index, %subgroup_size: index) -> (index, i1)
+
+template.decl @ggml.q5k.f16.small.tile(%rows: index, %inputs: index, %outputs: index, %weight_channels: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.def export("ggml_linear_q5k_f16_small_m16") @ggml_linear_q5k_f16_small_m16(%enabled_value: index, %inputs: index, %output_size: index, %weight_channels: index) {
+  %enabled = index.assume %enabled_value [range(%enabled_value, 0, 1)] : index
+  %rows = index.constant 16 : index
+  %outputs = index.assume %output_size [range(%output_size, 16, 32768), multiple_of(%output_size, 16)] : index
+  %c1 = index.constant 1 : index
+  %channel_padding = index.constant 63 : index
+  %channels_per_tile = index.constant 64 : index
+  %subgroup_size = target.subgroup.size : index
+  %subgroups, %two_fragments = template.apply<@ggml.q5k.f16.small.partition>(%rows, %subgroup_size) pure : (index, index) -> (index, i1)
+  %threads = index.mul %subgroups, %subgroup_size : index
+  %padded_outputs = index.add %outputs, %channel_padding : index
+  %groups = index.div %padded_outputs, %channels_per_tile : index
+  kernel.launch.config workgroups(%groups, %enabled, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%inputs: index, %outputs: index, %weight_channels: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = index.constant 16 : index
+  template.apply<@ggml.q5k.f16.small.tile>(%rows, %inputs, %outputs, %weight_channels, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def export("ggml_linear_q5k_f16_small_m32") @ggml_linear_q5k_f16_small_m32(%enabled_value: index, %inputs: index, %output_size: index, %weight_channels: index) {
+  %enabled = index.assume %enabled_value [range(%enabled_value, 0, 1)] : index
+  %rows = index.constant 32 : index
+  %outputs = index.assume %output_size [range(%output_size, 16, 32768), multiple_of(%output_size, 16)] : index
+  %c1 = index.constant 1 : index
+  %channel_padding = index.constant 63 : index
+  %channels_per_tile = index.constant 64 : index
+  %subgroup_size = target.subgroup.size : index
+  %subgroups, %two_fragments = template.apply<@ggml.q5k.f16.small.partition>(%rows, %subgroup_size) pure : (index, index) -> (index, i1)
+  %threads = index.mul %subgroups, %subgroup_size : index
+  %padded_outputs = index.add %outputs, %channel_padding : index
+  %groups = index.div %padded_outputs, %channels_per_tile : index
+  kernel.launch.config workgroups(%groups, %enabled, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%inputs: index, %outputs: index, %weight_channels: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows = index.constant 32 : index
+  template.apply<@ggml.q5k.f16.small.tile>(%rows, %inputs, %outputs, %weight_channels, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
