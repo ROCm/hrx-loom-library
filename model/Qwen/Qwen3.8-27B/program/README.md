@@ -46,6 +46,12 @@ replacing its bytes, preserving the packed footprint. `dflash_weights.loom`
 selects draft preparation. These policies are auxiliary compiler inputs in
 both representations; checkpoints stay outside the build payload graph.
 
+Small Q5 projections pass physical row geometry from the prepared stage into
+the shared GGML family: at most sixteen initialized rows select its 16-row
+entry, and larger small stages select 32. The existing launch-count observation
+controls enablement separately. Alpha and residual consumers keep their padded
+storage contracts; this changes neither allocations nor the count producer.
+
 Wide prefill composes the shared paired-Q5 gate/up kernel and Q6 residual
 projection. Their matrix tiles reuse decoded weights across 256 token rows;
 the Q5 pair publishes the fused SiLU product directly as F16, which the Q6
