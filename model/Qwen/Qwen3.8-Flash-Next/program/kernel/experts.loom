@@ -8,6 +8,8 @@ amdgpu.target<gfx11-generic> @flash_next_expert_wave32 {subgroup_size = 32}
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 func.decl @flash_next_qk_pair_partial(%q5_encoding: i1, %width: index, %token: index, %row: index, %lane: index, %stride: index, %input: buffer, %gate_weight: buffer, %up_weight: buffer) -> (f32, f32)
 
 func.decl @flash_next_q51_partial(%width: index, %token: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (f32)
@@ -227,28 +229,29 @@ kernel.def target(@flash_next_expert_wave32) @shared_gate_up(%neural_enabled: i1
   kernel.return
 }
 
+// A workgroup owns all 320 eight-value features of one output row. Traversal
+// reuses that ownership across live tokens without splitting rows across groups.
 kernel.def target(@flash_next_expert_wave32) @experts_combine(%neural_enabled: i1) {
-  %groups = index.constant 5 : index
+  %groups = index.constant 1 : index
   %tokens = config.get @flash_next.token_count : index
-  %threads = index.constant 64 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %groups, %units) : (index, index, index) -> (index)
+  %threads = index.constant 320 : index
   %c1 = index.constant 1 : index
   %c0_index = index.constant 0 : index
   %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%active_groups, %workers, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %experts_arg: buffer, %weights_arg: buffer, %shared_arg: buffer, %gate_arg: buffer, %output_arg: buffer) {
   %span, %experts, %weights, %shared, %gate, %output = buffer.assume.noalias %span_arg, %experts_arg, %weights_arg, %shared_arg, %gate_arg, %output_arg : buffer, buffer, buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %token = kernel.workgroup.id<y> : index
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
-    %group = kernel.workgroup.id<x> : index
-    %thread = kernel.workitem.id<x> : index
+  %worker = kernel.workgroup.id<y> : index
+  %workers = kernel.workgroup.count<y> : index
+  scf.for %token = [%worker to %end step %workers] {
+    %feature = kernel.workitem.id<x> : index
     %c0 = index.constant 0 : index
     %c1 = index.constant 1 : index
     %c10 = index.constant 10 : index
-    %threads = index.constant 64 : index
-    %feature = index.madd %group, %threads, %thread : index
     %origin = index.constant 0 : offset
     %experts_view = buffer.view %experts[%origin] : buffer -> view<[%tokens]x10x320x8xbf16>
     %weights_view = buffer.view %weights[%origin] : buffer -> view<[%tokens]x10xf32>
