@@ -14,6 +14,8 @@ func.decl @ggml_q6_k_load_codes4(%weight: buffer, %row_origin: offset, %block: i
 
 func.decl @ggml_q6_k_load_scale_pair(%weight: buffer, %row_origin: offset, %block: index, %group: index) -> (vector<2xf32>)
 
+func.decl @ggml_q6_k_load_group32(%weight: buffer, %row_origin: offset, %block: index, %group: index) -> (vector<32xi8>, vector<2xi8>, f32)
+
 func.def @initialize_factors(%input: buffer) {
   %begin = index.constant 0 : index
   %step = index.constant 1 : index
@@ -92,7 +94,7 @@ kernel.def target(@native) @materialize() {
     scf.yield %unit, %packets : index, index
   }
   kernel.launch.config workgroups(%blocks, %rows, %packet_groups) workgroup_size(%threads, %unit, %unit) : index
-} launch(%input: buffer, %output: buffer, %codes_output: buffer, %scales_output: buffer) {
+} launch(%input: buffer, %output: buffer, %codes_output: buffer, %scales_output: buffer, %groups_output: buffer) {
   %block = kernel.workgroup.id<x> : index
   %row = kernel.workgroup.id<y> : index
   %uniform = config.get @q6_buffer_test.uniform_packets : i1
@@ -110,6 +112,8 @@ kernel.def target(@native) @materialize() {
   %output_origin = index.constant 10 : offset
   %wide_origin = index.constant 20 : offset
   %scales_per_group = index.constant 2 : index
+  %code_count = index.constant 32 : index
+  %factor_index = index.constant 34 : index
   %first_packet = index.constant 0 : index
   %row_add = index.scale %row, %stride : index, offset -> offset
   %row_origin = index.add %origin, %row_add : offset
@@ -128,11 +132,18 @@ kernel.def target(@native) @materialize() {
     %scales_view = buffer.view %scales_output[%wide_origin] : buffer -> view<2x3x16xf32>
     %scale_column = index.mul %group, %scales_per_group : index
     vector.store %scales, %scales_view[%row, %block, %scale_column] : vector<2xf32>, view<2x3x16xf32>
+    %group_codes, %group_scales, %group_factor = func.call @ggml_q6_k_load_group32(%input, %row_origin, %block, %group) : (buffer, offset, index, index) -> (vector<32xi8>, vector<2xi8>, f32)
+    %group_codes_f32 = vector.sitofp %group_codes : vector<32xi8> to vector<32xf32>
+    %group_scales_f32 = vector.sitofp %group_scales : vector<2xi8> to vector<2xf32>
+    %groups_view = buffer.view %groups_output[%wide_origin] : buffer -> view<2x3x8x35xf32>
+    vector.store %group_codes_f32, %groups_view[%row, %block, %group, %first_packet] : vector<32xf32>, view<2x3x8x35xf32>
+    vector.store %group_scales_f32, %groups_view[%row, %block, %group, %code_count] : vector<2xf32>, view<2x3x8x35xf32>
+    view.store %group_factor, %groups_view[%row, %block, %group, %factor_index] : f32, view<2x3x8x35xf32>
   }
   kernel.return
 }
 
-func.def @reference(%input: buffer, %output: buffer, %codes_output: buffer, %scales_output: buffer) {
+func.def @reference(%input: buffer, %output: buffer, %codes_output: buffer, %scales_output: buffer, %groups_output: buffer) {
   %begin = index.constant 0 : index
   %step = index.constant 1 : index
   %rows = index.constant 2 : index
@@ -142,6 +153,7 @@ func.def @reference(%input: buffer, %output: buffer, %codes_output: buffer, %sca
   %half_bytes = index.constant 64 : index
   %quarter_width = index.constant 32 : index
   %scale_width = index.constant 16 : index
+  %factor_index = index.constant 34 : index
   %sides = index.constant 2 : index
   %origin = index.constant 2 : offset
   %stride = index.constant 636 : offset
@@ -159,6 +171,7 @@ func.def @reference(%input: buffer, %output: buffer, %codes_output: buffer, %sca
   %outputs = buffer.view %output[%output_origin] : buffer -> view<2x3x256xf16>
   %codes_view = buffer.view %codes_output[%wide_origin] : buffer -> view<2x3x256xf32>
   %scales_view = buffer.view %scales_output[%wide_origin] : buffer -> view<2x3x16xf32>
+  %groups_view = buffer.view %groups_output[%wide_origin] : buffer -> view<2x3x8x35xf32>
   scf.for %row = [%begin to %rows step %step] {
     %row_add = index.scale %row, %stride : index, offset -> offset
     %row_origin = index.add %origin, %row_add : offset
@@ -174,6 +187,7 @@ func.def @reference(%input: buffer, %output: buffer, %codes_output: buffer, %sca
       %factor_view = buffer.view %input[%factor_origin] : buffer -> view<1xf16>
       %factor_half = view.load %factor_view[0] : view<1xf16> -> f16
       %factor = scalar.extf %factor_half : f16 to f64
+      %factor_f32 = scalar.extf %factor_half : f16 to f32
       scf.for %value = [%begin to %values step %step] {
         %half = index.div %value, %half_width : index
         %within_half = index.rem %value, %half_width : index
@@ -207,11 +221,22 @@ func.def @reference(%input: buffer, %output: buffer, %codes_output: buffer, %sca
         %coefficient = scalar.mulf %scale, %factor : f64
         %code_f32 = scalar.sitofp %signed_code : i32 to f32
         view.store %code_f32, %codes_view[%row, %block, %value] : f32, view<2x3x256xf32>
+        %group = index.div %value, %quarter_width : index
+        %within_group = index.rem %value, %quarter_width : index
+        view.store %code_f32, %groups_view[%row, %block, %group, %within_group] : f32, view<2x3x8x35xf32>
+        %publishes_group = index.cmp eq, %within_group, %begin : index
+        scf.if %publishes_group {
+          view.store %factor_f32, %groups_view[%row, %block, %group, %factor_index] : f32, view<2x3x8x35xf32>
+        }
         %within_scale = index.rem %value, %scale_width : index
         %publishes_scale = index.cmp eq, %within_scale, %begin : index
         scf.if %publishes_scale {
           %coefficient_f32 = scalar.fptrunc %coefficient : f64 to f32
           view.store %coefficient_f32, %scales_view[%row, %block, %scale_index] : f32, view<2x3x16xf32>
+          %coefficient_half = index.div %within_group, %scale_width : index
+          %coefficient_index = index.add %quarter_width, %coefficient_half : index
+          %raw_scale_f32 = scalar.sitofp %scale_byte : i8 to f32
+          view.store %raw_scale_f32, %groups_view[%row, %block, %group, %coefficient_index] : f32, view<2x3x8x35xf32>
         }
         %wide = scalar.mulf %code, %coefficient : f64
         %result = scalar.fptrunc %wide : f64 to f16
@@ -231,10 +256,12 @@ check.scenario public @records_random {
     %output = check.generate.fill value(-99.0) : tensor<1544xf16>
     %codes = check.generate.fill value(-99.0) : tensor<1544xf32>
     %scales = check.generate.fill value(-99.0) : tensor<104xf32>
-    check.compare<@materialize, @reference>(%input, %output, %codes, %scales) : (tensor<1276xi8>, tensor<1544xf16>, tensor<1544xf32>, tensor<104xf32>) -> () {
+    %groups = check.generate.fill value(-99.0) : tensor<1688xf32>
+    check.compare<@materialize, @reference>(%input, %output, %codes, %scales, %groups) : (tensor<1276xi8>, tensor<1544xf16>, tensor<1544xf32>, tensor<104xf32>, tensor<1688xf32>) -> () {
       check.expect.bitwise actual(%output) expected(%output) : tensor<1544xf16>
       check.expect.bitwise actual(%codes) expected(%codes) : tensor<1544xf32>
       check.expect.bitwise actual(%scales) expected(%scales) : tensor<104xf32>
+      check.expect.bitwise actual(%groups) expected(%groups) : tensor<1688xf32>
       check.expect.bitwise actual(%input) expected(%input) : tensor<1276xi8>
     }
   }
@@ -249,10 +276,12 @@ check.scenario public @records_zero {
     %output = check.generate.fill value(-99.0) : tensor<1544xf16>
     %codes = check.generate.fill value(-99.0) : tensor<1544xf32>
     %scales = check.generate.fill value(-99.0) : tensor<104xf32>
-    check.compare<@materialize, @reference>(%input, %output, %codes, %scales) : (tensor<1276xi8>, tensor<1544xf16>, tensor<1544xf32>, tensor<104xf32>) -> () {
+    %groups = check.generate.fill value(-99.0) : tensor<1688xf32>
+    check.compare<@materialize, @reference>(%input, %output, %codes, %scales, %groups) : (tensor<1276xi8>, tensor<1544xf16>, tensor<1544xf32>, tensor<104xf32>, tensor<1688xf32>) -> () {
       check.expect.bitwise actual(%output) expected(%output) : tensor<1544xf16>
       check.expect.bitwise actual(%codes) expected(%codes) : tensor<1544xf32>
       check.expect.bitwise actual(%scales) expected(%scales) : tensor<104xf32>
+      check.expect.bitwise actual(%groups) expected(%groups) : tensor<1688xf32>
       check.expect.bitwise actual(%input) expected(%input) : tensor<1276xi8>
     }
   }
@@ -267,10 +296,12 @@ check.scenario public @records_ones {
     %output = check.generate.fill value(-99.0) : tensor<1544xf16>
     %codes = check.generate.fill value(-99.0) : tensor<1544xf32>
     %scales = check.generate.fill value(-99.0) : tensor<104xf32>
-    check.compare<@materialize, @reference>(%input, %output, %codes, %scales) : (tensor<1276xi8>, tensor<1544xf16>, tensor<1544xf32>, tensor<104xf32>) -> () {
+    %groups = check.generate.fill value(-99.0) : tensor<1688xf32>
+    check.compare<@materialize, @reference>(%input, %output, %codes, %scales, %groups) : (tensor<1276xi8>, tensor<1544xf16>, tensor<1544xf32>, tensor<104xf32>, tensor<1688xf32>) -> () {
       check.expect.bitwise actual(%output) expected(%output) : tensor<1544xf16>
       check.expect.bitwise actual(%codes) expected(%codes) : tensor<1544xf32>
       check.expect.bitwise actual(%scales) expected(%scales) : tensor<104xf32>
+      check.expect.bitwise actual(%groups) expected(%groups) : tensor<1688xf32>
       check.expect.bitwise actual(%input) expected(%input) : tensor<1276xi8>
     }
   }
@@ -285,10 +316,12 @@ check.scenario public @records_scale_extrema {
     %output = check.generate.fill value(-99.0) : tensor<1544xf16>
     %codes = check.generate.fill value(-99.0) : tensor<1544xf32>
     %scales = check.generate.fill value(-99.0) : tensor<104xf32>
-    check.compare<@materialize, @reference>(%input, %output, %codes, %scales) : (tensor<1276xi8>, tensor<1544xf16>, tensor<1544xf32>, tensor<104xf32>) -> () {
+    %groups = check.generate.fill value(-99.0) : tensor<1688xf32>
+    check.compare<@materialize, @reference>(%input, %output, %codes, %scales, %groups) : (tensor<1276xi8>, tensor<1544xf16>, tensor<1544xf32>, tensor<104xf32>, tensor<1688xf32>) -> () {
       check.expect.bitwise actual(%output) expected(%output) : tensor<1544xf16>
       check.expect.bitwise actual(%codes) expected(%codes) : tensor<1544xf32>
       check.expect.bitwise actual(%scales) expected(%scales) : tensor<104xf32>
+      check.expect.bitwise actual(%groups) expected(%groups) : tensor<1688xf32>
       check.expect.bitwise actual(%input) expected(%input) : tensor<1276xi8>
     }
   }
