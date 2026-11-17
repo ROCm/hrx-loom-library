@@ -34,6 +34,10 @@ func.decl @qwen38.tagged_feedback_bytes(%state: buffer) -> (i64)
 
 func.decl @qwen38.proposal_level(%count: i32) -> (i32)
 
+func.decl @qwen38.speculation_choose(%state: buffer, %plan: buffer, %first_count: i32, %next_count: i32, %media_count: i32) -> (i32)
+
+func.decl @qwen38.speculation_stages(%state: buffer) -> (i32, i32, i32)
+
 func.decl import("runner") @execute_3(%stage: i32, %b0: hal.buffer, %b1: hal.buffer, %b2: hal.buffer) -> (i64)
 
 func.decl import("runner") @execute_6(%stage: i32, %b0: hal.buffer, %b1: hal.buffer, %b2: hal.buffer, %b3: hal.buffer, %b4: hal.buffer, %b5: hal.buffer) -> (i64)
@@ -78,7 +82,7 @@ func.def public @text_encode_state_v1(%bindings: buffer, %count: i32, %origins: 
 // PROPOSE=2. The second plan follows the first cohort; known IDs form one
 // contiguous host stream. Six-word descriptors preserve source position and
 // selected output independently; neither field steals bits from the other.
-func.def @encode_plan(%plan: buffer, %inputs: buffer, %count: index, %first: index, %metadata: buffer, %metadata_origin: offset, %tokens: buffer, %token_origin: offset, %ordinary: i1) -> (i32, i32) {
+func.def @encode_plan(%plan: buffer, %inputs: buffer, %count: index, %first: index, %metadata: buffer, %metadata_origin: offset, %tokens: buffer, %token_origin: offset, %ordinary: i1, %chosen_width: i32) -> (i32, i32) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -110,7 +114,7 @@ func.def @encode_plan(%plan: buffer, %inputs: buffer, %count: index, %first: ind
   %token_count, %output_count = scf.for %i = [%c0 to %span_count step %c1](%cursor = %zero32 : i32, %outputs = %zero32 : i32) -> (i32, i32) {
     %record_value = index.add %first, %i : index
     %record = index.assume %record_value [ge(%record_value, 0), lt(%record_value, %plan_capacity)] : index
-    %length = view.load %requests[%record, 0] : view<[%plan_capacity]x9xi32> -> i32
+    %reserved_length = view.load %requests[%record, 0] : view<[%plan_capacity]x9xi32> -> i32
     %position = view.load %requests[%record, 1] : view<[%plan_capacity]x9xi32> -> i32
     %source_position = view.load %requests[%record, 2] : view<[%plan_capacity]x9xi32> -> i32
     %row = view.load %requests[%record, 3] : view<[%plan_capacity]x9xi32> -> i32
@@ -122,6 +126,9 @@ func.def @encode_plan(%plan: buffer, %inputs: buffer, %count: index, %first: ind
     %selected = scalar.cmpi ne, %select_bits, %zero32 : i32
     %propose_bits = scalar.andi %flags, %two32 : i32
     %proposes = scalar.cmpi ne, %propose_bits, %zero32 : i32
+    %chosen = scalar.cmpi ne, %chosen_width, %zero32 : i32
+    %shortened = scalar.andi %chosen, %proposes : i1
+    %length = scf.select %shortened, %chosen_width, %reserved_length : i32
     %speculative = scalar.cmpi ne, %credit, %zero32 : i32
     %speculative32 = scalar.extui %speculative : i1 to i32
     %mode = scf.select %proposes, %two32, %speculative32 : i32
@@ -211,8 +218,9 @@ func.def public @text_encode_epoch_v1(%control_state: buffer, %plan: buffer, %in
     buffer.copy %control_state[%source_offset], %metadata[%target_offset], %policy_stride
   }
   %media_count = scalar.addi %first_media_count, %next_media_count : i32
+  %chosen_width = func.call @qwen38.speculation_choose(%control_state, %plan, %first_count, %next_count, %media_count) : (buffer, buffer, i32, i32, i32) -> (i32)
   %ordinary = scalar.cmpi eq, %media_count, %zero32 : i32
-  %outputs, %first_tokens = func.call @encode_plan(%plan, %inputs, %first, %c0, %metadata, %origin, %tokens, %origin, %ordinary) : (buffer, buffer, index, index, buffer, offset, buffer, offset, i1) -> (i32, i32)
+  %outputs, %first_tokens = func.call @encode_plan(%plan, %inputs, %first, %c0, %metadata, %origin, %tokens, %origin, %ordinary, %chosen_width) : (buffer, buffer, index, index, buffer, offset, buffer, offset, i1, i32) -> (i32, i32)
   %eos_offset = func.call @qwen38_packet_eos_origin(%capacity) : (index) -> (offset)
   %terminal = buffer.view %metadata[%eos_offset] : buffer -> view<1xi32>
   view.store %eos, %terminal[0] : i32, view<1xi32>
@@ -228,7 +236,7 @@ func.def public @text_encode_epoch_v1(%control_state: buffer, %plan: buffer, %in
     %plane_count = index.constant 2 : index
     %plane_bytes = index.div %token_byte_count, %plane_count : index
     %token_base = index.cast %plane_bytes : index to offset
-    %next_outputs, %next_tokens = func.call @encode_plan(%plan, %inputs, %next, %first, %metadata, %metadata_base, %tokens, %token_base, %ordinary) : (buffer, buffer, index, index, buffer, offset, buffer, offset, i1) -> (i32, i32)
+    %next_outputs, %next_tokens = func.call @encode_plan(%plan, %inputs, %next, %first, %metadata, %metadata_base, %tokens, %token_base, %ordinary, %chosen_width) : (buffer, buffer, index, index, buffer, offset, buffer, offset, i1, i32) -> (i32, i32)
     %next_eos_offset = index.add %metadata_base, %eos_offset : offset
     %next_terminal = buffer.view %metadata[%next_eos_offset] : buffer -> view<1xi32>
     view.store %eos, %next_terminal[0] : i32, view<1xi32>
@@ -433,6 +441,8 @@ func.def @epoch_once(%control_state: buffer, %mixed: i1, %shape: i32, %proposes:
   %c1 = scalar.constant 1 : i32
   %c2 = scalar.constant 2 : i32
   %c0_2 = scalar.constant 0 : i64
+  %chosen_width, %chosen_proposal, %chosen_verifier = func.call @qwen38.speculation_stages(%control_state) : (buffer) -> (i32, i32, i32)
+  %alternative = scalar.cmpi ne, %chosen_width, %c0 : i32
   %propose = scalar.cmpi ne, %proposes, %c0 : i32
   %verify = scalar.cmpi ne, %verifies, %c0 : i32
   scf.if %verify {
@@ -445,7 +455,8 @@ func.def @epoch_once(%control_state: buffer, %mixed: i1, %shape: i32, %proposes:
     %last = scalar.subi %variants, %c1 : i32
     %level = func.call @qwen38.proposal_level(%span_count) : (i32) -> (i32)
     %selected = scalar.minui %level, %last : i32
-    %draft_stage = scalar.addi %draft_first, %selected : i32
+    %ordinary_draft_stage = scalar.addi %draft_first, %selected : i32
+    %draft_stage = scf.select %alternative, %chosen_proposal, %ordinary_draft_stage : i32
     %proposal = func.call @execute_6(%draft_stage, %metadata, %tokens, %draft_origins, %draft_cache, %carry, %results) : (i32, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer) -> (i64)
   }
   scf.if %verify {
@@ -454,7 +465,8 @@ func.def @epoch_once(%control_state: buffer, %mixed: i1, %shape: i32, %proposes:
   }
   %warm_stage = scalar.addi %warm_first, %shape : i32
   %target = scf.if %verify -> (i64) {
-    %verify_stage = scalar.addi %warm_stage, %shape_count : i32
+    %ordinary_verify_stage = scalar.addi %warm_stage, %shape_count : i32
+    %verify_stage = scf.select %alternative, %chosen_verifier, %ordinary_verify_stage : i32
     %completion = func.call @execute_7(%verify_stage, %residual, %metadata, %origins, %state, %tokens, %committed, %results) : (i32, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer) -> (i64)
     %end_offset = scalar.constant 16 : i64
     %measured = func.call @timestamp(%results, %end_offset) : (hal.buffer, i64) -> (i64)

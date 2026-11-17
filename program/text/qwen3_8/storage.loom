@@ -1,5 +1,6 @@
 // Control storage keeps the ten-word stage header and resident sampling
-// directory at stable offsets. A cold layout recipe precedes the upload table.
+// directory at stable offsets. A model-authored speculation catalog and cold
+// layout recipe precede the upload table.
 // Growth changes capacity without declaring stages or touching parameters.
 // Header fields are isolated prefill/decode, shape count, ordinary proposal,
 // draft kind, ordinary/mixed target, mixed proposal, and ordinary/mixed warm.
@@ -76,6 +77,16 @@ func.def public @qwen38.proposal_level(%count: i32) -> (i32) {
   func.return %level : i32
 }
 
+// The source's speculation catalog moves with resident growth; neither device
+// commands nor the native service interpret it. The trailing recipe and upload
+// table retain their offsets relative to the end of control storage.
+func.def public pure @qwen38.speculation_origin(%state: buffer) -> (offset) {
+  %bytes = buffer.length %state
+  %tail = index.constant 672 : offset
+  %origin = index.sub %bytes, %tail : offset
+  func.return %origin : offset
+}
+
 func.def public @qwen38.control_create(%packet_capacity: i64, %context: i64, %pool: i64, %rows_arg: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer) {
   %rows = scalar.assume %rows_arg [range(%rows_arg, 1, 2147483647)] : i64
   %count = index.cast %rows : i64 to index
@@ -83,7 +94,9 @@ func.def public @qwen38.control_create(%packet_capacity: i64, %context: i64, %po
   %policy_stride = index.constant 24 : offset
   %policy_bytes = index.scale %count, %policy_stride : index, offset -> offset
   %header_bytes = index.constant 40 : offset
-  %recipe_origin = index.add %header_bytes, %policy_bytes : offset
+  %catalog_origin = index.add %header_bytes, %policy_bytes : offset
+  %catalog_bytes = index.constant 48 : offset
+  %recipe_origin = index.add %catalog_origin, %catalog_bytes : offset
   %trailer_bytes = index.constant 624 : offset
   %state_bytes = index.add %recipe_origin, %trailer_bytes : offset
   %state = buffer.alloca<private> align(8) %state_bytes : buffer
@@ -122,9 +135,15 @@ func.def public @qwen38.control_resize(%state: buffer, %rows: i64) -> (buffer, i
   %enabled = scalar.cmpi ne, %enabled_word, %c0_i64 : i64
   %dflash = scalar.cmpi ne, %dflash_word, %c0_i64 : i64
   %grown = func.call @qwen38.control_create(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer)
-  // The retired upload table is scratch. Only stages and existing sampling
-  // policies survive; new residents start with an empty request policy.
-  buffer.copy %state[%origin], %grown[%origin], %recipe_origin
+  // The retired upload table is scratch. Stage handles, existing sampling
+  // policies, and the source's speculation catalog survive. New residents
+  // start with an empty request policy, not bytes from the old catalog.
+  %catalog_bytes = index.constant 48 : offset
+  %catalog_origin = index.sub %recipe_origin, %catalog_bytes : offset
+  buffer.copy %state[%origin], %grown[%origin], %catalog_origin
+  %old_catalog = func.call pure @qwen38.speculation_origin(%state) : (buffer) -> (offset)
+  %new_catalog = func.call pure @qwen38.speculation_origin(%grown) : (buffer) -> (offset)
+  buffer.copy %state[%old_catalog], %grown[%new_catalog], %catalog_bytes
   func.return %grown, %packet_capacity, %context, %pool, %pins, %packed, %enabled, %dflash : buffer, i64, i64, i64, i64, i1, i1, i1
 }
 

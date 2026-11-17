@@ -110,8 +110,20 @@ Acceptance follows each span's actual anchor-plus-draft length within the
 compiled verification ceiling. Different spans can therefore stop drafting at
 different widths without reading unused candidate slots. The completed
 publication callback receives the model's retained control state alongside
-both immutable feedback banks. The current policy retains its configured
-drafting depth; measurements do not themselves change proposal selection.
+both immutable feedback banks. Measurements do not themselves change proposal
+selection.
+
+`speculation.loom` consumes an optional model-prepared catalog of shorter
+proposal/verifier pairs. Each record supplies its verification width and both
+program identities; the composing model owns the cost policy. The configured
+depth remains the reservation ceiling. Selection inspects the live host plan,
+compacts generated spans to the chosen width, and keeps both queued banks on
+the same pair. Final ordinary decodes preserve their one-token spans beside
+proposing peers. Prefill, media, supplied candidates, and cohorts outside the
+catalog use the ordinary prepared stages. No request-time compilation, device
+readback, weight copy, or extra synchronization is involved. The catalog occupies
+48 host bytes per model and survives resident growth without entering newly
+admitted sampling rows.
 
 `chat_media.loom` plans and renders ordered images and timestamped video frames.
 Native inspection supplies decoded dimensions, source ranges, and finite,
