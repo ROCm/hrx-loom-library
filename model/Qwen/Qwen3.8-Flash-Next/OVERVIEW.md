@@ -151,7 +151,7 @@ request's sampling policy and commits only the accepted prefix. The matching
 embedding and vocabulary tensors can share target allocations. The source layout requires
 2,775,621,632 additional parameter bytes for the remaining predictor tensors.
 
-`chat` uses target-only execution. `mtp` enables three proposals, and
+`chat` uses target-only execution. `mtp` enables a ceiling of seven proposals, and
 `mtp-continuation` also enables two-epoch continuation. These are execution
 choices within the same text service. More speculative work is not itself a
 throughput guarantee; qualification compares equal prompts, sampling, output
@@ -185,7 +185,7 @@ The canonical chat configuration starts with four resident rows,
 16,384-position contexts, 32,768 pooled tokens, 16,384-token packed epochs,
 four checkpoints, and a 256-token default generation limit. `long-context` starts with eight rows,
 262,144-position contexts, 524,288 pooled tokens, and eight checkpoints.
-`long-context-mtp` uses those capacities with three predictor proposals.
+`long-context-mtp` uses those capacities with a seven-proposal ceiling and the same live-cohort policy.
 The context limit includes both input and output tokens.
 Context capacity must be divisible by 64, an epoch holds at most 32,768 tokens,
 and the composition requires pooled cache storage. Resident rows can grow

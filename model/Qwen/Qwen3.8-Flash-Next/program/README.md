@@ -60,6 +60,22 @@ accepted prefix into non-page state. Catch-up uses accepted target hidden
 rows to advance predictor state. Draft vocabulary membership is learned from
 accepted tokens and is retained with the request.
 
+Text preparation registers shorter paired proposal/verifier stages for rounded
+cohorts of four and eight requests. The shared packet owner selects both stage
+identities before enqueue; queued work keeps its captured choice while later
+cohorts can choose another. A three- or four-owner cohort uses at most two
+proposals, and a five- through eight-owner cohort uses one. One or two owners
+retain the configured ceiling. Alternative stages borrow the same parameters
+and retained storage; preparation adds no copies or model-specific host policy.
+
+Within each recursive chain, a predicted probability below 0.85 stops that
+owner's subsequent neural steps. The current prediction remains a target
+verification candidate. Stable compaction retains the original target span in
+shared proposal origins, so removing stopped owners cannot change request or
+media identity. The threshold and cohort policy do not modify target sampling
+or accepted-prefix verification. Prefill, media, supplied candidates, and
+cohorts beyond the prepared alternatives retain their ordinary stage pairing.
+
 The input-content kernels distinguish ordinary IDs from media records using
 composition facts. Target embedding reads original Q8 vocabulary rows or F32
 features and publishes BF16 residuals. Accepted predictor embedding binds the

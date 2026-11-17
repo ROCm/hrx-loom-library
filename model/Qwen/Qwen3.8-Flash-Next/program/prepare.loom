@@ -40,6 +40,10 @@ func.decl @qwen38.control_resize(%state: buffer, %rows: i64) -> (buffer, i64, i6
 
 func.decl @qwen38.proposal_level(%count: i32) -> (i32)
 
+func.decl @qwen38.speculation_configure(%state: buffer, %ceiling: i32, %capacity: i32)
+
+func.decl @qwen38.speculation_register(%state: buffer, %level: index, %width: i32, %proposal: i32, %verifier: i32)
+
 func.def public @text_resize_state_v1(%state: buffer, %rows: i64) -> (buffer, buffer, buffer, buffer, buffer, buffer) {
   %grown, %packet_capacity, %context, %pool, %pins, %packed, %enabled, %dflash = func.call @qwen38.control_resize(%state, %rows) : (buffer, i64) -> (buffer, i64, i64, i64, i64, i1, i1, i1)
   %allocations, %views, %target, %draft, %geometry = func.call @qwen38.storage(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
@@ -344,7 +348,7 @@ func.def @qwen38.storage(%tokens: i64, %context: i64, %pool: i64, %rows_arg: i64
 // Each catalog has consecutive target shapes, proposal cohorts, warm shapes,
 // verification shapes, and one continuation. Only the input representation
 // differs; every stage binds the same immutable checkpoint source handles.
-func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %enabled: i1, %depth: i64, %mixed: i64, %packet_capacity: i64) -> (i32, i32, i32, i64) {
+func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %enabled: i1, %depth: i64, %mixed: i64, %packet_capacity: i64) -> (i32, i32, i32, i64, i64) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -429,7 +433,57 @@ func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i6
   } else {
     scf.yield %c0_i32, %c0_i32 : i32, i32
   }
-  func.return %target_first, %proposal, %warm_first, %maximum : i32, i32, i32, i64
+  func.return %target_first, %proposal, %warm_first, %maximum, %proposal_capacity : i32, i32, i32, i64, i64
+}
+
+// Text cohorts use at most two proposals for three or four owners, and one
+// for five through eight owners. The shared packet owner captures each paired
+// stage selection before enqueue, retaining all original request identities.
+// One/two-owner work retains the configured ceiling. Every alternative borrows
+// the same target/draft parameter handles and retained state.
+func.def @declare_cohort_stages(%state: buffer, %depth: i64, %proposal_capacity: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %packet_capacity: i64) {
+  %c0_i64 = scalar.constant 0 : i64
+  %c1_i64 = scalar.constant 1 : i64
+  %c2_i64 = scalar.constant 2 : i64
+  %limit = scalar.constant 8 : i64
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %c2_i32 = scalar.constant 2 : i32
+  %admitted = scalar.minui %proposal_capacity, %limit : i64
+  %ceiling = scalar.addi %depth, %c1_i64 : i64
+  %ceiling_word = scalar.trunci %ceiling : i64 to i32
+  %capacity_word = scalar.trunci %admitted : i64 to i32
+  func.call @qwen38.speculation_configure(%state, %ceiling_word, %capacity_word) : (buffer, i32, i32)
+  %nonempty_capacity = scalar.maxui %capacity_word, %c1_i32 : i32
+  %last_word = func.call @qwen38.proposal_level(%nonempty_capacity) : (i32) -> (i32)
+  %last = index.cast %last_word : i32 to index
+  %begin = index.constant 2 : index
+  %step = index.constant 1 : index
+  %end = index.add %last, %step : index
+  %wide_level = index.constant 3 : index
+  %proposal_root = global.load @proposal_root : buffer
+  %verify_root = global.load @verify_root : buffer
+  %depth_key = global.load @draft_depth_key : buffer
+  %capacity_key = global.load @epoch_capacity_key : buffer
+  scf.for %level = [%begin to %end step %step] {
+    %wide = index.cmp eq, %level, %wide_level : index
+    %selected_depth = scf.select %wide, %c1_i64, %c2_i64 : i64
+    %shorter = scalar.cmpi ult, %selected_depth, %depth : i64
+    scf.if %shorter {
+      %width = scalar.addi %selected_depth, %c1_i64 : i64
+      %shift = index.cast %level : index to i64
+      %rounded = scalar.shli %c1_i64, %shift : i64
+      %spans = scalar.minui %rounded, %admitted : i64
+      %tokens = scalar.muli %spans, %width : i64
+      %proposal = func.call @declare_stage(%proposal_root, %spans, %spans, %context, %pool, %model_source, %draft_source, %c1_i32, %c2_i32, %c0_i64, %packet_capacity, %c0_i64) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
+      func.call @config_i64(%proposal, %depth_key, %selected_depth) : (i32, buffer, i64)
+      func.call @config_i64(%proposal, %capacity_key, %packet_capacity) : (i32, buffer, i64)
+      %verifier = func.call @declare_stage(%verify_root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %c0_i32, %c1_i32, %width, %packet_capacity, %c0_i64) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
+      %width_word = scalar.trunci %width : i64 to i32
+      func.call @qwen38.speculation_register(%state, %level, %width_word, %proposal, %verifier) : (buffer, index, i32, i32, i32)
+    }
+  }
+  func.return
 }
 
 func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %draft_depth: i32, %shapes: buffer, %shape_count: i64, %weights: buffer, %options: buffer) -> (i64, i32, buffer, buffer, buffer, buffer, buffer, buffer, buffer) {
@@ -464,11 +518,11 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
     scf.yield %c0_i32 : i32
   }
   %depth = scalar.extui %draft_depth : i32 to i64
-  %target_first, %proposal, %warm_first, %maximum = func.call @declare_packed_stages(%shapes, %shape_count, %context, %pool, %model_source, %draft_source, %enabled, %depth, %c0_i64, %packet_capacity) : (buffer, i64, i64, i64, i32, i32, i1, i64, i64, i64) -> (i32, i32, i32, i64)
+  %target_first, %proposal, %warm_first, %maximum, %proposal_capacity = func.call @declare_packed_stages(%shapes, %shape_count, %context, %pool, %model_source, %draft_source, %enabled, %depth, %c0_i64, %packet_capacity) : (buffer, i64, i64, i64, i32, i32, i1, i64, i64, i64) -> (i32, i32, i32, i64, i64)
   %images = config.get @flash_next.image_inputs : i1
   %mixed_target, %mixed_proposal, %mixed_warm = scf.if %images -> (i32, i32, i32) {
     %mixed = scalar.constant 1 : i64
-    %target, %proposal, %warm, %maximum = func.call @declare_packed_stages(%shapes, %shape_count, %context, %pool, %model_source, %draft_source, %enabled, %depth, %mixed, %packet_capacity) : (buffer, i64, i64, i64, i32, i32, i1, i64, i64, i64) -> (i32, i32, i32, i64)
+    %target, %proposal, %warm, %maximum, %proposal_capacity = func.call @declare_packed_stages(%shapes, %shape_count, %context, %pool, %model_source, %draft_source, %enabled, %depth, %mixed, %packet_capacity) : (buffer, i64, i64, i64, i32, i32, i1, i64, i64, i64) -> (i32, i32, i32, i64, i64)
     scf.yield %target, %proposal, %warm : i32, i32, i32
   } else {
     scf.yield %c0_i32, %c0_i32, %c0_i32 : i32, i32, i32
@@ -486,6 +540,9 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
   view.store %mixed_proposal, %state_view[7] : i32, view<10xi32>
   view.store %warm_first, %state_view[8] : i32, view<10xi32>
   view.store %mixed_warm, %state_view[9] : i32, view<10xi32>
+  scf.if %enabled {
+    func.call @declare_cohort_stages(%state, %depth, %proposal_capacity, %context, %pool, %model_source, %draft_source, %packet_capacity) : (buffer, i64, i64, i64, i64, i32, i32, i64)
+  }
   %less = scalar.cmpi ult, %maximum, %prefill : i64
   %effective = scf.select %less, %maximum, %prefill : i64
   %terminal = global.load @terminal : buffer
