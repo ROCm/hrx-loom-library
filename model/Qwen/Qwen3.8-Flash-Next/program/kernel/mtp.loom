@@ -6,6 +6,8 @@ config.decl @flash_next.token_count : %value: index where [range(%value, 1, 3276
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 func.decl @flash_next_q8_dot(%width: index, %input_origin: offset, %weight_origin: offset, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (f32)
 
 amdgpu.target<gfx11-generic> @flash_next_mtp_wave32 {subgroup_size = 32}
@@ -61,16 +63,18 @@ kernel.def @flash_next_mtp_normalize(%neural_enabled: i1) {
   %tokens = config.get @flash_next.token_count : index
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
   %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %tokens, %c0_index : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
   kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%width_value: index, %epoch: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %width = index.assume %width_value [range(%width_value, 2560, 10240), multiple_of(%width_value, 256)] : index
   %tokens = config.get @flash_next.token_count : index
-  %token = kernel.workgroup.id<x> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %count = func.call @flash_next_token_count(%epoch, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %count : index
-  scf.if %active {
+  scf.for %token = [%worker to %count step %workers] {
     template.apply<@flash_next.mtp_normalize_row>(%width, %tokens, %token, %token, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
   }
   kernel.return
@@ -82,14 +86,16 @@ kernel.def @flash_next_mtp_normalize_warm() {
   %tokens = config.get @flash_next.token_count : index
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%epoch: buffer, %mapping: buffer, %origins: buffer, %restored: buffer, %target: buffer, %weight: buffer, %output: buffer) {
   %width = index.constant 10240 : index
   %tokens = config.get @flash_next.token_count : index
-  %token = kernel.workgroup.id<x> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %count = func.call @flash_next_token_count(%epoch, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %count : index
-  scf.if %active {
+  scf.for %token = [%worker to %count step %workers] {
     %origin = index.constant 0 : offset
     // The mapping owns each compact span start, which indexes its original
     // target range independently of resident identity or rejection holes.
