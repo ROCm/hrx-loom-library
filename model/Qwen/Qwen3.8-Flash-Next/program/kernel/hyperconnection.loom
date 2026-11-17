@@ -8,6 +8,8 @@ amdgpu.target<gfx11-generic> @flash_next_hc_wave32 {subgroup_size = 32}
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 func.decl @flash_next_q8_batch_partial(%width: index, %group_size: index, %batch_size: index, %first: index, %end: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (vector<[%group_size]xf32>)
 
 // One wave normalizes each residual stream. GGUF already folded 1+gamma;
@@ -15,17 +17,19 @@ func.decl @flash_next_q8_batch_partial(%width: index, %group_size: index, %batch
 kernel.def target(@flash_next_hc_wave32) @hc_normalize(%neural_enabled: i1) {
   %tokens = config.get @flash_next.token_count : index
   %c1 = index.constant 1 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
   %threads = index.constant 128 : index
   %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %tokens, %c0_index : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
   kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %residual_arg: buffer, %gamma_arg: buffer, %normalized_arg: buffer) {
   %span, %residual, %gamma, %normalized = buffer.assume.noalias %span_arg, %residual_arg, %gamma_arg, %normalized_arg : buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
-  %token = kernel.workgroup.id<x> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
+  scf.for %token = [%worker to %end step %workers] {
     %stream = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
     %origin = index.constant 0 : offset
@@ -513,15 +517,17 @@ template.def<@flash_next.hc_combine.panel> device @hc_combine_panel(%tokens: ind
 kernel.def target(@flash_next_hc_wave32) @hc_combine_normalize() {
   %tokens = config.get @flash_next.token_count : index
   %c1 = index.constant 1 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
   %threads = index.constant 128 : index
-  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %residual_arg: buffer, %projected_arg: buffer, %injection_arg: buffer, %gamma_arg: buffer, %output_arg: buffer, %normalized_arg: buffer) {
   %span, %residual, %projected, %injection, %gamma, %output, %normalized = buffer.assume.noalias %span_arg, %residual_arg, %projected_arg, %injection_arg, %gamma_arg, %output_arg, %normalized_arg : buffer, buffer, buffer, buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
-  %token = kernel.workgroup.id<x> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
+  scf.for %token = [%worker to %end step %workers] {
     %stream = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
     %origin = index.constant 0 : offset
@@ -599,9 +605,9 @@ func.def inline @hc_injection_chunk(%stream: index, %channel: index, %packed: ve
   func.return %result : vector<4x8xf32>
 }
 
-// The active-token guard is uniform for the whole workgroup. Each stream's
-// leader publishes all four output partials before every wave joins the barrier.
-func.def inline @hc_injection_publish(%token: index, %stream: index, %lane: index, %partial: vector<4x8xf32>, %output: buffer) {
+// Live-row traversal is uniform across the workgroup. Each stream's leader
+// publishes four partials, then all waves rendezvous before reading them.
+func.def inline @hc_injection_publish(%token: index, %stream: index, %lane: index, %partial: vector<4x8xf32>, %storage: buffer, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %origin = index.constant 0 : offset
   %c0_index = index.constant 0 : index
@@ -609,8 +615,6 @@ func.def inline @hc_injection_publish(%token: index, %stream: index, %lane: inde
   %c2_index = index.constant 2 : index
   %c3_index = index.constant 3 : index
   %c4_index = index.constant 4 : index
-  %bytes = index.constant 64 : offset
-  %storage = buffer.alloca<workgroup> align(16) %bytes : buffer
   %exchange = buffer.view %storage[%origin] : buffer -> view<4x4xf32>
   %c0_f32 = scalar.constant 0.0 : f32
   %empty = vector.splatf 0.0 : vector<4xf32>
@@ -645,21 +649,32 @@ func.def inline @hc_injection_publish(%token: index, %stream: index, %lane: inde
     %gates = buffer.view %output[%origin] : buffer -> view<[%capacity]x4xf32>
     view.store %gate, %gates[%token, %stream] : f32, view<[%capacity]x4xf32>
   }
+  // A physical worker can revisit this exchange for another token. Small
+  // specializations own one row per worker and need no retirement barrier.
+  %workers = kernel.workgroup.count<x> : index
+  %reuses_exchange = index.cmp ult, %workers, %capacity : index
+  scf.if %reuses_exchange {
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  }
   func.return
 }
 
 kernel.def target(@flash_next_hc_wave32) @hc_normalize_inject() {
   %tokens = config.get @flash_next.token_count : index
   %c1 = index.constant 1 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
   %threads = index.constant 128 : index
-  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %residual_arg: buffer, %gamma_arg: buffer, %normalized_arg: buffer, %next_weight_arg: buffer, %next_injection_arg: buffer) {
   %span, %residual, %gamma, %normalized, %next_weight, %next_injection = buffer.assume.noalias %span_arg, %residual_arg, %gamma_arg, %normalized_arg, %next_weight_arg, %next_injection_arg : buffer, buffer, buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
-  %token = kernel.workgroup.id<x> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
+  %exchange_bytes = index.constant 64 : offset
+  %exchange = buffer.alloca<workgroup> align(16) %exchange_bytes : buffer
+  scf.for %token = [%worker to %end step %workers] {
     %stream = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
     %origin = index.constant 0 : offset
@@ -698,7 +713,7 @@ kernel.def target(@flash_next_hc_wave32) @hc_normalize_inject() {
       %next_dots = func.call @hc_injection_chunk(%stream, %channel, %packed, %next_weight, %current_dots) : (index, index, vector<8xbf16>, buffer, vector<4x8xf32>) -> (vector<4x8xf32>)
       scf.yield %next_dots : vector<4x8xf32>
     }
-    func.call @hc_injection_publish(%token, %stream, %lane, %dots, %next_injection) : (index, index, index, vector<4x8xf32>, buffer)
+    func.call @hc_injection_publish(%token, %stream, %lane, %dots, %exchange, %next_injection) : (index, index, index, vector<4x8xf32>, buffer, buffer)
   }
   kernel.return
 }
@@ -706,15 +721,19 @@ kernel.def target(@flash_next_hc_wave32) @hc_normalize_inject() {
 kernel.def target(@flash_next_hc_wave32) @hc_combine_normalize_inject() {
   %tokens = config.get @flash_next.token_count : index
   %c1 = index.constant 1 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
   %threads = index.constant 128 : index
-  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %residual_arg: buffer, %projected_arg: buffer, %injection_arg: buffer, %gamma_arg: buffer, %output_arg: buffer, %normalized_arg: buffer, %next_weight_arg: buffer, %next_injection_arg: buffer) {
   %span, %residual, %projected, %injection, %gamma, %output, %normalized, %next_weight, %next_injection = buffer.assume.noalias %span_arg, %residual_arg, %projected_arg, %injection_arg, %gamma_arg, %output_arg, %normalized_arg, %next_weight_arg, %next_injection_arg : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
-  %token = kernel.workgroup.id<x> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
+  %exchange_bytes = index.constant 64 : offset
+  %exchange = buffer.alloca<workgroup> align(16) %exchange_bytes : buffer
+  scf.for %token = [%worker to %end step %workers] {
     %stream = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
     %origin = index.constant 0 : offset
@@ -772,7 +791,7 @@ kernel.def target(@flash_next_hc_wave32) @hc_combine_normalize_inject() {
       %next_dots = func.call @hc_injection_chunk(%stream, %channel, %packed, %next_weight, %current_dots) : (index, index, vector<8xbf16>, buffer, vector<4x8xf32>) -> (vector<4x8xf32>)
       scf.yield %next_dots : vector<4x8xf32>
     }
-    func.call @hc_injection_publish(%token, %stream, %lane, %dots, %next_injection) : (index, index, index, vector<4x8xf32>, buffer)
+    func.call @hc_injection_publish(%token, %stream, %lane, %dots, %exchange, %next_injection) : (index, index, index, vector<4x8xf32>, buffer, buffer)
   }
   kernel.return
 }
@@ -1051,15 +1070,19 @@ kernel.def target(@hc_int8_wave32) @hc_matrix_down_int8() {
 kernel.def target(@flash_next_hc_wave32) @hc_normalize_inject_int8() {
   %tokens = config.get @flash_next.token_count : index
   %c1 = index.constant 1 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
   %threads = index.constant 128 : index
-  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %residual_arg: buffer, %gamma_arg: buffer, %normalized_arg: buffer, %next_weight_arg: buffer, %next_injection_arg: buffer, %quantized_arg: buffer) {
   %span, %residual, %gamma, %normalized, %next_weight, %next_injection, %quantized = buffer.assume.noalias %span_arg, %residual_arg, %gamma_arg, %normalized_arg, %next_weight_arg, %next_injection_arg, %quantized_arg : buffer, buffer, buffer, buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
-  %token = kernel.workgroup.id<x> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
+  %exchange_bytes = index.constant 64 : offset
+  %exchange = buffer.alloca<workgroup> align(16) %exchange_bytes : buffer
+  scf.for %token = [%worker to %end step %workers] {
     %stream = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
     %origin = index.constant 0 : offset
@@ -1099,7 +1122,7 @@ kernel.def target(@flash_next_hc_wave32) @hc_normalize_inject_int8() {
       %next_dots = func.call @hc_injection_chunk(%stream, %channel, %packed, %next_weight, %current_dots) : (index, index, vector<8xbf16>, buffer, vector<4x8xf32>) -> (vector<4x8xf32>)
       scf.yield %next_dots : vector<4x8xf32>
     }
-    func.call @hc_injection_publish(%token, %stream, %lane, %dots, %next_injection) : (index, index, index, vector<4x8xf32>, buffer)
+    func.call @hc_injection_publish(%token, %stream, %lane, %dots, %exchange, %next_injection) : (index, index, index, vector<4x8xf32>, buffer, buffer)
   }
   kernel.return
 }
@@ -1107,15 +1130,19 @@ kernel.def target(@flash_next_hc_wave32) @hc_normalize_inject_int8() {
 kernel.def target(@flash_next_hc_wave32) @hc_combine_normalize_inject_int8() {
   %tokens = config.get @flash_next.token_count : index
   %c1 = index.constant 1 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
   %threads = index.constant 128 : index
-  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %residual_arg: buffer, %projected_arg: buffer, %injection_arg: buffer, %gamma_arg: buffer, %output_arg: buffer, %normalized_arg: buffer, %next_weight_arg: buffer, %next_injection_arg: buffer, %quantized_arg: buffer) {
   %span, %residual, %projected, %injection, %gamma, %output, %normalized, %next_weight, %next_injection, %quantized = buffer.assume.noalias %span_arg, %residual_arg, %projected_arg, %injection_arg, %gamma_arg, %output_arg, %normalized_arg, %next_weight_arg, %next_injection_arg, %quantized_arg : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
-  %token = kernel.workgroup.id<x> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
+  %exchange_bytes = index.constant 64 : offset
+  %exchange = buffer.alloca<workgroup> align(16) %exchange_bytes : buffer
+  scf.for %token = [%worker to %end step %workers] {
     %stream = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
     %origin = index.constant 0 : offset
@@ -1174,7 +1201,7 @@ kernel.def target(@flash_next_hc_wave32) @hc_combine_normalize_inject_int8() {
       %next_dots = func.call @hc_injection_chunk(%stream, %channel, %packed, %next_weight, %current_dots) : (index, index, vector<8xbf16>, buffer, vector<4x8xf32>) -> (vector<4x8xf32>)
       scf.yield %next_dots : vector<4x8xf32>
     }
-    func.call @hc_injection_publish(%token, %stream, %lane, %dots, %next_injection) : (index, index, index, vector<4x8xf32>, buffer)
+    func.call @hc_injection_publish(%token, %stream, %lane, %dots, %exchange, %next_injection) : (index, index, index, vector<4x8xf32>, buffer, buffer)
   }
   kernel.return
 }
