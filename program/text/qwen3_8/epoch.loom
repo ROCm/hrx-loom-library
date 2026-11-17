@@ -28,6 +28,10 @@ func.decl @qwen38_feedback_records_origin() -> (offset)
 
 func.decl @qwen38_feedback_bank_bytes(%capacity: index) -> (offset)
 
+func.decl @qwen38_feedback_outputs(%counts: i32) -> (i32)
+
+func.decl @qwen38_feedback_proposals(%counts: i32) -> (i32)
+
 func.decl import("runner") @timestamp(%target: hal.buffer, %offset: i64) -> (i64)
 
 func.decl @qwen38.tagged_feedback_bytes(%state: buffer) -> (i64)
@@ -279,8 +283,9 @@ func.def public @text_encode_epoch_v1(%control_state: buffer, %plan: buffer, %in
 
 // Semantic progress is {consumed, known, outputs, verifications,
 // source_position, tokens[16]}. Only completed feedback enters this transform;
-// bank contents are immutable.
-func.def public @text_publish_epoch_v1(%control_state: buffer, %plan: buffer, %media_plan: buffer, %count: i32, %first_media_count: i32, %next_media_count: i32, %verified: i32, %continues: i32, %continuation_flags: buffer, %ordinary: buffer, %first_results: buffer, %next_results: buffer, %progress: buffer) {
+// bank contents are immutable. Actual candidate counts are published separately,
+// indexed by the same first-cohort ordinal, including compacted continuations.
+func.def public @text_publish_epoch_v1(%control_state: buffer, %plan: buffer, %media_plan: buffer, %count: i32, %first_media_count: i32, %next_media_count: i32, %verified: i32, %continues: i32, %continuation_flags: buffer, %ordinary: buffer, %first_results: buffer, %next_results: buffer, %progress: buffer, %proposal_counts: buffer) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -293,14 +298,17 @@ func.def public @text_publish_epoch_v1(%control_state: buffer, %plan: buffer, %m
   %progress_bytes = buffer.length %progress
   buffer.fill %zero32, %progress[%origin], %progress_bytes : i32
   %requests = buffer.view %plan[%origin] : buffer -> view<[%extent]x9xi32>
+  %proposals = buffer.view %proposal_counts[%origin] : buffer -> view<[%extent]xi32>
   %published = buffer.view %progress[%origin] : buffer -> view<[%extent]x21xi32>
   %verifies = scalar.cmpi ne, %verified, %zero32 : i32
   %outputs = scf.for %i = [%c0 to %extent step %c1](%ordinary_index = %c0 : index) -> (index) {
-    %consumed, %known, %output_count, %verifications = scf.if %verifies -> (i32, i32, i32, i32) {
+    %consumed, %known, %output_count, %verifications, %proposed = scf.if %verifies -> (i32, i32, i32, i32, i32) {
       %result_origin = func.call @qwen38_feedback_records_origin() : () -> (offset)
       %records = buffer.view %first_results[%result_origin] : buffer -> view<[%extent]x10xi32>
       %consumed = view.load %records[%i, 0] : view<[%extent]x10xi32> -> i32
-      %output_count = view.load %records[%i, 1] : view<[%extent]x10xi32> -> i32
+      %counts = view.load %records[%i, 1] : view<[%extent]x10xi32> -> i32
+      %output_count = func.call @qwen38_feedback_outputs(%counts) : (i32) -> (i32)
+      %proposed = func.call @qwen38_feedback_proposals(%counts) : (i32) -> (i32)
       %credit = view.load %requests[%i, 7] : view<[%extent]x9xi32> -> i32
       %speculative = scalar.cmpi ne, %credit, %zero32 : i32
       %verifications = scalar.extui %speculative : i1 to i32
@@ -314,7 +322,7 @@ func.def public @text_publish_epoch_v1(%control_state: buffer, %plan: buffer, %m
         %token = view.load %records[%i, %source] : view<[%extent]x10xi32> -> i32
         view.store %token, %published[%i, %target] : i32, view<[%extent]x21xi32>
       }
-      scf.yield %consumed, %known, %output_count, %verifications : i32, i32, i32, i32
+      scf.yield %consumed, %known, %output_count, %verifications, %proposed : i32, i32, i32, i32, i32
     } else {
       %length = view.load %requests[%i, 0] : view<[%extent]x9xi32> -> i32
       %flags = view.load %requests[%i, 6] : view<[%extent]x9xi32> -> i32
@@ -327,8 +335,9 @@ func.def public @text_publish_epoch_v1(%control_state: buffer, %plan: buffer, %m
         %token = view.load %tokens[%slot] : view<[%extent]xi32> -> i32
         view.store %token, %published[%i, 5] : i32, view<[%extent]x21xi32>
       }
-      scf.yield %length, %length, %selected_count, %zero32 : i32, i32, i32, i32
+      scf.yield %length, %length, %selected_count, %zero32, %zero32 : i32, i32, i32, i32, i32
     }
+    view.store %proposed, %proposals[%i] : i32, view<[%extent]xi32>
     view.store %consumed, %published[%i, 0] : i32, view<[%extent]x21xi32>
     view.store %known, %published[%i, 1] : i32, view<[%extent]x21xi32>
     view.store %output_count, %published[%i, 2] : i32, view<[%extent]x21xi32>
@@ -358,7 +367,12 @@ func.def public @text_publish_epoch_v1(%control_state: buffer, %plan: buffer, %m
         %first_value = index.cast %tag : i32 to index
         %first = index.assume %first_value [range(%first_value, 0, 2147483647), lt(%first_value, %extent)] : index
         %consumed = view.load %records[%i, 0] : view<[%extent]x10xi32> -> i32
-        %output_count = view.load %records[%i, 1] : view<[%extent]x10xi32> -> i32
+        %counts = view.load %records[%i, 1] : view<[%extent]x10xi32> -> i32
+        %output_count = func.call @qwen38_feedback_outputs(%counts) : (i32) -> (i32)
+        %proposed = func.call @qwen38_feedback_proposals(%counts) : (i32) -> (i32)
+        %prior_proposed = view.load %proposals[%first] : view<[%extent]xi32> -> i32
+        %total_proposed = scalar.addi %prior_proposed, %proposed : i32
+        view.store %total_proposed, %proposals[%first] : i32, view<[%extent]xi32>
         %prior_consumed = view.load %published[%first, 0] : view<[%extent]x21xi32> -> i32
         %prior_known = view.load %published[%first, 1] : view<[%extent]x21xi32> -> i32
         %prior_outputs = view.load %published[%first, 2] : view<[%extent]x21xi32> -> i32
