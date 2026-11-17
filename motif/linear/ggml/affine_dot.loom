@@ -22,3 +22,46 @@ template.def<@ggml.qk.unsigned_q8_1_dot> device @ggml_qk_unsigned_q8_1_dot(%quan
   %contribution = scalar.subf<reassoc|nnan|ninf|nsz> %scaled_dot, %minimum_correction : f32
   template.return %contribution : f32
 }
+
+// Complete 32-value affine-weight contraction against planar Q8_1. Weight
+// values are (code * scale - minimum); Q8_1 stores signed codes, its scale,
+// and the exact unscaled integer-code sum. A zero minimum also expresses
+// symmetric signed formats such as Q8_0 without changing representations.
+// The operation grouping follows the GGML GPU kernels: finish the integer dot,
+// apply the weight affine transform, and then apply the activation scale.
+template.decl @ggml.qk.affine_q8_1_planar_dot(%weight_codes: vector<32xi8>, %weight_scale: f32, %weight_minimum: f32, %q8_codes: vector<32xi8>, %q8_scale: f32, %q8_code_sum: f32) -> (f32)
+
+template.def<@ggml.qk.affine_q8_1_planar_dot> device @ggml_qk_affine_q8_1_planar_dot(%weight_codes: vector<32xi8>, %weight_scale: f32, %weight_minimum: f32, %q8_codes: vector<32xi8>, %q8_scale: f32, %q8_code_sum: f32) -> (f32) {
+  %zero_dot = vector.splati 0 : vector<1xi32>
+  %weight0 = vector.slice %weight_codes[0] : vector<32xi8> -> vector<4xi8>
+  %q8_0 = vector.slice %q8_codes[0] : vector<32xi8> -> vector<4xi8>
+  %dot0 = vector.dot4i<s8s8> %weight0, %q8_0, %zero_dot : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight1 = vector.slice %weight_codes[4] : vector<32xi8> -> vector<4xi8>
+  %q8_1 = vector.slice %q8_codes[4] : vector<32xi8> -> vector<4xi8>
+  %dot1 = vector.dot4i<s8s8> %weight1, %q8_1, %dot0 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight2 = vector.slice %weight_codes[8] : vector<32xi8> -> vector<4xi8>
+  %q8_2 = vector.slice %q8_codes[8] : vector<32xi8> -> vector<4xi8>
+  %dot2 = vector.dot4i<s8s8> %weight2, %q8_2, %dot1 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight3 = vector.slice %weight_codes[12] : vector<32xi8> -> vector<4xi8>
+  %q8_3 = vector.slice %q8_codes[12] : vector<32xi8> -> vector<4xi8>
+  %dot3 = vector.dot4i<s8s8> %weight3, %q8_3, %dot2 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight4 = vector.slice %weight_codes[16] : vector<32xi8> -> vector<4xi8>
+  %q8_4 = vector.slice %q8_codes[16] : vector<32xi8> -> vector<4xi8>
+  %dot4 = vector.dot4i<s8s8> %weight4, %q8_4, %dot3 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight5 = vector.slice %weight_codes[20] : vector<32xi8> -> vector<4xi8>
+  %q8_5 = vector.slice %q8_codes[20] : vector<32xi8> -> vector<4xi8>
+  %dot5 = vector.dot4i<s8s8> %weight5, %q8_5, %dot4 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight6 = vector.slice %weight_codes[24] : vector<32xi8> -> vector<4xi8>
+  %q8_6 = vector.slice %q8_codes[24] : vector<32xi8> -> vector<4xi8>
+  %dot6 = vector.dot4i<s8s8> %weight6, %q8_6, %dot5 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight7 = vector.slice %weight_codes[28] : vector<32xi8> -> vector<4xi8>
+  %q8_7 = vector.slice %q8_codes[28] : vector<32xi8> -> vector<4xi8>
+  %dot7 = vector.dot4i<s8s8> %weight7, %q8_7, %dot6 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %integer_dot = vector.extract %dot7[0] : vector<1xi32> -> i32
+  %floating_dot = scalar.sitofp %integer_dot : i32 to f32
+  %scaled_dot = scalar.mulf %floating_dot, %weight_scale : f32
+  %minimum_correction = scalar.mulf %q8_code_sum, %weight_minimum : f32
+  %centered = scalar.subf %scaled_dot, %minimum_correction : f32
+  %contribution = scalar.mulf %centered, %q8_scale : f32
+  template.return %contribution : f32
+}
