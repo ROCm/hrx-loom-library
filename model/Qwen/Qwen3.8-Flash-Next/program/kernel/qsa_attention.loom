@@ -10,6 +10,8 @@ config.decl @flash_next.pool_capacity : %value: index where [range(%value, 64, 2
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 func.decl @flash_next_token_binding(%mapping: buffer, %token: index) -> (index, index, index, index)
 
 func.decl @flash_next_token_coordinate(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %mapping: buffer, %inputs: buffer, %origins: buffer, %token: index, %lane: index) -> (index)
@@ -28,15 +30,27 @@ func.decl @qsa_normalize_rotate(%width: index, %position: index, %input: buffer,
 // contiguous matrix operand loads without a second cache or a repacking pass.
 // A 64-token ownership page contains both heads' K/V records. Each appender
 // writes only its member; unpublished members remain untouched.
+// Up to four independent waves share a workgroup and stride the live prefix;
+// no cache publication depends on another wave or reuses workgroup storage.
 template.decl @flash_next.qsa_append_kv(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer)
 
-template.def<@flash_next.qsa_append_kv> device @qsa_append_kv_body(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer) {
+template.def<@flash_next.qsa_append_kv> device @qsa_append_kv_body(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %inputs_arg: buffer, %origins_arg: buffer, %key_origin: offset, %value_origin: offset, %span_arg: buffer, %mapping_arg: buffer, %rows_arg: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer) {
+  // Packed metadata is immutable until this epoch completes.
+  %inputs = buffer.assume.memory_space<constant> %inputs_arg : buffer
+  %origins = buffer.assume.memory_space<constant> %origins_arg : buffer
+  %span = buffer.assume.memory_space<constant> %span_arg : buffer
+  %mapping = buffer.assume.memory_space<constant> %mapping_arg : buffer
+  %rows = buffer.assume.memory_space<constant> %rows_arg : buffer
   %tokens = config.get @flash_next.token_count : index
   %capacity = config.get @flash_next.context_capacity : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %token = kernel.workgroup.id<y> : index
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
+  %worker = kernel.workgroup.id<y> : index
+  %workers = kernel.workgroup.count<y> : index
+  %wave = kernel.subgroup.id : index
+  %waves = kernel.subgroup.count : index
+  %first_token = index.madd %worker, %waves, %wave : index
+  %stride = index.mul %workers, %waves : index
+  scf.for %token = [%first_token to %end step %stride] {
     %head = kernel.workgroup.id<x> : index
     %position, %row, %begin, %first = func.call @flash_next_token_binding(%mapping, %token) : (buffer, index) -> (index, index, index, index)
     %physical = func.call @flash_next_physical_token(%rows, %row, %position) : (buffer, index, index) -> (index)
@@ -79,11 +93,19 @@ template.def<@flash_next.qsa_append_kv> device @qsa_append_kv_body(%mixed: index
 kernel.def target(@qsa_attention_wave32) @qsa_append_kv(%neural_enabled: i1) {
   %heads = index.constant 2 : index
   %tokens = config.get @flash_next.token_count : index
-  %threads = index.constant 32 : index
+  %wave_width = index.constant 32 : index
+  %maximum_waves = index.constant 4 : index
+  %waves = index.min %tokens, %maximum_waves : index
+  %threads = index.mul %waves, %wave_width : index
   %c1 = index.constant 1 : index
   %c0_index = index.constant 0 : index
+  %padding = index.sub %waves, %c1 : index
+  %rounded = index.add %tokens, %padding : index
+  %panels = index.div %rounded, %waves : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%panels, %heads, %units) : (index, index, index) -> (index)
   %active_groups = scf.select %neural_enabled, %heads, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%active_groups, %workers, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer) {
   %mixed = index.constant 0 : index
   %remapped = scalar.constant false : i1
@@ -95,11 +117,19 @@ kernel.def target(@qsa_attention_wave32) @qsa_append_kv(%neural_enabled: i1) {
 kernel.def target(@qsa_attention_wave32) @qsa_append_kv_mixed(%neural_enabled: i1) {
   %heads = index.constant 2 : index
   %tokens = config.get @flash_next.token_count : index
-  %threads = index.constant 32 : index
+  %wave_width = index.constant 32 : index
+  %maximum_waves = index.constant 4 : index
+  %waves = index.min %tokens, %maximum_waves : index
+  %threads = index.mul %waves, %wave_width : index
   %c1 = index.constant 1 : index
   %c0_index = index.constant 0 : index
+  %padding = index.sub %waves, %c1 : index
+  %rounded = index.add %tokens, %padding : index
+  %panels = index.div %rounded, %waves : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%panels, %heads, %units) : (index, index, index) -> (index)
   %active_groups = scf.select %neural_enabled, %heads, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%active_groups, %workers, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer) {
   %mixed = index.constant 1 : index
   %remapped = scalar.constant false : i1
@@ -110,11 +140,19 @@ kernel.def target(@qsa_attention_wave32) @qsa_append_kv_mixed(%neural_enabled: i
 kernel.def target(@qsa_attention_wave32) @qsa_append_kv_remapped(%neural_enabled: i1) {
   %heads = index.constant 2 : index
   %tokens = config.get @flash_next.token_count : index
-  %threads = index.constant 32 : index
+  %wave_width = index.constant 32 : index
+  %maximum_waves = index.constant 4 : index
+  %waves = index.min %tokens, %maximum_waves : index
+  %threads = index.mul %waves, %wave_width : index
   %c1 = index.constant 1 : index
   %c0_index = index.constant 0 : index
+  %padding = index.sub %waves, %c1 : index
+  %rounded = index.add %tokens, %padding : index
+  %panels = index.div %rounded, %waves : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%panels, %heads, %units) : (index, index, index) -> (index)
   %active_groups = scf.select %neural_enabled, %heads, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%active_groups, %workers, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %keys: buffer, %values: buffer, %weight: buffer, %arena: buffer) {
   %mixed = index.constant 1 : index
   %remapped = scalar.constant true : i1
