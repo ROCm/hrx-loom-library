@@ -19,18 +19,27 @@ template.decl @qwen38.token_embedding_q5k_f32.row(%token_id_i32: i32, %output_by
 // Expands one selected embedding row at an explicit output byte offset. The
 // prefill and decode wrappers differ only in how they select that row.
 template.def<@qwen38.token_embedding_q5k_f32.row> device @qwen38_token_embedding_q5k_f32_row(%token_id_i32: i32, %output_byte_offset: offset, %weight: buffer, %output: buffer) {
+  %row_bytes = index.constant 3520 : offset
+  %token_id0 = index.cast %token_id_i32 : i32 to index
+  %token_id = index.assume %token_id0 [range(%token_id0, 0, 248319)] : index
+  %row_byte_base = index.scale %token_id, %row_bytes : index, offset -> offset
+  template.apply<@qwen38.token_embedding_q5k_f32.bytes>(%row_byte_base, %output_byte_offset, %weight, %output) : (offset, offset, buffer, buffer)
+  template.return
+}
+
+// Physical byte origins also address relocated rows without treating cache slots
+// as vocabulary IDs. Each workgroup still supplies 256 lanes to the same decoder.
+template.decl @qwen38.token_embedding_q5k_f32.bytes(%row_byte_base: offset, %output_byte_offset: offset, %weight: buffer, %output: buffer)
+
+template.def<@qwen38.token_embedding_q5k_f32.bytes> device @qwen38_token_embedding_q5k_f32_bytes(%row_byte_base: offset, %output_byte_offset: offset, %weight: buffer, %output: buffer) {
   %workitem0 = kernel.workitem.id<x> : index
   %workitem = index.assume %workitem0 [range(%workitem0, 0, 255)] : index
   %c2 = index.constant 2 : index
   %c16 = index.constant 16 : index
   %c256 = index.constant 256 : index
   %chunk_count = index.constant 320 : index
-  %row_bytes = index.constant 3520 : offset
   %weight_noalias, %output_noalias = buffer.assume.noalias %weight, %output : buffer, buffer
   %output_view = buffer.view %output_noalias[%output_byte_offset] : buffer -> view<5120xf32>
-  %token_id0 = index.cast %token_id_i32 : i32 to index
-  %token_id = index.assume %token_id0 [range(%token_id0, 0, 248319)] : index
-  %row_byte_base = index.scale %token_id, %row_bytes : index, offset -> offset
   scf.for %chunk = [%workitem to %chunk_count step %c256] {
     %q5_block = index.div %chunk, %c16 : index
     %block_chunk = index.rem %chunk, %c16 : index

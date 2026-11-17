@@ -1,0 +1,117 @@
+// Compact set-associative cache for one immutable source and serialized cohorts.
+// Directory entries contain a 32-bit generation, pending bit, and key plus one.
+// Keys are in [0, 2147483646]. Capacity is positive ways times a power-of-two
+// set count. The directory and previous generation are initially zero.
+// The caller retires every previous reader before begin, supplies complete bytes
+// before publish, and abandons failed pending writes before the next begin.
+// This implementation requires native 64-bit device atomics. Payload layout,
+// byte descriptors, spill storage, and decoding remain caller-owned.
+
+func.def public inline @cohort_cache_reserve(%capacity: index, %ways: index, %tags: view<[%capacity]xi64>, %generation: i64, %row_word: i32) -> (index, i1) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %sets = index.div %capacity, %ways : index
+  %rounds = index.add %ways, %c1 : index
+  %shift = scalar.constant 32 : i64
+  %generation_bits = scalar.shli %generation, %shift : i64
+  %key_mask = scalar.constant 2147483647 : i64
+  %pending_bit = scalar.constant 2147483648 : i64
+  %zero64 = scalar.constant 0 : i64
+  %one64 = scalar.constant 1 : i64
+  %hash_factor = scalar.constant -1640531535 : i32
+  %set_mask_value = index.sub %sets, %c1 : index
+  %set_mask = index.cast %set_mask_value : index to i32
+  %false = scalar.constant false : i1
+  %true = scalar.constant true : i1
+  %row = scalar.extui %row_word : i32 to i64
+  %key = scalar.addi %row, %one64 : i64
+  %hash = scalar.muli %row_word, %hash_factor : i32
+  %set_word = scalar.andi %hash, %set_mask : i32
+  %set_value = index.cast %set_word : i32 to index
+  %set = index.assume %set_value [range(%set_value, 0, %set_mask_value)] : index
+  %base = index.mul %set, %ways : index
+  %slot, %read, %done = scf.for %round = [%c0 to %rounds step %c1](%chosen = %capacity : index, %needs_read = %true : i1, %resolved = %false : i1) -> (index, i1, i1) {
+    %next_slot, %next_read, %next_done = scf.if %resolved -> (index, i1, i1) {
+      scf.yield %chosen, %needs_read, %resolved : index, i1, i1
+    } else {
+      %match, %match_tag, %victim, %victim_tag, %oldest = scf.for %way = [%c0 to %ways step %c1](%found = %capacity : index, %found_tag = %zero64 : i64, %replace = %capacity : index, %replace_tag = %zero64 : i64, %age = %generation : i64) -> (index, i64, index, i64, i64) {
+        %index = index.add %base, %way : index
+        %tag = view.atomic.load %tags[%index] {ordering = relaxed, scope = device} : view<[%capacity]xi64> -> i64
+        %tag_generation = scalar.shrui %tag, %shift : i64
+        %tag_key = scalar.andi %tag, %key_mask : i64
+        %pending = scalar.andi %tag, %pending_bit : i64
+        %ready = scalar.cmpi eq, %pending, %zero64 : i64
+        %current = scalar.cmpi eq, %tag_generation, %generation : i64
+        %valid = scalar.ori %ready, %current : i1
+        %equal = scalar.cmpi eq, %tag_key, %key : i64
+        %hit = scalar.andi %equal, %valid : i1
+        %new_match = scf.select %hit, %index, %found : index
+        %new_match_tag = scf.select %hit, %tag, %found_tag : i64
+        %older = scalar.cmpi ult, %tag_generation, %age : i64
+        %new_victim = scf.select %older, %index, %replace : index
+        %new_victim_tag = scf.select %older, %tag, %replace_tag : i64
+        %new_age = scf.select %older, %tag_generation, %age : i64
+        scf.yield %new_match, %new_match_tag, %new_victim, %new_victim_tag, %new_age : index, i64, index, i64, i64
+      }
+      %hit = index.cmp ult, %match, %capacity : index
+      %selected = scf.select %hit, %match, %victim : index
+      %expected = scf.select %hit, %match_tag, %victim_tag : i64
+      %available = index.cmp ult, %selected, %capacity : index
+      %result_slot, %result_read, %result_done = scf.if %available -> (index, i1, i1) {
+        %selected_index = index.assume %selected [range(%selected, 0, %capacity), lt(%selected, %capacity)] : index
+        %expected_generation = scalar.shrui %expected, %shift : i64
+        %already_claimed = scalar.cmpi eq, %expected_generation, %generation : i64
+        %miss = scalar.xori %hit, %true : i1
+        %status = scf.select %miss, %pending_bit, %zero64 : i64
+        %tag_key = scalar.ori %key, %status : i64
+        %desired = scalar.ori %generation_bits, %tag_key : i64
+        %accepted = scf.if %already_claimed -> (i1) {
+          scf.yield %true : i1
+        } else {
+          %observed = view.atomic.cmpxchg %expected, %desired, %tags[%selected_index] {failure_ordering = relaxed, scope = device, success_ordering = relaxed} : i64, view<[%capacity]xi64> -> i64
+          %accepted = scalar.cmpi eq, %observed, %expected : i64
+          scf.yield %accepted : i1
+        }
+        %result_slot = scf.select %accepted, %selected_index, %chosen : index
+        %result_read = scf.select %accepted, %miss, %needs_read : i1
+        scf.yield %result_slot, %result_read, %accepted : index, i1, i1
+      } else {
+        scf.yield %capacity, %true, %true : index, i1, i1
+      }
+      scf.yield %result_slot, %result_read, %result_done : index, i1, i1
+    }
+    scf.yield %next_slot, %next_read, %next_done : index, i1, i1
+  }
+  func.return %slot, %read : index, i1
+}
+
+// Only the successful unique fill owner publishes a resident slot. The
+// transfer-ready dependency precedes this call; consumers follow publication.
+func.def public inline @cohort_cache_publish(%capacity: index, %tags: view<[%capacity]xi64>, %slot: index) {
+  %ready_mask = scalar.constant -2147483649 : i64
+  %tag = view.load %tags[%slot] : view<[%capacity]xi64> -> i64
+  %ready = scalar.andi %tag, %ready_mask : i64
+  view.store %ready, %tags[%slot] : i64, view<[%capacity]xi64>
+  func.return
+}
+
+// Called by every lane of one workgroup. Each lane loads previous before this
+// call; the barrier protects that snapshot from the caller's leader store.
+// Subsequent planning follows completion of the complete begin dispatch.
+func.def public inline @cohort_cache_begin(%capacity: index, %directory: view<[%capacity]xi64>, %previous: i64) -> (i64) {
+  kernel.barrier<global> scope(workgroup) ordering(acq_rel)
+  %limit = scalar.constant 4294967295 : i64
+  %rollover = scalar.cmpi eq, %previous, %limit : i64
+  %lane = kernel.workitem.id<x> : index
+  %threads = kernel.workgroup.size<x> : index
+  %one64 = scalar.constant 1 : i64
+  scf.if %rollover {
+    %zero64 = scalar.constant 0 : i64
+    scf.for %slot = [%lane to %capacity step %threads] {
+      view.store %zero64, %directory[%slot] : i64, view<[%capacity]xi64>
+    }
+  }
+  %next = scalar.addi %previous, %one64 : i64
+  %generation = scf.select %rollover, %one64, %next : i64
+  func.return %generation : i64
+}

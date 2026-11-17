@@ -9,6 +9,7 @@ and specialize them with the value facts available at their composition roots.
 
 | Path | Contents |
 | --- | --- |
+| [`cache/`](cache/) | Immutable payload reservation and publication across ordered cohorts. |
 | [`format/`](format/) | Physical tensor representations and their reusable operations. |
 | [`linear/`](linear/) | Packed-weight contractions and reusable row schedules. |
 | [`text/`](text/) | Unicode properties, full uppercase, UTF-8 traversal, and trimming. |

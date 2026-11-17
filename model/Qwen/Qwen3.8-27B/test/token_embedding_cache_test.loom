@@ -1,0 +1,336 @@
+// Two cache geometries feed the actual Q27 byte-origin decoder. Expected
+// values come from its existing independent scalar Q5_K physical-layout oracle.
+// Transfer is a bounded test provider copying exact encoded bytes; native file
+// retirement is covered separately. Failed plans never publish or consume.
+
+func.decl @cohort_cache_reserve(%capacity: index, %ways: index, %tags: view<[%capacity]xi64>, %generation: i64, %row_word: i32) -> (index, i1)
+
+func.decl @cohort_cache_publish(%capacity: index, %tags: view<[%capacity]xi64>, %slot: index)
+
+func.decl @cohort_cache_begin(%capacity: index, %directory: view<[%capacity]xi64>, %previous: i64) -> (i64)
+
+template.decl @qwen38.token_embedding_q5k_f32.bytes(%row_byte_base: offset, %output_byte_offset: offset, %weight: buffer, %output: buffer)
+
+func.def @fixture(%configuration_ordinal: index, %trial: index, %ids_buffer: buffer, %weight: buffer) {
+  %ways, %abandon = func.call pure @geometry(%configuration_ordinal) : (index) -> (index, index)
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %two = index.constant 2 : index
+  %rows = index.constant 512 : index
+  %blocks = index.constant 20 : index
+  %count = index.constant 32 : index
+  scf.for %row = [%zero to %rows step %one] {
+    scf.for %lane = [%zero to %blocks step %one] {
+      %row_bytes = index.constant 3520 : offset
+      %block_bytes = index.constant 176 : offset
+      %row_origin = index.scale %row, %row_bytes : index, offset -> offset
+      %delta = index.scale %lane, %block_bytes : index, offset -> offset
+      %base = index.add %row_origin, %delta : offset
+      %header = buffer.view %weight[%base] : buffer -> view<2xf16>
+      %period = index.constant 19 : index
+      %mixed = index.add %row, %lane : index
+      %ordinal = index.rem %mixed, %period : index
+      %word = index.cast %ordinal : index to i32
+      %center = scalar.constant 9 : i32
+      %signed = scalar.subi %word, %center : i32
+      %value = scalar.sitofp %signed : i32 to f32
+      %factor = scalar.constant 0.03125 : f32
+      %scale = scalar.mulf %value, %factor : f32
+      %minimum = scalar.constant 0.015625 : f32
+      %d = scalar.fptrunc %scale : f32 to f16
+      %dmin = scalar.fptrunc %minimum : f32 to f16
+      view.store %d, %header[0] : f16, view<2xf16>
+      view.store %dmin, %header[1] : f16, view<2xf16>
+    }
+    %active = index.cmp ult, %row, %count : index
+    scf.if %active {
+      %capacity = index.constant 64 : index
+      %sets = index.div %capacity, %ways : index
+      %pattern = index.rem %trial, %two : index
+      %duplicates = index.cmp ne, %pattern, %zero : index
+      %small = index.rem %row, %ways : index
+      %ordinal = scf.select %duplicates, %small, %row : index
+      %key = index.mul %ordinal, %sets : index
+      %key_word = index.cast %key : index to i32
+      %origin = index.constant 0 : offset
+      %ids = buffer.view %ids_buffer[%origin] : buffer -> view<32xi32>
+      view.store %key_word, %ids[%row] : i32, view<32xi32>
+    }
+  }
+  func.return
+}
+
+kernel.def @seed() {
+  %one = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%configuration: buffer, %header_buffer: buffer, %tags_buffer: buffer) {
+  %origin = index.constant 0 : offset
+  %configuration_view = buffer.view %configuration[%origin] : buffer -> view<1xi32>
+  %trial_word = view.load %configuration_view[0] : view<1xi32> -> i32
+  %trial_value = index.cast %trial_word : i32 to index
+  %trial = index.assume %trial_value [range(%trial_value, 0, 5)] : index
+  %capacity = index.constant 64 : index
+  %tags = buffer.view %tags_buffer[%origin] : buffer -> view<[%capacity]xi64>
+  %lane = kernel.workitem.id<x> : index
+  %zero64 = scalar.constant 0 : i64
+  view.store %zero64, %tags[%lane] : i64, view<[%capacity]xi64>
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %two = index.constant 2 : index
+  %three = index.constant 3 : index
+  %pair = index.div %trial, %two : index
+  %position = index.rem %pair, %three : index
+  %initial = index.cmp eq, %position, %zero : index
+  %before = index.cmp eq, %position, %one : index
+  %penultimate = scalar.constant 4294967294 : i64
+  %last = scalar.constant 4294967295 : i64
+  %boundary = scf.select %before, %penultimate, %last : i64
+  %previous = scf.select %initial, %zero64, %boundary : i64
+  %leader = index.cmp eq, %lane, %zero : index
+  scf.if %leader {
+    %header = buffer.view %header_buffer[%origin] : buffer -> view<1xi64>
+    view.store %previous, %header[0] : i64, view<1xi64>
+  }
+  kernel.return
+}
+
+kernel.def @begin() {
+  %one = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%header_buffer: buffer, %tags_buffer: buffer) {
+  %origin = index.constant 0 : offset
+  %capacity = index.constant 64 : index
+  %header = buffer.view %header_buffer[%origin] : buffer -> view<1xi64>
+  %tags = buffer.view %tags_buffer[%origin] : buffer -> view<[%capacity]xi64>
+  %previous = view.load %header[0] : view<1xi64> -> i64
+  %generation = func.call @cohort_cache_begin(%capacity, %tags, %previous) : (index, view<[%capacity]xi64>, i64) -> (i64)
+  %lane = kernel.workitem.id<x> : index
+  %zero = index.constant 0 : index
+  %leader = index.cmp eq, %lane, %zero : index
+  scf.if %leader {
+    view.store %generation, %header[0] : i64, view<1xi64>
+  }
+  kernel.return
+}
+
+kernel.def @plan() {
+  %one = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%ways_value: index, %header_buffer: buffer, %ids_buffer: buffer, %tags_buffer: buffer, %mapping_buffer: buffer, %records_buffer: buffer) {
+  %ways = index.assume %ways_value [range(%ways_value, 4, 8), multiple_of(%ways_value, 4)] : index
+  %origin = index.constant 0 : offset
+  %capacity = index.constant 64 : index
+  %count = index.constant 32 : index
+  %header = buffer.view %header_buffer[%origin] : buffer -> view<1xi64>
+  %tags = buffer.view %tags_buffer[%origin] : buffer -> view<[%capacity]xi64>
+  %ids = buffer.view %ids_buffer[%origin] : buffer -> view<32xi32>
+  %mapping = buffer.view %mapping_buffer[%origin] : buffer -> view<32xi32>
+  %records = buffer.view %records_buffer[%origin] : buffer -> view<32x3xi64>
+  %generation = view.load %header[0] : view<1xi64> -> i64
+  %request = kernel.workitem.id<x> : index
+  %active = index.cmp ult, %request, %count : index
+  scf.if %active {
+    %key = view.load %ids[%request] : view<32xi32> -> i32
+    %selected, %read = func.call @cohort_cache_reserve(%capacity, %ways, %tags, %generation, %key) : (index, index, view<[%capacity]xi64>, i64, i32) -> (index, i1)
+    %resident = index.cmp ult, %selected, %capacity : index
+    %spill = index.add %capacity, %request : index
+    %slot = scf.select %resident, %selected, %spill : index
+    %row = scalar.extui %key : i32 to i64
+    %slot_word = index.cast %slot : index to i32
+    %slot_wide = index.cast %slot : index to i64
+    %row_bytes = scalar.constant 3520 : i64
+    %zero64 = scalar.constant 0 : i64
+    %source = scalar.muli %row, %row_bytes : i64
+    %target = scalar.muli %slot_wide, %row_bytes : i64
+    %length = scf.select %read, %row_bytes, %zero64 : i64
+    view.store %slot_word, %mapping[%request] : i32, view<32xi32>
+    view.store %source, %records[%request, 0] : i64, view<32x3xi64>
+    view.store %target, %records[%request, 1] : i64, view<32x3xi64>
+    view.store %length, %records[%request, 2] : i64, view<32x3xi64>
+  }
+  kernel.return
+}
+
+// Serial provider writes make accidental aliased destinations observable
+// without creating a second data race in the dependency being modeled.
+kernel.def @transfer() {
+  %one = index.constant 1 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%one, %one, %one) : index
+} launch(%source_buffer: buffer, %records_buffer: buffer, %payload_buffer: buffer) {
+  %origin = index.constant 0 : offset
+  %records = buffer.view %records_buffer[%origin] : buffer -> view<32x3xi64>
+  %source = buffer.view %source_buffer[%origin] : buffer -> view<1802240xi8>
+  %target = buffer.view %payload_buffer[%origin] : buffer -> view<337920xi8>
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %count = index.constant 32 : index
+  %zero64 = scalar.constant 0 : i64
+  scf.for %request = [%zero to %count step %one] {
+    %length_word = view.load %records[%request, 2] : view<32x3xi64> -> i64
+    %wrote = scalar.cmpi ne, %length_word, %zero64 : i64
+    scf.if %wrote {
+      %source_word = view.load %records[%request, 0] : view<32x3xi64> -> i64
+      %target_word = view.load %records[%request, 1] : view<32x3xi64> -> i64
+      %source_word_bounded = scalar.assume %source_word [range(%source_word, 0, 1798720)] : i64
+      %source_index_value = index.cast %source_word_bounded : i64 to index
+      %source_index = index.assume %source_index_value [range(%source_index_value, 0, 1798720)] : index
+      %target_word_bounded = scalar.assume %target_word [range(%target_word, 0, 334400)] : i64
+      %target_index_value = index.cast %target_word_bounded : i64 to index
+      %target_index = index.assume %target_index_value [range(%target_index_value, 0, 334400)] : index
+      %length_word_bounded = scalar.assume %length_word [range(%length_word, 0, 3520)] : i64
+      %length_value = index.cast %length_word_bounded : i64 to index
+      %length = index.assume %length_value [range(%length_value, 0, 3520)] : index
+      scf.for %column = [%zero to %length step %one] {
+        %source_byte = index.add %source_index, %column : index
+        %target_byte = index.add %target_index, %column : index
+        %value = view.load %source[%source_byte] : view<1802240xi8> -> i8
+        view.store %value, %target[%target_byte] : i8, view<337920xi8>
+      }
+    }
+  }
+  kernel.return
+}
+
+kernel.def @publish() {
+  %one = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%tags_buffer: buffer, %mapping_buffer: buffer, %records_buffer: buffer) {
+  %origin = index.constant 0 : offset
+  %capacity = index.constant 64 : index
+  %tags = buffer.view %tags_buffer[%origin] : buffer -> view<[%capacity]xi64>
+  %mapping = buffer.view %mapping_buffer[%origin] : buffer -> view<32xi32>
+  %records = buffer.view %records_buffer[%origin] : buffer -> view<32x3xi64>
+  %count = index.constant 32 : index
+  %request = kernel.workitem.id<x> : index
+  %active = index.cmp ult, %request, %count : index
+  scf.if %active {
+    %word = view.load %mapping[%request] : view<32xi32> -> i32
+    %slot = index.cast %word : i32 to index
+    %resident = index.cmp ult, %slot, %capacity : index
+    %length = view.load %records[%request, 2] : view<32x3xi64> -> i64
+    %zero64 = scalar.constant 0 : i64
+    %wrote = scalar.cmpi ne, %length, %zero64 : i64
+    %ready = scalar.andi %resident, %wrote : i1
+    scf.if %ready {
+      func.call @cohort_cache_publish(%capacity, %tags, %slot) : (index, view<[%capacity]xi64>, index)
+    }
+  }
+  kernel.return
+}
+
+kernel.def @decode() {
+  %one = index.constant 1 : index
+  %rows = index.constant 32 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%round: index, %mapping_buffer: buffer, %payload: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %mapping = buffer.view %mapping_buffer[%origin] : buffer -> view<32xi32>
+  %request = kernel.workgroup.id<x> : index
+  %slot_word = view.load %mapping[%request] : view<32xi32> -> i32
+  %slot_value = index.cast %slot_word : i32 to index
+  %slot = index.assume %slot_value [range(%slot_value, 0, 95)] : index
+  %row_bytes = index.constant 3520 : offset
+  %output_row_bytes = index.constant 20480 : offset
+  %count = index.constant 32 : index
+  %output_row = index.madd %round, %count, %request : index
+  %input_origin = index.scale %slot, %row_bytes : index, offset -> offset
+  %output_origin = index.scale %output_row, %output_row_bytes : index, offset -> offset
+  template.apply<@qwen38.token_embedding_q5k_f32.bytes>(%input_origin, %output_origin, %payload, %output) : (offset, offset, buffer, buffer)
+  kernel.return
+}
+
+command.def @rounds(%configuration_ordinal: index) launch(%configuration: buffer, %ids: buffer, %weight: buffer, %output: buffer) {
+  %ways, %abandon_value = func.call pure @geometry(%configuration_ordinal) : (index) -> (index, index)
+  %header_bytes = index.constant 8 : offset
+  %directory_bytes = index.constant 512 : offset
+  %mapping_bytes = index.constant 128 : offset
+  %record_bytes = index.constant 768 : offset
+  %payload_bytes = index.constant 337920 : offset
+  %header = buffer.alloca<global> align(16) %header_bytes : buffer
+  %directory = buffer.alloca<global> align(16) %directory_bytes : buffer
+  %mapping = buffer.alloca<global> align(16) %mapping_bytes : buffer
+  %records = buffer.alloca<global> align(16) %record_bytes : buffer
+  %payload = buffer.alloca<global> align(16) %payload_bytes : buffer
+  kernel.launch @seed(%configuration, %header, %directory) : (buffer, buffer, buffer)
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %three = index.constant 3 : index
+  %abandon = index.cmp ne, %abandon_value, %zero : index
+  scf.if %abandon {
+    kernel.launch @begin(%header, %directory) : (buffer, buffer)
+    kernel.launch @plan(%ways, %header, %ids, %directory, %mapping, %records) : (index, buffer, buffer, buffer, buffer, buffer)
+  }
+  scf.for %round = [%zero to %three step %one] unroll {
+    kernel.launch @begin(%header, %directory) : (buffer, buffer)
+    kernel.launch @plan(%ways, %header, %ids, %directory, %mapping, %records) : (index, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @transfer(%weight, %records, %payload) : (buffer, buffer, buffer)
+    kernel.launch @publish(%directory, %mapping, %records) : (buffer, buffer, buffer)
+    kernel.launch @decode(%round, %mapping, %payload, %output) : (index, buffer, buffer, buffer)
+  }
+  command.return
+}
+
+func.decl @qwen38_embedding_reference_row(%token_id_i32: i32, %output_origin: offset, %first_channel: index, %channel_stride: index, %weight: buffer, %output: buffer)
+
+func.def @reference_rows(%configuration: buffer, %ids: buffer, %weight: buffer, %output: buffer) {
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %three = index.constant 3 : index
+  %round_bytes = index.constant 655360 : offset
+  %row_bytes = index.constant 20480 : offset
+  %count = index.constant 32 : index
+  %zero_offset = index.constant 0 : offset
+  %tokens = buffer.view %ids[%zero_offset] : buffer -> view<32xi32>
+  scf.for %round = [%zero to %three step %one] {
+    %origin = index.scale %round, %round_bytes : index, offset -> offset
+    scf.for %row = [%zero to %count step %one] {
+      %token = view.load %tokens[%row] : view<32xi32> -> i32
+      %delta = index.scale %row, %row_bytes : index, offset -> offset
+      %row_origin = index.add %origin, %delta : offset
+      func.call @qwen38_embedding_reference_row(%token, %row_origin, %zero, %one, %weight, %output) : (i32, offset, index, index, buffer, buffer)
+    }
+  }
+  func.return
+}
+
+func.def @write_configuration(%trial: index, %buffer: buffer) {
+  %origin = index.constant 0 : offset
+  %view = buffer.view %buffer[%origin] : buffer -> view<1xi32>
+  %word = index.cast %trial : index to i32
+  view.store %word, %view[0] : i32, view<1xi32>
+  func.return
+}
+
+func.def pure @geometry(%configuration: index) -> (index, index) {
+  %one = index.constant 1 : index
+  %four = index.constant 4 : index
+  %two = index.constant 2 : index
+  %geometry_index = index.rem %configuration, %two : index
+  %abandon = index.div %configuration, %two : index
+  %geometry = index.add %geometry_index, %one : index
+  %ways = index.mul %geometry, %four : index
+  func.return %ways, %abandon : index, index
+}
+
+check.scenario public @q5_cache configure[4](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[6](%trial: index, %entropy: check.entropy) {
+    %configuration_buffer = check.generate.fill value(0) : tensor<1xi32>
+    check.generate<@write_configuration>(%trial, %configuration_buffer) : (index, tensor<1xi32>) -> ()
+    %ids = check.generate.fill value(-1) : tensor<32xi32>
+    %weight = check.generate.iota offset(-127) step(17) period(15) : tensor<512x20x176xi8>
+    check.generate<@fixture>(%configuration, %trial, %ids, %weight) : (index, index, tensor<32xi32>, tensor<512x20x176xi8>) -> ()
+    %actual = check.generate.fill value(9.0) : tensor<3x32x5120xf32>
+    check.compare<@rounds, @reference_rows>[%configuration](%configuration_buffer, %ids, %weight, %actual) : [index](tensor<1xi32>, tensor<32xi32>, tensor<512x20x176xi8>, tensor<3x32x5120xf32>) -> () {
+      check.expect.approximate actual(%actual) expected(%actual) atol(0.0) rtol(0.0) nan(same) : tensor<3x32x5120xf32>, tensor<3x32x5120xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_cache> @q5_cache_benchmark
