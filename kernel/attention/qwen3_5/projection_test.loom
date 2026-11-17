@@ -1,0 +1,327 @@
+// Exact Qwen3.5 attention-projection routing and packed integer arithmetic.
+// One 256-value block per row exercises every Q4_K group, both signed Q6_K
+// half-scales, and direct query/gate separation from the interleaved weights.
+
+kernel.decl @qwen35_attention_projection_q4_decode(%input_size: index, %query_heads: index, %key_value_heads: index) launch(%input_size_argument: index, %query_heads_argument: index, %key_value_heads_argument: index, %q8_input: buffer, %query_gate_weight: buffer, %key_weight: buffer, %value_weight: buffer, %query_output: buffer, %gate_output: buffer, %key_output: buffer, %value_output: buffer)
+
+kernel.decl @qwen35_attention_projection_q6_decode(%input_size: index, %query_heads: index, %key_value_heads: index) launch(%input_size_argument: index, %query_heads_argument: index, %key_value_heads_argument: index, %q8_input: buffer, %query_gate_weight: buffer, %key_weight: buffer, %value_weight: buffer, %query_output: buffer, %gate_output: buffer, %key_output: buffer, %value_output: buffer)
+
+func.def @projection_test_q4_code(%row: index, %bias: i32) -> (i32) {
+  %modulus = index.constant 7 : index
+  %remainder = index.rem %row, %modulus : index
+  %remainder_i32 = index.cast %remainder : index to i32
+  %code = scalar.addi %remainder_i32, %bias : i32
+  func.return %code : i32
+}
+
+func.def @initialize_q8(%input: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %group_count = index.constant 8 : index
+  %origin = index.constant 0 : offset
+  %metadata_origin = index.constant 256 : offset
+  %packed_ones = vector.splati 16843009 : vector<8xi32>
+  %metadata_values = vector.constantf [1.0, 32.0] : vector<2xf32>
+  %payload = buffer.view %input[%origin] : buffer -> view<8x8xi32>
+  %metadata = buffer.view %input[%metadata_origin] : buffer -> view<8x2xf32>
+  scf.for %group = [%begin to %group_count step %step] {
+    vector.store %packed_ones, %payload[%group, %begin] : vector<8xi32>, view<8x8xi32>
+    vector.store %metadata_values, %metadata[%group, %begin] : vector<2xf32>, view<8x2xf32>
+  }
+  func.return
+}
+
+// Values chosen so the Vulkan F32 coefficient boundary differs bitwise from
+// multiplying each completed dot by its signed scale in I32. This protects the
+// portable contraction's reference arithmetic rather than only its algebra.
+func.def @initialize_q8_q6_boundary(%input: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %group_count = index.constant 8 : index
+  %origin = index.constant 0 : offset
+  %metadata_origin = index.constant 256 : offset
+  %packed_127 = vector.splati 2139062143 : vector<8xi32>
+  %metadata_values = vector.constantf [0.10000000000000001, 4064.0] : vector<2xf32>
+  %payload = buffer.view %input[%origin] : buffer -> view<8x8xi32>
+  %metadata = buffer.view %input[%metadata_origin] : buffer -> view<8x2xf32>
+  scf.for %group = [%begin to %group_count step %step] {
+    vector.store %packed_127, %payload[%group, %begin] : vector<8xi32>, view<8x8xi32>
+    vector.store %metadata_values, %metadata[%group, %begin] : vector<2xf32>, view<8x2xf32>
+  }
+  func.return
+}
+
+func.def @initialize_q4(%row_count: index, %bias: i32, %weight: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %direct_end = index.constant 4 : index
+  %minimum_end = index.constant 8 : index
+  %metadata_end = index.constant 12 : index
+  %payload_end = index.constant 128 : index
+  %row_bytes = index.constant 144 : offset
+  %metadata_displacement = index.constant 4 : offset
+  %payload_displacement = index.constant 16 : offset
+  %c1_f32 = scalar.constant 1.0 : f32
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c1_i8 = scalar.constant 1 : i8
+  %c0_i8 = scalar.constant 0 : i8
+  %shift4 = scalar.constant 4 : i32
+  %factor = scalar.fptrunc %c1_f32 : f32 to f16
+  %minimum = scalar.fptrunc %c0_f32 : f32 to f16
+  scf.for %row = [%begin to %row_count step %step] {
+    %row_origin = index.scale %row, %row_bytes : index, offset -> offset
+    %metadata_origin = index.add %row_origin, %metadata_displacement : offset
+    %payload_origin = index.add %row_origin, %payload_displacement : offset
+    %header = buffer.view %weight[%row_origin] : buffer -> view<2xf16>
+    view.store %factor, %header[0] : f16, view<2xf16>
+    view.store %minimum, %header[1] : f16, view<2xf16>
+    %metadata = buffer.view %weight[%metadata_origin] : buffer -> view<12xi8>
+    scf.for %index = [%begin to %direct_end step %step] {
+      view.store %c1_i8, %metadata[%index] : i8, view<12xi8>
+    }
+    scf.for %index = [%direct_end to %minimum_end step %step] {
+      view.store %c0_i8, %metadata[%index] : i8, view<12xi8>
+    }
+    scf.for %index = [%minimum_end to %metadata_end step %step] {
+      view.store %c1_i8, %metadata[%index] : i8, view<12xi8>
+    }
+    %code = func.call @projection_test_q4_code(%row, %bias) : (index, i32) -> (i32)
+    %high = scalar.shli %code, %shift4 : i32
+    %packed_i32 = scalar.ori %code, %high : i32
+    %packed = scalar.trunci %packed_i32 : i32 to i8
+    %payload = buffer.view %weight[%payload_origin] : buffer -> view<128xi8>
+    scf.for %index = [%begin to %payload_end step %step] {
+      view.store %packed, %payload[%index] : i8, view<128xi8>
+    }
+  }
+  func.return
+}
+
+func.def @initialize_q6(%row_count: index, %weight: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %low_end = index.constant 128 : index
+  %high_end = index.constant 64 : index
+  %scale_end = index.constant 16 : index
+  %c2_index = index.constant 2 : index
+  %row_bytes = index.constant 210 : offset
+  %high_displacement = index.constant 128 : offset
+  %scale_displacement = index.constant 192 : offset
+  %factor_displacement = index.constant 208 : offset
+  %zero_code = scalar.constant 0 : i8
+  %scale0 = scalar.constant 127 : i8
+  %scale1 = scalar.constant 126 : i8
+  %factor_f32 = scalar.constant 0.10000000000000001 : f32
+  %factor = scalar.fptrunc %factor_f32 : f32 to f16
+  scf.for %row = [%begin to %row_count step %step] {
+    %row_origin = index.scale %row, %row_bytes : index, offset -> offset
+    %high_origin = index.add %row_origin, %high_displacement : offset
+    %scale_origin = index.add %row_origin, %scale_displacement : offset
+    %factor_origin = index.add %row_origin, %factor_displacement : offset
+    %low_view = buffer.view %weight[%row_origin] : buffer -> view<128xi8>
+    %high_view = buffer.view %weight[%high_origin] : buffer -> view<64xi8>
+    %scale_view = buffer.view %weight[%scale_origin] : buffer -> view<16xi8>
+    %factor_view = buffer.view %weight[%factor_origin] : buffer -> view<1xf16>
+    scf.for %index = [%begin to %low_end step %step] {
+      view.store %zero_code, %low_view[%index] : i8, view<128xi8>
+    }
+    scf.for %index = [%begin to %high_end step %step] {
+      view.store %zero_code, %high_view[%index] : i8, view<64xi8>
+    }
+    scf.for %index = [%begin to %scale_end step %step] {
+      %even = index.rem %index, %c2_index : index
+      %is_first = index.cmp eq, %even, %begin : index
+      %scale = scf.select %is_first, %scale0, %scale1 : i8
+      view.store %scale, %scale_view[%index] : i8, view<16xi8>
+    }
+    view.store %factor, %factor_view[0] : f16, view<1xf16>
+  }
+  func.return
+}
+
+func.def @initialize_q4_case(%q8_input: buffer, %query_gate_weight: buffer, %key_weight: buffer, %value_weight: buffer) {
+  %query_gate_rows = index.constant 512 : index
+  %key_value_rows = index.constant 256 : index
+  %query_bias = scalar.constant 1 : i32
+  %key_bias = scalar.constant 2 : i32
+  %value_bias = scalar.constant 3 : i32
+  func.call @initialize_q8(%q8_input) : (buffer)
+  func.call @initialize_q4(%query_gate_rows, %query_bias, %query_gate_weight) : (index, i32, buffer)
+  func.call @initialize_q4(%key_value_rows, %key_bias, %key_weight) : (index, i32, buffer)
+  func.call @initialize_q4(%key_value_rows, %value_bias, %value_weight) : (index, i32, buffer)
+  func.return
+}
+
+func.def @initialize_q6_case(%q8_input: buffer, %query_gate_weight: buffer, %key_weight: buffer, %value_weight: buffer) {
+  %query_gate_rows = index.constant 512 : index
+  %key_value_rows = index.constant 256 : index
+  %query_bias = scalar.constant 1 : i32
+  %key_bias = scalar.constant 2 : i32
+  func.call @initialize_q8_q6_boundary(%q8_input) : (buffer)
+  func.call @initialize_q4(%query_gate_rows, %query_bias, %query_gate_weight) : (index, i32, buffer)
+  func.call @initialize_q4(%key_value_rows, %key_bias, %key_weight) : (index, i32, buffer)
+  func.call @initialize_q6(%key_value_rows, %value_weight) : (index, buffer)
+  func.return
+}
+
+func.def @reference_q4_value(%row: index, %bias: i32) -> (f32) {
+  %group_values = scalar.constant 256 : i32
+  %code = func.call @projection_test_q4_code(%row, %bias) : (index, i32) -> (i32)
+  %sum = scalar.muli %code, %group_values : i32
+  %value = scalar.sitofp %sum : i32 to f32
+  func.return %value : f32
+}
+
+func.def @reference_q4_q6_input_value(%row: index, %bias: i32) -> (f32) {
+  %group_dot_values = scalar.constant 4064 : i32
+  %group_count = scalar.constant 8.0 : f32
+  %q8_scale = scalar.constant 0.10000000000000001 : f32
+  %code = func.call @projection_test_q4_code(%row, %bias) : (index, i32) -> (i32)
+  %integer_dot = scalar.muli %code, %group_dot_values : i32
+  %floating_dot = scalar.sitofp %integer_dot : i32 to f32
+  %group_value = scalar.mulf %floating_dot, %q8_scale : f32
+  %value = scalar.mulf %group_value, %group_count : f32
+  func.return %value : f32
+}
+
+func.def @reference_q6_value(%row: index) -> (f32) {
+  %dot = scalar.constant -65024 : i32
+  %scale0 = scalar.constant 127.0 : f32
+  %scale1 = scalar.constant 126.0 : f32
+  %factor_value = scalar.constant 0.10000000000000001 : f32
+  %factor_half = scalar.fptrunc %factor_value : f32 to f16
+  %factor = scalar.extf %factor_half : f16 to f32
+  %q8_scale = scalar.constant 0.10000000000000001 : f32
+  %group_count = scalar.constant 8.0 : f32
+  %coefficient0 = scalar.mulf %scale0, %factor : f32
+  %coefficient1 = scalar.mulf %scale1, %factor : f32
+  %floating_dot = scalar.sitofp %dot : i32 to f32
+  %scaled_dot0 = scalar.mulf %floating_dot, %coefficient0 : f32
+  %scaled_dot1 = scalar.mulf %floating_dot, %coefficient1 : f32
+  %combined = scalar.addf %scaled_dot1, %scaled_dot0 : f32
+  %group_value = scalar.mulf %combined, %q8_scale : f32
+  %value = scalar.mulf %group_value, %group_count : f32
+  func.return %value : f32
+}
+
+func.def @reference_outputs(%value_is_q6: i1, %query_output: buffer, %gate_output: buffer, %key_output: buffer, %value_output: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %channels = index.constant 256 : index
+  %origin = index.constant 0 : offset
+  %query_bias = scalar.constant 1 : i32
+  %key_bias = scalar.constant 2 : i32
+  %value_bias = scalar.constant 3 : i32
+  %query_view = buffer.view %query_output[%origin] : buffer -> view<256xf32>
+  %gate_view = buffer.view %gate_output[%origin] : buffer -> view<256xf32>
+  %key_view = buffer.view %key_output[%origin] : buffer -> view<256xf32>
+  %value_view = buffer.view %value_output[%origin] : buffer -> view<256xf32>
+  scf.for %row = [%begin to %channels step %step] {
+    %gate_weight_row = index.add %row, %channels : index
+    %query, %gate, %key = scf.if %value_is_q6 -> (f32, f32, f32) {
+      %q6_query = func.call @reference_q4_q6_input_value(%row, %query_bias) : (index, i32) -> (f32)
+      %q6_gate = func.call @reference_q4_q6_input_value(%gate_weight_row, %query_bias) : (index, i32) -> (f32)
+      %q6_key = func.call @reference_q4_q6_input_value(%row, %key_bias) : (index, i32) -> (f32)
+      scf.yield %q6_query, %q6_gate, %q6_key : f32, f32, f32
+    } else {
+      %q4_query = func.call @reference_q4_value(%row, %query_bias) : (index, i32) -> (f32)
+      %q4_gate = func.call @reference_q4_value(%gate_weight_row, %query_bias) : (index, i32) -> (f32)
+      %q4_key = func.call @reference_q4_value(%row, %key_bias) : (index, i32) -> (f32)
+      scf.yield %q4_query, %q4_gate, %q4_key : f32, f32, f32
+    }
+    %value = scf.if %value_is_q6 -> (f32) {
+      %q6_value = func.call @reference_q6_value(%row) : (index) -> (f32)
+      scf.yield %q6_value : f32
+    } else {
+      %q4_value = func.call @reference_q4_value(%row, %value_bias) : (index, i32) -> (f32)
+      scf.yield %q4_value : f32
+    }
+    view.store %query, %query_view[%row] : f32, view<256xf32>
+    view.store %gate, %gate_view[%row] : f32, view<256xf32>
+    view.store %key, %key_view[%row] : f32, view<256xf32>
+    view.store %value, %value_view[%row] : f32, view<256xf32>
+  }
+  func.return
+}
+
+command.def @project_q4() launch(%q8_input: buffer, %query_gate_weight: buffer, %key_weight: buffer, %value_weight: buffer, %query_output: buffer, %gate_output: buffer, %key_output: buffer, %value_output: buffer) {
+  %input_size = index.constant 256 : index
+  %query_heads = index.constant 1 : index
+  %key_value_heads = index.constant 1 : index
+  kernel.launch @qwen35_attention_projection_q4_decode[%input_size, %query_heads, %key_value_heads](%input_size, %query_heads, %key_value_heads, %q8_input, %query_gate_weight, %key_weight, %value_weight, %query_output, %gate_output, %key_output, %value_output) : [index, index, index](index, index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.def @project_q6() launch(%q8_input: buffer, %query_gate_weight: buffer, %key_weight: buffer, %value_weight: buffer, %query_output: buffer, %gate_output: buffer, %key_output: buffer, %value_output: buffer) {
+  %input_size = index.constant 256 : index
+  %query_heads = index.constant 1 : index
+  %key_value_heads = index.constant 1 : index
+  kernel.launch @qwen35_attention_projection_q6_decode[%input_size, %query_heads, %key_value_heads](%input_size, %query_heads, %key_value_heads, %q8_input, %query_gate_weight, %key_weight, %value_weight, %query_output, %gate_output, %key_output, %value_output) : [index, index, index](index, index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+func.def @reference_q4(%q8_input: buffer, %query_gate_weight: buffer, %key_weight: buffer, %value_weight: buffer, %query_output: buffer, %gate_output: buffer, %key_output: buffer, %value_output: buffer) {
+  %value_is_q6 = scalar.constant false : i1
+  func.call @reference_outputs(%value_is_q6, %query_output, %gate_output, %key_output, %value_output) : (i1, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @reference_q6(%q8_input: buffer, %query_gate_weight: buffer, %key_weight: buffer, %value_weight: buffer, %query_output: buffer, %gate_output: buffer, %key_output: buffer, %value_output: buffer) {
+  %value_is_q6 = scalar.constant true : i1
+  func.call @reference_outputs(%value_is_q6, %query_output, %gate_output, %key_output, %value_output) : (i1, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @q4_value_projection {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %q8_input = check.generate.fill value(0) : tensor<80xi32>
+    %query_gate_weight = check.generate.fill value(0) : tensor<73728xi8>
+    %key_weight = check.generate.fill value(0) : tensor<36864xi8>
+    %value_weight = check.generate.fill value(0) : tensor<36864xi8>
+    check.generate<@initialize_q4_case>(%q8_input, %query_gate_weight, %key_weight, %value_weight) : (tensor<80xi32>, tensor<73728xi8>, tensor<36864xi8>, tensor<36864xi8>) -> ()
+    %query_output = check.generate.fill value(-99.0) : tensor<256xf32>
+    %gate_output = check.generate.fill value(-99.0) : tensor<256xf32>
+    %key_output = check.generate.fill value(-99.0) : tensor<256xf32>
+    %value_output = check.generate.fill value(-99.0) : tensor<256xf32>
+    check.compare<@project_q4, @reference_q4>(%q8_input, %query_gate_weight, %key_weight, %value_weight, %query_output, %gate_output, %key_output, %value_output) : (tensor<80xi32>, tensor<73728xi8>, tensor<36864xi8>, tensor<36864xi8>, tensor<256xf32>, tensor<256xf32>, tensor<256xf32>, tensor<256xf32>) -> () {
+      check.expect.bitwise actual(%query_output) expected(%query_output) : tensor<256xf32>
+      check.expect.bitwise actual(%gate_output) expected(%gate_output) : tensor<256xf32>
+      check.expect.bitwise actual(%key_output) expected(%key_output) : tensor<256xf32>
+      check.expect.bitwise actual(%value_output) expected(%value_output) : tensor<256xf32>
+      check.expect.bitwise actual(%q8_input) expected(%q8_input) : tensor<80xi32>
+      check.expect.bitwise actual(%query_gate_weight) expected(%query_gate_weight) : tensor<73728xi8>
+      check.expect.bitwise actual(%key_weight) expected(%key_weight) : tensor<36864xi8>
+      check.expect.bitwise actual(%value_weight) expected(%value_weight) : tensor<36864xi8>
+    }
+  }
+  check.return
+}
+
+check.scenario public @q6_value_projection {
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %q8_input = check.generate.fill value(0) : tensor<80xi32>
+    %query_gate_weight = check.generate.fill value(0) : tensor<73728xi8>
+    %key_weight = check.generate.fill value(0) : tensor<36864xi8>
+    %value_weight = check.generate.fill value(0) : tensor<53760xi8>
+    check.generate<@initialize_q6_case>(%q8_input, %query_gate_weight, %key_weight, %value_weight) : (tensor<80xi32>, tensor<73728xi8>, tensor<36864xi8>, tensor<53760xi8>) -> ()
+    %query_output = check.generate.fill value(-99.0) : tensor<256xf32>
+    %gate_output = check.generate.fill value(-99.0) : tensor<256xf32>
+    %key_output = check.generate.fill value(-99.0) : tensor<256xf32>
+    %value_output = check.generate.fill value(-99.0) : tensor<256xf32>
+    check.compare<@project_q6, @reference_q6>(%q8_input, %query_gate_weight, %key_weight, %value_weight, %query_output, %gate_output, %key_output, %value_output) : (tensor<80xi32>, tensor<73728xi8>, tensor<36864xi8>, tensor<53760xi8>, tensor<256xf32>, tensor<256xf32>, tensor<256xf32>, tensor<256xf32>) -> () {
+      check.expect.bitwise actual(%query_output) expected(%query_output) : tensor<256xf32>
+      check.expect.bitwise actual(%gate_output) expected(%gate_output) : tensor<256xf32>
+      check.expect.bitwise actual(%key_output) expected(%key_output) : tensor<256xf32>
+      check.expect.bitwise actual(%value_output) expected(%value_output) : tensor<256xf32>
+      check.expect.bitwise actual(%q8_input) expected(%q8_input) : tensor<80xi32>
+      check.expect.bitwise actual(%query_gate_weight) expected(%query_gate_weight) : tensor<73728xi8>
+      check.expect.bitwise actual(%key_weight) expected(%key_weight) : tensor<36864xi8>
+      check.expect.bitwise actual(%value_weight) expected(%value_weight) : tensor<53760xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q4_value_projection> @qwen35_attention_projection_q4_family
+
+check.benchmark<@q6_value_projection> @qwen35_attention_projection_q6_family

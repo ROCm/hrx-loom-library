@@ -65,3 +65,55 @@ template.def<@ggml.qk.affine_q8_1_planar_dot> device @ggml_qk_affine_q8_1_planar
   %contribution = scalar.mulf %centered, %q8_scale : f32
   template.return %contribution : f32
 }
+
+// Complete 32-value Q6_K contraction against planar Q8_1. Q6_K assigns one
+// signed integer scale to each 16-value half. Both half dots remain exact I32
+// until complete, then follow the Vulkan Q6_K path's F32 scale application:
+// convert each dot, combine its signed scale with the shared block factor,
+// add the two scaled halves, and apply the Q8 scale. Keeping the raw scales in
+// the carrier also preserves the information needed by integer-scaled target
+// specializations without imposing their different rounding boundary here.
+template.decl @ggml.qk.q6_k_q8_1_planar_dot(%weight_codes: vector<32xi8>, %weight_scales: vector<2xi8>, %weight_factor: f32, %q8_codes: vector<32xi8>, %q8_scale: f32) -> (f32)
+
+template.def<@ggml.qk.q6_k_q8_1_planar_dot> device @ggml_qk_q6_k_q8_1_planar_dot(%weight_codes: vector<32xi8>, %weight_scales: vector<2xi8>, %weight_factor: f32, %q8_codes: vector<32xi8>, %q8_scale: f32) -> (f32) {
+  %zero_dot = vector.splati 0 : vector<1xi32>
+  %weight0 = vector.slice %weight_codes[0] : vector<32xi8> -> vector<4xi8>
+  %q8_0 = vector.slice %q8_codes[0] : vector<32xi8> -> vector<4xi8>
+  %dot0 = vector.dot4i<s8s8> %weight0, %q8_0, %zero_dot : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight1 = vector.slice %weight_codes[4] : vector<32xi8> -> vector<4xi8>
+  %q8_1 = vector.slice %q8_codes[4] : vector<32xi8> -> vector<4xi8>
+  %dot1 = vector.dot4i<s8s8> %weight1, %q8_1, %dot0 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight2 = vector.slice %weight_codes[8] : vector<32xi8> -> vector<4xi8>
+  %q8_2 = vector.slice %q8_codes[8] : vector<32xi8> -> vector<4xi8>
+  %dot2 = vector.dot4i<s8s8> %weight2, %q8_2, %dot1 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight3 = vector.slice %weight_codes[12] : vector<32xi8> -> vector<4xi8>
+  %q8_3 = vector.slice %q8_codes[12] : vector<32xi8> -> vector<4xi8>
+  %dot3 = vector.dot4i<s8s8> %weight3, %q8_3, %dot2 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight4 = vector.slice %weight_codes[16] : vector<32xi8> -> vector<4xi8>
+  %q8_4 = vector.slice %q8_codes[16] : vector<32xi8> -> vector<4xi8>
+  %dot4 = vector.dot4i<s8s8> %weight4, %q8_4, %zero_dot : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight5 = vector.slice %weight_codes[20] : vector<32xi8> -> vector<4xi8>
+  %q8_5 = vector.slice %q8_codes[20] : vector<32xi8> -> vector<4xi8>
+  %dot5 = vector.dot4i<s8s8> %weight5, %q8_5, %dot4 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight6 = vector.slice %weight_codes[24] : vector<32xi8> -> vector<4xi8>
+  %q8_6 = vector.slice %q8_codes[24] : vector<32xi8> -> vector<4xi8>
+  %dot6 = vector.dot4i<s8s8> %weight6, %q8_6, %dot5 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %weight7 = vector.slice %weight_codes[28] : vector<32xi8> -> vector<4xi8>
+  %q8_7 = vector.slice %q8_codes[28] : vector<32xi8> -> vector<4xi8>
+  %dot7 = vector.dot4i<s8s8> %weight7, %q8_7, %dot6 : vector<4xi8>, vector<4xi8>, vector<1xi32>
+  %half_dot0 = vector.extract %dot3[0] : vector<1xi32> -> i32
+  %half_dot1 = vector.extract %dot7[0] : vector<1xi32> -> i32
+  %scale0_i8 = vector.extract %weight_scales[0] : vector<2xi8> -> i8
+  %scale1_i8 = vector.extract %weight_scales[1] : vector<2xi8> -> i8
+  %scale0 = scalar.sitofp %scale0_i8 : i8 to f32
+  %scale1 = scalar.sitofp %scale1_i8 : i8 to f32
+  %coefficient0 = scalar.mulf %scale0, %weight_factor : f32
+  %coefficient1 = scalar.mulf %scale1, %weight_factor : f32
+  %floating_dot0 = scalar.sitofp %half_dot0 : i32 to f32
+  %floating_dot1 = scalar.sitofp %half_dot1 : i32 to f32
+  %scaled_dot0 = scalar.mulf %floating_dot0, %coefficient0 : f32
+  %scaled_dot1 = scalar.mulf %floating_dot1, %coefficient1 : f32
+  %floating_dot = scalar.addf %scaled_dot1, %scaled_dot0 : f32
+  %contribution = scalar.mulf %floating_dot, %q8_scale : f32
+  template.return %contribution : f32
+}
