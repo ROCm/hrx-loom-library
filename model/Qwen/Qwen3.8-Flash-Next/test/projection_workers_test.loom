@@ -1,0 +1,74 @@
+// One physical worker publishes four logical 128x128 panels. Ragged rows and
+// columns exercise reader retirement before LDS is reused, while inactive
+// inputs contain NaNs and the complete output is compared with the shared
+// scalar-byte F64 oracle. Both coefficient modes use the same ownership loop.
+
+func.decl @flash_next_q8_fixture(%count: index, %inputs: index, %outputs: index, %epoch: buffer, %input: buffer, %weight: buffer)
+
+func.decl @ggml_q8_0_reference(%half_coefficients: i1, %tokens: index, %count: index, %streams: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+template.decl @flash_next.q8_tile_stage(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %use_stage64: i1, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+
+amdgpu.target<gfx11-generic> @panel_wave32 {subgroup_size = 32}
+
+kernel.def target(@panel_wave32) @panel_projection() {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%half_coefficients: i1, %epoch: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %capacity = index.constant 129 : index
+  %inputs = index.constant 96 : index
+  %outputs = index.constant 132 : index
+  %tile = index.constant 128 : index
+  %wave_rows = index.constant 4 : index
+  %wave_columns = index.constant 2 : index
+  %depth = index.constant 2 : index
+  %prepared = scalar.constant false : i1
+  template.apply<@flash_next.q8_tile_stage>(%prepared, %capacity, %inputs, %outputs, %tile, %tile, %wave_rows, %wave_columns, %depth, %half_coefficients, %epoch, %input, %weight, %output) : (i1, index, index, index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+func.def @panel_reference(%half_coefficients: i1, %epoch: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %capacity = index.constant 129 : index
+  %inputs = index.constant 96 : index
+  %outputs = index.constant 132 : index
+  %streams = index.constant 1 : index
+  %origin = index.constant 0 : offset
+  %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %count_word = view.load %header[0] : view<3xi32> -> i32
+  %count_value = index.cast %count_word : i32 to index
+  %count = index.assume %count_value [range(%count_value, 0, 129)] : index
+  func.call @ggml_q8_0_reference(%half_coefficients, %capacity, %count, %streams, %inputs, %outputs, %input, %weight, %output) : (i1, index, index, index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+func.def @panel_geometry(%configuration: index, %trial: index) -> (i1, index) {
+  %c0 = index.constant 0 : index
+  %half = index.cmp ne, %configuration, %c0 : index
+  %counts = vector.constanti [0, 1, 128, 129] : vector<4xi32>
+  %selected = index.assume %trial [range(%trial, 0, 3)] : index
+  %word = vector.extract %counts[%selected] : vector<4xi32> -> i32
+  %count = index.cast %word : i32 to index
+  func.return %half, %count : i1, index
+}
+
+check.scenario public @repeated_projection configure[2](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %half, %count = check.generate<@panel_geometry>(%configuration, %trial) : (index, index) -> (i1, index)
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %inputs = check.literal value(96) : index
+    %outputs = check.literal value(132) : index
+    %epoch = check.generate.fill value(0) : tensor<3xi32>
+    %input = check.generate.random.uniform seed(%seed) range(-1.0 to 1.0) : tensor<129x96xbf16>
+    %weight = check.generate.random.uniform seed(%seed) range(-127 to 127) : tensor<132x3x34xi8>
+    check.generate<@flash_next_q8_fixture>(%count, %inputs, %outputs, %epoch, %input, %weight) : (index, index, index, tensor<3xi32>, tensor<129x96xbf16>, tensor<132x3x34xi8>) -> ()
+    %output = check.generate.fill value(-17.0) : tensor<129x132xbf16>
+    check.compare<@panel_projection, @panel_reference>(%half, %epoch, %input, %weight, %output) : (i1, tensor<3xi32>, tensor<129x96xbf16>, tensor<132x3x34xi8>, tensor<129x132xbf16>) -> () {
+      check.expect.approximate actual(%output) expected(%output) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<129x132xbf16>, tensor<129x132xbf16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@repeated_projection> @repeated_projection_benchmark
