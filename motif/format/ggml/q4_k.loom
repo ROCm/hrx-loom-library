@@ -162,3 +162,30 @@ func.def public inline @ggml_q4_k_load_chunk16(%weight: buffer, %row_origin: off
   %scale, %minimum = func.call @ggml_q4_k_load_scale_minimum(%weight, %block_origin, %group) : (buffer, offset, index) -> (f32, f32)
   func.return %codes, %scale, %minimum : vector<16xi8>, f32, f32
 }
+
+// Loads one complete 32-value group and its affine coefficients. Row origin is
+// in bytes; block selects a complete 144-byte record and group is in [0, 7].
+// The complete payload and shared header each require one 32-byte or 16-byte
+// load, respectively, so a contraction can retain the group's metadata once.
+func.def public inline @ggml_q4_k_load_group32(%weight: buffer, %row_origin: offset, %block: index, %group_value: index) -> (vector<32xi8>, f32, f32) {
+  %group = index.assume %group_value [range(%group_value, 0, 7)] : index
+  %groups_per_page = index.constant 2 : index
+  %words_per_page = index.constant 8 : index
+  %block_bytes = index.constant 144 : offset
+  %header_bytes = index.constant 16 : offset
+  %block_add = index.scale %block, %block_bytes : index, offset -> offset
+  %block_origin = index.add %row_origin, %block_add : offset
+  %payload_origin = index.add %block_origin, %header_bytes : offset
+  %page = index.div %group, %groups_per_page : index
+  %word = index.mul %page, %words_per_page : index
+  %nibble = index.rem %group, %groups_per_page : index
+  %words = buffer.view %weight[%payload_origin] : buffer -> view<32xi32>
+  %packed = vector.load %words[%word] : view<32xi32> -> vector<8xi32>
+  %packed_low = vector.slice %packed[0] : vector<8xi32> -> vector<4xi32>
+  %packed_high = vector.slice %packed[4] : vector<8xi32> -> vector<4xi32>
+  %codes_low = func.call @ggml_q4_k_unpack_codes16(%packed_low, %nibble) : (vector<4xi32>, index) -> (vector<16xi8>)
+  %codes_high = func.call @ggml_q4_k_unpack_codes16(%packed_high, %nibble) : (vector<4xi32>, index) -> (vector<16xi8>)
+  %codes = vector.concat<0> %codes_low, %codes_high : vector<16xi8>, vector<16xi8> -> vector<32xi8>
+  %scale, %minimum = func.call @ggml_q4_k_load_scale_minimum(%weight, %block_origin, %group) : (buffer, offset, index) -> (f32, f32)
+  func.return %codes, %scale, %minimum : vector<32xi8>, f32, f32
+}

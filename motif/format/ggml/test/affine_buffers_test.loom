@@ -8,7 +8,11 @@ amdgpu.target<gfx11-generic> @native
 
 func.decl @ggml_q4_k_load_chunk16(%weight: buffer, %row_origin: offset, %block: index, %group: index, %half: index) -> (vector<16xi8>, f32, f32)
 
+func.decl @ggml_q4_k_load_group32(%weight: buffer, %row_origin: offset, %block: index, %group: index) -> (vector<32xi8>, f32, f32)
+
 func.decl @ggml_q5_k_load_chunk16(%weight: buffer, %row_origin: offset, %block: index, %group: index, %half: index) -> (vector<16xi8>, f32, f32)
+
+func.decl @ggml_q5_k_load_group32(%weight: buffer, %row_origin: offset, %block: index, %group: index) -> (vector<32xi8>, f32, f32)
 
 func.decl @ggml_q4_k_load_codes4(%weight: buffer, %row_origin: offset, %block: index, %group: index, %packet: index) -> (vector<4xf32>)
 
@@ -252,6 +256,50 @@ check.scenario public @q4_16_ones {
 
 check.benchmark<@q4_16_random> @q4_16_records
 
+kernel.def target(@native) @read_q4_32() {
+  %blocks = index.constant 3 : index
+  %rows = index.constant 2 : index
+  %unit = index.constant 1 : index
+  %threads = index.constant 8 : index
+  kernel.launch.config workgroups(%blocks, %rows, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%input: buffer, %output: buffer, %metadata: buffer) {
+  %block = kernel.workgroup.id<x> : index
+  %row = kernel.workgroup.id<y> : index
+  %group = kernel.workitem.id<x> : index
+  %origin = index.constant 16 : offset
+  %row_stride = index.constant 448 : offset
+  %packet_width = index.constant 32 : index
+  %row_add = index.scale %row, %row_stride : index, offset -> offset
+  %row_origin = index.add %origin, %row_add : offset
+  %codes, %scale, %minimum = func.call @ggml_q4_k_load_group32(%input, %row_origin, %block, %group) : (buffer, offset, index, index) -> (vector<32xi8>, f32, f32)
+  %values = vector.uitofp %codes : vector<32xi8> to vector<32xf32>
+  %outputs = buffer.view %output[%origin] : buffer -> view<2x3x256xf32>
+  %coefficients = buffer.view %metadata[%origin] : buffer -> view<2x3x8x2xf32>
+  %output_index = index.mul %group, %packet_width : index
+  vector.store %values, %outputs[%row, %block, %output_index] : vector<32xf32>, view<2x3x256xf32>
+  view.store %scale, %coefficients[%row, %block, %group, 0] : f32, view<2x3x8x2xf32>
+  view.store %minimum, %coefficients[%row, %block, %group, 1] : f32, view<2x3x8x2xf32>
+  kernel.return
+}
+
+check.scenario public @q4_32_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %block_bytes = check.literal value(144) : offset
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<912xi8>
+    check.generate<@initialize_headers>(%block_bytes, %input) : (offset, tensor<912xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<1544xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<104xf32>
+    check.compare<@read_q4_32, @reference_q4_16>(%input, %output, %metadata) : (tensor<912xi8>, tensor<1544xf32>, tensor<104xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<1544xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<104xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<912xi8>
+    }
+  }
+  check.return
+}
+
 kernel.def target(@native) @read_q4_4() {
   %blocks = index.constant 3 : index
   %rows = index.constant 2 : index
@@ -445,3 +493,47 @@ check.scenario public @q5_16_ones {
 }
 
 check.benchmark<@q5_16_random> @q5_16_records
+
+kernel.def target(@native) @read_q5_32() {
+  %blocks = index.constant 3 : index
+  %rows = index.constant 2 : index
+  %unit = index.constant 1 : index
+  %threads = index.constant 8 : index
+  kernel.launch.config workgroups(%blocks, %rows, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%input: buffer, %output: buffer, %metadata: buffer) {
+  %block = kernel.workgroup.id<x> : index
+  %row = kernel.workgroup.id<y> : index
+  %group = kernel.workitem.id<x> : index
+  %origin = index.constant 16 : offset
+  %row_stride = index.constant 544 : offset
+  %packet_width = index.constant 32 : index
+  %row_add = index.scale %row, %row_stride : index, offset -> offset
+  %row_origin = index.add %origin, %row_add : offset
+  %codes, %scale, %minimum = func.call @ggml_q5_k_load_group32(%input, %row_origin, %block, %group) : (buffer, offset, index, index) -> (vector<32xi8>, f32, f32)
+  %values = vector.uitofp %codes : vector<32xi8> to vector<32xf32>
+  %outputs = buffer.view %output[%origin] : buffer -> view<2x3x256xf32>
+  %coefficients = buffer.view %metadata[%origin] : buffer -> view<2x3x8x2xf32>
+  %output_index = index.mul %group, %packet_width : index
+  vector.store %values, %outputs[%row, %block, %output_index] : vector<32xf32>, view<2x3x256xf32>
+  view.store %scale, %coefficients[%row, %block, %group, 0] : f32, view<2x3x8x2xf32>
+  view.store %minimum, %coefficients[%row, %block, %group, 1] : f32, view<2x3x8x2xf32>
+  kernel.return
+}
+
+check.scenario public @q5_32_random {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %block_bytes = check.literal value(176) : offset
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<1104xi8>
+    check.generate<@initialize_headers>(%block_bytes, %input) : (offset, tensor<1104xi8>) -> ()
+    %output = check.generate.fill value(-99.0) : tensor<1544xf32>
+    %metadata = check.generate.fill value(-99.0) : tensor<104xf32>
+    check.compare<@read_q5_32, @reference_q5_16>(%input, %output, %metadata) : (tensor<1104xi8>, tensor<1544xf32>, tensor<104xf32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<1544xf32>
+      check.expect.bitwise actual(%metadata) expected(%metadata) : tensor<104xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<1104xi8>
+    }
+  }
+  check.return
+}
