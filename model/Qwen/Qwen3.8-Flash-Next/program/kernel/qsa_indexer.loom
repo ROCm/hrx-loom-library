@@ -303,14 +303,18 @@ template.decl @flash_next.qsa_prepare_queries(%mixed: index, %remapped: i1, %sou
 
 template.def<@flash_next.qsa_prepare_queries> device @qsa_prepare_queries_body(%mixed: index, %remapped: i1, %source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %tokens = config.get @flash_next.token_count : index
-  %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %token = kernel.workgroup.id<y> : index
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
-    %head = kernel.workgroup.id<x> : index
-    %lane = kernel.subgroup.lane.id : index
+  %count = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
+  %end = index.mul %count, %heads : index
+  %group = kernel.workgroup.id<x> : index
+  %groups = kernel.workgroup.count<x> : index
+  %wave = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %waves = index.constant 4 : index
+  %first = index.madd %group, %waves, %wave : index
+  %step = index.mul %groups, %waves : index
+  scf.for %linear_head = [%first to %end step %step] {
+    %token = index.div %linear_head, %heads : index
     %position = func.call @flash_next_token_coordinate(%mixed, %remapped, %source_capacity, %origin_capacity, %mapping, %inputs, %origins, %token, %lane) : (index, i1, index, index, buffer, buffer, buffer, index, index) -> (index)
-    %linear_head = index.madd %token, %heads, %head : index
     %input_element = index.mul %linear_head, %head_stride : index
     %output_element = index.mul %linear_head, %width : index
     %element_bytes = index.constant 2 : offset
@@ -322,14 +326,30 @@ template.def<@flash_next.qsa_prepare_queries> device @qsa_prepare_queries_body(%
   template.return
 }
 
-kernel.def target(@qsa_wave32) @qsa_prepare_queries(%neural_enabled: i1, %heads: index) {
+// Four wave-private queries share a physical group. The target bounds the
+// group count; waves walk the live packed prefix without shared scratch.
+func.def pure inline @qsa_query_workers(%heads: index, %units: index) -> (index) {
   %count = index.assume %heads [range(%heads, 4, 24)] : index
   %tokens = config.get @flash_next.token_count : index
-  %threads = index.constant 32 : index
+  %waves = index.constant 4 : index
+  %rounding = index.constant 3 : index
+  %work = index.mul %tokens, %count : index
+  %rounded = index.add %work, %rounding : index
+  %groups = index.div %rounded, %waves : index
+  %groups_per_unit = index.constant 32 : index
+  %budget = index.mul %units, %groups_per_unit : index
+  %workers = index.min %groups, %budget : index
+  func.return %workers : index
+}
+
+kernel.def target(@qsa_wave32) @qsa_prepare_queries(%neural_enabled: i1, %heads: index) {
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @qsa_query_workers(%heads, %units) : (index, index) -> (index)
+  %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
   %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %count, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %mixed = index.constant 0 : index
   %remapped = scalar.constant false : i1
@@ -339,13 +359,13 @@ kernel.def target(@qsa_wave32) @qsa_prepare_queries(%neural_enabled: i1, %heads:
 }
 
 kernel.def target(@qsa_wave32) @qsa_prepare_queries_mixed(%neural_enabled: i1, %heads: index) {
-  %count = index.assume %heads [range(%heads, 4, 24)] : index
-  %tokens = config.get @flash_next.token_count : index
-  %threads = index.constant 32 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @qsa_query_workers(%heads, %units) : (index, index) -> (index)
+  %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
   %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %count, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %mixed = index.constant 1 : index
   %remapped = scalar.constant false : i1
@@ -354,13 +374,13 @@ kernel.def target(@qsa_wave32) @qsa_prepare_queries_mixed(%neural_enabled: i1, %
 }
 
 kernel.def target(@qsa_wave32) @qsa_prepare_queries_remapped(%neural_enabled: i1, %heads: index) {
-  %count = index.assume %heads [range(%heads, 4, 24)] : index
-  %tokens = config.get @flash_next.token_count : index
-  %threads = index.constant 32 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @qsa_query_workers(%heads, %units) : (index, index) -> (index)
+  %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
   %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %count, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%source_capacity: index, %origin_capacity: index, %inputs: buffer, %origins: buffer, %width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %mixed = index.constant 1 : index
   %remapped = scalar.constant true : i1

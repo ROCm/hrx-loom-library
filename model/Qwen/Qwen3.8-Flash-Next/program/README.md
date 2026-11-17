@@ -181,9 +181,12 @@ the next head from overwriting live values. Both schedules call one
 publication body. BF16 rounding, retained history ownership, and speculative
 capture remain at the same boundaries.
 
-Sparse scoring keeps each 64-key panel resident while two four-query phases
-consume it. Query scratch changes only after all waves finish the previous
-phase; each query retains its own reduction order and cache-page ownership.
+Sparse scoring keeps each 64-key panel resident across a 128-query window,
+consumed in four-query phases. Query scratch changes only after all waves
+finish the previous phase; each query retains its own reduction order and
+cache-page ownership. Workers retire both shared panels before advancing to
+another key panel or request. The physical worker grid scales with device
+capacity, while each worker traverses its share of the live spans and panels.
 Sparse attention exchanges eight-word lane records as two four-word planes
 so 128-bit LDS transfers use neighboring bank groups. Both BF16 probability
 components and the original peer-reduction order are retained.

@@ -1,0 +1,193 @@
+// Seventeen histories cross the physical span-worker boundary; 513 queries
+// cross resident key windows and partial four-query phases. Shuffled pages and
+// resident IDs distinguish logical request identity from cache addressing.
+// Dyadic, channel-constant operands give exact closed-form scores independent
+// of matrix partitioning. The small scoring scenarios own the F64 dot oracle.
+
+kernel.decl @qsa_score_tiled(%enabled: i1) launch(%query_begin: index, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
+
+kernel.def @scoring_worker_fixture() {
+  %groups = index.constant 64 : index
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%empty_value: index, %epoch: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %expected: buffer) {
+  %group = kernel.workgroup.id<x> : index
+  %thread = kernel.workitem.id<x> : index
+  %c0 = index.constant 0 : index
+  %empty = index.cmp ne, %empty_value, %c0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c7 = index.constant 7 : index
+  %c11 = index.constant 11 : index
+  %c13 = index.constant 13 : index
+  %c16 = index.constant 16 : index
+  %c17 = index.constant 17 : index
+  %c31 = index.constant 31 : index
+  %c32 = index.constant 32 : index
+  %c128 = index.constant 128 : index
+  %c512 = index.constant 512 : index
+  %blocks = index.constant 8192 : index
+  %stride = index.constant 8192 : index
+  %first = index.madd %group, %c128, %thread : index
+  %origin = index.constant 0 : offset
+  %descriptor_origin = index.constant 12 : offset
+  %map_origin = index.constant 680 : offset
+  %cache_origin = index.constant 64 : offset
+  %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %records = buffer.view %epoch[%descriptor_origin] : buffer -> view<17x6xi32>
+  %entries = buffer.view %rows[%origin] : buffer -> view<17x5xi64>
+  %maps = buffer.view %rows[%map_origin] : buffer -> view<17x512xi32>
+  %query_values = buffer.view %queries[%origin] : buffer -> view<513x4x128xbf16>
+  %keys = buffer.view %arena[%cache_origin] : buffer -> view<17x8192x128xbf16>
+  %scores = buffer.view %expected[%origin] : buffer -> view<514x8192xf32>
+  %position_base = index.constant 24576 : index
+  %leader = index.cmp eq, %first, %c0 : index
+  scf.if %leader {
+    %live = scalar.constant 509 : i32
+    %spans = scalar.constant 17 : i32
+    %absent = scalar.constant 0 : i32
+    %live_count = scf.select %empty, %absent, %live : i32
+    %span_count = scf.select %empty, %absent, %spans : i32
+    view.store %live_count, %header[0] : i32, view<3xi32>
+    view.store %span_count, %header[1] : i32, view<3xi32>
+    scf.for %span = [%c0 to %c17 step %c1] {
+      %last = index.cmp eq, %span, %c16 : index
+      %length = scf.select %last, %c13, %c31 : index
+      %begin = index.mul %span, %c31 : index
+      %position = index.madd %span, %c32, %position_base : index
+      %row_value = index.madd %span, %c3, %c1 : index
+      %row = index.rem %row_value, %c17 : index
+      %length_word = index.cast %length : index to i32
+      %begin_word = index.cast %begin : index to i32
+      %position_word = index.cast %position : index to i32
+      %row_word = index.cast %row : index to i32
+      view.store %length_word, %records[%span, 0] : i32, view<17x6xi32>
+      view.store %position_word, %records[%span, 1] : i32, view<17x6xi32>
+      view.store %begin_word, %records[%span, 2] : i32, view<17x6xi32>
+      view.store %row_word, %records[%span, 3] : i32, view<17x6xi32>
+      %span_wide = index.cast %span : index to i64
+      %cache_bytes = scalar.constant 2097152 : i64
+      %base = scalar.muli %span_wide, %cache_bytes : i64
+      view.store %base, %entries[%row, 2] : i64, view<17x5xi64>
+      %row_wide = index.cast %row : index to i64
+      %map_bytes = scalar.constant 2048 : i64
+      %map_header = scalar.constant 680 : i64
+      %map_relative = scalar.muli %row_wide, %map_bytes : i64
+      %map_base = scalar.addi %map_relative, %map_header : i64
+      view.store %map_base, %entries[%row, 4] : i64, view<17x5xi64>
+    }
+  }
+  %query_elements = index.constant 262656 : index
+  %query_scale = scalar.constant 0.125 : f32
+  %center = scalar.constant 5 : i32
+  scf.for %element = [%first to %query_elements step %stride] {
+    %token = index.div %element, %c512 : index
+    %head_element = index.div %element, %c128 : index
+    %head = index.rem %head_element, %c4 : index
+    %channel = index.rem %element, %c128 : index
+    %period = index.rem %token, %c11 : index
+    %period_word = index.cast %period : index to i32
+    %signed = scalar.subi %period_word, %center : i32
+    %head_ordinal = index.add %head, %c1 : index
+    %head_word = index.cast %head_ordinal : index to i32
+    %integer = scalar.muli %signed, %head_word : i32
+    %value = scalar.sitofp %integer : i32 to f32
+    %scaled = scalar.mulf %value, %query_scale : f32
+    %packed = scalar.fptrunc %scaled : f32 to bf16
+    view.store %packed, %query_values[%token, %head, %channel] : bf16, view<513x4x128xbf16>
+  }
+  %cache_elements = index.constant 17825792 : index
+  %cache_row_elements = index.constant 1048576 : index
+  %key_scale = scalar.constant 0.015625 : f32
+  scf.for %element = [%first to %cache_elements step %stride] {
+    %span = index.div %element, %cache_row_elements : index
+    %linear_block = index.div %element, %c128 : index
+    %block = index.rem %linear_block, %blocks : index
+    %channel = index.rem %element, %c128 : index
+    %row_value = index.madd %span, %c3, %c1 : index
+    %row = index.rem %row_value, %c17 : index
+    %page = index.div %block, %c16 : index
+    %page_value = index.madd %page, %c7, %row : index
+    %physical_page = index.rem %page_value, %c512 : index
+    %within_page = index.rem %block, %c16 : index
+    %physical = index.madd %physical_page, %c16, %within_page : index
+    %period = index.rem %block, %c13 : index
+    %factor = index.add %period, %c1 : index
+    %owner = index.add %span, %c1 : index
+    %integer = index.mul %factor, %owner : index
+    %word = index.cast %integer : index to i32
+    %value = scalar.sitofp %word : i32 to f32
+    %scaled = scalar.mulf %value, %key_scale : f32
+    %packed = scalar.fptrunc %scaled : f32 to bf16
+    view.store %packed, %keys[%span, %physical, %channel] : bf16, view<17x8192x128xbf16>
+    %first_channel = index.cmp eq, %channel, %c0 : index
+    %first_block = index.cmp eq, %within_page, %c0 : index
+    %page_leader = scalar.andi %first_channel, %first_block : i1
+    scf.if %page_leader {
+      %page_word = index.cast %physical_page : index to i32
+      view.store %page_word, %maps[%row, %page] : i32, view<17x512xi32>
+    }
+  }
+  // Sum_h ReLU(sum_k Q[h,k] * K[k]) = max(q,0) * owner * factor * 2.5.
+  // Publication follows the causal prefix; all other cells retain the sentinel.
+  %score_elements = index.constant 4202496 : index
+  %live_tokens = index.constant 509 : index
+  %score_scale = scalar.constant 2.5 : f32
+  %present = scalar.constant true : i1
+  %occupied = scalar.xori %empty, %present : i1
+  scf.for %element = [%first to %score_elements step %stride] {
+    %query = index.div %element, %blocks : index
+    %block = index.rem %element, %blocks : index
+    %token = index.add %query, %c5 : index
+    %live = index.cmp ult, %token, %live_tokens : index
+    %active = scalar.andi %occupied, %live : i1
+    scf.if %active {
+      %span = index.div %token, %c31 : index
+      %begin = index.mul %span, %c31 : index
+      %relative = index.sub %token, %begin : index
+      %position = index.madd %span, %c32, %position_base : index
+      %last = index.add %position, %relative : index
+      %visible = index.add %last, %c1 : index
+      %complete = index.div %visible, %c4 : index
+      %causal = index.cmp ult, %block, %complete : index
+      scf.if %causal {
+        %period = index.rem %token, %c11 : index
+        %positive = index.max %period, %c5 : index
+        %query_value = index.sub %positive, %c5 : index
+        %key_period = index.rem %block, %c13 : index
+        %key_value = index.add %key_period, %c1 : index
+        %owner = index.add %span, %c1 : index
+        %key = index.mul %key_value, %owner : index
+        %integer = index.mul %query_value, %key : index
+        %word = index.cast %integer : index to i32
+        %value = scalar.sitofp %word : i32 to f32
+        %score = scalar.mulf %value, %score_scale : f32
+        view.store %score, %scores[%query, %block] : f32, view<514x8192xf32>
+      }
+    }
+  }
+  kernel.return
+}
+
+check.case public @scoring_worker_ownership {
+  %empty = check.param.choice values([0, 1]) name("empty") : index
+  %epoch = check.generate.fill value(0) : tensor<105xi32>
+  %rows = check.generate.fill value(0) : tensor<35496xi8>
+  %mapping = check.generate.fill value(0) : tensor<1xi32>
+  %queries = check.generate.fill value(0.0) : tensor<513x4x128xbf16>
+  %arena = check.generate.fill value(0.0) : tensor<17825824xbf16>
+  %actual = check.generate.fill value(-99.0) : tensor<514x8192xf32>
+  %expected = check.generate.fill value(-99.0) : tensor<514x8192xf32>
+  kernel.launch @scoring_worker_fixture(%empty, %epoch, %rows, %queries, %arena, %expected) : (index, tensor<105xi32>, tensor<35496xi8>, tensor<513x4x128xbf16>, tensor<17825824xbf16>, tensor<514x8192xf32>)
+  %enabled = check.literal value(true) : i1
+  %query_begin = check.literal value(5) : index
+  %index_origin = check.literal value(64) : offset
+  kernel.launch @qsa_score_tiled[%enabled](%query_begin, %index_origin, %epoch, %mapping, %rows, %queries, %arena, %actual) : [i1](index, offset, tensor<105xi32>, tensor<1xi32>, tensor<35496xi8>, tensor<513x4x128xbf16>, tensor<17825824xbf16>, tensor<514x8192xf32>)
+  check.expect.bitwise actual(%actual) expected(%expected) : tensor<514x8192xf32>
+  check.return
+}
+
+check.benchmark<@scoring_worker_ownership> @scoring_workers
