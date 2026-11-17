@@ -12,6 +12,7 @@ match that lock. The checker owns its server and joins it before returning.
 """
 
 import argparse
+import contextlib
 import http.client
 import json
 import os
@@ -28,6 +29,21 @@ import vision_check
 from loom_serve_testing.chat import request
 from loom_serve_testing.http_harness import control, running_server, wait_status
 from loom_serve_testing.model_staging import stage_model
+
+
+@contextlib.contextmanager
+def failure_status(address):
+    """Preserve component diagnostics before the owned server is joined."""
+    try:
+        yield
+    except Exception as error:
+        try:
+            status = control(address, "GET", "/v1/status", 200)
+        except Exception as status_error:
+            error.add_note(f"Model status could not be collected: {status_error}")
+        else:
+            error.add_note("Model status at failure:\n" + json.dumps(status, indent=2))
+        raise
 
 
 def messages(text):
@@ -362,26 +378,27 @@ def main():
                         raise RuntimeError(details)
                     if details["registration"] == "ready":
                         break
-                if phase == "cold-replay":
-                    if args.native_context:
-                        result["cold_replay"] = context_check.replay(
-                            address, model, result, cold=True
-                        )
+                with failure_status(address):
+                    if phase == "cold-replay":
+                        if args.native_context:
+                            result["cold_replay"] = context_check.replay(
+                                address, model, result, cold=True
+                            )
+                        else:
+                            result["cold_replay"] = vision_check.replay(
+                                address, model, result
+                            )
+                    elif scenario:
+                        result = scenario.run(address, model)
                     else:
-                        result["cold_replay"] = vision_check.replay(
-                            address, model, result
-                        )
-                elif scenario:
-                    result = scenario.run(address, model)
-                else:
-                    result = run(address, model, reference)
-                wait_status(
-                    address,
-                    model=model,
-                    phase="idle",
-                    queued_requests=0,
-                    active_requests=0,
-                )
+                        result = run(address, model, reference)
+                    wait_status(
+                        address,
+                        model=model,
+                        phase="idle",
+                        queued_requests=0,
+                        active_requests=0,
+                    )
             assert process.returncode == 0, process.returncode
     result.update(
         model=model, device=args.device, joined=True, returncode=process.returncode
