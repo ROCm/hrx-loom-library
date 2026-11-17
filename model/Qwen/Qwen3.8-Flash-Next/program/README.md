@@ -121,11 +121,13 @@ root and keep every row. Packet and scratch extents follow the configured
 span and token capacities rather than a fixed client count.
 
 The vocabulary projection shares each decoded Q8 row across four selected
-queries for small output capacities and eight for larger ones. Query groups
-occupy the contiguous grid axis, allowing neighboring workgroups to reuse the
-same vocabulary rows. Each query retains its original block reduction order
-and BF16 logit publication; inactive queries neither read inputs nor publish
-outputs.
+queries for small output capacities and eight for larger ones. A device-sized
+worker pool traverses live query/vocabulary panels while retaining that reuse.
+Head mixing also shares weights across query panels. Each query retains its
+original block reduction order and BF16 publication; inactive queries neither
+read inputs nor publish outputs. Large residual stages reuse workers across
+live rows with fixed stream/feature ownership, while small shapes specialize
+to direct ownership without a row loop.
 
 ## Original image and video projector
 

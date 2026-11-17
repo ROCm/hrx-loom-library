@@ -353,19 +353,31 @@ kernel.def target(@flash_next_hc_wave32) @hc_up_mix(%neural_enabled: i1) {
   %padded = index.add %tokens, %tail : index
   %rows = index.div %padded, %batch_size : index
   %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %rows, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %panels = index.mul %groups, %rows : index
+  %units = target.execution.unit.count : index
+  %groups_per_unit = index.constant 32 : index
+  %budget = index.mul %units, %groups_per_unit : index
+  %workers = index.min %panels, %budget : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %normalized_arg: buffer, %lowrank_arg: buffer, %weight_arg: buffer, %mixed_arg: buffer) {
   %span, %normalized, %lowrank, %weight, %mixed = buffer.assume.noalias %span_arg, %normalized_arg, %lowrank_arg, %weight_arg, %mixed_arg : buffer, buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
-  %token_group = kernel.workgroup.id<y> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %batch_limit = index.constant 4 : index
   %batch_size = index.min %tokens, %batch_limit : index
-  %first = index.mul %token_group, %batch_size : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %first, %end : index
-  scf.if %active {
-    %group = kernel.workgroup.id<x> : index
+  %panel_step = index.constant 1 : index
+  %tail = index.sub %batch_size, %panel_step : index
+  %padded = index.add %end, %tail : index
+  %batches = index.div %padded, %batch_size : index
+  %groups = index.constant 640 : index
+  %panels = index.mul %groups, %batches : index
+  scf.for %panel = [%worker to %panels step %workers] {
+    %token_group = index.div %panel, %groups : index
+    %group = index.rem %panel, %groups : index
+    %first = index.mul %token_group, %batch_size : index
     %wave = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
     %c0_index = index.constant 0 : index
@@ -429,47 +441,73 @@ kernel.def target(@flash_next_hc_wave32) @hc_up_mix(%neural_enabled: i1) {
   kernel.return
 }
 
-// One workgroup owns 512 features of one residual stream. The injection gate
-// is uniform within that workgroup; accumulation rounds once into BF16.
+// Small residual shapes keep direct panel ownership; larger shapes stride
+// live rows within the same physical worker budget. Stream and feature identity
+// stay fixed per worker, keeping each injection gate uniform across its lanes.
 kernel.def target(@flash_next_hc_wave32) @hc_combine(%neural_enabled: i1) {
   %groups = index.constant 20 : index
   %tokens = config.get @flash_next.token_count : index
+  %units = target.execution.unit.count : index
+  %groups_per_unit = index.constant 32 : index
+  %budget = index.mul %units, %groups_per_unit : index
+  %row_budget = index.div %budget, %groups : index
+  %rows = index.min %tokens, %row_budget : index
   %threads = index.constant 64 : index
   %c1 = index.constant 1 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %c0 = index.constant 0 : index
+  %active_groups = scf.select %neural_enabled, %groups, %c0 : index
+  kernel.launch.config workgroups(%active_groups, %rows, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %residual_arg: buffer, %projected_arg: buffer, %injection_arg: buffer, %output_arg: buffer) {
   %span, %residual, %projected, %injection, %output = buffer.assume.noalias %span_arg, %residual_arg, %projected_arg, %injection_arg, %output_arg : buffer, buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %token = kernel.workgroup.id<y> : index
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
-    %group = kernel.workgroup.id<x> : index
-    %lane = kernel.workitem.id<x> : index
-    %c5 = index.constant 5 : index
-    %threads = index.constant 64 : index
-    %stream = index.div %group, %c5 : index
-    %feature_group = index.rem %group, %c5 : index
-    %block = index.madd %feature_group, %threads, %lane : index
-    %c0 = index.constant 0 : index
-    %origin = index.constant 0 : offset
-    %residual_view = buffer.view %residual[%origin] : buffer -> view<[%tokens]x4x320x8xbf16>
-    %projected_view = buffer.view %projected[%origin] : buffer -> view<[%tokens]x320x8xbf16>
-    %injection_view = buffer.view %injection[%origin] : buffer -> view<[%tokens]x4xf32>
-    %output_view = buffer.view %output[%origin] : buffer -> view<[%tokens]x4x320x8xbf16>
-    %stored_residual = vector.load %residual_view[%token, %stream, %block, %c0] : view<[%tokens]x4x320x8xbf16> -> vector<8xbf16>
-    %stored_projected = vector.load %projected_view[%token, %block, %c0] : view<[%tokens]x320x8xbf16> -> vector<8xbf16>
-    %gate = view.load %injection_view[%token, %stream] : view<[%tokens]x4xf32> -> f32
-    %residual_values = vector.extf %stored_residual : vector<8xbf16> to vector<8xf32>
-    %projected_values = vector.extf %stored_projected : vector<8xbf16> to vector<8xf32>
-    %gates = vector.splat %gate : vector<8xf32>
-    %sum = vector.fmaf %projected_values, %gates, %residual_values : vector<8xf32>
-    %packed = vector.fptrunc %sum : vector<8xf32> to vector<8xbf16>
-    vector.store %packed, %output_view[%token, %stream, %block, %c0] : vector<8xbf16>, view<[%tokens]x4x320x8xbf16>
+  %first = kernel.workgroup.id<y> : index
+  %rows = kernel.workgroup.count<y> : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %units = target.execution.unit.count : index
+  %groups_per_unit = index.constant 32 : index
+  %groups = index.constant 20 : index
+  %budget = index.mul %units, %groups_per_unit : index
+  %row_budget = index.div %budget, %groups : index
+  %direct = index.cmp ule, %tokens, %row_budget : index
+  scf.if %direct {
+    %active = index.cmp ult, %first, %end : index
+    scf.if %active {
+      template.apply<@flash_next.hc_combine.panel>(%tokens, %first, %group, %lane, %residual, %projected, %injection, %output) : (index, index, index, index, buffer, buffer, buffer, buffer)
+    }
+  } else {
+    scf.for %token = [%first to %end step %rows] {
+      template.apply<@flash_next.hc_combine.panel>(%tokens, %token, %group, %lane, %residual, %projected, %injection, %output) : (index, index, index, index, buffer, buffer, buffer, buffer)
+    }
   }
   kernel.return
+}
+
+template.decl @flash_next.hc_combine.panel(%tokens: index, %token: index, %group: index, %lane: index, %residual: buffer, %projected: buffer, %injection: buffer, %output: buffer)
+
+template.def<@flash_next.hc_combine.panel> device @hc_combine_panel(%tokens: index, %token: index, %group: index, %lane: index, %residual: buffer, %projected: buffer, %injection: buffer, %output: buffer) {
+  %c5 = index.constant 5 : index
+  %threads = index.constant 64 : index
+  %stream = index.div %group, %c5 : index
+  %feature_group = index.rem %group, %c5 : index
+  %block = index.madd %feature_group, %threads, %lane : index
+  %c0 = index.constant 0 : index
+  %origin = index.constant 0 : offset
+  %residual_view = buffer.view %residual[%origin] : buffer -> view<[%tokens]x4x320x8xbf16>
+  %projected_view = buffer.view %projected[%origin] : buffer -> view<[%tokens]x320x8xbf16>
+  %injection_view = buffer.view %injection[%origin] : buffer -> view<[%tokens]x4xf32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%tokens]x4x320x8xbf16>
+  %stored_residual = vector.load %residual_view[%token, %stream, %block, %c0] : view<[%tokens]x4x320x8xbf16> -> vector<8xbf16>
+  %stored_projected = vector.load %projected_view[%token, %block, %c0] : view<[%tokens]x320x8xbf16> -> vector<8xbf16>
+  %gate = view.load %injection_view[%token, %stream] : view<[%tokens]x4xf32> -> f32
+  %residual_values = vector.extf %stored_residual : vector<8xbf16> to vector<8xf32>
+  %projected_values = vector.extf %stored_projected : vector<8xbf16> to vector<8xf32>
+  %gates = vector.splat %gate : vector<8xf32>
+  %sum = vector.fmaf %projected_values, %gates, %residual_values : vector<8xf32>
+  %packed = vector.fptrunc %sum : vector<8xf32> to vector<8xbf16>
+  vector.store %packed, %output_view[%token, %stream, %block, %c0] : vector<8xbf16>, view<[%tokens]x4x320x8xbf16>
+  template.return
 }
 
 kernel.def target(@flash_next_hc_wave32) @hc_combine_normalize() {
