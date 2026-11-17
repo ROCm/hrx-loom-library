@@ -133,6 +133,14 @@ consumed. The queued bank packs owner tags immediately after its live records,
 so the host can download the admitted request bound without another count
 readback. Unused feedback requires no initialization and is never consumed.
 
+Model preparation can reserve an eight-byte-aligned payload in that same
+control allocation. `qwen38.control_context` supplies its origin and the prepared
+packet capacity; the model defines the payload's contents, such as source and
+stage identities used by its target provider. Growth moves these facts and the
+speculation catalog past the enlarged policy directory, preserves existing
+policies, and leaves newly admitted policies empty. A zero-byte payload keeps
+the ordinary layout. This adds no device allocation or runtime-side model schema.
+
 Shared storage writers describe allocations and row views in caller-owned
 tables. Model preparation computes extents, and the native materializer owns
 the actual allocations. Each source documents its record layout and update
