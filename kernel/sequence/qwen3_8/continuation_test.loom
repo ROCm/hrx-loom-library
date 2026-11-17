@@ -104,25 +104,11 @@ func.def @continuation_oracle(%mixed_inputs: index, %context: index, %capacity_v
   %options = buffer.view %epoch[%options_origin] : buffer -> view<[%capacity]x2xi32>
   %identities = buffer.view %epoch[%identity_origin] : buffer -> view<[%capacity]x2xi32>
   %active_tokens = buffer.view %tokens[%origin] : buffer -> view<[%capacity]xi32>
-  %record_words = index.constant 10 : index
-  %result_words = index.mul %capacity, %record_words : index
-  %next = buffer.view %results[%next_origin] : buffer -> view<[%result_words]xi32>
   %tags = buffer.view %results[%tags_origin] : buffer -> view<[%capacity]xi32>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
-  %c4 = index.constant 4 : index
-  %c16 = index.constant 16 : index
-  %c160 = index.constant 160 : index
-  %c0_v4xi32 = vector.splati 0 : vector<4xi32>
-  %none = scalar.constant -1 : i32
   scf.for %i = [%c0 to %capacity step %c1] {
     view.store %c0_i32, %active_tokens[%i] : i32, view<[%capacity]xi32>
-  }
-  scf.for %i = [%c0 to %result_words step %c1] {
-    view.store %c0_i32, %next[%i] : i32, view<[%result_words]xi32>
-  }
-  scf.for %i = [%c0 to %capacity step %c1] {
-    view.store %none, %tags[%i] : i32, view<[%capacity]xi32>
   }
   %advanced = scalar.constant 102 : i32
   %advanced_source = scalar.constant 25 : i32
@@ -149,6 +135,9 @@ func.def @continuation_oracle(%mixed_inputs: index, %context: index, %capacity_v
     view.store %value, %active_tokens[%token] : i32, view<[%capacity]xi32>
   }
   view.store %c0_i32, %tags[0] : i32, view<[%capacity]xi32>
+  %live_tags_origin = index.add %next_origin, %result_stride : offset
+  %live_tags = buffer.view %results[%live_tags_origin] : buffer -> view<1xi32>
+  view.store %c0_i32, %live_tags[0] : i32, view<1xi32>
   func.return
 }
 
@@ -192,10 +181,7 @@ check.scenario public @ordinary_continuation_preserves_source_position {
 // Only two or more remaining outputs can repay another full-width proposal.
 // Each case supplies literal liveness, including exact and one-short context
 // frontiers, independently of the implementation's admission predicate.
-kernel.def @speculative_continuation_fixture() {
-  %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
-} launch(%width: index, %remaining: index, %terminal_value: i32, %expected_live: i1, %epoch: buffer, %results: buffer, %expected_header: buffer, %expected_inputs: buffer, %expected_tags: buffer) {
+func.def @speculative_continuation_fixture(%width: index, %remaining: index, %terminal_value: i32, %expected_live: i1, %epoch: buffer, %results: buffer, %expected_header: buffer, %expected_inputs: buffer, %expected_results: buffer) {
   %capacity = index.constant 512 : index
   %origin = index.constant 0 : offset
   %plan_origin = func.call @qwen38_packet_bank_bytes(%capacity) : (index) -> (offset)
@@ -214,7 +200,6 @@ kernel.def @speculative_continuation_fixture() {
   %first = buffer.view %results[%result_origin] : buffer -> view<[%capacity]x10xi32>
   %header = buffer.view %expected_header[%origin] : buffer -> view<3xi32>
   %inputs = buffer.view %expected_inputs[%origin] : buffer -> view<512xi32>
-  %tags = buffer.view %expected_tags[%origin] : buffer -> view<[%capacity]xi32>
   %c0_i32 = scalar.constant 0 : i32
   %terminal = scalar.cmpi ne, %terminal_value, %c0_i32 : i32
   %c1_i32 = scalar.constant 1 : i32
@@ -244,419 +229,160 @@ kernel.def @speculative_continuation_fixture() {
   %packed_counts = scalar.constant 131074 : i32
   view.store %packed_counts, %first[5, 1] : i32, view<[%capacity]x10xi32>
   view.store %prediction, %first[5, 3] : i32, view<[%capacity]x10xi32>
+  %result_bytes = buffer.length %results
+  buffer.copy %results[%origin], %expected_results[%origin], %result_bytes
   scf.if %expected_live {
     view.store %width_word, %header[0] : i32, view<3xi32>
     view.store %c1_i32, %header[1] : i32, view<3xi32>
     view.store %width_word, %header[2] : i32, view<3xi32>
     view.store %token, %inputs[0] : i32, view<512xi32>
-    view.store %tag, %tags[0] : i32, view<[%capacity]xi32>
+    // One live record follows the second header. Its tag is packed directly
+    // after that record, while the temporary tail retains the same owner.
+    %packed_origin = index.constant 20760 : offset
+    %temporary_origin = index.constant 41200 : offset
+    %packed = buffer.view %expected_results[%packed_origin] : buffer -> view<1xi32>
+    %temporary = buffer.view %expected_results[%temporary_origin] : buffer -> view<1xi32>
+    view.store %tag, %packed[0] : i32, view<1xi32>
+    view.store %tag, %temporary[0] : i32, view<1xi32>
   }
-  kernel.return
+  func.return
 }
 
-check.case public @continuation_exact_fit_width_2 {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(2) : index
-  %remaining = check.literal value(2) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(66) : index
-  %expected_live = check.literal value(true) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
+// Literal cases cover every verification width, spare/exhausted output credit,
+// EOS, exact/short context frontiers, and combined stops. Liveness is supplied
+// independently of the production predicate.
+func.def @speculative_continuation_parameters(%trial: index) -> (index, index, i32, index, i1) {
+  %widths = vector.constanti [2, 3, 4, 5, 6, 7, 8, 5, 6, 7, 4, 8, 2, 8, 3] : vector<15xi32>
+  %credits = vector.constanti [2, 2, 2, 2, 2, 2, 2, 3, 0, 1, 2, 3, 3, 2, 0] : vector<15xi32>
+  %terminals = vector.constanti [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1] : vector<15xi32>
+  %contexts = vector.constanti [66, 67, 68, 69, 70, 71, 72, 128, 128, 128, 68, 64, 65, 71, 64] : vector<15xi32>
+  %liveness = vector.constanti [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0] : vector<15xi32>
+  %width_word = vector.extract %widths[%trial] : vector<15xi32> -> i32
+  %credit_word = vector.extract %credits[%trial] : vector<15xi32> -> i32
+  %terminal = vector.extract %terminals[%trial] : vector<15xi32> -> i32
+  %context_word = vector.extract %contexts[%trial] : vector<15xi32> -> i32
+  %live_word = vector.extract %liveness[%trial] : vector<15xi32> -> i32
+  %width = index.cast %width_word : i32 to index
+  %credit = index.cast %credit_word : i32 to index
+  %context = index.cast %context_word : i32 to index
+  %c0_i32 = scalar.constant 0 : i32
+  %live = scalar.cmpi ne, %live_word, %c0_i32 : i32
+  func.return %width, %credit, %terminal, %context, %live : index, index, i32, index, i1
+}
+
+// The fixture above supplies the independent expected buffers.
+func.def @continuation_expected(%mixed_inputs: index, %context: index, %capacity: index, %epoch: buffer, %tokens: buffer, %results: buffer) {
+  func.return
+}
+
+check.scenario public @speculative_continuation_frontiers {
+  check.trial[15](%trial: index, %entropy: check.entropy) {
+    %width, %remaining, %terminal, %context, %expected_live = check.generate<@speculative_continuation_parameters>(%trial) : (index) -> (index, index, i32, index, i1)
+    %epoch = check.generate.fill value(0) : tensor<14346xi32>
+    %tokens = check.generate.fill value(-17) : tensor<1024xi32>
+    %results = check.generate.fill value(-99) : tensor<10812xi32>
+    %expected_header = check.generate.fill value(0) : tensor<3xi32>
+    %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
+    %expected_results = check.generate.fill value(-99) : tensor<10812xi32>
+    check.generate<@speculative_continuation_fixture>(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_results) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<10812xi32>) -> ()
+    %mixed_inputs = check.literal value(0) : index
+    %capacity = check.literal value(512) : index
+    %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
+    %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
+    check.compare<@qwen38_continue_dispatch, @continuation_expected>(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>) -> () {
+      check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
+      check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
+      check.expect.bitwise actual(%results) expected(%expected_results) : tensor<10812xi32>
+    }
+  }
   check.return
 }
 
-check.benchmark<@continuation_exact_fit_width_2> @continuation_exact_fit_width_2_benchmark
+check.benchmark<@speculative_continuation_frontiers> @speculative_continuation_frontiers_benchmark
 
-check.case public @continuation_exact_fit_width_3 {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(3) : index
-  %remaining = check.literal value(2) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(67) : index
-  %expected_live = check.literal value(true) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
+// Sixteen retained owners continue in reverse order. Fifteen live tags make
+// the packed destination overlap the temporary source; zero and sixteen also
+// exercise the empty and identical-range cases. Old record bytes stay poisoned.
+func.def @continuation_tag_fixture(%live_value: index, %epoch: buffer, %results: buffer, %expected: buffer) {
+  %live = index.assume %live_value [range(%live_value, 0, 16)] : index
+  %capacity = index.constant 16 : index
+  %origin = index.constant 0 : offset
+  %plan_origin = func.call @qwen38_packet_bank_bytes(%capacity) : (index) -> (offset)
+  %descriptor_origin = index.constant 12 : offset
+  %planned_origin = index.add %plan_origin, %descriptor_origin : offset
+  %options_origin = func.call @qwen38_packet_options_origin(%capacity) : (index) -> (offset)
+  %credits_origin = index.add %plan_origin, %options_origin : offset
+  %indices_origin = func.call @qwen38_packet_indices_origin(%capacity) : (index) -> (offset)
+  %plan = buffer.view %epoch[%plan_origin] : buffer -> view<3xi32>
+  %planned = buffer.view %epoch[%planned_origin] : buffer -> view<16x6xi32>
+  %credits = buffer.view %epoch[%credits_origin] : buffer -> view<16x2xi32>
+  %indices = buffer.view %epoch[%indices_origin] : buffer -> view<16xi32>
+  %result_origin = index.constant 120 : offset
+  %first = buffer.view %results[%result_origin] : buffer -> view<16x10xi32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %last = index.constant 15 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %absent = scalar.constant -1 : i32
+  %count = index.cast %live : index to i32
+  view.store %count, %plan[1] : i32, view<3xi32>
+  scf.for %i = [%c0 to %live step %c1] {
+    %owner = index.sub %last, %i : index
+    %owner_word = index.cast %owner : index to i32
+    %source = index.cast %i : index to i32
+    view.store %c1_i32, %planned[%i, 0] : i32, view<16x6xi32>
+    view.store %source, %planned[%i, 2] : i32, view<16x6xi32>
+    view.store %owner_word, %planned[%i, 3] : i32, view<16x6xi32>
+    view.store %absent, %planned[%i, 5] : i32, view<16x6xi32>
+    view.store %c0_i32, %credits[%i, 0] : i32, view<16x2xi32>
+    view.store %owner_word, %indices[%i] : i32, view<16xi32>
+    view.store %c1_i32, %first[%owner, 0] : i32, view<16x10xi32>
+    view.store %c0_i32, %first[%owner, 1] : i32, view<16x10xi32>
+  }
+  %bytes = buffer.length %results
+  buffer.copy %results[%origin], %expected[%origin], %bytes
+  %temporary_origin = index.constant 1520 : offset
+  %temporary = buffer.view %expected[%temporary_origin] : buffer -> view<16xi32>
+  %next_records = index.constant 880 : offset
+  %record_bytes = index.constant 40 : offset
+  %payload = index.scale %live, %record_bytes : index, offset -> offset
+  %packed_origin = index.add %next_records, %payload : offset
+  %packed = buffer.view %expected[%packed_origin] : buffer -> view<[%live]xi32>
+  scf.for %i = [%c0 to %live step %c1] {
+    %owner = index.sub %last, %i : index
+    %word = index.cast %owner : index to i32
+    view.store %word, %temporary[%i] : i32, view<16xi32>
+  }
+  scf.for %i = [%c0 to %live step %c1] {
+    %owner = index.sub %last, %i : index
+    %word = index.cast %owner : index to i32
+    view.store %word, %packed[%i] : i32, view<[%live]xi32>
+  }
+  func.return
 }
 
-check.benchmark<@continuation_exact_fit_width_3> @continuation_exact_fit_width_3_benchmark
-
-check.case public @continuation_exact_fit_width_4 {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(4) : index
-  %remaining = check.literal value(2) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(68) : index
-  %expected_live = check.literal value(true) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
+func.def @continuation_tag_count(%trial: index) -> (index) {
+  %counts = vector.constanti [0, 1, 15, 16] : vector<4xi32>
+  %word = vector.extract %counts[%trial] : vector<4xi32> -> i32
+  %count = index.cast %word : i32 to index
+  func.return %count : index
 }
 
-check.benchmark<@continuation_exact_fit_width_4> @continuation_exact_fit_width_4_benchmark
-
-check.case public @continuation_exact_fit_width_5 {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(5) : index
-  %remaining = check.literal value(2) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(69) : index
-  %expected_live = check.literal value(true) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
+check.scenario public @continuation_tags_preserve_record_banks {
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %live = check.generate<@continuation_tag_count>(%trial) : (index) -> (index)
+    %epoch = check.generate.fill value(0) : tensor<480xi32>
+    %tokens = check.generate.iota offset(100) step(1) : tensor<32xi32>
+    %results = check.generate.fill value(-99) : tensor<396xi32>
+    %expected = check.generate.fill value(-99) : tensor<396xi32>
+    check.generate<@continuation_tag_fixture>(%live, %epoch, %results, %expected) : (index, tensor<480xi32>, tensor<396xi32>, tensor<396xi32>) -> ()
+    %mixed = check.literal value(0) : index
+    %context = check.literal value(256) : index
+    %capacity = check.literal value(16) : index
+    check.compare<@qwen38_continue_dispatch, @continuation_expected>(%mixed, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<480xi32>, tensor<32xi32>, tensor<396xi32>) -> () {
+      check.expect.bitwise actual(%results) expected(%expected) : tensor<396xi32>
+    }
+  }
   check.return
 }
-
-check.benchmark<@continuation_exact_fit_width_5> @continuation_exact_fit_width_5_benchmark
-
-check.case public @continuation_exact_fit_width_6 {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(6) : index
-  %remaining = check.literal value(2) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(70) : index
-  %expected_live = check.literal value(true) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
-}
-
-check.benchmark<@continuation_exact_fit_width_6> @continuation_exact_fit_width_6_benchmark
-
-check.case public @continuation_exact_fit_width_7 {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(7) : index
-  %remaining = check.literal value(2) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(71) : index
-  %expected_live = check.literal value(true) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
-}
-
-check.benchmark<@continuation_exact_fit_width_7> @continuation_exact_fit_width_7_benchmark
-
-check.case public @continuation_exact_fit_width_8 {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(8) : index
-  %remaining = check.literal value(2) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(72) : index
-  %expected_live = check.literal value(true) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
-}
-
-check.benchmark<@continuation_exact_fit_width_8> @continuation_exact_fit_width_8_benchmark
-
-check.case public @continuation_spare_credit {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(5) : index
-  %remaining = check.literal value(3) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(128) : index
-  %expected_live = check.literal value(true) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
-}
-
-check.benchmark<@continuation_spare_credit> @continuation_spare_credit_benchmark
-
-check.case public @continuation_no_credit {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(6) : index
-  %remaining = check.literal value(0) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(128) : index
-  %expected_live = check.literal value(false) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
-}
-
-check.benchmark<@continuation_no_credit> @continuation_no_credit_benchmark
-
-check.case public @continuation_ordinary_decode_credit {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(7) : index
-  %remaining = check.literal value(1) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(128) : index
-  %expected_live = check.literal value(false) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
-}
-
-check.benchmark<@continuation_ordinary_decode_credit> @continuation_ordinary_decode_credit_benchmark
-
-check.case public @continuation_eos {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(4) : index
-  %remaining = check.literal value(2) : index
-  %terminal = check.literal value(1) : i32
-  %context = check.literal value(68) : index
-  %expected_live = check.literal value(false) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
-}
-
-check.benchmark<@continuation_eos> @continuation_eos_benchmark
-
-check.case public @continuation_context_exhausted {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(8) : index
-  %remaining = check.literal value(3) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(64) : index
-  %expected_live = check.literal value(false) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
-}
-
-check.benchmark<@continuation_context_exhausted> @continuation_context_exhausted_benchmark
-
-check.case public @continuation_short_context_width_2 {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(2) : index
-  %remaining = check.literal value(3) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(65) : index
-  %expected_live = check.literal value(false) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
-}
-
-check.benchmark<@continuation_short_context_width_2> @continuation_short_context_width_2_benchmark
-
-check.case public @continuation_short_context_width_8 {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(8) : index
-  %remaining = check.literal value(2) : index
-  %terminal = check.literal value(0) : i32
-  %context = check.literal value(71) : index
-  %expected_live = check.literal value(false) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
-}
-
-check.benchmark<@continuation_short_context_width_8> @continuation_short_context_width_8_benchmark
-
-check.case public @continuation_multiple_stops {
-  %mixed_inputs = check.literal value(0) : index
-  %width = check.literal value(3) : index
-  %remaining = check.literal value(0) : index
-  %terminal = check.literal value(1) : i32
-  %context = check.literal value(64) : index
-  %expected_live = check.literal value(false) : i1
-  %epoch = check.generate.fill value(0) : tensor<14346xi32>
-  %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-  %results = check.generate.fill value(0) : tensor<10812xi32>
-  %expected_header = check.generate.fill value(0) : tensor<3xi32>
-  %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-  %expected_tags = check.generate.fill value(-1) : tensor<512xi32>
-  kernel.launch @speculative_continuation_fixture(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_tags) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<512xi32>)
-  %capacity = check.literal value(512) : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>)
-  %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
-  %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-  %tags = check.tensor.view %results offset(41200) : tensor<10812xi32> -> tensor<512xi32>
-  check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
-  check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-  check.expect.bitwise actual(%tags) expected(%expected_tags) : tensor<512xi32>
-  check.return
-}
-
-check.benchmark<@continuation_multiple_stops> @continuation_multiple_stops_benchmark
-
-check.benchmark<@ordinary_continuation_preserves_source_position> @ordinary_continuation_preserves_source_position_benchmark
