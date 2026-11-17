@@ -41,6 +41,21 @@ PLE adds hashed n-gram lookup and its own token and convolution history.
 Read anchors and writable endpoints are distinct arguments, allowing forks
 to share immutable history while publishing into private state.
 
+The finite PLE stages separate request generation, layer zero, and the remaining
+target layers. The requester reads the old token history and writes a live byte
+range list without advancing that history. Layer zero has no PLE dependency and
+can execute while file reads fill the packed row cache. The suffix starts after
+read completion, publishes filled cache entries, and uses the same decoding,
+projection, and convolution as the resident path. Layer bounds and input mode
+specialize the existing unfused, normalized, and fused bodies; they do not
+introduce runtime layer dispatch.
+
+Speculative verification retains both prefix and suffix weight domains, captures
+all transition inputs, and replays only accepted history. Its layer-zero replay
+uses the prefix domain. Resident verification supplies one domain for both and
+retains the complete-body root. No request or cache-planning stage publishes
+speculative state on behalf of the verifier.
+
 Each sparse-attention layer pairs K and V within four-token, single-head
 records. A record contains a 2 KiB K tile followed by a 2 KiB V tile. K keeps
 its `[channel / 16, member, channel % 16]` order; V keeps its

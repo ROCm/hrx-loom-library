@@ -1,7 +1,6 @@
 // Complete Flash-Next target epochs over packed spans. Layer ordering and
 // output-only selection specialize from prepared capacities; active
 // ownership, page maps, and retained frontiers remain runtime inputs.
-
 func.decl readonly @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
 config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
@@ -16,7 +15,7 @@ kernel.decl @flash_next_map_tokens(%neural_enabled: i1) launch(%epoch: buffer, %
 
 kernel.decl @flash_next_embedding_q8_0() launch(%epoch: buffer, %ids: buffer, %weight: buffer, %residual: buffer)
 
-command.decl @flash_next_ple_residual(%workload_count: index, %layer: index, %token_history_origin: offset, %convolution_history_origin: offset) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %origins: buffer, %tokens: buffer, %residual: buffer, %arena: buffer, %output: buffer, %capture: buffer)
+command.decl @flash_next_ple_residual(%stream: i1, %workload_count: index, %layer: index, %token_history_origin: offset, %convolution_history_origin: offset) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %origins: buffer, %tokens: buffer, %residual: buffer, %arena: buffer, %output: buffer, %capture: buffer, %cache: buffer)
 
 command.decl @flash_next_qsa_residual(%workload_count: index, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset, %mixed_inputs: index) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %residual: buffer, %rows: buffer, %arena: buffer, %working: buffer, %output: buffer, %capture: buffer, %inputs: buffer)
 
@@ -28,7 +27,7 @@ command.decl @flash_next_output_head() launch(%parameters: buffer, %epoch: buffe
 
 // All layer decisions are cold specialization. Runtime packets contain only
 // active tokens, span ownership, physical page IDs, and recurrent frontiers.
-command.def public @flash_next_body_unfused() launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
+command.def public @flash_next_body_unfused(%begin_layer: index, %end_layer: index, %stream: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
   %neural_enabled = scalar.constant true : i1
   %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %tokens = config.get @flash_next.token_count : index
@@ -40,14 +39,17 @@ command.def public @flash_next_body_unfused() launch(%parameters: buffer, %resid
   %mapping_bytes = index.scale %tokens, %mapping_stride : index, offset -> offset
   %mapping = buffer.alloca<global> align(16) %mapping_bytes : buffer
   kernel.launch @flash_next_map_tokens[%neural_enabled](%epoch, %mapping) : [i1](buffer, buffer)
-  %embedding = command.parameter %parameters, "token_embd.weight" : view<675430400xi8>
-  kernel.launch @flash_next_embedding_q8_0(%epoch, %input_tokens, %embedding, %residual) : (buffer, buffer, view<675430400xi8>, buffer)
+  %initial_layer = index.constant 0 : index
+  %initial = index.cmp eq, %begin_layer, %initial_layer : index
+  scf.if %initial {
+    %embedding = command.parameter %parameters, "token_embd.weight" : view<675430400xi8>
+    kernel.launch @flash_next_embedding_q8_0(%epoch, %input_tokens, %embedding, %residual) : (buffer, buffer, view<675430400xi8>, buffer)
+  }
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c3 = index.constant 3 : index
   %c4 = index.constant 4 : index
   %last_layer = index.constant 47 : index
-  %layers = index.constant 48 : index
   %main_planes = index.constant 12 : index
   %gdn_stride = index.constant 3207168 : offset
   %main_token_stride = index.constant 2048 : offset
@@ -63,16 +65,17 @@ command.def public @flash_next_body_unfused() launch(%parameters: buffer, %resid
   %conv_history = index.constant 115458304 : offset
   %tail_base = index.constant 115642624 : offset
   %tail_stride = index.constant 768 : offset
-  %final = scf.for %layer = [%c0 to %layers step %c1](%current = %residual : buffer) -> (buffer) unroll {
+  %final = scf.for %layer = [%begin_layer to %end_layer step %c1](%current = %residual : buffer) -> (buffer) unroll {
     %has_ple = index.cmp eq, %layer, %c1 : index
     %input = scf.if %has_ple -> (buffer) {
       %ple = buffer.alloca<global> align(256) %activation_bytes : buffer
-      command.launch @flash_next_ple_residual[%workload_count, %layer, %token_history, %conv_history](%parameters, %epoch, %mapping, %rows, %input_tokens, %current, %state, %ple, %capture) : [index, index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+      command.launch @flash_next_ple_residual[%stream, %workload_count, %layer, %token_history, %conv_history](%parameters, %epoch, %mapping, %rows, %input_tokens, %current, %state, %ple, %capture, %residual) : [i1, index, index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       scf.yield %ple : buffer
     } else {
       scf.yield %current : buffer
     }
-    %last = index.cmp eq, %layer, %last_layer : index
+    %after_layer = index.add %layer, %c1 : index
+    %last = index.cmp eq, %after_layer, %end_layer : index
     %output = scf.if %last -> (buffer) {
       scf.yield %residual : buffer
     } else {
@@ -130,7 +133,7 @@ command.decl @flash_next_experts(%workload_count: index, %layer: index) launch(%
 // Every publication starts at its producer and ends at its last consumer.
 // Distinct SSA roots let the transient planner reuse their storage between
 // mixers, attention, and expert stages without retaining one live buffer.
-command.def public @flash_next_body_normalized(%outputs_only: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
+command.def public @flash_next_body_normalized(%outputs_only: i1, %begin_layer: index, %end_layer: index, %stream: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
   %neural_enabled = scalar.constant true : i1
   %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %tokens = config.get @flash_next.token_count : index
@@ -150,14 +153,17 @@ command.def public @flash_next_body_normalized(%outputs_only: i1) launch(%parame
   %mapping_bytes = index.scale %tokens, %mapping_stride : index, offset -> offset
   %mapping = buffer.alloca<global> align(16) %mapping_bytes : buffer
   kernel.launch @flash_next_map_tokens[%neural_enabled](%epoch, %mapping) : [i1](buffer, buffer)
-  %embedding = command.parameter %parameters, "token_embd.weight" : view<675430400xi8>
-  kernel.launch @flash_next_embedding_q8_0(%epoch, %input_tokens, %embedding, %residual) : (buffer, buffer, view<675430400xi8>, buffer)
+  %initial_layer = index.constant 0 : index
+  %initial = index.cmp eq, %begin_layer, %initial_layer : index
+  scf.if %initial {
+    %embedding = command.parameter %parameters, "token_embd.weight" : view<675430400xi8>
+    kernel.launch @flash_next_embedding_q8_0(%epoch, %input_tokens, %embedding, %residual) : (buffer, buffer, view<675430400xi8>, buffer)
+  }
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c3 = index.constant 3 : index
   %c4 = index.constant 4 : index
   %last_layer = index.constant 47 : index
-  %layers = index.constant 48 : index
   %main_planes = index.constant 12 : index
   %gdn_stride = index.constant 3207168 : offset
   %main_token_stride = index.constant 2048 : offset
@@ -170,14 +176,28 @@ command.def public @flash_next_body_normalized(%outputs_only: i1) launch(%parame
   %conv_history = index.constant 115458304 : offset
   %tail_base = index.constant 115642624 : offset
   %tail_stride = index.constant 768 : offset
+  // PLE produces the first residual before hyperconnection setup when the
+  // byte dependency splits the program here. This preserves parameter order
+  // across small, normalized, and fused cohorts sharing the same weight bank.
+  %starts_with_ple = index.cmp eq, %begin_layer, %c1 : index
+  %initial_residual = scf.if %starts_with_ple -> (buffer) {
+    %ple = buffer.alloca<global> align(256) %activation_bytes : buffer
+    command.launch @flash_next_ple_residual[%stream, %workload_count, %begin_layer, %token_history, %conv_history](%parameters, %epoch, %mapping, %rows, %input_tokens, %residual, %state, %ple, %capture, %residual) : [i1, index, index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    scf.yield %ple : buffer
+  } else {
+    scf.yield %residual : buffer
+  }
   %initial_normalized = buffer.alloca<global> align(256) %activation_bytes : buffer
-  %initial_gamma = command.parameter %parameters, "blk.{}.hc_attn_norm.weight"[%c0] : view<4x2560xf32>
-  kernel.launch @hc_normalize[%neural_enabled](%epoch, %residual, %initial_gamma, %initial_normalized) : [i1](buffer, buffer, view<4x2560xf32>, buffer)
-  %final, %final_normalized = scf.for %layer = [%c0 to %layers step %c1](%current = %residual : buffer, %current_normalized = %initial_normalized : buffer) -> (buffer, buffer) unroll {
-    %has_ple = index.cmp eq, %layer, %c1 : index
+  %initial_gamma = command.parameter %parameters, "blk.{}.hc_attn_norm.weight"[%begin_layer] : view<4x2560xf32>
+  kernel.launch @hc_normalize[%neural_enabled](%epoch, %initial_residual, %initial_gamma, %initial_normalized) : [i1](buffer, buffer, view<4x2560xf32>, buffer)
+
+  %final, %final_normalized = scf.for %layer = [%begin_layer to %end_layer step %c1](%current = %initial_residual : buffer, %current_normalized = %initial_normalized : buffer) -> (buffer, buffer) unroll {
+    %at_ple = index.cmp eq, %layer, %c1 : index
+    %following = index.cmp ne, %layer, %begin_layer : index
+    %has_ple = scalar.andi %at_ple, %following : i1
     %input, %input_normalized = scf.if %has_ple -> (buffer, buffer) {
       %ple = buffer.alloca<global> align(256) %activation_bytes : buffer
-      command.launch @flash_next_ple_residual[%workload_count, %layer, %token_history, %conv_history](%parameters, %epoch, %mapping, %rows, %input_tokens, %current, %state, %ple, %capture) : [index, index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+      command.launch @flash_next_ple_residual[%stream, %workload_count, %layer, %token_history, %conv_history](%parameters, %epoch, %mapping, %rows, %input_tokens, %current, %state, %ple, %capture, %residual) : [i1, index, index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       %ple_normalized = buffer.alloca<global> align(256) %activation_bytes : buffer
       %ple_gamma = command.parameter %parameters, "blk.{}.hc_attn_norm.weight"[%layer] : view<4x2560xf32>
       kernel.launch @hc_normalize[%neural_enabled](%epoch, %ple, %ple_gamma, %ple_normalized) : [i1](buffer, buffer, view<4x2560xf32>, buffer)
@@ -231,7 +251,8 @@ command.def public @flash_next_body_normalized(%outputs_only: i1) launch(%parame
       command.launch @flash_next_route[%neural_enabled, %layer](%parameters, %epoch, %ffn_mixed, %ids, %weights, %shared_gate) : [i1, index](buffer, buffer, buffer, buffer, buffer, buffer)
       %branch = buffer.alloca<global> align(256) %hidden_bytes : buffer
       command.launch @flash_next_experts[%workload_count, %layer](%parameters, %epoch, %ffn_mixed, %ids, %weights, %shared_gate, %branch) : [index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
-      %last = index.cmp eq, %layer, %last_layer : index
+      %after_layer = index.add %layer, %c1 : index
+      %last = index.cmp eq, %after_layer, %end_layer : index
       %output = scf.if %last -> (buffer) {
         scf.yield %residual : buffer
       } else {
@@ -266,6 +287,14 @@ command.def public @flash_next_body() launch(%parameters: buffer, %residual: buf
 }
 
 command.def public @flash_next_body_select(%outputs_only: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
+  %begin = index.constant 0 : index
+  %end = index.constant 48 : index
+  %stream = scalar.constant false : i1
+  command.launch @flash_next_body_range[%outputs_only, %begin, %end, %stream](%parameters, %residual, %epoch, %rows, %state, %input_tokens, %capture) : [i1, index, index, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.def public @flash_next_body_range(%outputs_only: i1, %begin: index, %end: index, %stream: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %threshold = index.constant 128 : index
   %wide = index.cmp uge, %tokens, %threshold : index
@@ -276,15 +305,15 @@ command.def public @flash_next_body_select(%outputs_only: i1) launch(%parameters
       %quantized_capacity = index.constant 2048 : index
       %use_quantized = index.cmp eq, %tokens, %quantized_capacity : index
       scf.if %use_quantized {
-        command.launch @flash_next_body_quant_injection[%outputs_only](%parameters, %residual, %epoch, %rows, %state, %input_tokens, %capture) : [i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+        command.launch @flash_next_body_quant_injection[%outputs_only, %begin, %end, %stream](%parameters, %residual, %epoch, %rows, %state, %input_tokens, %capture) : [i1, index, index, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       } else {
-        command.launch @flash_next_body_injection_fused[%outputs_only](%parameters, %residual, %epoch, %rows, %state, %input_tokens, %capture) : [i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+        command.launch @flash_next_body_injection_fused[%outputs_only, %begin, %end, %stream](%parameters, %residual, %epoch, %rows, %state, %input_tokens, %capture) : [i1, index, index, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       }
     } else {
-      command.launch @flash_next_body_normalized[%outputs_only](%parameters, %residual, %epoch, %rows, %state, %input_tokens, %capture) : [i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+      command.launch @flash_next_body_normalized[%outputs_only, %begin, %end, %stream](%parameters, %residual, %epoch, %rows, %state, %input_tokens, %capture) : [i1, index, index, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
     }
   } else {
-    command.launch @flash_next_body_unfused(%parameters, %residual, %epoch, %rows, %state, %input_tokens, %capture) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    command.launch @flash_next_body_unfused[%begin, %end, %stream](%parameters, %residual, %epoch, %rows, %state, %input_tokens, %capture) : [index, index, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   }
   command.return
 }
@@ -295,7 +324,7 @@ kernel.decl @hc_combine_normalize_inject() launch(%span: buffer, %residual: buff
 
 command.decl @flash_next_hc_mix_normalized(%down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>) launch(%span: buffer, %normalized: buffer, %mixed: buffer)
 
-command.def public @flash_next_body_injection_fused(%outputs_only: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
+command.def public @flash_next_body_injection_fused(%outputs_only: i1, %begin_layer: index, %end_layer: index, %stream: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
   %neural_enabled = scalar.constant true : i1
   %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %tokens = config.get @flash_next.token_count : index
@@ -315,14 +344,17 @@ command.def public @flash_next_body_injection_fused(%outputs_only: i1) launch(%p
   %mapping_bytes = index.scale %tokens, %mapping_stride : index, offset -> offset
   %mapping = buffer.alloca<global> align(16) %mapping_bytes : buffer
   kernel.launch @flash_next_map_tokens[%neural_enabled](%epoch, %mapping) : [i1](buffer, buffer)
-  %embedding = command.parameter %parameters, "token_embd.weight" : view<675430400xi8>
-  kernel.launch @flash_next_embedding_q8_0(%epoch, %input_tokens, %embedding, %residual) : (buffer, buffer, view<675430400xi8>, buffer)
+  %initial_layer = index.constant 0 : index
+  %initial = index.cmp eq, %begin_layer, %initial_layer : index
+  scf.if %initial {
+    %embedding = command.parameter %parameters, "token_embd.weight" : view<675430400xi8>
+    kernel.launch @flash_next_embedding_q8_0(%epoch, %input_tokens, %embedding, %residual) : (buffer, buffer, view<675430400xi8>, buffer)
+  }
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c3 = index.constant 3 : index
   %c4 = index.constant 4 : index
   %last_layer = index.constant 47 : index
-  %layers = index.constant 48 : index
   %main_planes = index.constant 12 : index
   %gdn_stride = index.constant 3207168 : offset
   %main_token_stride = index.constant 2048 : offset
@@ -335,18 +367,32 @@ command.def public @flash_next_body_injection_fused(%outputs_only: i1) launch(%p
   %conv_history = index.constant 115458304 : offset
   %tail_base = index.constant 115642624 : offset
   %tail_stride = index.constant 768 : offset
+  // PLE produces the first residual before hyperconnection setup when the
+  // byte dependency splits the program here. This preserves parameter order
+  // across small, normalized, and fused cohorts sharing the same weight bank.
+  %starts_with_ple = index.cmp eq, %begin_layer, %c1 : index
+  %initial_residual = scf.if %starts_with_ple -> (buffer) {
+    %ple = buffer.alloca<global> align(256) %activation_bytes : buffer
+    command.launch @flash_next_ple_residual[%stream, %workload_count, %begin_layer, %token_history, %conv_history](%parameters, %epoch, %mapping, %rows, %input_tokens, %residual, %state, %ple, %capture, %residual) : [i1, index, index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    scf.yield %ple : buffer
+  } else {
+    scf.yield %residual : buffer
+  }
   %initial_normalized = buffer.alloca<global> align(256) %activation_bytes : buffer
   %initial_injection = buffer.alloca<global> align(256) %injection_bytes : buffer
-  %initial_gamma = command.parameter %parameters, "blk.{}.hc_attn_norm.weight"[%c0] : view<4x2560xf32>
-  %initial_down = command.parameter %parameters, "blk.{}.hc_attn_down.weight"[%c0] : view<3481600xi8>
-  %initial_up = command.parameter %parameters, "blk.{}.hc_attn_up.weight"[%c0] : view<3481600xi8>
-  %initial_weight = command.parameter %parameters, "blk.{}.hc_attn_inject.weight"[%c0] : view<4x10240xf32>
-  kernel.launch @hc_normalize_inject(%epoch, %residual, %initial_gamma, %initial_normalized, %initial_weight, %initial_injection) : (buffer, buffer, view<4x2560xf32>, buffer, view<4x10240xf32>, buffer)
-  %final, %final_normalized, %final_injection, %final_down, %final_up = scf.for %layer = [%c0 to %layers step %c1](%current = %residual : buffer, %current_normalized = %initial_normalized : buffer, %current_injection = %initial_injection : buffer, %current_down = %initial_down : view<3481600xi8>, %current_up = %initial_up : view<3481600xi8>) -> (buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>) unroll {
-    %has_ple = index.cmp eq, %layer, %c1 : index
+  %initial_gamma = command.parameter %parameters, "blk.{}.hc_attn_norm.weight"[%begin_layer] : view<4x2560xf32>
+  %initial_down = command.parameter %parameters, "blk.{}.hc_attn_down.weight"[%begin_layer] : view<3481600xi8>
+  %initial_up = command.parameter %parameters, "blk.{}.hc_attn_up.weight"[%begin_layer] : view<3481600xi8>
+  %initial_weight = command.parameter %parameters, "blk.{}.hc_attn_inject.weight"[%begin_layer] : view<4x10240xf32>
+  kernel.launch @hc_normalize_inject(%epoch, %initial_residual, %initial_gamma, %initial_normalized, %initial_weight, %initial_injection) : (buffer, buffer, view<4x2560xf32>, buffer, view<4x10240xf32>, buffer)
+
+  %final, %final_normalized, %final_injection, %final_down, %final_up = scf.for %layer = [%begin_layer to %end_layer step %c1](%current = %initial_residual : buffer, %current_normalized = %initial_normalized : buffer, %current_injection = %initial_injection : buffer, %current_down = %initial_down : view<3481600xi8>, %current_up = %initial_up : view<3481600xi8>) -> (buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>) unroll {
+    %at_ple = index.cmp eq, %layer, %c1 : index
+    %following = index.cmp ne, %layer, %begin_layer : index
+    %has_ple = scalar.andi %at_ple, %following : i1
     %input, %input_normalized, %attention_injection, %attention_down, %attention_up = scf.if %has_ple -> (buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>) {
       %ple = buffer.alloca<global> align(256) %activation_bytes : buffer
-      command.launch @flash_next_ple_residual[%workload_count, %layer, %token_history, %conv_history](%parameters, %epoch, %mapping, %rows, %input_tokens, %current, %state, %ple, %capture) : [index, index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+      command.launch @flash_next_ple_residual[%stream, %workload_count, %layer, %token_history, %conv_history](%parameters, %epoch, %mapping, %rows, %input_tokens, %current, %state, %ple, %capture, %residual) : [i1, index, index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       %ple_normalized = buffer.alloca<global> align(256) %activation_bytes : buffer
       %ple_injection = buffer.alloca<global> align(256) %injection_bytes : buffer
       %ple_gamma = command.parameter %parameters, "blk.{}.hc_attn_norm.weight"[%layer] : view<4x2560xf32>
@@ -406,7 +452,8 @@ command.def public @flash_next_body_injection_fused(%outputs_only: i1) launch(%p
       command.launch @flash_next_route[%neural_enabled, %layer](%parameters, %epoch, %ffn_mixed, %ids, %weights, %shared_gate) : [i1, index](buffer, buffer, buffer, buffer, buffer, buffer)
       %branch = buffer.alloca<global> align(256) %hidden_bytes : buffer
       command.launch @flash_next_experts[%workload_count, %layer](%parameters, %epoch, %ffn_mixed, %ids, %weights, %shared_gate, %branch) : [index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
-      %last = index.cmp eq, %layer, %last_layer : index
+      %after_layer = index.add %layer, %c1 : index
+      %last = index.cmp eq, %after_layer, %end_layer : index
       %output = scf.if %last -> (buffer) {
         scf.yield %residual : buffer
       } else {
@@ -444,7 +491,7 @@ kernel.decl @hc_combine_normalize_inject_int8() launch(%span: buffer, %residual:
 
 command.decl @flash_next_hc_mix_quantized(%down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>) launch(%span: buffer, %normalized: buffer, %quantized: buffer, %mixed: buffer)
 
-command.def public @flash_next_body_quant_injection(%outputs_only: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
+command.def public @flash_next_body_quant_injection(%outputs_only: i1, %begin_layer: index, %end_layer: index, %stream: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
   %neural_enabled = scalar.constant true : i1
   %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %tokens = config.get @flash_next.token_count : index
@@ -470,14 +517,17 @@ command.def public @flash_next_body_quant_injection(%outputs_only: i1) launch(%p
   %mapping_bytes = index.scale %tokens, %mapping_stride : index, offset -> offset
   %mapping = buffer.alloca<global> align(16) %mapping_bytes : buffer
   kernel.launch @flash_next_map_tokens[%neural_enabled](%epoch, %mapping) : [i1](buffer, buffer)
-  %embedding = command.parameter %parameters, "token_embd.weight" : view<675430400xi8>
-  kernel.launch @flash_next_embedding_q8_0(%epoch, %input_tokens, %embedding, %residual) : (buffer, buffer, view<675430400xi8>, buffer)
+  %initial_layer = index.constant 0 : index
+  %initial = index.cmp eq, %begin_layer, %initial_layer : index
+  scf.if %initial {
+    %embedding = command.parameter %parameters, "token_embd.weight" : view<675430400xi8>
+    kernel.launch @flash_next_embedding_q8_0(%epoch, %input_tokens, %embedding, %residual) : (buffer, buffer, view<675430400xi8>, buffer)
+  }
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c3 = index.constant 3 : index
   %c4 = index.constant 4 : index
   %last_layer = index.constant 47 : index
-  %layers = index.constant 48 : index
   %main_planes = index.constant 12 : index
   %gdn_stride = index.constant 3207168 : offset
   %main_token_stride = index.constant 2048 : offset
@@ -490,19 +540,33 @@ command.def public @flash_next_body_quant_injection(%outputs_only: i1) launch(%p
   %conv_history = index.constant 115458304 : offset
   %tail_base = index.constant 115642624 : offset
   %tail_stride = index.constant 768 : offset
+  // PLE produces the first residual before hyperconnection setup when the
+  // byte dependency splits the program here. This preserves parameter order
+  // across small, normalized, and fused cohorts sharing the same weight bank.
+  %starts_with_ple = index.cmp eq, %begin_layer, %c1 : index
+  %initial_residual = scf.if %starts_with_ple -> (buffer) {
+    %ple = buffer.alloca<global> align(256) %activation_bytes : buffer
+    command.launch @flash_next_ple_residual[%stream, %workload_count, %begin_layer, %token_history, %conv_history](%parameters, %epoch, %mapping, %rows, %input_tokens, %residual, %state, %ple, %capture, %residual) : [i1, index, index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    scf.yield %ple : buffer
+  } else {
+    scf.yield %residual : buffer
+  }
   %initial_normalized = buffer.alloca<global> align(256) %activation_bytes : buffer
   %initial_quantized = buffer.alloca<global> align(256) %quantized_bytes : buffer
   %initial_injection = buffer.alloca<global> align(256) %injection_bytes : buffer
-  %initial_gamma = command.parameter %parameters, "blk.{}.hc_attn_norm.weight"[%c0] : view<4x2560xf32>
-  %initial_down = command.parameter %parameters, "blk.{}.hc_attn_down.weight"[%c0] : view<3481600xi8>
-  %initial_up = command.parameter %parameters, "blk.{}.hc_attn_up.weight"[%c0] : view<3481600xi8>
-  %initial_weight = command.parameter %parameters, "blk.{}.hc_attn_inject.weight"[%c0] : view<4x10240xf32>
-  kernel.launch @hc_normalize_inject_int8(%epoch, %residual, %initial_gamma, %initial_normalized, %initial_weight, %initial_injection, %initial_quantized) : (buffer, buffer, view<4x2560xf32>, buffer, view<4x10240xf32>, buffer, buffer)
-  %final, %final_normalized, %final_injection, %final_down, %final_up, %final_quantized = scf.for %layer = [%c0 to %layers step %c1](%current = %residual : buffer, %current_normalized = %initial_normalized : buffer, %current_injection = %initial_injection : buffer, %current_down = %initial_down : view<3481600xi8>, %current_up = %initial_up : view<3481600xi8>, %current_quantized = %initial_quantized : buffer) -> (buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>, buffer) unroll {
-    %has_ple = index.cmp eq, %layer, %c1 : index
+  %initial_gamma = command.parameter %parameters, "blk.{}.hc_attn_norm.weight"[%begin_layer] : view<4x2560xf32>
+  %initial_down = command.parameter %parameters, "blk.{}.hc_attn_down.weight"[%begin_layer] : view<3481600xi8>
+  %initial_up = command.parameter %parameters, "blk.{}.hc_attn_up.weight"[%begin_layer] : view<3481600xi8>
+  %initial_weight = command.parameter %parameters, "blk.{}.hc_attn_inject.weight"[%begin_layer] : view<4x10240xf32>
+  kernel.launch @hc_normalize_inject_int8(%epoch, %initial_residual, %initial_gamma, %initial_normalized, %initial_weight, %initial_injection, %initial_quantized) : (buffer, buffer, view<4x2560xf32>, buffer, view<4x10240xf32>, buffer, buffer)
+
+  %final, %final_normalized, %final_injection, %final_down, %final_up, %final_quantized = scf.for %layer = [%begin_layer to %end_layer step %c1](%current = %initial_residual : buffer, %current_normalized = %initial_normalized : buffer, %current_injection = %initial_injection : buffer, %current_down = %initial_down : view<3481600xi8>, %current_up = %initial_up : view<3481600xi8>, %current_quantized = %initial_quantized : buffer) -> (buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>, buffer) unroll {
+    %at_ple = index.cmp eq, %layer, %c1 : index
+    %following = index.cmp ne, %layer, %begin_layer : index
+    %has_ple = scalar.andi %at_ple, %following : i1
     %input, %input_normalized, %attention_injection, %attention_down, %attention_up, %input_quantized = scf.if %has_ple -> (buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>, buffer) {
       %ple = buffer.alloca<global> align(256) %activation_bytes : buffer
-      command.launch @flash_next_ple_residual[%workload_count, %layer, %token_history, %conv_history](%parameters, %epoch, %mapping, %rows, %input_tokens, %current, %state, %ple, %capture) : [index, index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+      command.launch @flash_next_ple_residual[%stream, %workload_count, %layer, %token_history, %conv_history](%parameters, %epoch, %mapping, %rows, %input_tokens, %current, %state, %ple, %capture, %residual) : [i1, index, index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       %ple_normalized = buffer.alloca<global> align(256) %activation_bytes : buffer
       %ple_quantized = buffer.alloca<global> align(256) %quantized_bytes : buffer
       %ple_injection = buffer.alloca<global> align(256) %injection_bytes : buffer
@@ -571,7 +635,8 @@ command.def public @flash_next_body_quant_injection(%outputs_only: i1) launch(%p
       command.launch @flash_next_route[%neural_enabled, %layer](%parameters, %epoch, %ffn_mixed, %ids, %weights, %shared_gate) : [i1, index](buffer, buffer, buffer, buffer, buffer, buffer)
       %branch = buffer.alloca<global> align(256) %hidden_bytes : buffer
       command.launch @flash_next_experts[%workload_count, %layer](%parameters, %epoch, %ffn_mixed, %ids, %weights, %shared_gate, %branch) : [index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
-      %last = index.cmp eq, %layer, %last_layer : index
+      %after_layer = index.add %layer, %c1 : index
+      %last = index.cmp eq, %after_layer, %end_layer : index
       %output = scf.if %last -> (buffer) {
         scf.yield %residual : buffer
       } else {
