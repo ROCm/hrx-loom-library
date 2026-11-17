@@ -5,29 +5,125 @@
 
 config.decl @runner.qwen38.verification_width : %value: index where [range(%value, 2, 8)]
 
-template.decl @selection.topk_partial_f32(%rows: index, %columns: index, %count: index, %input: buffer, %output_values: buffer, %output_ids: buffer)
-
 template.decl @selection.topk_merge_f32(%rows: index, %partitions: index, %count: index, %input_values: buffer, %input_ids: buffer, %output_values: buffer, %output_ids: buffer)
 
 template.decl @selection.chain_q4k_256(%blocks: index, %length: index, %vocabulary: index, %anchors: buffer, %candidates: buffer, %unary: buffer, %hidden: buffer, %predecessors: buffer, %successors: buffer, %output: buffer)
 
+func.decl @qwen38_span_binding(%epoch: buffer, %span: index) -> (offset, index, index)
+
+func.decl pure @qwen38_dflash_vocabulary_record(%owner: index) -> (offset)
+
+func.decl @qwen38_dflash_vocabulary_table_id(%column: index, %carry: buffer, %record: offset) -> (index)
+
+func.decl pure @qwen38_output_workgroup_budget() -> (index)
+
+template.decl @selection.topk_tile_f32(%count: index, %output_row: index, %output_rows: index, %values: vector<16xf32>, %ids: vector<16xi32>, %output_values: buffer, %output_ids: buffer)
+
+// Prefix tiles and the owner's table publish disjoint top-k lists. IDs are
+// canonical vocabulary IDs before comparison, including ties in the rare table.
+// A deployment-sized population visits logical row/partition tiles. Physical
+// head padding is storage only; only actual tokenizer IDs enter the selector.
 kernel.def @qwen38_dflash_topk_partial(%rows: index) {
   %partitions = index.constant 61 : index
-  %c1 = index.constant 1 : index
+  %tiles = index.mul %rows, %partitions : index
+  %budget = func.call pure @qwen38_output_workgroup_budget() : () -> (index)
+  %groups = index.min %tiles, %budget : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%partitions, %rows, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%rows: index, %control: buffer, %logits: buffer, %scores: buffer, %ids: buffer) {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%rows: index, %draft: buffer, %control: buffer, %carry: buffer, %logits: buffer, %table: buffer, %scores: buffer, %ids: buffer) {
   %origin = index.constant 0 : offset
-  %metadata = buffer.assume.memory_space<constant> %control : buffer
-  %header = buffer.view %metadata[%origin] : buffer -> view<1xi32>
-  %live_word = view.load %header[0] : view<1xi32> -> i32
-  %live = index.cast %live_word : i32 to index
-  %row = kernel.workgroup.id<y> : index
-  %active = index.cmp ult, %row, %live : index
-  %vocabulary = index.constant 248320 : index
-  %count = index.constant 16 : index
-  scf.if %active {
-    template.apply<@selection.topk_partial_f32>(%rows, %vocabulary, %count, %logits, %scores, %ids) : (index, index, index, buffer, buffer, buffer)
+  %header = buffer.view %control[%origin] : buffer -> view<4xi32>
+  %live_word = view.load %header[0] : view<4xi32> -> i32
+  %mode = view.load %header[3] : view<4xi32> -> i32
+  %live_value = index.cast %live_word : i32 to index
+  %live = index.assume %live_value [ge(%live_value, 0), le(%live_value, %rows)] : index
+  %c0_i32 = scalar.constant 0 : i32
+  %full = scalar.cmpi ne, %mode, %c0_i32 : i32
+  %full_partitions = index.constant 61 : index
+  %small_partitions = index.constant 25 : index
+  %partitions = scf.select %full, %full_partitions, %small_partitions : index
+  %tasks = index.mul %live, %partitions : index
+  %group = kernel.workgroup.id<x> : index
+  %groups = kernel.workgroup.count<x> : index
+  %thread = kernel.workitem.id<x> : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %threads = index.constant 256 : index
+  %tile_width = index.constant 4096 : index
+  %table_partition = index.constant 24 : index
+  %vocabulary = index.constant 248077 : index
+  %width = config.get @runner.qwen38.verification_width : index
+  %depth = index.sub %width, %c1 : index
+  %dense = buffer.view %logits[%origin] : buffer -> view<[%rows]x248320xf32>
+  %prefix = buffer.view %logits[%origin] : buffer -> view<[%rows]x98304xf32>
+  %extra = buffer.view %table[%origin] : buffer -> view<[%rows]x1024xf32>
+  %negative = scalar.constant -inf : f32
+  %largest = scalar.constant 2147483647 : i32
+  %negative_vector = vector.splatf -inf : vector<16xf32>
+  %largest_vector = vector.splati 2147483647 : vector<16xi32>
+  scf.for %task = [%group to %tasks step %groups] {
+    %row_value = index.div %task, %partitions : index
+    %row = index.assume %row_value [ge(%row_value, 0), lt(%row_value, %rows)] : index
+    %partition = index.rem %task, %partitions : index
+    %begin = index.mul %partition, %tile_width : index
+    %prefix_tile = index.cmp ult, %partition, %table_partition : index
+    %values, %tokens = scf.for %slot = [%c0 to %c16 step %c1](%values = %negative_vector : vector<16xf32>, %tokens = %largest_vector : vector<16xi32>) -> (vector<16xf32>, vector<16xi32>) unroll {
+      %stride = index.mul %slot, %threads : index
+      %column = index.add %thread, %stride : index
+      %channel = index.add %begin, %column : index
+      %value, %id = scf.if %full -> (f32, i32) {
+        %valid = index.cmp ult, %channel, %vocabulary : index
+        %value, %id = scf.if %valid -> (f32, i32) {
+          %value = view.load %dense[%row, %channel] : view<[%rows]x248320xf32> -> f32
+          %id = index.cast %channel : index to i32
+          scf.yield %value, %id : f32, i32
+        } else {
+          scf.yield %negative, %largest : f32, i32
+        }
+        scf.yield %value, %id : f32, i32
+      } else {
+        %value, %id = scf.if %prefix_tile -> (f32, i32) {
+          %bounded = index.assume %channel [range(%channel, 0, 98303)] : index
+          %value = view.load %prefix[%row, %bounded] : view<[%rows]x98304xf32> -> f32
+          %id = index.cast %bounded : index to i32
+          scf.yield %value, %id : f32, i32
+        } else {
+          %span = index.div %row, %depth : index
+          %descriptor_origin, %unused_begin, %owner = func.call @qwen38_span_binding(%draft, %span) : (buffer, index) -> (offset, index, index)
+          %record = func.call pure @qwen38_dflash_vocabulary_record(%owner) : (index) -> (offset)
+          %record_header = buffer.view %carry[%record] : buffer -> view<3xi32>
+          %rare_word = view.load %record_header[0] : view<3xi32> -> i32
+          %rare_value = index.cast %rare_word : i32 to index
+          %rare = index.assume %rare_value [range(%rare_value, 0, 991)] : index
+          %controls = index.constant 33 : index
+          %columns = index.add %rare, %controls : index
+          %table_capacity = index.constant 1024 : index
+          %within = index.cmp ult, %column, %table_capacity : index
+          %present = index.cmp ult, %column, %columns : index
+          %valid = scalar.andi %within, %present : i1
+          %value, %id = scf.if %valid -> (f32, i32) {
+            %entry = index.assume %column [range(%column, 0, 1023)] : index
+            %value = view.load %extra[%row, %entry] : view<[%rows]x1024xf32> -> f32
+            %token = func.call @qwen38_dflash_vocabulary_table_id(%entry, %carry, %record) : (index, buffer, offset) -> (index)
+            %id = index.cast %token : index to i32
+            scf.yield %value, %id : f32, i32
+          } else {
+            scf.yield %negative, %largest : f32, i32
+          }
+          scf.yield %value, %id : f32, i32
+        }
+        scf.yield %value, %id : f32, i32
+      }
+      %next_values = vector.insert %value into %values[%slot] : f32, vector<16xf32>
+      %next_tokens = vector.insert %id into %tokens[%slot] : i32, vector<16xi32>
+      scf.yield %next_values, %next_tokens : vector<16xf32>, vector<16xi32>
+    }
+    %output_rows = index.mul %rows, %partitions : index
+    %output_row = index.assume %task [ge(%task, 0), lt(%task, %output_rows)] : index
+    template.apply<@selection.topk_tile_f32>(%c16, %output_row, %output_rows, %values, %tokens, %scores, %ids) : (index, index, index, vector<16xf32>, vector<16xi32>, buffer, buffer)
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   }
   kernel.return
 }
@@ -38,16 +134,23 @@ kernel.def @qwen38_dflash_topk_merge(%rows: index) {
   kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%rows: index, %control: buffer, %partial_scores: buffer, %partial_ids: buffer, %scores: buffer, %ids: buffer) {
   %origin = index.constant 0 : offset
-  %metadata = buffer.assume.memory_space<constant> %control : buffer
-  %header = buffer.view %metadata[%origin] : buffer -> view<1xi32>
-  %live_word = view.load %header[0] : view<1xi32> -> i32
+  %header = buffer.view %control[%origin] : buffer -> view<4xi32>
+  %live_word = view.load %header[0] : view<4xi32> -> i32
+  %mode = view.load %header[3] : view<4xi32> -> i32
+  %c0_i32 = scalar.constant 0 : i32
+  %full = scalar.cmpi ne, %mode, %c0_i32 : i32
   %live = index.cast %live_word : i32 to index
   %row = kernel.workgroup.id<x> : index
   %active = index.cmp ult, %row, %live : index
-  %partitions = index.constant 61 : index
   %count = index.constant 16 : index
   scf.if %active {
-    template.apply<@selection.topk_merge_f32>(%rows, %partitions, %count, %partial_scores, %partial_ids, %scores, %ids) : (index, index, index, buffer, buffer, buffer, buffer)
+    scf.if %full {
+      %partitions = index.constant 61 : index
+      template.apply<@selection.topk_merge_f32>(%rows, %partitions, %count, %partial_scores, %partial_ids, %scores, %ids) : (index, index, index, buffer, buffer, buffer, buffer)
+    } else {
+      %partitions = index.constant 25 : index
+      template.apply<@selection.topk_merge_f32>(%rows, %partitions, %count, %partial_scores, %partial_ids, %scores, %ids) : (index, index, index, buffer, buffer, buffer, buffer)
+    }
   }
   kernel.return
 }

@@ -1,21 +1,19 @@
-// The model owns only the live-prefix contract around the shared contraction.
-// A complete inactive cohort must preserve its destination bitwise; an active
-// cohort computes every reserved row even when the live prefix ends inside it.
-// Six-, fourteen-, and thirty-two-row cohorts exercise exact tails and the full
-// bank. Small packed operands use the shared independent scalar-byte F64 oracle.
+// Full and prefix projections borrow one output allocation with different row
+// strides. The same live-row decision guards both domains. Exact six-, fourteen-,
+// and thirty-two-row banks use the shared independent scalar-byte F64 oracle;
+// inactive cohorts and the unused compact-output tail retain their sentinels.
 
-kernel.decl @qwen38_output_projection_q6k_prefix(%rows: index, %inputs: index, %outputs: index, %workgroup_budget: index) launch(%rows_argument: index, %row_begin: index, %inputs_argument: index, %outputs_argument: index, %control: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @qwen38_dflash_vocabulary_head(%rows: index, %inputs: index, %full_columns: index, %prefix_columns: index, %budget: index) launch(%rows_argument: index, %row_begin: index, %inputs_argument: index, %full_columns_argument: index, %prefix_columns_argument: index, %control: buffer, %input: buffer, %weight: buffer, %full_output: buffer, %prefix_output: buffer)
 
 func.decl @initialize_q6(%uniform: i1, %quantized: i1, %rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
 
 func.decl @q6_q8_reference(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
 
-func.def pure inline @prefix_configuration(%configuration: index) -> (index, index, index, index) {
+func.def pure @vocabulary_projection_shape(%configuration: index) -> (index, index, index, index, index) {
   %c0 = index.constant 0 : index
   %c2 = index.constant 2 : index
-  %c32 = index.constant 32 : index
-  %c33 = index.constant 33 : index
-  %shape = index.div %configuration, %c2 : index
+  %c4 = index.constant 4 : index
+  %shape = index.div %configuration, %c4 : index
   %rows = scf.switch %shape -> (index) {
     case 0 {
       %rows = index.constant 6 : index
@@ -26,64 +24,73 @@ func.def pure inline @prefix_configuration(%configuration: index) -> (index, ind
       scf.yield %rows : index
     }
     default {
-      scf.yield %c32 : index
+      %rows = index.constant 32 : index
+      scf.yield %rows : index
     }
   }
-  %parity = index.rem %configuration, %c2 : index
-  %partial = index.cmp ne, %parity, %c0 : index
-  %row_begin = scf.select %partial, %c32, %c0 : index
-  %live_rows = scf.select %partial, %c33, %rows : index
-  %q8_row_bytes = index.constant 864 : index
-  %input_bytes = index.mul %rows, %q8_row_bytes : index
-  func.return %rows, %row_begin, %live_rows, %input_bytes : index, index, index, index
+  %phase = index.rem %configuration, %c4 : index
+  %full = index.rem %phase, %c2 : index
+  %inactive = index.cmp uge, %phase, %c2 : index
+  %c32 = index.constant 32 : index
+  %c33 = index.constant 33 : index
+  %live = scf.select %inactive, %c32, %c33 : index
+  %input_stride = index.constant 864 : index
+  %input_bytes = index.mul %rows, %input_stride : index
+  %inactive_rows = scf.select %inactive, %rows, %c0 : index
+  func.return %rows, %input_bytes, %live, %full, %inactive_rows : index, index, index, index, index
 }
 
-func.def @initialize_prefix(%configuration: index, %live_rows: index, %control: buffer) {
-  %live_word = index.cast %live_rows : index to i32
+func.def @vocabulary_projection_fixture(%configuration: index, %control: buffer) {
+  %rows, %input_bytes, %live, %full, %inactive_rows = func.call pure @vocabulary_projection_shape(%configuration) : (index) -> (index, index, index, index, index)
+  %live_word = index.cast %live : index to i32
   %configuration_word = index.cast %configuration : index to i32
+  %mode = index.cast %full : index to i32
   %origin = index.constant 0 : offset
-  %header = buffer.view %control[%origin] : buffer -> view<2xi32>
-  view.store %live_word, %header[0] : i32, view<2xi32>
-  view.store %configuration_word, %header[1] : i32, view<2xi32>
+  %header = buffer.view %control[%origin] : buffer -> view<4xi32>
+  view.store %live_word, %header[0] : i32, view<4xi32>
+  view.store %configuration_word, %header[1] : i32, view<4xi32>
+  view.store %mode, %header[3] : i32, view<4xi32>
   func.return
 }
 
-func.def @prefix_reference(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+func.def @vocabulary_projection_reference(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %origin = index.constant 0 : offset
-  %header = buffer.view %control[%origin] : buffer -> view<2xi32>
-  %configuration_word = view.load %header[1] : view<2xi32> -> i32
+  %header = buffer.view %control[%origin] : buffer -> view<4xi32>
+  %configuration_word = view.load %header[1] : view<4xi32> -> i32
   %configuration = index.cast %configuration_word : i32 to index
-  %rows, %row_begin, %live_rows, %input_bytes = func.call pure @prefix_configuration(%configuration) : (index) -> (index, index, index, index)
-  %inputs = index.constant 768 : index
-  %outputs = index.constant 33 : index
-  %live_word = view.load %header[0] : view<2xi32> -> i32
-  %live = index.cast %live_word : i32 to index
+  %rows, %input_bytes, %live, %full, %inactive_rows = func.call pure @vocabulary_projection_shape(%configuration) : (index) -> (index, index, index, index, index)
+  %row_begin = index.constant 32 : index
   %active = index.cmp ult, %row_begin, %live : index
   scf.if %active {
+    %inputs = index.constant 768 : index
+    %prefix_columns = index.constant 17 : index
+    %full_columns = index.constant 33 : index
+    %c0 = index.constant 0 : index
+    %is_full = index.cmp ne, %full, %c0 : index
+    %outputs = scf.select %is_full, %full_columns, %prefix_columns : index
     func.call @q6_q8_reference(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
   }
   func.return
 }
 
-// Production derives the reserved row count during command construction;
-// the live prefix remains device data read by the contraction.
-command.def @prefix_projection(%configuration: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
-  %rows, %row_begin, %live_rows, %input_bytes = func.call pure @prefix_configuration(%configuration) : (index) -> (index, index, index, index)
+command.def @vocabulary_projection(%configuration: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %rows, %input_bytes, %live, %full, %inactive_rows = func.call pure @vocabulary_projection_shape(%configuration) : (index) -> (index, index, index, index, index)
+  %row_begin = index.constant 32 : index
   %inputs = index.constant 768 : index
-  %outputs = index.constant 33 : index
+  %full_columns = index.constant 33 : index
+  %prefix_columns = index.constant 17 : index
   %budget = index.constant 2 : index
-  kernel.launch @qwen38_output_projection_q6k_prefix[%rows, %inputs, %outputs, %budget](%rows, %row_begin, %inputs, %outputs, %control, %input, %weight, %output) : [index, index, index, index](index, index, index, index, buffer, buffer, buffer, buffer)
+  kernel.launch @qwen38_dflash_vocabulary_head[%rows, %inputs, %full_columns, %prefix_columns, %budget](%rows, %row_begin, %inputs, %full_columns, %prefix_columns, %control, %input, %weight, %output, %output) : [index, index, index, index, index](index, index, index, index, index, buffer, buffer, buffer, buffer, buffer)
   command.return
 }
 
-check.scenario public @output_projection_live_cohort configure[6](%configuration: index, %configuration_entropy: check.entropy) {
+check.scenario public @output_projection_vocabulary configure[12](%configuration: index, %configuration_entropy: check.entropy) {
   check.trial[1](%trial: index, %entropy: check.entropy) {
     %inputs = check.literal value(768) : index
     %outputs = check.literal value(33) : index
-    // The protected second word supplies scenario shape to the CPU oracle.
-    %control = check.generate.fill value(0) : tensor<2xi32>
-    %rows, %row_begin, %live_rows, %input_bytes = check.generate<@prefix_configuration>(%configuration) : (index) -> (index, index, index, index)
-    check.generate<@initialize_prefix>(%configuration, %live_rows, %control) : (index, index, tensor<2xi32>) -> ()
+    %control = check.generate.fill value(-99) : tensor<4xi32>
+    %rows, %input_bytes, %live, %full, %inactive_rows = check.generate<@vocabulary_projection_shape>(%configuration) : (index) -> (index, index, index, index, index)
+    check.generate<@vocabulary_projection_fixture>(%configuration, %control) : (index, tensor<4xi32>) -> ()
     %seed = check.entropy.read %entropy[0] : check.entropy -> i64
     %input = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<[%input_bytes]xi8>
     %weight = check.generate.random.uniform seed(%seed) range(-128 to 127) : tensor<20790xi8>
@@ -91,54 +98,16 @@ check.scenario public @output_projection_live_cohort configure[6](%configuration
     %quantized = check.literal value(true) : i1
     check.generate<@initialize_q6>(%uniform, %quantized, %rows, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%input_bytes]xi8>, tensor<20790xi8>) -> ()
     %output = check.generate.fill value(-99.0) : tensor<[%rows]x33xf32>
-    check.compare<@prefix_projection, @prefix_reference>[%configuration](%control, %input, %weight, %output) : [index](tensor<2xi32>, tensor<[%input_bytes]xi8>, tensor<20790xi8>, tensor<[%rows]x33xf32>) -> () {
+    %inactive_output = check.tensor.view %output offset(0) : tensor<[%rows]x33xf32> -> tensor<[%inactive_rows]x33xf32>
+    check.compare<@vocabulary_projection, @vocabulary_projection_reference>[%configuration](%control, %input, %weight, %output) : [index](tensor<4xi32>, tensor<[%input_bytes]xi8>, tensor<20790xi8>, tensor<[%rows]x33xf32>) -> () {
       check.expect.approximate actual(%output) expected(%output) atol(0.001) rtol(1.9999999999999999e-06) nan(different) : tensor<[%rows]x33xf32>, tensor<[%rows]x33xf32>
+      check.expect.bitwise actual(%inactive_output) expected(%inactive_output) : tensor<[%inactive_rows]x33xf32>
       check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_bytes]xi8>
       check.expect.bitwise actual(%weight) expected(%weight) : tensor<20790xi8>
-      check.expect.bitwise actual(%control) expected(%control) : tensor<2xi32>
+      check.expect.bitwise actual(%control) expected(%control) : tensor<4xi32>
     }
   }
   check.return
 }
 
-command.def @inactive_prefix_projection(%configuration: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
-  %rows = index.constant 32 : index
-  %row_begin = index.mul %configuration, %rows : index
-  %inputs = index.constant 256 : index
-  %outputs = index.constant 17 : index
-  %budget = index.constant 2 : index
-  kernel.launch @qwen38_output_projection_q6k_prefix[%rows, %inputs, %outputs, %budget](%rows, %row_begin, %inputs, %outputs, %control, %input, %weight, %output) : [index, index, index, index](index, index, index, index, buffer, buffer, buffer, buffer)
-  command.return
-}
-
-func.def @inactive_prefix_reference(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
-  func.return
-}
-
-func.def @initialize_inactive_prefix(%configuration: index, %control: buffer) {
-  %rows = index.constant 32 : index
-  %count = index.mul %configuration, %rows : index
-  %word = index.cast %count : index to i32
-  %origin = index.constant 0 : offset
-  %header = buffer.view %control[%origin] : buffer -> view<1xi32>
-  view.store %word, %header[0] : i32, view<1xi32>
-  func.return
-}
-
-check.scenario public @output_projection_inactive_cohort configure[2](%configuration: index, %configuration_entropy: check.entropy) {
-  check.trial[1](%trial: index, %entropy: check.entropy) {
-    %control = check.generate.fill value(0) : tensor<1xi32>
-    check.generate<@initialize_inactive_prefix>(%configuration, %control) : (index, tensor<1xi32>) -> ()
-    %input = check.generate.fill value(0) : tensor<9216xi8>
-    %weight = check.generate.fill value(0) : tensor<3570xi8>
-    %output = check.generate.fill value(-99.0) : tensor<32x17xf32>
-    check.compare<@inactive_prefix_projection, @inactive_prefix_reference>[%configuration](%control, %input, %weight, %output) : [index](tensor<1xi32>, tensor<9216xi8>, tensor<3570xi8>, tensor<32x17xf32>) -> () {
-      check.expect.bitwise actual(%output) expected(%output) : tensor<32x17xf32>
-    }
-  }
-  check.return
-}
-
-check.benchmark<@output_projection_live_cohort> @output_projection_live_cohort_benchmark
-
-check.benchmark<@output_projection_inactive_cohort> @output_projection_inactive_cohort_benchmark
+check.benchmark<@output_projection_vocabulary> @output_projection_vocabulary_benchmark

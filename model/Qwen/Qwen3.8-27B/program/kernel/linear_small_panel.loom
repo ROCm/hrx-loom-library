@@ -1,0 +1,48 @@
+// Qwen's four/eight-row projections bind shared GGML F32 panels to wave64.
+// The row bank is a preparation-time fact; all rows contain initialized F32
+// activations. Raw weights and exact-sized output buffers remain disjoint.
+// The queue's execution-unit count bounds channel workers, each of which
+// retains its activation allocation while traversing further output tiles.
+
+amdgpu.target<gfx11-generic> @qwen38_small_panel_rdna {subgroup_size = 64}
+
+template.decl @ggml.q4k.f32.small_panels(%rows: index, %inputs: index, %outputs: index, %budget: index, %input: buffer, %weight: buffer, %output: buffer)
+
+template.decl @ggml.q6k.f32.small_panels(%rows: index, %inputs: index, %outputs: index, %budget: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl pure @ggml_q4k_f32_small_panel_grid(%outputs: index, %budget: index) -> (index)
+
+func.decl pure @ggml_q6k_f32_small_panel_grid(%outputs: index, %budget: index) -> (index)
+
+func.def pure inline @small_panel_budget() -> (index) {
+  %units = target.execution.unit.count : index
+  %unit_limit = index.constant 1250 : index
+  %groups_per_unit = index.constant 8 : index
+  %bounded_units = index.min %units, %unit_limit : index
+  %budget = index.mul %bounded_units, %groups_per_unit : index
+  func.return %budget : index
+}
+
+kernel.def target(@qwen38_small_panel_rdna) @qwen38_linear_q4k_f32_small_panel(%rows: index, %inputs: index, %outputs: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 512 : index
+  %budget = func.call pure @small_panel_budget() : () -> (index)
+  %groups = func.call pure @ggml_q4k_f32_small_panel_grid(%outputs, %budget) : (index, index) -> (index)
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %budget = func.call pure @small_panel_budget() : () -> (index)
+  template.apply<@ggml.q4k.f32.small_panels>(%rows, %inputs, %outputs, %budget, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@qwen38_small_panel_rdna) @qwen38_linear_q6k_f32_small_panel(%rows: index, %inputs: index, %outputs: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 512 : index
+  %budget = func.call pure @small_panel_budget() : () -> (index)
+  %groups = func.call pure @ggml_q6k_f32_small_panel_grid(%outputs, %budget) : (index, index) -> (index)
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %budget = func.call pure @small_panel_budget() : () -> (index)
+  template.apply<@ggml.q6k.f32.small_panels>(%rows, %inputs, %outputs, %budget, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}

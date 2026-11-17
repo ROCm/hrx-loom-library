@@ -67,6 +67,24 @@ These are reusable Loom schedules, qualified for correctness through the
 packed-byte semantics, addressing, and numerical results; they do not establish
 a throughput comparison against another implementation.
 
+## Small Q5_K matrices with F32 storage
+
+`q5_k_f16_small.loom` contracts a complete 16- or 32-row input bank against
+64 output channels. F32 activations and reconstructed weights round to F16;
+native matrix products accumulate and publish F32. Encoded K256 records and
+their affine metadata are staged once, then reused across eight K32 slices
+and every input row. Padded 40-half pitches keep fragment staging distinct
+from packed weight storage. The final contraction barrier retires readers
+before the encoded slab becomes a subgroup output transpose.
+
+Physical rows, K/N, and channel interleaving are explicit caller facts. The
+motif owns the subgroup partition for wave32 and wave64. Each staged K32
+panel feeds two K16 matrix instructions on gfx9.4, gfx11, and gfx12, or one
+K32 instruction on gfx12.5; the kernel leaf binds that native shape. A 16-row
+bank needs 21,760 bytes of workgroup storage;
+32 rows need 23,040. It chooses neither live request counts nor a model policy.
+The concrete small-row kernels own zero-dispatch behavior and entry selection.
+
 ## Paired Q5_K matrices with F16 storage
 
 `q5_k_f16_pair.loom` contracts two projections and publishes their SwiGLU
@@ -99,6 +117,22 @@ bound the active weight set. Explicit capacity and worker-budget facts retain
 single-tile specialization while larger assignments reuse worker storage.
 The concrete wave32 kernel owns count-buffer sampling and target selection;
 empty prefixes and both tile tails require no padded global operands.
+
+## Small-row register panels with F32 storage
+
+The Q4_K and Q6_K F32 panel motifs also provide four/eight-row banks. A
+512-thread worker stages K1024 activations once for 64 Q4 or 48 Q6 output
+channels. Decoded weights serve every row in registers. The Q4 schedule uses
+XOR-rotated four-float packets and stored activation sums for its affine
+correction; Q6 uses a padded 20-float pitch. Workgroup storage is 17/34 KiB for
+Q4 and 20/40 KiB for Q6, depending on the row bank. All arithmetic remains F32.
+
+The kernel entries fix the row bank while K, N, and the admitted worker budget
+remain arguments. Workers traverse channel tiles, including exact-sized tails,
+without expanding parameters or creating an activation carrier. This schedule
+supplies a small-cohort alternative to matrix instructions whose larger row
+tiles leave most lanes inactive. The sixteen-row Q6 schedule below retains its
+different row reduction and thread geometry.
 
 ## Q6_K register panels with F32 storage
 

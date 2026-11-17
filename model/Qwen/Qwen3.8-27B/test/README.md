@@ -15,16 +15,12 @@ cohorts check compact offsets independently of resident rows. Attention checks
 cover short, intermediate, and full blocks against the F64 reference, including
 the retained-context window boundary.
 
-The fixed-depth Q5 projection scenarios call the production commands and check
-them against a scalar-byte GGUF decoder with ordered F64 accumulation. Random
-packed fields, dyadic block scales, and signed unit activations make every F16
-operand exact and bound every partial sum below the F32 integer precision
-limit. This isolates fragment ownership, both weight orders, and partial
-channel tiles without depending on a driver's matrix rounding order. The
-reference reuses decoded activations and one weight row; output guards and
-input immutability are checked independently. The split projection also checks
-each published K interval independently before checking the reduced output,
-including the shorter final partition and disabled launches.
+Small Q5 matrix arithmetic, physical row bounds, tails, and zero-dispatch
+ownership are checked in the shared GGML package. The model checks its
+16/32-row consumers together with in-place channel-eight preparation:
+raw consumption, preparation, and prepared consumption use one weight image
+and produce bit-identical outputs. Split projections retain their independent
+K-interval oracle here, including the final partition and disabled launches.
 
 The Q6 composition scenarios retain a 32-row command specialization while the
 device header supplies 0, 16, 17, or 32 live rows. They exercise the RDNA

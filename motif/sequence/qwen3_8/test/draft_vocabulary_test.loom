@@ -1,0 +1,223 @@
+// Accepted vocabulary against independently constructed intervals and headers.
+// Ordinary/media records, empty/partial/saturated history, chunking, overflow,
+// and offset storage share one scenario. Complete carrier comparisons include
+// inactive rare slots, alignment padding, and guards around the retained record.
+
+amdgpu.target<gfx11-generic> @native
+
+template.decl @qwen38.draft_vocabulary.update(%mixed: index, %capacity: index, %position: index, %begin: index, %length: index, %record: offset, %ids: buffer, %carry: buffer)
+
+func.decl @qwen38_draft_vocabulary_id(%column: index, %full: i1, %carry: buffer, %record: offset) -> (index)
+
+func.def pure @shape(%configuration: index) -> (index, index, index) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c8 = index.constant 8 : index
+  %short = index.constant 37 : index
+  %long = index.constant 1059 : index
+  %mixed = index.rem %configuration, %c2 : index
+  %case = index.div %configuration, %c2 : index
+  %media = index.cmp ne, %mixed, %c0 : index
+  %empty = index.cmp eq, %case, %c0 : index
+  %partial = index.cmp eq, %case, %c1 : index
+  %nonempty = scf.select %partial, %short, %long : index
+  %length = scf.select %empty, %c0, %nonempty : index
+  %stride = scf.select %media, %c8, %c1 : index
+  func.return %mixed, %stride, %length : index, index, index
+}
+
+func.def @history_input(%configuration: index, %input: buffer) {
+  %mixed, %stride, %length = func.call pure @shape(%configuration) : (index) -> (index, index, index)
+  %origin = index.constant 0 : offset
+  %tokens = buffer.view %input[%origin] : buffer -> view<1064x[%stride]xi32>
+  %configuration_word = index.cast %configuration : index to i32
+  view.store %configuration_word, %tokens[0, 0] : i32, view<1064x[%stride]xi32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %begin = index.constant 5 : index
+  %controls = index.constant 33 : index
+  %end = index.constant 1024 : index
+  %control_base = scalar.constant 248044 : i32
+  %rare_base = scalar.constant 100000 : i32
+  %overflow = scalar.constant 110000 : i32
+  scf.for %i = [%c0 to %end step %c1] {
+    %control = index.cmp ult, %i, %controls : index
+    %word = index.cast %i : index to i32
+    %control_id = scalar.addi %word, %control_base : i32
+    %relative = index.sub %i, %controls : index
+    %rare_word = index.cast %relative : index to i32
+    %rare_id = scalar.addi %rare_word, %rare_base : i32
+    %id = scf.select %control, %control_id, %rare_id : i32
+    %row = index.add %begin, %i : index
+    view.store %id, %tokens[%row, 0] : i32, view<1064x[%stride]xi32>
+  }
+  view.store %rare_base, %tokens[1030, 0] : i32, view<1064x[%stride]xi32>
+  view.store %overflow, %tokens[1031, 0] : i32, view<1064x[%stride]xi32>
+  view.store %overflow, %tokens[1032, 0] : i32, view<1064x[%stride]xi32>
+  func.return
+}
+
+func.def @reference_record(%configuration: index, %expected: buffer, %expected_ids: buffer) {
+  %mixed, %stride, %length = func.call pure @shape(%configuration) : (index) -> (index, index, index)
+  %origin = index.constant 0 : offset
+  %record = index.constant 32 : offset
+  %bitmap_origin = index.constant 48 : offset
+  %table_origin = index.constant 18768 : offset
+  %header = buffer.view %expected[%record] : buffer -> view<3xi32>
+  %bitmap = buffer.view %expected[%bitmap_origin] : buffer -> view<4680xi32>
+  %table = buffer.view %expected[%table_origin] : buffer -> view<991xi32>
+  %mapped = buffer.view %expected_ids[%origin] : buffer -> view<1024xi32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %controls = index.constant 33 : index
+  %full_count = index.constant 991 : index
+  %short_count = index.constant 4 : index
+  %history = index.constant 1059 : index
+  %words = index.constant 4680 : index
+  %first_bit = index.constant 1696 : index
+  %empty = index.cmp eq, %length, %c0 : index
+  %saturated = index.cmp eq, %length, %history : index
+  %nonempty_count = scf.select %saturated, %full_count, %short_count : index
+  %count = scf.select %empty, %c0, %nonempty_count : index
+  %end_bit = index.add %first_bit, %count : index
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %control_base = scalar.constant 248044 : i32
+  %rare_base = scalar.constant 100000 : i32
+  %count_word = index.cast %count : index to i32
+  %short_latest = scalar.constant 37 : i32
+  %short_prior = scalar.constant 36 : i32
+  %full_latest = scalar.constant 1028 : i32
+  %full_prior = scalar.constant 1027 : i32
+  %nonempty_latest = scf.select %saturated, %full_latest, %short_latest : i32
+  %nonempty_prior = scf.select %saturated, %full_prior, %short_prior : i32
+  %latest = scf.select %empty, %c0_i32, %nonempty_latest : i32
+  %prior = scf.select %empty, %c0_i32, %nonempty_prior : i32
+  view.store %count_word, %header[0] : i32, view<3xi32>
+  view.store %latest, %header[1] : i32, view<3xi32>
+  view.store %prior, %header[2] : i32, view<3xi32>
+  scf.for %i = [%c0 to %controls step %c1] {
+    %word = index.cast %i : index to i32
+    %id = scalar.addi %word, %control_base : i32
+    view.store %id, %mapped[%i] : i32, view<1024xi32>
+  }
+  scf.for %i = [%c0 to %full_count step %c1] {
+    %word = index.cast %i : index to i32
+    %id = scalar.addi %word, %rare_base : i32
+    %relative = index.add %controls, %i : index
+    %accepted = index.cmp ult, %i, %count : index
+    scf.if %accepted {
+      view.store %id, %table[%i] : i32, view<991xi32>
+      view.store %id, %mapped[%relative] : i32, view<1024xi32>
+    }
+  }
+  // Independent interval membership: no token replay or mutable bitset search.
+  scf.for %word = [%c0 to %words step %c1] {
+    %base = index.mul %word, %c32 : index
+    %bits = scf.for %bit = [%c0 to %c32 step %c1](%packed = %c0_i32 : i32) -> (i32) {
+      %position = index.add %base, %bit : index
+      %after = index.cmp uge, %position, %first_bit : index
+      %before = index.cmp ult, %position, %end_bit : index
+      %member = scalar.andi %after, %before : i1
+      %value = scalar.extui %member : i1 to i32
+      %shift = index.cast %bit : index to i32
+      %mask = scalar.shli %value, %shift : i32
+      %next = scalar.ori %packed, %mask : i32
+      scf.yield %next : i32
+    }
+    view.store %bits, %bitmap[%word] : i32, view<4680xi32>
+  }
+  func.return
+}
+
+kernel.def target(@native) @learn(%mixed: index) {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%mixed: index, %position: index, %length: index, %input: buffer, %carry: buffer) {
+  %capacity = index.constant 1064 : index
+  %packet_begin = index.constant 5 : index
+  %begin = index.add %position, %packet_begin : index
+  %record = index.constant 32 : offset
+  template.apply<@qwen38.draft_vocabulary.update>(%mixed, %capacity, %position, %begin, %length, %record, %input, %carry) : (index, index, index, index, index, offset, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@native) @map_ids() {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%carry: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %record = index.constant 32 : offset
+  %header = buffer.view %carry[%record] : buffer -> view<3xi32>
+  %count_word = view.load %header[0] : view<3xi32> -> i32
+  %count_value = index.cast %count_word : i32 to index
+  %count = index.assume %count_value [range(%count_value, 0, 991)] : index
+  %controls = index.constant 33 : index
+  %columns = index.add %count, %controls : index
+  %prefix = index.constant 98304 : index
+  %thread = kernel.workitem.id<x> : index
+  %threads = kernel.workgroup.size<x> : index
+  %subset = scalar.constant false : i1
+  %ids = buffer.view %output[%origin] : buffer -> view<1024xi32>
+  scf.for %column = [%thread to %columns step %threads] {
+    %logical = index.add %prefix, %column : index
+    %id = func.call @qwen38_draft_vocabulary_id(%logical, %subset, %carry, %record) : (index, i1, buffer, offset) -> (index)
+    %word = index.cast %id : index to i32
+    view.store %word, %ids[%column] : i32, view<1024xi32>
+  }
+  kernel.return
+}
+
+command.def @publish(%configuration: index) launch(%input: buffer, %whole: buffer, %chunks: buffer, %mapped: buffer) {
+  %mixed, %stride, %length = func.call pure @shape(%configuration) : (index) -> (index, index, index)
+  %c0 = index.constant 0 : index
+  %controls = index.constant 33 : index
+  %middle = index.constant 511 : index
+  %first = index.min %length, %controls : index
+  %remaining = index.sub %length, %first : index
+  %second = index.min %remaining, %middle : index
+  %last_begin = index.add %first, %second : index
+  %last = index.sub %length, %last_begin : index
+  kernel.launch @learn[%mixed](%mixed, %c0, %length, %input, %whole) : [index](index, index, index, buffer, buffer)
+  kernel.launch @learn[%mixed](%mixed, %c0, %first, %input, %chunks) : [index](index, index, index, buffer, buffer)
+  kernel.launch @learn[%mixed](%mixed, %first, %second, %input, %chunks) : [index](index, index, index, buffer, buffer)
+  kernel.launch @learn[%mixed](%mixed, %last_begin, %last, %input, %chunks) : [index](index, index, index, buffer, buffer)
+  kernel.launch @map_ids(%whole, %mapped) : (buffer, buffer)
+  command.return
+}
+
+func.def @reference(%input: buffer, %whole: buffer, %chunks: buffer, %mapped: buffer) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %input[%origin] : buffer -> view<1xi32>
+  %word = view.load %header[0] : view<1xi32> -> i32
+  %configuration = index.cast %word : i32 to index
+
+  func.call @reference_record(%configuration, %whole, %mapped) : (index, buffer, buffer)
+  func.call @reference_record(%configuration, %chunks, %mapped) : (index, buffer, buffer)
+  func.return
+}
+
+check.scenario public @accepted_history configure[6](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %mixed, %stride, %length = check.generate<@shape>(%configuration) : (index) -> (index, index, index)
+    %input = check.generate.fill value(7) : tensor<1064x[%stride]xi32>
+    %whole = check.generate.fill value(-7) : tensor<5712xi32>
+    %chunks = check.generate.fill value(-7) : tensor<5712xi32>
+    %mapped = check.generate.fill value(-7) : tensor<1024xi32>
+    check.generate<@history_input>(%configuration, %input) : (index, tensor<1064x[%stride]xi32>) -> ()
+    check.compare<@publish, @reference>[%configuration](%input, %whole, %chunks, %mapped) : [index](tensor<1064x[%stride]xi32>, tensor<5712xi32>, tensor<5712xi32>, tensor<1024xi32>) -> () {
+      check.expect.bitwise actual(%whole) expected(%whole) : tensor<5712xi32>
+      check.expect.bitwise actual(%chunks) expected(%chunks) : tensor<5712xi32>
+      check.expect.bitwise actual(%mapped) expected(%mapped) : tensor<1024xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<1064x[%stride]xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@accepted_history> @accepted_history_shapes

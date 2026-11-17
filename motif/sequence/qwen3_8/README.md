@@ -36,3 +36,10 @@ identity even when source and destination records overlap.
 The [checks](test/) compare complete records with independent expectations.
 [Component authoring](../../../docs/component-authoring.md) explains the shared
 dependency and verification workflow.
+
+Accepted-token vocabulary records retain a common prefix, all control IDs,
+and a bounded first-use table for rare IDs. Membership and recent misses
+advance only when the target publishes accepted inputs. Request storage owns
+the record, so forks and checkpoints preserve its identity and rejected
+proposals never teach it. Dense and Flash-Next compositions supply their own
+record offsets and input extents; the representation owns no allocation.

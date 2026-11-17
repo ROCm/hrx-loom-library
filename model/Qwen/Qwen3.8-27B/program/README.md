@@ -27,6 +27,12 @@ The selected width specializes convolution, bidirectional attention, candidate
 selection, and private storage together. Shorter blocks reduce proposal and
 verification work without changing the target's acceptance rule.
 
+RDNA proposals containing four or eight neural positions use shared raw
+Q4_K/Q6_K register panels. Each decoded weight serves the complete row bank
+before retirement, reducing inactive matrix lanes at those sizes. Model
+composition selects that schedule from the prepared shape; changing the
+proposal length during a response remains a separate serving-policy concern.
+
 ## Link and parameter boundaries
 
 `config` owns model defaults and concrete matrix target bindings. `kernel:numerics`
@@ -39,6 +45,12 @@ into channel-eight storage. The transform reads each disjoint group before
 replacing its bytes, preserving the packed footprint. `dflash_weights.loom`
 selects draft preparation. These policies are auxiliary compiler inputs in
 both representations; checkpoints stay outside the build payload graph.
+
+Small Q5 projections pass physical row geometry from the prepared stage into
+the shared GGML family: at most sixteen initialized rows select its 16-row
+entry, and larger small stages select 32. The existing launch-count observation
+controls enablement separately. Alpha and residual consumers keep their padded
+storage contracts; this changes neither allocations nor the count producer.
 
 Wide prefill composes the shared paired-Q5 gate/up kernel and Q6 residual
 projection. Their matrix tiles reuse decoded weights across 256 token rows;
@@ -68,13 +80,28 @@ Native AOT compilation requires a deployment profile carrying the count; an
 architecture name alone does not specify device capacity. Four groups per unit
 is the head's launch policy, not a claim about exact kernel residency.
 
-The proposal-prefix projection shares each weight pass across up to 32 rows,
+The proposal vocabulary projection shares each weight pass across up to 32 rows,
 including an exact row specialization for the final short cohort. It preserves
 complete inactive cohorts and computes every initialized row of a partially
 live cohort; selection consumes only the live prefix. The shared motif owns
 the accumulator bank and matching launch geometry, while the model owns the
 control record and row partition. Ordinary target projection uses the same
 numerical body through its fixed-row entries.
+
+DFlash candidates normally score a 98,304-token prefix, all 33 control tokens,
+and up to 991 rare IDs learned from accepted target inputs. Each request retains
+its membership bitmap, first-use table, and recent miss positions in a
+22,784-byte carry record. The shared sequence motif owns that representation;
+the service's existing checkpoint, fork, growth, and retirement paths preserve
+its lifetime. Fresh publication initializes the header and bitmap without
+clearing unused table entries.
+
+An unknown anchor or two misses in the preceding 32 committed positions selects
+the full vocabulary. One full-head request selects a shared full pass for the
+cohort. Otherwise, a small table projection reuses each raw Q6 row across that
+request's draft positions. Selection compares canonical token IDs, including
+ties, and excludes physical head padding. This reduces proposal work; target
+weights, target sampling, and speculative verification remain unchanged.
 
 ## Image input
 

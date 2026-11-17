@@ -1,4 +1,4 @@
-kernel.decl @qwen38_dflash_proposal_prepare() launch(%epoch: buffer, %target_tokens: buffer, %draft: buffer, %origins: buffer, %anchors: buffer, %draft_tokens: buffer, %selection: buffer)
+kernel.decl @qwen38_dflash_proposal_prepare() launch(%epoch: buffer, %target_tokens: buffer, %draft: buffer, %origins: buffer, %anchors: buffer, %draft_tokens: buffer, %selection: buffer, %carry: buffer)
 
 kernel.decl @qwen38_dflash_proposal_publish() launch(%draft: buffer, %origins: buffer, %proposals: buffer, %target_tokens: buffer, %results: buffer)
 
@@ -74,7 +74,19 @@ func.def @dflash_epoch_fixture(%trial: index, %epoch: buffer) {
   func.return
 }
 
-func.def @dflash_prepare_reference(%epoch: buffer, %target_tokens: buffer, %draft: buffer, %origins: buffer, %anchors: buffer, %draft_tokens: buffer, %selection: buffer) {
+func.def @dflash_carry_fixture(%trial: index, %carry: buffer) {
+  %c1 = index.constant 1 : index
+  %mixed = index.cmp eq, %trial, %c1 : index
+  %miss = scalar.constant 90 : i32
+  %none = scalar.constant 0 : i32
+  %prior = scf.select %mixed, %miss, %none : i32
+  %origin = index.constant 0 : offset
+  %history = buffer.view %carry[%origin] : buffer -> view<64x5696xi32>
+  view.store %prior, %history[1, 2] : i32, view<64x5696xi32>
+  func.return
+}
+
+func.def @dflash_prepare_reference(%epoch: buffer, %target_tokens: buffer, %draft: buffer, %origins: buffer, %anchors: buffer, %draft_tokens: buffer, %selection: buffer, %carry: buffer) {
   %origin = index.constant 0 : offset
   %descriptor_origin = index.constant 12 : offset
   %options_origin = index.constant 14348 : offset
@@ -87,7 +99,7 @@ func.def @dflash_prepare_reference(%epoch: buffer, %target_tokens: buffer, %draf
   %mapping = buffer.view %origins[%origin] : buffer -> view<64xi32>
   %anchor_view = buffer.view %anchors[%origin] : buffer -> view<64xi32>
   %inputs = buffer.view %draft_tokens[%origin] : buffer -> view<512xi32>
-  %selected = buffer.view %selection[%origin] : buffer -> view<3xi32>
+  %selected = buffer.view %selection[%origin] : buffer -> view<4xi32>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %verification_width = config.get @runner.qwen38.verification_width : index
@@ -147,9 +159,28 @@ func.def @dflash_prepare_reference(%epoch: buffer, %target_tokens: buffer, %draf
   view.store %token_word, %out_header[0] : i32, view<3xi32>
   view.store %count_word, %out_header[1] : i32, view<3xi32>
   view.store %selection_word, %out_header[2] : i32, view<3xi32>
-  view.store %selection_word, %selected[0] : i32, view<3xi32>
-  view.store %count_word, %selected[1] : i32, view<3xi32>
-  view.store %selection_word, %selected[2] : i32, view<3xi32>
+  view.store %selection_word, %selected[0] : i32, view<4xi32>
+  view.store %count_word, %selected[1] : i32, view<4xi32>
+  view.store %selection_word, %selected[2] : i32, view<4xi32>
+  // The fixture's anchors are common IDs. Only owner one has recent misses,
+  // and only the mixed trial initializes those misses. Inspect the selected
+  // resident owners independently of compact draft slots.
+  %history = buffer.view %carry[%origin] : buffer -> view<64x5696xi32>
+  %no_pressure = scalar.constant false : i1
+  %full = scf.for %i = [%c0 to %length step %c1](%any = %no_pressure : i1) -> (i1) {
+    %flag = view.load %options[%i, 0] : view<64x2xi32> -> i32
+    %generated = scalar.cmpi eq, %flag, %c2_2 : i32
+    %owner_word = view.load %spans[%i, 3] : view<64x6xi32> -> i32
+    %owner_value = index.cast %owner_word : i32 to index
+    %owner = index.assume %owner_value [range(%owner_value, 0, 63)] : index
+    %prior = view.load %history[%owner, 2] : view<64x5696xi32> -> i32
+    %pressure = scalar.cmpi ne, %prior, %c0_2 : i32
+    %included = scalar.andi %generated, %pressure : i1
+    %combined = scalar.ori %any, %included : i1
+    scf.yield %combined : i1
+  }
+  %mode = scalar.extui %full : i1 to i32
+  view.store %mode, %selected[3] : i32, view<4xi32>
   func.return
 }
 
@@ -233,13 +264,16 @@ check.scenario public @dflash_proposal_control {
     %origins = check.generate.fill value(-99) : tensor<64xi32>
     %anchors = check.generate.fill value(-99) : tensor<64xi32>
     %inputs = check.generate.fill value(-99) : tensor<512xi32>
-    %selection = check.generate.fill value(-99) : tensor<3xi32>
-    check.compare<@qwen38_dflash_proposal_prepare, @dflash_prepare_reference>(%epoch, %target, %draft, %origins, %anchors, %inputs, %selection) : (tensor<14346xi32>, tensor<512xi32>, tensor<387xi32>, tensor<64xi32>, tensor<64xi32>, tensor<512xi32>, tensor<3xi32>) -> () {
+    %selection = check.generate.fill value(-99) : tensor<4xi32>
+    %carry = check.generate.fill value(0) : tensor<64x5696xi32>
+    check.generate<@dflash_carry_fixture>(%trial, %carry) : (index, tensor<64x5696xi32>) -> ()
+    check.compare<@qwen38_dflash_proposal_prepare, @dflash_prepare_reference>(%epoch, %target, %draft, %origins, %anchors, %inputs, %selection, %carry) : (tensor<14346xi32>, tensor<512xi32>, tensor<387xi32>, tensor<64xi32>, tensor<64xi32>, tensor<512xi32>, tensor<4xi32>, tensor<64x5696xi32>) -> () {
       check.expect.bitwise actual(%draft) expected(%draft) : tensor<387xi32>
       check.expect.bitwise actual(%origins) expected(%origins) : tensor<64xi32>
       check.expect.bitwise actual(%anchors) expected(%anchors) : tensor<64xi32>
       check.expect.bitwise actual(%inputs) expected(%inputs) : tensor<512xi32>
-      check.expect.bitwise actual(%selection) expected(%selection) : tensor<3xi32>
+      check.expect.bitwise actual(%selection) expected(%selection) : tensor<4xi32>
+      check.expect.bitwise actual(%carry) expected(%carry) : tensor<64x5696xi32>
     }
   }
   check.return
@@ -254,8 +288,10 @@ check.scenario public @dflash_proposal_publication {
     %origins = check.generate.fill value(-99) : tensor<64xi32>
     %anchors = check.generate.fill value(-99) : tensor<64xi32>
     %inputs = check.generate.fill value(-99) : tensor<512xi32>
-    %selection = check.generate.fill value(-99) : tensor<3xi32>
-    check.generate<@dflash_prepare_reference>(%epoch, %target, %draft, %origins, %anchors, %inputs, %selection) : (tensor<14346xi32>, tensor<512xi32>, tensor<387xi32>, tensor<64xi32>, tensor<64xi32>, tensor<512xi32>, tensor<3xi32>) -> ()
+    %selection = check.generate.fill value(-99) : tensor<4xi32>
+    %carry = check.generate.fill value(0) : tensor<64x5696xi32>
+    check.generate<@dflash_carry_fixture>(%trial, %carry) : (index, tensor<64x5696xi32>) -> ()
+    check.generate<@dflash_prepare_reference>(%epoch, %target, %draft, %origins, %anchors, %inputs, %selection, %carry) : (tensor<14346xi32>, tensor<512xi32>, tensor<387xi32>, tensor<64xi32>, tensor<64xi32>, tensor<512xi32>, tensor<4xi32>, tensor<64x5696xi32>) -> ()
     %width, %depth, %blocks = check.generate<@tested_block_shape>() : () -> (index, index, index)
     %proposals = check.generate.iota offset(10000) step(1) : tensor<64x[%depth]xi32>
     %observations = check.generate.fill value(-99) : tensor<30xi32>
@@ -276,8 +312,10 @@ check.scenario public @dflash_proposal_rows {
     %origins = check.generate.fill value(-99) : tensor<64xi32>
     %anchors = check.generate.fill value(-99) : tensor<64xi32>
     %inputs = check.generate.fill value(-99) : tensor<512xi32>
-    %selection = check.generate.fill value(-99) : tensor<3xi32>
-    check.generate<@dflash_prepare_reference>(%epoch, %target, %draft, %origins, %anchors, %inputs, %selection) : (tensor<14346xi32>, tensor<512xi32>, tensor<387xi32>, tensor<64xi32>, tensor<64xi32>, tensor<512xi32>, tensor<3xi32>) -> ()
+    %selection = check.generate.fill value(-99) : tensor<4xi32>
+    %carry = check.generate.fill value(0) : tensor<64x5696xi32>
+    check.generate<@dflash_carry_fixture>(%trial, %carry) : (index, tensor<64x5696xi32>) -> ()
+    check.generate<@dflash_prepare_reference>(%epoch, %target, %draft, %origins, %anchors, %inputs, %selection, %carry) : (tensor<14346xi32>, tensor<512xi32>, tensor<387xi32>, tensor<64xi32>, tensor<64xi32>, tensor<512xi32>, tensor<4xi32>, tensor<64x5696xi32>) -> ()
     %width, %depth, %blocks = check.generate<@tested_block_shape>() : () -> (index, index, index)
     %normalized = check.generate.iota offset(0.0) step(1.52587890625e-05) : tensor<[%blocks]x[%width]x5120xf32>
     %compact = check.generate.fill value(-99.0) : tensor<[%blocks]x[%depth]x5120xf32>

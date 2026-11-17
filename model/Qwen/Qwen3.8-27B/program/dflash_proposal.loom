@@ -10,17 +10,23 @@ target.decl @qwen38_execution
 
 config.decl @runner.qwen38.span_capacity : %value: index where [range(%value, 1, 2147483647)]
 
-command.decl @qwen38_output_projection_logits_prefix(%tokens: index) launch(%parameters: buffer, %control: buffer, %normalized: buffer, %logits: buffer)
+func.decl pure @qwen38_output_workgroup_budget() -> (index)
+
+kernel.decl @ggml_quantize_q8_1_x4_f32_bounded(%tokens: index, %inputs: index, %budget: index) launch(%tokens_argument: index, %inputs_argument: index, %input: buffer, %output: buffer)
+
+kernel.decl @qwen38_dflash_vocabulary_head(%rows: index, %inputs: index, %full_columns: index, %prefix_columns: index, %budget: index) launch(%rows_argument: index, %row_begin: index, %inputs_argument: index, %full_columns_argument: index, %prefix_columns_argument: index, %control: buffer, %input: buffer, %weight: buffer, %full_output: buffer, %prefix_output: buffer)
+
+kernel.decl @qwen38_dflash_vocabulary_table(%spans: index) launch(%spans_argument: index, %draft: buffer, %control: buffer, %carry: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 command.decl @qwen38_dflash_transform() launch(%parameters: buffer, %context_parameters: buffer, %epoch: buffer, %rows: buffer, %context: buffer, %embedding: buffer, %normalized: buffer)
 
-kernel.decl @qwen38_dflash_proposal_prepare() launch(%epoch: buffer, %target_tokens: buffer, %draft: buffer, %origins: buffer, %anchors: buffer, %draft_tokens: buffer, %selection: buffer)
+kernel.decl @qwen38_dflash_proposal_prepare() launch(%epoch: buffer, %target_tokens: buffer, %draft: buffer, %origins: buffer, %anchors: buffer, %draft_tokens: buffer, %selection: buffer, %carry: buffer)
 
 kernel.decl @qwen38_dflash_selection_rows(%blocks: index) launch(%blocks_argument: index, %draft: buffer, %normalized: buffer, %output: buffer)
 
 kernel.decl @qwen38_dflash_proposal_publish() launch(%draft: buffer, %origins: buffer, %proposals: buffer, %target_tokens: buffer, %results: buffer)
 
-kernel.decl @qwen38_dflash_topk_partial(%rows: index) launch(%rows_argument: index, %control: buffer, %logits: buffer, %scores: buffer, %ids: buffer)
+kernel.decl @qwen38_dflash_topk_partial(%rows: index) launch(%rows_argument: index, %draft: buffer, %control: buffer, %carry: buffer, %logits: buffer, %table: buffer, %scores: buffer, %ids: buffer)
 
 kernel.decl @qwen38_dflash_topk_merge(%rows: index) launch(%rows_argument: index, %control: buffer, %partial_scores: buffer, %partial_ids: buffer, %scores: buffer, %ids: buffer)
 
@@ -35,7 +41,7 @@ kernel.decl @qwen38_linear_q4k_f16_wmma_x128(%tokens: index, %inputs: index, %ou
 // The target vocabulary head supplies unary candidates; the small draft
 // projection and codebooks supply transition scores. Both parameter roots are
 // borrowed, so embeddings and vocabulary weights remain shared with the target.
-command.def public target(@qwen38_execution) @qwen38_dflash_candidates(%spans: index) launch(%target_parameters: buffer, %draft_parameters: buffer, %control: buffer, %anchors: buffer, %normalized: buffer, %proposals: buffer) where [range(%spans, 1, 64)] {
+command.def public target(@qwen38_execution) @qwen38_dflash_candidates(%spans: index) launch(%target_parameters: buffer, %draft_parameters: buffer, %draft: buffer, %control: buffer, %carry: buffer, %anchors: buffer, %normalized: buffer, %proposals: buffer) where [range(%spans, 1, 64)] {
   %verification_width = config.get @runner.qwen38.verification_width : index
   %anchor_count = index.constant 1 : index
   %draft_depth = index.sub %verification_width, %anchor_count : index
@@ -50,6 +56,9 @@ command.def public target(@qwen38_execution) @qwen38_dflash_candidates(%spans: i
   %partial_bytes = index.scale %rows, %partial_stride : index, offset -> offset
   %candidate_bytes = index.scale %rows, %candidate_stride : index, offset -> offset
   %hidden_bytes = index.scale %rows, %hidden_stride : index, offset -> offset
+  %table_stride = index.constant 4096 : offset
+  %table_bytes = index.scale %rows, %table_stride : index, offset -> offset
+  %table = buffer.alloca<global> align(256) %table_bytes : buffer
   %logits = buffer.alloca<global> align(256) %logit_bytes : buffer
   %partial_scores = buffer.alloca<global> align(256) %partial_bytes : buffer
   %partial_ids = buffer.alloca<global> align(256) %partial_bytes : buffer
@@ -62,14 +71,14 @@ command.def public target(@qwen38_execution) @qwen38_dflash_candidates(%spans: i
   %c65 = index.constant 65 : index
   %narrow = index.cmp ult, %rows, %c65 : index
   command.concurrent {
-    command.launch @qwen38_output_projection_logits_prefix[%rows](%target_parameters, %control, %normalized, %logits) : [index](buffer, buffer, buffer, buffer)
+    command.launch @qwen38_dflash_vocabulary_logits[%spans](%target_parameters, %draft, %control, %carry, %normalized, %logits, %table) : [index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
     scf.if %narrow {
       kernel.launch @qwen38_linear_q4k_f16_wmma_x64[%rows, %hidden_size, %rank](%control, %hidden_size, %rank, %normalized, %projection, %hidden) : [index, index, index](buffer, index, index, buffer, view<737280xi8>, buffer)
     } else {
       kernel.launch @qwen38_linear_q4k_f16_wmma_x128[%rows, %hidden_size, %rank](%control, %hidden_size, %rank, %normalized, %projection, %hidden) : [index, index, index](buffer, index, index, buffer, view<737280xi8>, buffer)
     }
   }
-  kernel.launch @qwen38_dflash_topk_partial[%rows](%rows, %control, %logits, %partial_scores, %partial_ids) : [index](index, buffer, buffer, buffer, buffer)
+  kernel.launch @qwen38_dflash_topk_partial[%rows](%rows, %draft, %control, %carry, %logits, %table, %partial_scores, %partial_ids) : [index](index, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.launch @qwen38_dflash_topk_merge[%rows](%rows, %control, %partial_scores, %partial_ids, %scores, %candidates) : [index](index, buffer, buffer, buffer, buffer, buffer)
   kernel.launch @qwen38_dflash_select[%spans](%spans, %control, %anchors, %candidates, %scores, %hidden, %predecessors, %successors, %proposals) : [index](index, buffer, buffer, buffer, buffer, buffer, view<35758080xi8>, view<35758080xi8>, buffer)
   command.return
@@ -77,7 +86,7 @@ command.def public target(@qwen38_execution) @qwen38_dflash_candidates(%spans: i
 
 // Publication writes the reserved target input suffix and its work facts.
 // Draft activations, private block K/V, and selector intermediates are transient.
-command.def public target(@qwen38_execution) @qwen38_dflash_propose() launch(%embedding_parameters: buffer, %head_parameters: buffer, %draft_parameters: buffer, %context_parameters: buffer, %epoch: buffer, %target_tokens: buffer, %rows: buffer, %cache: buffer, %results: buffer) {
+command.def public target(@qwen38_execution) @qwen38_dflash_propose() launch(%embedding_parameters: buffer, %head_parameters: buffer, %draft_parameters: buffer, %context_parameters: buffer, %epoch: buffer, %target_tokens: buffer, %rows: buffer, %cache: buffer, %carry: buffer, %results: buffer) {
   %spans = config.get @runner.qwen38.span_capacity : index
   %verification_width = config.get @runner.qwen38.verification_width : index
   %anchor_count = index.constant 1 : index
@@ -99,18 +108,54 @@ command.def public target(@qwen38_execution) @qwen38_dflash_propose() launch(%em
   %mapping = buffer.alloca<global> align(256) %mapping_bytes : buffer
   %anchors = buffer.alloca<global> align(256) %mapping_bytes : buffer
   %inputs = buffer.alloca<global> align(256) %token_bytes : buffer
-  %selection = buffer.alloca<global> align(256) %header_bytes : buffer
+  %selection_bytes = index.constant 16 : offset
+  %selection = buffer.alloca<global> align(256) %selection_bytes : buffer
   %embedding = buffer.alloca<global> align(256) %hidden_bytes : buffer
   %normalized = buffer.alloca<global> align(256) %hidden_bytes : buffer
   %compact = buffer.alloca<global> align(256) %selected_bytes : buffer
   %proposals = buffer.alloca<global> align(256) %proposal_bytes : buffer
   %embedding_weight = command.parameter %embedding_parameters, "token_embd.weight" : view<874086400xi8>
-  kernel.launch @qwen38_dflash_proposal_prepare(%epoch, %target_tokens, %draft, %mapping, %anchors, %inputs, %selection) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @qwen38_dflash_proposal_prepare(%epoch, %target_tokens, %draft, %mapping, %anchors, %inputs, %selection, %carry) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   %ordinary_inputs = index.constant 0 : index
   kernel.launch @qwen38_input_embedding_f32[%tokens](%ordinary_inputs, %draft, %inputs, %embedding_weight, %embedding) : [index](index, buffer, buffer, view<874086400xi8>, buffer)
   command.launch @qwen38_dflash_transform(%draft_parameters, %context_parameters, %draft, %rows, %cache, %embedding, %normalized) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.launch @qwen38_dflash_selection_rows[%spans](%spans, %draft, %normalized, %compact) : [index](index, buffer, buffer, buffer)
-  command.launch @qwen38_dflash_candidates[%spans](%head_parameters, %draft_parameters, %selection, %anchors, %compact, %proposals) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+  command.launch @qwen38_dflash_candidates[%spans](%head_parameters, %draft_parameters, %draft, %selection, %carry, %anchors, %compact, %proposals) : [index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.launch @qwen38_dflash_proposal_publish(%draft, %mapping, %proposals, %target_tokens, %results) : (buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+command.def public target(@qwen38_execution) @qwen38_dflash_vocabulary_logits(%spans: index) launch(%parameters: buffer, %draft: buffer, %control: buffer, %carry: buffer, %normalized: buffer, %logits: buffer, %table: buffer) {
+  %budget = func.call pure @qwen38_output_workgroup_budget() : () -> (index)
+  %width = config.get @runner.qwen38.verification_width : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %depth = index.sub %width, %c1 : index
+  %tokens = index.mul %spans, %depth : index
+  %hidden = index.constant 5120 : index
+  %cohort = index.constant 32 : index
+  %full_columns = index.constant 248320 : index
+  %prefix_columns = index.constant 98304 : index
+  %input_stride = index.constant 5760 : offset
+  %input_bytes = index.scale %tokens, %input_stride : index, offset -> offset
+  %packed = buffer.alloca<global> align(256) %input_bytes : buffer
+  %weight = command.parameter %parameters, "output.weight" : view<1042944000xi8>
+  kernel.launch @ggml_quantize_q8_1_x4_f32_bounded[%tokens, %hidden, %budget](%tokens, %hidden, %normalized, %packed) : [index, index, index](index, index, buffer, buffer)
+  command.concurrent {
+    scf.for %first = [%c0 to %tokens step %cohort] unroll {
+      %remaining = index.sub %tokens, %first : index
+      %rows = index.min %remaining, %cohort : index
+      %input_origin = index.scale %first, %input_stride : index, offset -> offset
+      %input = buffer.view %packed[%input_origin] : buffer -> view<[%rows]x5760xi8>
+      %full_stride = index.constant 993280 : offset
+      %prefix_stride = index.constant 393216 : offset
+      %full_origin = index.scale %first, %full_stride : index, offset -> offset
+      %prefix_origin = index.scale %first, %prefix_stride : index, offset -> offset
+      %full_output = buffer.view %logits[%full_origin] : buffer -> view<[%rows]x248320xf32>
+      %prefix_output = buffer.view %logits[%prefix_origin] : buffer -> view<[%rows]x98304xf32>
+      kernel.launch @qwen38_dflash_vocabulary_head[%rows, %hidden, %full_columns, %prefix_columns, %budget](%rows, %first, %hidden, %full_columns, %prefix_columns, %control, %input, %weight, %full_output, %prefix_output) : [index, index, index, index, index](index, index, index, index, index, buffer, view<[%rows]x5760xi8>, view<1042944000xi8>, view<[%rows]x248320xf32>, view<[%rows]x98304xf32>)
+    }
+    kernel.launch @qwen38_dflash_vocabulary_table[%spans](%spans, %draft, %control, %carry, %packed, %weight, %table) : [index](index, buffer, buffer, buffer, buffer, view<1042944000xi8>, buffer)
+  }
   command.return
 }

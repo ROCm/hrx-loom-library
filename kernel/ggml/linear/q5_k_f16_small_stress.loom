@@ -1,0 +1,82 @@
+// Complete small-row projections with an analytical, nonzero numerical oracle.
+// Uniform Q5_K records represent 17*0.125-0.03125 and F32 inputs are 0.5;
+// every output is exactly K*1.046875. This avoids a large scalar contraction.
+// Configuration controls physical rows, K/N, and raw/channel-eight storage.
+// Cases run manually; the default projection retains at most 512 workgroups.
+
+config.decl @q5_small_benchmark.rows : %value: index where [range(%value, 16, 32), multiple_of(%value, 16)]
+
+config.decl @q5_small_benchmark.inputs : %value: index where [range(%value, 256, 32768), multiple_of(%value, 256)]
+
+config.decl @q5_small_benchmark.outputs : %value: index where [range(%value, 16, 32768), multiple_of(%value, 16)]
+
+config.decl @q5_small_benchmark.channels : %value: index where [range(%value, 1, 8)]
+
+kernel.decl @ggml_linear_q5k_f16_small_m16(%enabled: index, %configured_inputs: index, %configured_outputs: index, %configured_channels: index) launch(%inputs: index, %outputs: index, %channels: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @ggml_linear_q5k_f16_small_m32(%enabled: index, %configured_inputs: index, %configured_outputs: index, %configured_channels: index) launch(%inputs: index, %outputs: index, %channels: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @initialize_affine(%uniform: i1, %fifth_bit: i1, %rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer)
+
+func.decl @q5_uniform_reference(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+func.def @geometry() -> (index, index, index, index, index) {
+  %rows = config.get @q5_small_benchmark.rows : index
+  %inputs = config.get @q5_small_benchmark.inputs : index
+  %outputs = config.get @q5_small_benchmark.outputs : index
+  %block_values = index.constant 256 : index
+  %block_bytes = index.constant 176 : index
+  %guards = index.constant 8 : index
+  %blocks = index.div %inputs, %block_values : index
+  %records = index.mul %outputs, %blocks : index
+  %weight_bytes = index.mul %records, %block_bytes : index
+  %elements = index.mul %rows, %outputs : index
+  %storage_values = index.add %elements, %guards : index
+  func.return %rows, %inputs, %outputs, %weight_bytes, %storage_values : index, index, index, index, index
+}
+
+command.def @project() launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @q5_small_benchmark.rows : index
+  %inputs = config.get @q5_small_benchmark.inputs : index
+  %outputs = config.get @q5_small_benchmark.outputs : index
+  %channels = config.get @q5_small_benchmark.channels : index
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %small = index.cmp eq, %rows, %c16 : index
+  scf.if %small {
+    kernel.launch @ggml_linear_q5k_f16_small_m16[%c1, %inputs, %outputs, %channels](%inputs, %outputs, %channels, %input, %weight, %output) : [index, index, index, index](index, index, index, buffer, buffer, buffer)
+  } else {
+    kernel.launch @ggml_linear_q5k_f16_small_m32[%c1, %inputs, %outputs, %channels](%inputs, %outputs, %channels, %input, %weight, %output) : [index, index, index, index](index, index, index, buffer, buffer, buffer)
+  }
+  command.return
+}
+
+func.def @reference(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @q5_small_benchmark.rows : index
+  %inputs = config.get @q5_small_benchmark.inputs : index
+  %outputs = config.get @q5_small_benchmark.outputs : index
+  func.call @q5_uniform_reference(%rows, %inputs, %outputs, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @q5_f16_small_projection {
+  check.requires<hal.amdgpu.target> {targets = ["gfx11-generic", "gfx9-4-generic", "gfx12-generic", "gfx1250"]}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %rows, %inputs, %outputs, %weight_bytes, %storage_values = check.generate<@geometry>() : () -> (index, index, index, index, index)
+    %yes = check.literal value(true) : i1
+    %c0 = check.literal value(0) : index
+    %input = check.generate.fill value(0.5) : tensor<[%rows]x[%inputs]xf32>
+    %weight = check.generate.fill value(17) : tensor<[%weight_bytes]xi8>
+    check.generate<@initialize_affine>(%yes, %yes, %c0, %inputs, %outputs, %input, %weight) : (i1, i1, index, index, index, tensor<[%rows]x[%inputs]xf32>, tensor<[%weight_bytes]xi8>) -> ()
+    %storage = check.generate.fill value(-99.0) : tensor<[%storage_values]xf32>
+    %output = check.tensor.view %storage offset(16) : tensor<[%storage_values]xf32> -> tensor<[%rows]x[%outputs]xf32>
+    check.compare<@project, @reference>(%input, %weight, %output) : (tensor<[%rows]x[%inputs]xf32>, tensor<[%weight_bytes]xi8>, tensor<[%rows]x[%outputs]xf32>) -> () {
+      check.expect.bitwise actual(%storage) expected(%storage) : tensor<[%storage_values]xf32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%rows]x[%inputs]xf32>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<[%weight_bytes]xi8>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@q5_f16_small_projection> @q5_f16_small_projection_shapes

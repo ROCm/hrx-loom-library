@@ -42,15 +42,11 @@ kernel.decl @qwen38_linear_q6k_q8_1_cohort(%dispatch_inputs: index, %dispatch_ou
 
 kernel.decl @ggml_linear_q6k_f32_decode_m4(%dispatch_rows: index, %dispatch_inputs: index, %dispatch_outputs: index) launch(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
 
-kernel.decl @qwen38_linear_q6k_f32_cohort(%dispatch_inputs: index, %dispatch_outputs: index) launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+command.decl @qwen38_dispatch_linear_q6k_f32_cohort(%rows: index, %inputs: index, %outputs: index) launch(%input: buffer, %weight: buffer, %output: buffer)
 
 command.decl @qwen38_dispatch_linear_q5k_f16(%dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%token_count_data: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 command.decl @qwen38_dispatch_linear_q5k_f16_channel8(%dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%token_count_data: buffer, %input: buffer, %weight: buffer, %output: buffer)
-
-command.decl @qwen38_dispatch_linear_q5k_f16_c64t32_f32acc(%dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%token_count_data: buffer, %input: buffer, %weight: buffer, %output: buffer)
-
-command.decl @qwen38_dispatch_linear_q5k_f16_c64t32_f32acc_channel8(%dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%token_count_data: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 command.decl @qwen38_dispatch_linear_q5k_f16_alpha_split_k(%dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%token_count_data: buffer, %input: buffer, %weight: buffer, %partials: buffer)
 
@@ -61,6 +57,8 @@ kernel.decl @qwen38_linear_q5k_f16_wmma_c128_t128_wave32_input_f16(%token_count:
 kernel.decl @ggml_linear_q5k_f16_pair(%capacity: index, %inputs: index, %outputs: index, %channels: index, %budget: index) launch(%count: buffer, %launch_capacity: index, %launch_inputs: index, %launch_outputs: index, %launch_channels: index, %launch_budget: index, %input: buffer, %gate: buffer, %up: buffer, %output: buffer)
 
 command.decl @qwen38_dispatch_linear_q6k_f16_x64(%dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%token_count_data: buffer, %input: buffer, %weight: buffer, %output: buffer)
+
+command.decl @qwen38_dispatch_linear_q5k_f16_small(%physical_rows: index, %scheduled_rows: index, %inputs: index, %outputs: index, %weight_channels: index) launch(%input: buffer, %weight: buffer, %output: buffer)
 
 command.decl @qwen38_dispatch_linear_q6k_f16_c64t32_f32acc_residual(%live_rows: index, %dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%token_count_data: buffer, %input: buffer, %weight: buffer, %residual: buffer)
 
@@ -116,6 +114,7 @@ command.def public target(@qwen38_execution) @qwen38_gdn_layer_prefill(%live_row
   %gate_size = index.constant 48 : index
   %ffn_size = index.constant 17408 : index
   %c0 = index.constant 0 : index
+  %raw_q5_channels = index.constant 1 : index
   %c32 = index.constant 32 : index
   %c4 = index.constant 4 : index
   %c8 = index.constant 8 : index
@@ -143,6 +142,9 @@ command.def public target(@qwen38_execution) @qwen38_gdn_layer_prefill(%live_row
   } else {
     scf.yield %c0 : index
   }
+  %small_q5_rows = index.constant 16 : index
+  %uses_small_q5 = index.cmp ule, %token_count, %small_q5_rows : index
+  %q5_physical_rows = scf.select %uses_small_q5, %small_q5_rows, %c32 : index
   %uses_c64t32 = index.cmp ule, %schedule_token_count, %c32 : index
   %c64t32_token_count = scf.if %uses_c64t32 -> (index) {
     scf.yield %c32 : index
@@ -266,8 +268,8 @@ command.def public target(@qwen38_execution) @qwen38_gdn_layer_prefill(%live_row
     scf.if %uses_x64 {
       scf.if %uses_c64t32 {
         command.concurrent {
-          command.launch @qwen38_dispatch_linear_q5k_f16_c64t32_f32acc[%c64t32_token_count, %hidden_size, %qkv_size, %hidden_size, %qkv_size](%token_count_data, %normalized, %qkv_weight, %qkv) : [index, index, index, index, index](buffer, buffer, view<36044800xi8>, buffer)
-          command.launch @qwen38_dispatch_linear_q5k_f16_c64t32_f32acc[%c64t32_token_count, %hidden_size, %gdn_size, %hidden_size, %gdn_size](%token_count_data, %normalized, %attention_gate_weight, %z) : [index, index, index, index, index](buffer, buffer, view<21626880xi8>, buffer)
+          command.launch @qwen38_dispatch_linear_q5k_f16_small[%q5_physical_rows, %c64t32_token_count, %hidden_size, %qkv_size, %raw_q5_channels](%normalized, %qkv_weight, %qkv) : [index, index, index, index, index](buffer, view<36044800xi8>, buffer)
+          command.launch @qwen38_dispatch_linear_q5k_f16_small[%q5_physical_rows, %c64t32_token_count, %hidden_size, %gdn_size, %raw_q5_channels](%normalized, %attention_gate_weight, %z) : [index, index, index, index, index](buffer, view<21626880xi8>, buffer)
           command.launch @qwen38_dispatch_linear_q5k_f16_alpha_split_k[%c64t32_token_count, %hidden_size, %gate_size, %hidden_size, %gate_size](%token_count_data, %normalized, %alpha_weight, %alpha_partials) : [index, index, index, index, index](buffer, buffer, view<168960xi8>, buffer)
           kernel.launch @ggml_linear_q4k_q8_1_x4[%token_count, %hidden_size, %gate_size](%token_capacity, %hidden_size, %gate_size, %normalized_q8, %beta_weight, %beta) : [index, index, index](index, index, index, buffer, view<138240xi8>, buffer)
         }
@@ -417,8 +419,8 @@ command.def public target(@qwen38_execution) @qwen38_gdn_layer_prefill(%live_row
       scf.if %uses_x64 {
         scf.if %uses_c64t32 {
           command.concurrent {
-            command.launch @qwen38_dispatch_linear_q5k_f16_c64t32_f32acc_channel8[%c64t32_token_count, %hidden_size, %ffn_size, %hidden_size, %ffn_size](%token_count_data, %post_normalized, %ffn_gate_weight, %ffn_gate) : [index, index, index, index, index](buffer, buffer, view<61276160xi8>, buffer)
-            command.launch @qwen38_dispatch_linear_q5k_f16_c64t32_f32acc_channel8[%c64t32_token_count, %hidden_size, %ffn_size, %hidden_size, %ffn_size](%token_count_data, %post_normalized, %ffn_up_weight, %ffn_up) : [index, index, index, index, index](buffer, buffer, view<61276160xi8>, buffer)
+            command.launch @qwen38_dispatch_linear_q5k_f16_small[%q5_physical_rows, %c64t32_token_count, %hidden_size, %ffn_size, %c8](%post_normalized, %ffn_gate_weight, %ffn_gate) : [index, index, index, index, index](buffer, view<61276160xi8>, buffer)
+            command.launch @qwen38_dispatch_linear_q5k_f16_small[%q5_physical_rows, %c64t32_token_count, %hidden_size, %ffn_size, %c8](%post_normalized, %ffn_up_weight, %ffn_up) : [index, index, index, index, index](buffer, view<61276160xi8>, buffer)
           }
         } else {
           command.concurrent {
@@ -440,7 +442,7 @@ command.def public target(@qwen38_execution) @qwen38_gdn_layer_prefill(%live_row
     scf.if %four_row_cohort {
       kernel.launch @ggml_linear_q6k_f32_decode_m4[%cohort_rows, %ffn_size, %hidden_size](%cohort_rows, %ffn_size, %hidden_size, %swiglu, %ffn_down_weight, %ffn_output) : [index, index, index](index, index, index, buffer, view<73113600xi8>, buffer)
     } else {
-      kernel.launch @qwen38_linear_q6k_f32_cohort[%ffn_size, %hidden_size](%ffn_size, %hidden_size, %swiglu, %ffn_down_weight, %ffn_output) : [index, index](index, index, buffer, view<73113600xi8>, buffer)
+      command.launch @qwen38_dispatch_linear_q6k_f32_cohort[%cohort_rows, %ffn_size, %hidden_size](%swiglu, %ffn_down_weight, %ffn_output) : [index, index, index](buffer, view<73113600xi8>, buffer)
     }
     kernel.launch @qwen38_residual_add_f32_prefill[%token_count](%token_capacity, %residual, %ffn_output, %residual) : [index](index, buffer, buffer, buffer)
   } else {

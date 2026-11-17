@@ -21,10 +21,14 @@ func.decl @qwen38_packet_options_origin(%capacity: index) -> (offset)
 
 func.decl @qwen38_feedback_proposal(%results: buffer, %step: index, %tokens: i32, %capacity: index)
 
+func.decl pure @qwen38_dflash_vocabulary_record(%owner: index) -> (offset)
+
+func.decl @qwen38_draft_vocabulary_full(%carry: buffer, %record: offset, %position: index, %anchor: index) -> (i1)
+
 kernel.def @qwen38_dflash_proposal_prepare() {
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
-} launch(%epoch: buffer, %target_tokens: buffer, %draft: buffer, %origins: buffer, %anchors: buffer, %draft_tokens: buffer, %selection: buffer) {
+} launch(%epoch: buffer, %target_tokens: buffer, %draft: buffer, %origins: buffer, %anchors: buffer, %draft_tokens: buffer, %selection: buffer, %carry: buffer) {
   %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %origin = index.constant 0 : offset
   %descriptor_origin = index.constant 12 : offset
@@ -42,7 +46,7 @@ kernel.def @qwen38_dflash_proposal_prepare() {
   %mapping = buffer.view %origins[%origin] : buffer -> view<[%slots]xi32>
   %anchor_view = buffer.view %anchors[%origin] : buffer -> view<[%slots]xi32>
   %inputs = buffer.view %draft_tokens[%origin] : buffer -> view<[%capacity]xi32>
-  %selection_header = buffer.view %selection[%origin] : buffer -> view<3xi32>
+  %selection_header = buffer.view %selection[%origin] : buffer -> view<4xi32>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c4 = index.constant 4 : index
@@ -66,10 +70,11 @@ kernel.def @qwen38_dflash_proposal_prepare() {
   %span_word = view.load %header[1] : view<3xi32> -> i32
   %span_value = index.cast %span_word : i32 to index
   %span_count = index.assume %span_value [range(%span_value, 0, %packet_capacity)] : index
-  %count = scf.for %span = [%c0 to %span_count step %c1](%count = %c0 : index) -> (index) {
+  %no_full = scalar.constant false : i1
+  %count, %any_full = scf.for %span = [%c0 to %span_count step %c1](%count = %c0 : index, %needs_full = %no_full : i1) -> (index, i1) {
     %flag = view.load %options[%span, 0] : view<[%packet_capacity]x2xi32> -> i32
     %generated = scalar.cmpi eq, %flag, %generated_word : i32
-    %next = scf.if %generated -> (index) {
+    %next, %combined = scf.if %generated -> (index, i1) {
       %slot = index.assume %count [ge(%count, 0), lt(%count, %slots)] : index
       %position = view.load %spans[%span, 1] : view<[%packet_capacity]x6xi32> -> i32
       %begin_word = view.load %spans[%span, 2] : view<[%packet_capacity]x6xi32> -> i32
@@ -91,12 +96,19 @@ kernel.def @qwen38_dflash_proposal_prepare() {
       view.store %begin_word, %mapping[%slot] : i32, view<[%slots]xi32>
       view.store %anchor, %anchor_view[%slot] : i32, view<[%slots]xi32>
       view.store %anchor, %inputs[%draft_begin] : i32, view<[%capacity]xi32>
+      %owner = index.cast %row : i32 to index
+      %absolute = index.cast %position : i32 to index
+      %anchor_value = index.cast %anchor : i32 to index
+      %anchor_id = index.assume %anchor_value [range(%anchor_value, 0, 248076)] : index
+      %record = func.call pure @qwen38_dflash_vocabulary_record(%owner) : (index) -> (offset)
+      %full = func.call @qwen38_draft_vocabulary_full(%carry, %record, %absolute, %anchor_id) : (buffer, offset, index, index) -> (i1)
+      %combined = scalar.ori %needs_full, %full : i1
       %incremented = index.add %count, %c1 : index
-      scf.yield %incremented : index
+      scf.yield %incremented, %combined : index, i1
     } else {
-      scf.yield %count : index
+      scf.yield %count, %needs_full : index, i1
     }
-    scf.yield %next : index
+    scf.yield %next, %combined : index, i1
   }
   %token_count = index.mul %count, %verification_width : index
   %selection_count = index.mul %count, %draft_depth : index
@@ -106,9 +118,11 @@ kernel.def @qwen38_dflash_proposal_prepare() {
   view.store %token_word, %draft_header[0] : i32, view<3xi32>
   view.store %count_word, %draft_header[1] : i32, view<3xi32>
   view.store %selection_word, %draft_header[2] : i32, view<3xi32>
-  view.store %selection_word, %selection_header[0] : i32, view<3xi32>
-  view.store %count_word, %selection_header[1] : i32, view<3xi32>
-  view.store %selection_word, %selection_header[2] : i32, view<3xi32>
+  view.store %selection_word, %selection_header[0] : i32, view<4xi32>
+  view.store %count_word, %selection_header[1] : i32, view<4xi32>
+  view.store %selection_word, %selection_header[2] : i32, view<4xi32>
+  %mode = scalar.extui %any_full : i1 to i32
+  view.store %mode, %selection_header[3] : i32, view<4xi32>
   kernel.return
 }
 

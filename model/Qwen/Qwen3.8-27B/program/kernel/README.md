@@ -6,13 +6,12 @@ target contracts; model commands own complete layer ordering and intermediate
 lifetimes. A projection's packed representation and rounding boundaries remain
 part of its contract when selecting a native matrix implementation.
 
-The 32-token Q5 projection shares a 32x64 output tile across GPU targets.
-Subgroup width selects the distribution of its 16x16 result fragments: eight
-32-lane subgroups retain one fragment each, while four 64-lane subgroups retain
-two. Both arrangements use 256 workitems and the same encoded-weight,
-activation, and metadata panels, preserving staging reuse and read-ahead.
-Canonical and channel-eight weight orders share this body and their command
-ABI; the matrix motif supplies the target's operand carrier.
+Small Q5 projections use the shared GGML 16/32-row matrix family. The model
+passes its physical stage capacity and weight order to the command adapter;
+raw and channel-eight operands share the same contraction. The shared kernel
+owns staging, native matrix fragments, and output publication. Wider model
+schedules also use the shared packed-code accessor, so their physical Q5
+interpretation remains identical.
 
 The narrow alpha projection retains seven aligned K partitions and its ordered
 reducer. Four subgroups share each decoded panel; their width determines the
@@ -37,6 +36,15 @@ projections use it through 16 rows and retain the matrix schedule above that
 crossover. Other targets retain their matrix providers. The enclosing command
 samples the live count once and forwards it through the layers, allowing all
 indirect launch counts to share one device producer.
+
+Four/eight-row DFlash projections bind the shared Q4_K and Q6_K F32 panel
+templates to 512-workitem wave64 kernels. Every raw weight packet serves the
+complete row bank, and K1024 activation panels serve 64 Q4 or 48 Q6 channels.
+The same Q6 bank handles eight-row target down projections. Four-row target
+down projections retain their separate channel distribution. The launch
+adapter caps queued work at eight groups per execution unit; channel traversal,
+tail masking, and arithmetic remain in the shared motifs. Native command
+selection preserves the other targets' matrix and cohort providers.
 
 Wide RDNA gate/up prefill calls the shared paired Q5_K/F16 kernel directly.
 Its 256-token/128-channel tile retains K64 activations and both projections in
@@ -74,8 +82,10 @@ proposals from advancing committed history.
 The output head and predictors preserve request-owned policy and accepted carry.
 
 The output-head contraction lives in the shared Q6_K/Q8_1 x4 panel kernel
-family. Its model-local leaf adds only the device-controlled live-prefix
-contract. Greedy and sampled partial selection receive explicit logical
+family. Its model-local leaf adds device-controlled live rows and vocabulary
+extent. The rare/control table uses the same packed-block arithmetic while
+sharing each selected weight row across an owner's proposal positions.
+Greedy and sampled partial selection receive explicit logical
 row/tile coordinates, allowing their groups to stride under the composition's
 budget while preserving tie-breaking, excluded tokens, and output ownership.
 

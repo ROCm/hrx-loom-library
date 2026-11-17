@@ -41,6 +41,67 @@ command.def public target(@qwen38_execution) @qwen38_dispatch_rmsnorm_q8_1_x4_f3
   command.return
 }
 
+// Four/eight initialized rows fit the register-bank projections on RDNA.
+// Other targets keep their existing matrix and cohort providers.
+template.decl @qwen38.linear.small_panel(%rows: index) -> (i1)
+
+template.def<@qwen38.linear.small_panel> priority(-1) @small_panel_default(%rows: index) -> (i1) {
+  %enabled = scalar.constant false : i1
+  template.return %enabled : i1
+}
+
+template.def<@qwen38.linear.small_panel> target(@qwen38_dispatch_rdna) @small_panel_rdna(%rows: index) -> (i1) {
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %four = index.cmp eq, %rows, %c4 : index
+  %eight = index.cmp eq, %rows, %c8 : index
+  %enabled = scalar.ori %four, %eight : i1
+  template.return %enabled : i1
+}
+
+kernel.decl @qwen38_linear_q4k_f32_small_panel(%row_count: index, %input_size: index, %output_size: index) launch(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_linear_q6k_f32_small_panel(%row_count: index, %input_size: index, %output_size: index) launch(%rows: index, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qwen38_linear_q4k_f16_wmma_x64(%tokens: index, %input_size: index, %output_size: index) launch(%control: buffer, %inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+command.def public target(@qwen38_execution) @qwen38_dispatch_dflash_q4k(%rows: index, %inputs: index, %outputs: index, %input_argument: index, %output_argument: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %small_panel = template.apply<@qwen38.linear.small_panel>(%rows) : (index) -> (i1)
+  scf.if %small_panel {
+    kernel.launch @qwen38_linear_q4k_f32_small_panel[%rows, %inputs, %outputs](%rows, %input_argument, %output_argument, %input, %weight, %output) : [index, index, index](index, index, index, buffer, buffer, buffer)
+  } else {
+    kernel.launch @qwen38_linear_q4k_f16_wmma_x64[%rows, %inputs, %outputs](%control, %input_argument, %output_argument, %input, %weight, %output) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+  }
+  command.return
+}
+
+command.def public target(@qwen38_execution) @qwen38_dispatch_dflash_q6k(%rows: index, %inputs: index, %outputs: index, %input_argument: index, %output_argument: index) launch(%control: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %small_panel = template.apply<@qwen38.linear.small_panel>(%rows) : (index) -> (i1)
+  scf.if %small_panel {
+    kernel.launch @qwen38_linear_q6k_f32_small_panel[%rows, %inputs, %outputs](%rows, %input_argument, %output_argument, %input, %weight, %output) : [index, index, index](index, index, index, buffer, buffer, buffer)
+  } else {
+    command.launch @qwen38_dispatch_linear_q6k_f16_x64[%rows, %inputs, %outputs, %input_argument, %output_argument](%control, %input, %weight, %output) : [index, index, index, index, index](buffer, buffer, buffer, buffer)
+  }
+  command.return
+}
+
+kernel.decl @qwen38_linear_q6k_f32_cohort(%input_size: index, %output_size: index) launch(%inputs: index, %outputs: index, %input: buffer, %weight: buffer, %output: buffer)
+
+// The four-row target cohort keeps its separate channel distribution. This
+// command serves the other cohort widths and selects the new bank at eight.
+command.def public target(@qwen38_execution) @qwen38_dispatch_linear_q6k_f32_cohort(%rows: index, %inputs: index, %outputs: index) launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %c8 = index.constant 8 : index
+  %eight = index.cmp eq, %rows, %c8 : index
+  %supported = template.apply<@qwen38.linear.small_panel>(%rows) : (index) -> (i1)
+  %small_panel = scalar.andi %eight, %supported : i1
+  scf.if %small_panel {
+    kernel.launch @qwen38_linear_q6k_f32_small_panel[%rows, %inputs, %outputs](%rows, %inputs, %outputs, %input, %weight, %output) : [index, index, index](index, index, index, buffer, buffer, buffer)
+  } else {
+    kernel.launch @qwen38_linear_q6k_f32_cohort[%inputs, %outputs](%inputs, %outputs, %input, %weight, %output) : [index, index](index, index, buffer, buffer, buffer)
+  }
+  command.return
+}
+
 template.decl @qwen38.prefill.projection_schedule(%tokens: index) -> (index)
 
 template.decl @qwen38.prefill.integer_ffn(%tokens: index) -> (i1)
@@ -166,17 +227,24 @@ command.def public target(@qwen38_execution) @qwen38_dispatch_linear_q5k_f16_cha
   command.return
 }
 
-kernel.decl @qwen38_linear_q5k_f16_c64t32_f32acc(%token_count: index, %input_size: index, %output_size: index) launch(%token_count_data: buffer, %input_size_data: index, %output_size_data: index, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @ggml_linear_q5k_f16_small_m16(%enabled: index, %configured_inputs: index, %configured_outputs: index, %configured_channels: index) launch(%inputs: index, %outputs: index, %channels: index, %input: buffer, %weight: buffer, %output: buffer)
 
-command.def public target(@qwen38_execution) @qwen38_dispatch_linear_q5k_f16_c64t32_f32acc(%dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%token_count_data: buffer, %input: buffer, %weight: buffer, %output: buffer) {
-  kernel.launch @qwen38_linear_q5k_f16_c64t32_f32acc[%dispatch_token_count, %dispatch_input_size, %dispatch_output_size](%token_count_data, %input_size_data, %output_size_data, %input, %weight, %output) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
-  command.return
-}
+kernel.decl @ggml_linear_q5k_f16_small_m32(%enabled: index, %configured_inputs: index, %configured_outputs: index, %configured_channels: index) launch(%inputs: index, %outputs: index, %channels: index, %input: buffer, %weight: buffer, %output: buffer)
 
-kernel.decl @qwen38_linear_q5k_f16_c64t32_f32acc_channel8(%token_count: index, %input_size: index, %output_size: index) launch(%token_count_data: buffer, %input_size_data: index, %output_size_data: index, %input: buffer, %weight: buffer, %output: buffer)
-
-command.def public target(@qwen38_execution) @qwen38_dispatch_linear_q5k_f16_c64t32_f32acc_channel8(%dispatch_token_count: index, %dispatch_input_size: index, %dispatch_output_size: index, %input_size_data: index, %output_size_data: index) launch(%token_count_data: buffer, %input: buffer, %weight: buffer, %output: buffer) {
-  kernel.launch @qwen38_linear_q5k_f16_c64t32_f32acc_channel8[%dispatch_token_count, %dispatch_input_size, %dispatch_output_size](%token_count_data, %input_size_data, %output_size_data, %input, %weight, %output) : [index, index, index](buffer, index, index, buffer, buffer, buffer)
+// The stage owns its initialized physical row bank. The sampled schedule only
+// enables the dispatch; the numerical body consumes no live-count buffer.
+command.def public target(@qwen38_execution) @qwen38_dispatch_linear_q5k_f16_small(%physical_rows: index, %scheduled_rows: index, %inputs: index, %outputs: index, %weight_channels: index) launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c16 = index.constant 16 : index
+  %active = index.cmp ne, %scheduled_rows, %c0 : index
+  %enabled = scf.select %active, %c1, %c0 : index
+  %small = index.cmp eq, %physical_rows, %c16 : index
+  scf.if %small {
+    kernel.launch @ggml_linear_q5k_f16_small_m16[%enabled, %inputs, %outputs, %weight_channels](%inputs, %outputs, %weight_channels, %input, %weight, %output) : [index, index, index, index](index, index, index, buffer, buffer, buffer)
+  } else {
+    kernel.launch @ggml_linear_q5k_f16_small_m32[%enabled, %inputs, %outputs, %weight_channels](%inputs, %outputs, %weight_channels, %input, %weight, %output) : [index, index, index, index](index, index, index, buffer, buffer, buffer)
+  }
   command.return
 }
 

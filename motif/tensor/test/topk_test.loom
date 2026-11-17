@@ -4,19 +4,19 @@
 
 amdgpu.target<gfx11-generic> @wave32 {subgroup_size = 32}
 
-template.decl @selection.topk_partial_f32(%rows: index, %columns: index, %count: index, %input: buffer, %output_values: buffer, %output_ids: buffer)
+template.decl @selection.topk_partial_f32(%rows: index, %row_stride: index, %columns: index, %count: index, %input: buffer, %output_values: buffer, %output_ids: buffer)
 
 template.decl @selection.topk_merge_f32(%rows: index, %partitions: index, %count: index, %input_values: buffer, %input_ids: buffer, %output_values: buffer, %output_ids: buffer)
 
 // Serial order-statistic oracle. Each rank scans the unmodified input using
 // the preceding rank's strict (value descending, ID ascending) frontier.
-func.def @topk_reference(%rows: index, %columns: index, %count: index, %partitions: index, %tile_width0: index, %indexed: i1, %input: buffer, %input_ids: buffer, %output_values: buffer, %output_ids: buffer) {
+func.def @topk_reference(%rows: index, %row_stride: index, %columns: index, %count: index, %partitions: index, %tile_width0: index, %indexed: i1, %input: buffer, %input_ids: buffer, %output_values: buffer, %output_ids: buffer) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %tile_width = index.assume %tile_width0 [ge(%tile_width0, 1)] : index
-  %x = buffer.view %input[%origin] : buffer -> view<[%rows]x[%columns]xf32>
-  %t = buffer.view %input_ids[%origin] : buffer -> view<[%rows]x[%columns]xi32>
+  %x = buffer.view %input[%origin] : buffer -> view<[%rows]x[%row_stride]xf32>
+  %t = buffer.view %input_ids[%origin] : buffer -> view<[%rows]x[%row_stride]xi32>
   %y = buffer.view %output_values[%origin] : buffer -> view<[%rows]x[%partitions]x[%count]xf32>
   %ids = buffer.view %output_ids[%origin] : buffer -> view<[%rows]x[%partitions]x[%count]xi32>
   %negative = scalar.constant -inf : f32
@@ -31,9 +31,9 @@ func.def @topk_reference(%rows: index, %columns: index, %count: index, %partitio
       %last_value, %last_id = scf.for %rank = [%c0 to %count step %c1](%previous = %positive : f32, %previous_id = %none : i32) -> (f32, i32) {
         %value, %id = scf.for %column0 = [%begin to %end step %c1](%best = %negative : f32, %best_id = %largest : i32) -> (f32, i32) {
           %column = index.assume %column0 [ge(%column0, 0), lt(%column0, %columns)] : index
-          %candidate = view.load %x[%row, %column] : view<[%rows]x[%columns]xf32> -> f32
+          %candidate = view.load %x[%row, %column] : view<[%rows]x[%row_stride]xf32> -> f32
           %candidate_id = scf.if %indexed -> (i32) {
-            %id = view.load %t[%row, %column] : view<[%rows]x[%columns]xi32> -> i32
+            %id = view.load %t[%row, %column] : view<[%rows]x[%row_stride]xi32> -> i32
             scf.yield %id : i32
           } else {
             %id = index.cast %column : index to i32
@@ -70,13 +70,14 @@ kernel.def target(@wave32) @vocabulary() {
   %y = index.constant 1 : index
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%x, %y, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %groups = index.mul %x, %y : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %input_ids: buffer, %output_values: buffer, %output_ids: buffer) {
   %rows = index.constant 1 : index
   %columns = index.constant 248320 : index
   %partitions = index.constant 61 : index
   %count = index.constant 16 : index
-  template.apply<@selection.topk_partial_f32>(%rows, %columns, %count, %input, %output_values, %output_ids) : (index, index, index, buffer, buffer, buffer)
+  template.apply<@selection.topk_partial_f32>(%rows, %columns, %columns, %count, %input, %output_values, %output_ids) : (index, index, index, index, buffer, buffer, buffer)
   kernel.return
 }
 
@@ -87,7 +88,7 @@ func.def @vocabulary_reference(%input: buffer, %input_ids: buffer, %output_value
   %partitions = index.constant 61 : index
   %tile_width = index.constant 4096 : index
   %indexed = scalar.constant false : i1
-  func.call @topk_reference(%rows, %columns, %count, %partitions, %tile_width, %indexed, %input, %input_ids, %output_values, %output_ids) : (index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
+  func.call @topk_reference(%rows, %columns, %columns, %count, %partitions, %tile_width, %indexed, %input, %input_ids, %output_values, %output_ids) : (index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
   func.return
 }
 
@@ -112,13 +113,14 @@ kernel.def target(@wave32) @short_tail() {
   %y = index.constant 2 : index
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%x, %y, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %groups = index.mul %x, %y : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %input_ids: buffer, %output_values: buffer, %output_ids: buffer) {
   %rows = index.constant 2 : index
   %columns = index.constant 8201 : index
   %partitions = index.constant 3 : index
   %count = index.constant 16 : index
-  template.apply<@selection.topk_partial_f32>(%rows, %columns, %count, %input, %output_values, %output_ids) : (index, index, index, buffer, buffer, buffer)
+  template.apply<@selection.topk_partial_f32>(%rows, %columns, %columns, %count, %input, %output_values, %output_ids) : (index, index, index, index, buffer, buffer, buffer)
   kernel.return
 }
 
@@ -129,7 +131,7 @@ func.def @short_tail_reference(%input: buffer, %input_ids: buffer, %output_value
   %partitions = index.constant 3 : index
   %tile_width = index.constant 4096 : index
   %indexed = scalar.constant false : i1
-  func.call @topk_reference(%rows, %columns, %count, %partitions, %tile_width, %indexed, %input, %input_ids, %output_values, %output_ids) : (index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
+  func.call @topk_reference(%rows, %columns, %columns, %count, %partitions, %tile_width, %indexed, %input, %input_ids, %output_values, %output_ids) : (index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
   func.return
 }
 
@@ -154,13 +156,14 @@ kernel.def target(@wave32) @ties() {
   %y = index.constant 2 : index
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%x, %y, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %groups = index.mul %x, %y : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%input: buffer, %input_ids: buffer, %output_values: buffer, %output_ids: buffer) {
   %rows = index.constant 2 : index
   %columns = index.constant 256 : index
   %partitions = index.constant 1 : index
   %count = index.constant 1 : index
-  template.apply<@selection.topk_partial_f32>(%rows, %columns, %count, %input, %output_values, %output_ids) : (index, index, index, buffer, buffer, buffer)
+  template.apply<@selection.topk_partial_f32>(%rows, %columns, %columns, %count, %input, %output_values, %output_ids) : (index, index, index, index, buffer, buffer, buffer)
   kernel.return
 }
 
@@ -171,7 +174,7 @@ func.def @ties_reference(%input: buffer, %input_ids: buffer, %output_values: buf
   %partitions = index.constant 1 : index
   %tile_width = index.constant 4096 : index
   %indexed = scalar.constant false : i1
-  func.call @topk_reference(%rows, %columns, %count, %partitions, %tile_width, %indexed, %input, %input_ids, %output_values, %output_ids) : (index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
+  func.call @topk_reference(%rows, %columns, %columns, %count, %partitions, %tile_width, %indexed, %input, %input_ids, %output_values, %output_ids) : (index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
   func.return
 }
 
@@ -213,7 +216,7 @@ func.def @merge_reference(%input: buffer, %input_ids: buffer, %output_values: bu
   %partitions = index.constant 1 : index
   %tile_width = index.constant 976 : index
   %indexed = scalar.constant true : i1
-  func.call @topk_reference(%rows, %columns, %count, %partitions, %tile_width, %indexed, %input, %input_ids, %output_values, %output_ids) : (index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
+  func.call @topk_reference(%rows, %columns, %columns, %count, %partitions, %tile_width, %indexed, %input, %input_ids, %output_values, %output_ids) : (index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
   func.return
 }
 
@@ -255,7 +258,7 @@ func.def @merge_ties_reference(%input: buffer, %input_ids: buffer, %output_value
   %partitions = index.constant 1 : index
   %tile_width = index.constant 24 : index
   %indexed = scalar.constant true : i1
-  func.call @topk_reference(%rows, %columns, %count, %partitions, %tile_width, %indexed, %input, %input_ids, %output_values, %output_ids) : (index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
+  func.call @topk_reference(%rows, %columns, %columns, %count, %partitions, %tile_width, %indexed, %input, %input_ids, %output_values, %output_ids) : (index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
   func.return
 }
 
@@ -304,6 +307,135 @@ check.case public @vocabulary_merge_case {
   check.expect.bitwise actual(%ids) expected(%expected_ids) : tensor<1x16xi32>
   check.return
 }
+
+// One worker revisits unrelated rows and partitions. Padding scores exceed
+// every eligible value, and short rows exhaust before all sixteen winners.
+func.def @padded_fixture(%configuration: index, %control: buffer, %input: buffer) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %control[%origin] : buffer -> view<2xi32>
+  %values = buffer.view %input[%origin] : buffer -> view<3x4128xf32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %rows = index.constant 3 : index
+  %stride = index.constant 4128 : index
+  %short = index.constant 7 : index
+  %long = index.constant 4105 : index
+  %period = index.constant 17 : index
+  %empty = index.cmp eq, %configuration, %c0 : index
+  %tail = index.cmp eq, %configuration, %c1 : index
+  %live = scf.select %empty, %c0, %rows : index
+  %columns = scf.select %tail, %short, %long : index
+  %live_word = index.cast %live : index to i32
+  %columns_word = index.cast %columns : index to i32
+  view.store %live_word, %header[0] : i32, view<2xi32>
+  view.store %columns_word, %header[1] : i32, view<2xi32>
+  %poison = scalar.constant 1000.0 : f32
+  scf.for %row = [%c0 to %rows step %c1] {
+    scf.for %column = [%c0 to %stride step %c1] {
+      %relative = index.rem %column, %period : index
+      %row_base = index.mul %row, %period : index
+      %integer = index.add %relative, %row_base : index
+      %word = index.cast %integer : index to i32
+      %score = scalar.sitofp %word : i32 to f32
+      %eligible = index.cmp ult, %column, %columns : index
+      %value = scf.select %eligible, %score, %poison : f32
+      view.store %value, %values[%row, %column] : f32, view<3x4128xf32>
+    }
+  }
+  func.return
+}
+
+func.def inline @padded_shape(%control: buffer) -> (index, index, index) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %control[%origin] : buffer -> view<2xi32>
+  %rows_word = view.load %header[0] : view<2xi32> -> i32
+  %columns_word = view.load %header[1] : view<2xi32> -> i32
+  %rows_value = index.cast %rows_word : i32 to index
+  %columns_value = index.cast %columns_word : i32 to index
+  %rows = index.assume %rows_value [range(%rows_value, 0, 3)] : index
+  %columns = index.assume %columns_value [range(%columns_value, 1, 4128)] : index
+  %padding = index.constant 4095 : index
+  %tile = index.constant 4096 : index
+  %padded = index.add %columns, %padding : index
+  %partitions = index.div %padded, %tile : index
+  func.return %rows, %columns, %partitions : index, index, index
+}
+
+kernel.def target(@wave32) @padded_partial() {
+  %workers = index.constant 2 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%control: buffer, %input: buffer, %values: buffer, %ids: buffer) {
+  %rows, %columns, %partitions = func.call @padded_shape(%control) : (buffer) -> (index, index, index)
+  %stride = index.constant 4128 : index
+  %count = index.constant 16 : index
+  template.apply<@selection.topk_partial_f32>(%rows, %stride, %columns, %count, %input, %values, %ids) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@wave32) @padded_merge() {
+  %rows = index.constant 3 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%control: buffer, %partial: buffer, %partial_ids: buffer, %values: buffer, %ids: buffer) {
+  %rows, %columns, %partitions = func.call @padded_shape(%control) : (buffer) -> (index, index, index)
+  %row = kernel.workgroup.id<x> : index
+  %live = index.cmp ult, %row, %rows : index
+  %count = index.constant 16 : index
+  scf.if %live {
+    template.apply<@selection.topk_merge_f32>(%rows, %partitions, %count, %partial, %partial_ids, %values, %ids) : (index, index, index, buffer, buffer, buffer, buffer)
+  }
+  kernel.return
+}
+
+command.def @padded_selection() launch(%control: buffer, %input: buffer, %partial: buffer, %partial_ids: buffer, %values: buffer, %ids: buffer) {
+  kernel.launch @padded_partial(%control, %input, %partial, %partial_ids) : (buffer, buffer, buffer, buffer)
+  kernel.launch @padded_merge(%control, %partial, %partial_ids, %values, %ids) : (buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+func.def @padded_reference(%control: buffer, %input: buffer, %partial: buffer, %partial_ids: buffer, %values: buffer, %ids: buffer) {
+  %rows, %columns, %partitions = func.call @padded_shape(%control) : (buffer) -> (index, index, index)
+  %stride = index.constant 4128 : index
+  %count = index.constant 16 : index
+  %tile = index.constant 4096 : index
+  %c1 = index.constant 1 : index
+  %indexed = scalar.constant false : i1
+  func.call @topk_reference(%rows, %stride, %columns, %count, %partitions, %tile, %indexed, %input, %input, %partial, %partial_ids) : (index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
+  // Final winners come directly from the original eligible input, independently
+  // of the partial-list producer and the device merge algorithm.
+  func.call @topk_reference(%rows, %stride, %columns, %count, %c1, %columns, %indexed, %input, %input, %values, %ids) : (index, index, index, index, index, index, i1, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @padded_rows configure[3](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %control = check.generate.fill value(0) : tensor<2xi32>
+    %input = check.generate.fill value(0.0) : tensor<3x4128xf32>
+    check.generate<@padded_fixture>(%configuration, %control, %input) : (index, tensor<2xi32>, tensor<3x4128xf32>) -> ()
+    %partial_storage = check.generate.fill value(-99.0) : tensor<104xf32>
+    %partial_id_storage = check.generate.fill value(-99) : tensor<104xi32>
+    %value_storage = check.generate.fill value(-99.0) : tensor<56xf32>
+    %id_storage = check.generate.fill value(-99) : tensor<56xi32>
+    %partial = check.tensor.view %partial_storage offset(16) : tensor<104xf32> -> tensor<3x2x16xf32>
+    %partial_ids = check.tensor.view %partial_id_storage offset(16) : tensor<104xi32> -> tensor<3x2x16xi32>
+    %values = check.tensor.view %value_storage offset(16) : tensor<56xf32> -> tensor<3x16xf32>
+    %ids = check.tensor.view %id_storage offset(16) : tensor<56xi32> -> tensor<3x16xi32>
+    check.compare<@padded_selection, @padded_reference>(%control, %input, %partial, %partial_ids, %values, %ids) : (tensor<2xi32>, tensor<3x4128xf32>, tensor<3x2x16xf32>, tensor<3x2x16xi32>, tensor<3x16xf32>, tensor<3x16xi32>) -> () {
+      check.expect.bitwise actual(%partial_storage) expected(%partial_storage) : tensor<104xf32>
+      check.expect.bitwise actual(%partial_id_storage) expected(%partial_id_storage) : tensor<104xi32>
+      check.expect.bitwise actual(%value_storage) expected(%value_storage) : tensor<56xf32>
+      check.expect.bitwise actual(%id_storage) expected(%id_storage) : tensor<56xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<3x4128xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@padded_rows> @padded_selection_shapes
 
 check.benchmark<@vocabulary_case> @vocabulary_case_benchmark
 
