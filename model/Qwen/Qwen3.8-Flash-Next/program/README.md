@@ -129,6 +129,14 @@ read inputs nor publish outputs. Large residual stages reuse workers across
 live rows with fixed stream/feature ownership, while small shapes specialize
 to direct ownership without a row loop.
 
+The recurrent update shares the register-only gated-delta motif with Qwen3.8-27B.
+Four adjacent lanes retain one 128-key state column, with contiguous fragments
+of 32 keys per lane. A bounded worker pool traverses the live span/column pairs
+without multiplying the unbounded span coordinate by the column count. The
+model adapter owns BF16 publication, normalization, the near-one decay
+polynomial, and immutable-reader/private-writer selection; the retained F32
+state layout and accepted-prefix replay contract are unchanged.
+
 ## Original image and video projector
 
 Image-enabled variants set `flash_next.image_inputs` and add the image service

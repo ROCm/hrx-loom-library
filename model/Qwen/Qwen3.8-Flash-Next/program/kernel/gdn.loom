@@ -163,22 +163,38 @@ func.def public inline @flash_next_gdn_decay(%log_decay: f32) -> (f32) {
   func.return %decay : f32
 }
 
-// GGUF tiles V heads over K heads. Persistent state is [head, value, key]; a
-// wave retains four value columns as one 4x4 F32 tile per lane across the span.
-// The stored ssm_a is already -exp(A_log), not the original logarithm.
+template.decl @gated_delta.update_128(%prior: vector<32xf32>, %query: vector<32xf32>, %key: vector<32xf32>, %value: f32, %decay: f32, %update_gate: f32) -> (vector<32xf32>, f32)
+
+// GGUF tiles V heads over K heads. Each four-lane cluster carries one state
+// column across the complete span, with 32 consecutive keys per lane. The
+// stored ssm_a is already -exp(A_log), not the original logarithm.
 template.decl @flash_next.gdn_recur.body(%capacity: index, %verification: index, %span_arg: buffer, %origins_arg: buffer, %layer_origin: offset, %qkv_arg: buffer, %norm_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer, %a_arg: buffer, %bias_arg: buffer, %state_arg: buffer, %output_arg: buffer)
 
 template.def<@flash_next.gdn_recur.body> device @gdn_recur_body(%capacity: index, %verification: index, %span_arg: buffer, %origins_arg: buffer, %layer_origin: offset, %qkv_arg: buffer, %norm_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer, %a_arg: buffer, %bias_arg: buffer, %state_arg: buffer, %output_arg: buffer) {
   %span, %origins, %qkv, %norm, %alpha, %beta, %a, %bias, %state, %output = buffer.assume.noalias %span_arg, %origins_arg, %qkv_arg, %norm_arg, %alpha_arg, %beta_arg, %a_arg, %bias_arg, %state_arg, %output_arg : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer
-  %first_span = kernel.workgroup.id<z> : index
-  %span_stride = kernel.workgroup.count<z> : index
+  %first_work = kernel.workgroup.id<x> : index
+  %work_stride = kernel.workgroup.count<x> : index
+  %columns_per_head = index.constant 4 : index
+  %work_per_span = index.constant 192 : index
   %span_count = func.call @flash_next_span_count(%span) : (buffer) -> (index)
-  scf.for %span_index = [%first_span to %span_count step %span_stride] {
+  // Carry the span and its tile separately. The logical product can exceed
+  // the index domain even though each coordinate and the bounded grid fit.
+  %first_span = index.div %first_work, %work_per_span : index
+  %first_tile = index.rem %first_work, %work_per_span : index
+  %stride_spans = index.div %work_stride, %work_per_span : index
+  %stride_tiles = index.rem %work_stride, %work_per_span : index
+  %terminal_span, %terminal_tile = scf.while(%span_before = %first_span : index, %tile_before = %first_tile : index) -> (index, index) {
+    %active = index.cmp ult, %span_before, %span_count : index
+    scf.condition %active, %span_before, %tile_before : i1, index, index
+  } do(%span_index: index, %within_span: index) {
+    %head = index.div %within_span, %columns_per_head : index
+    %tile = index.rem %within_span, %columns_per_head : index
     %begin, %end, %fresh, %reader, %writer = func.call @flash_next_span_state(%span, %origins, %span_index, %layer_origin, %capacity) : (buffer, buffer, index, offset, index) -> (index, index, i1, offset, offset)
     %c0_index = index.constant 0 : index
     %c1_index = index.constant 1 : index
     %c4 = index.constant 4 : index
     %c16 = index.constant 16 : index
+    %keys_per_lane = index.constant 32 : index
     %width = index.constant 128 : index
     %key_origin = index.constant 2048 : index
     %value_origin = index.constant 4096 : index
@@ -189,105 +205,95 @@ template.def<@flash_next.gdn_recur.body> device @gdn_recur_body(%capacity: index
     %beta_view = buffer.view %beta[%origin] : buffer -> view<[%capacity]x48xf32>
     %a_view = buffer.view %a[%origin] : buffer -> view<48xf32>
     %bias_view = buffer.view %bias[%origin] : buffer -> view<48xf32>
-    %state_view = buffer.view %state[%reader] : buffer -> view<786432xf32>
-    %write_state = buffer.view %state[%writer] : buffer -> view<786432xf32>
+    %state_view = buffer.view %state[%reader] : buffer -> view<48x128x128xf32>
+    %write_state = buffer.view %state[%writer] : buffer -> view<48x128x128xf32>
     %output_view = buffer.view %output[%origin] : buffer -> view<[%capacity]x6144xbf16>
-    %head = kernel.workgroup.id<x> : index
-    %tile = kernel.workgroup.id<y> : index
-    %lane = kernel.subgroup.lane.id : index
+    %thread = kernel.workitem.id<x> : index
+    %lane = index.rem %thread, %c4 : index
+    %local_column = index.div %thread, %c4 : index
+    %tile_column = index.mul %tile, %keys_per_lane : index
+    %column = index.add %tile_column, %local_column : index
+    %key_begin = index.mul %lane, %keys_per_lane : index
     %key_head = index.rem %head, %c16 : index
     %key_norm_index = index.add %key_head, %c16 : index
-    %query_channel = index.madd %key_head, %width, %lane : index
+    %query_channel = index.madd %key_head, %width, %key_begin : index
     %key_channel = index.add %query_channel, %key_origin : index
-    %column_base = index.mul %tile, %c4 : index
-    %value_column = index.madd %head, %width, %column_base : index
+    %value_column = index.madd %head, %width, %column : index
     %value_channel = index.add %value_column, %value_origin : index
-    %state_index = index.madd %value_column, %width, %lane : index
-    %c0_i32 = scalar.constant 0 : i32
-    %row_step = scalar.constant 32 : i32
-    %column_step = scalar.constant 128 : i32
-    %row_offsets = vector.iota %c0_i32 step %row_step : vector<4xi32>
-    %column_offsets = vector.iota %c0_i32 step %column_step : vector<4xi32>
-    %rows_broadcast = vector.broadcast %row_offsets : vector<4xi32> -> vector<4x4xi32>
-    %rows = vector.transpose<[1, 0]> %rows_broadcast : vector<4x4xi32> -> vector<4x4xi32>
-    %columns = vector.broadcast %column_offsets : vector<4xi32> -> vector<4x4xi32>
-    %state_offsets = vector.addi %rows, %columns : vector<4x4xi32>
-    %initial = scf.if %fresh -> (vector<4x4xf32>) {
-      %c0v = vector.splatf 0.0 : vector<4x4xf32>
-      scf.yield %c0v : vector<4x4xf32>
+    %initial = scf.if %fresh -> (vector<32xf32>) {
+      %c0v = vector.splatf 0.0 : vector<32xf32>
+      scf.yield %c0v : vector<32xf32>
     } else {
-      %stored = vector.gather %state_view[%state_index][%state_offsets] : view<786432xf32>, vector<4x4xi32> -> vector<4x4xf32>
-      scf.yield %stored : vector<4x4xf32>
+      %stored = vector.load %state_view[%head, %column, %key_begin] : view<48x128x128xf32> -> vector<32xf32>
+      scf.yield %stored : vector<32xf32>
     }
     %stored_a = view.load %a_view[%head] : view<48xf32> -> f32
     %stored_bias = view.load %bias_view[%head] : view<48xf32> -> f32
     %query_factor = scalar.constant 0.088388347648318447 : f32
     %c1 = scalar.constant 1.0 : f32
-    %empty_columns = vector.splatf 0.0 : vector<4xf32>
     %leader = index.cmp eq, %lane, %c0_index : index
-    %final = scf.for %token = [%begin to %end step %c1_index](%old = %initial : vector<4x4xf32>) -> (vector<4x4xf32>) {
-      %packed_query = vector.gather %qkv_view[%token, %query_channel][%row_offsets] : view<[%capacity]x10240xbf16>, vector<4xi32> -> vector<4xbf16>
-      %packed_key = vector.gather %qkv_view[%token, %key_channel][%row_offsets] : view<[%capacity]x10240xbf16>, vector<4xi32> -> vector<4xbf16>
-      %query_values = vector.extf %packed_query : vector<4xbf16> to vector<4xf32>
-      %key_values = vector.extf %packed_key : vector<4xbf16> to vector<4xf32>
+    %final = scf.for %token = [%begin to %end step %c1_index](%old = %initial : vector<32xf32>) -> (vector<32xf32>) {
+      %packed_query = vector.load %qkv_view[%token, %query_channel] : view<[%capacity]x10240xbf16> -> vector<32xbf16>
+      %packed_key = vector.load %qkv_view[%token, %key_channel] : view<[%capacity]x10240xbf16> -> vector<32xbf16>
+      %query_values = vector.extf %packed_query : vector<32xbf16> to vector<32xf32>
+      %key_values = vector.extf %packed_key : vector<32xbf16> to vector<32xf32>
       %query_inverse = view.load %norm_view[%token, %key_head] : view<[%capacity]x32xf32> -> f32
       %key_inverse = view.load %norm_view[%token, %key_norm_index] : view<[%capacity]x32xf32> -> f32
       %query_scale = scalar.mulf %query_inverse, %query_factor : f32
-      %query_scales = vector.splat %query_scale : vector<4xf32>
-      %key_scales = vector.splat %key_inverse : vector<4xf32>
-      %query_rows = vector.mulf %query_values, %query_scales : vector<4xf32>
-      %key_rows = vector.mulf %key_values, %key_scales : vector<4xf32>
-      %query_broadcast = vector.broadcast %query_rows : vector<4xf32> -> vector<4x4xf32>
-      %query_tile = vector.transpose<[1, 0]> %query_broadcast : vector<4x4xf32> -> vector<4x4xf32>
-      %key_broadcast = vector.broadcast %key_rows : vector<4xf32> -> vector<4x4xf32>
-      %key_tile = vector.transpose<[1, 0]> %key_broadcast : vector<4x4xf32> -> vector<4x4xf32>
+      %query_scales = vector.splat %query_scale : vector<32xf32>
+      %key_scales = vector.splat %key_inverse : vector<32xf32>
+      %query_rows = vector.mulf %query_values, %query_scales : vector<32xf32>
+      %key_rows = vector.mulf %key_values, %key_scales : vector<32xf32>
       %alpha_value = view.load %alpha_view[%token, %head] : view<[%capacity]x48xf32> -> f32
       %biased = scalar.addf %alpha_value, %stored_bias : f32
       %positive = scalar.softplusf<afn> %biased : f32
       %log_decay = scalar.mulf %positive, %stored_a : f32
       %decay = func.call @flash_next_gdn_decay(%log_decay) : (f32) -> (f32)
-      %decay_tile = vector.splat %decay : vector<4x4xf32>
-      %decayed = vector.mulf %old, %decay_tile : vector<4x4xf32>
-      %prediction_tile = vector.mulf %decayed, %key_tile : vector<4x4xf32>
-      %prediction_partial = vector.reduce.axes<addf> %prediction_tile, %empty_columns axes [0] : vector<4x4xf32>, vector<4xf32>
-      %prediction = kernel.subgroup.reduce<addf> %prediction_partial : vector<4xf32>
-      %packed_values = vector.load %qkv_view[%token, %value_channel] : view<[%capacity]x10240xbf16> -> vector<4xbf16>
-      %values = vector.extf %packed_values : vector<4xbf16> to vector<4xf32>
+      %packed_value = view.load %qkv_view[%token, %value_channel] : view<[%capacity]x10240xbf16> -> bf16
+      %value = scalar.extf %packed_value : bf16 to f32
       %beta_value = view.load %beta_view[%token, %head] : view<[%capacity]x48xf32> -> f32
       %negative_beta = scalar.negf %beta_value : f32
       %beta_exp = scalar.expf<afn> %negative_beta : f32
       %beta_denominator = scalar.addf %c1, %beta_exp : f32
       %beta_gate = scalar.divf %c1, %beta_denominator : f32
-      %beta_vector = vector.splat %beta_gate : vector<4xf32>
-      %residual = vector.subf %values, %prediction : vector<4xf32>
-      %delta = vector.mulf %residual, %beta_vector : vector<4xf32>
-      %delta_tile = vector.broadcast %delta : vector<4xf32> -> vector<4x4xf32>
-      %next = vector.fmaf %key_tile, %delta_tile, %decayed : vector<4x4xf32>
-      %output_tile = vector.mulf %next, %query_tile : vector<4x4xf32>
-      %output_partial = vector.reduce.axes<addf> %output_tile, %empty_columns axes [0] : vector<4x4xf32>, vector<4xf32>
-      %output_values = kernel.subgroup.reduce<addf> %output_partial : vector<4xf32>
+      %next, %output_value = template.apply<@gated_delta.update_128>(%old, %query_rows, %key_rows, %value, %decay, %beta_gate) : (vector<32xf32>, vector<32xf32>, vector<32xf32>, f32, f32, f32) -> (vector<32xf32>, f32)
       scf.if %leader {
-        %packed_output = vector.fptrunc %output_values : vector<4xf32> to vector<4xbf16>
-        vector.store %packed_output, %output_view[%token, %value_column] : vector<4xbf16>, view<[%capacity]x6144xbf16>
+        %packed_output = scalar.fptrunc %output_value : f32 to bf16
+        view.store %packed_output, %output_view[%token, %value_column] : bf16, view<[%capacity]x6144xbf16>
       }
-      scf.yield %next : vector<4x4xf32>
+      scf.yield %next : vector<32xf32>
     }
     %publish = func.call @flash_next_span_publishes(%verification, %span, %span_index) : (index, buffer, index) -> (i1)
     scf.if %publish {
-      vector.scatter %final, %write_state[%state_index][%state_offsets] : vector<4x4xf32>, view<786432xf32>, vector<4x4xi32>
+      vector.store %final, %write_state[%head, %column, %key_begin] : vector<32xf32>, view<48x128x128xf32>
     }
+    %tile_sum = index.add %within_span, %stride_tiles : index
+    %carry = index.div %tile_sum, %work_per_span : index
+    %next_tile = index.rem %tile_sum, %work_per_span : index
+    %advance = index.add %stride_spans, %carry : index
+    %remaining = index.sub %span_count, %span_index : index
+    %bounded_advance = index.min %advance, %remaining : index
+    %next_span = index.add %span_index, %bounded_advance : index
+    scf.yield %next_span, %next_tile : index, index
   }
   template.return
 }
 
 kernel.def target(@flash_next_gdn_wave32) @gdn_recur() {
-  %heads = index.constant 48 : index
-  %columns = index.constant 32 : index
-  %lanes = index.constant 32 : index
+  %work_per_span = index.constant 192 : index
+  %groups_per_unit = index.constant 4 : index
+  %units = target.execution.unit.count : index
+  %budget = index.mul %units, %groups_per_unit : index
+  %lanes = index.constant 128 : index
   %c1 = index.constant 1 : index
   %span_capacity = config.get @flash_next.span_capacity : index
-  %spans = func.call pure @flash_next_span_workers(%span_capacity) : (index) -> (index)
-  kernel.launch.config workgroups(%heads, %columns, %spans) workgroup_size(%lanes, %c1, %c1) : index
+  %rounding = index.constant 191 : index
+  %rounded_budget = index.add %budget, %rounding : index
+  %budget_spans = index.div %rounded_budget, %work_per_span : index
+  %active_spans = index.min %span_capacity, %budget_spans : index
+  %work = index.mul %active_spans, %work_per_span : index
+  %groups = index.min %work, %budget : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%lanes, %c1, %c1) : index
 } launch(%span_arg: buffer, %origins_arg: buffer, %layer_origin: offset, %qkv_arg: buffer, %norm_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer, %a_arg: buffer, %bias_arg: buffer, %state_arg: buffer, %output_arg: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %verification = config.get @flash_next.verification_width : index
@@ -296,13 +302,20 @@ kernel.def target(@flash_next_gdn_wave32) @gdn_recur() {
 }
 
 kernel.def target(@flash_next_gdn_wave32) @gdn_recur_commit() {
-  %heads = index.constant 48 : index
-  %columns = index.constant 32 : index
-  %lanes = index.constant 32 : index
+  %work_per_span = index.constant 192 : index
+  %groups_per_unit = index.constant 4 : index
+  %units = target.execution.unit.count : index
+  %budget = index.mul %units, %groups_per_unit : index
+  %lanes = index.constant 128 : index
   %c1 = index.constant 1 : index
   %span_capacity = config.get @flash_next.span_capacity : index
-  %spans = func.call pure @flash_next_span_workers(%span_capacity) : (index) -> (index)
-  kernel.launch.config workgroups(%heads, %columns, %spans) workgroup_size(%lanes, %c1, %c1) : index
+  %rounding = index.constant 191 : index
+  %rounded_budget = index.add %budget, %rounding : index
+  %budget_spans = index.div %rounded_budget, %work_per_span : index
+  %active_spans = index.min %span_capacity, %budget_spans : index
+  %work = index.mul %active_spans, %work_per_span : index
+  %groups = index.min %work, %budget : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%lanes, %c1, %c1) : index
 } launch(%span_arg: buffer, %origins_arg: buffer, %layer_origin: offset, %qkv_arg: buffer, %norm_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer, %a_arg: buffer, %bias_arg: buffer, %state_arg: buffer, %output_arg: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %verification = index.constant 0 : index
