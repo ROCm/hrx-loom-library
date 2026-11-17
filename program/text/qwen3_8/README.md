@@ -144,6 +144,14 @@ immutable feedback may be published. Continuations preserve their first-cohort
 owner while compacting live rows. Neither policy transforms nor packet writers
 wait for a device or infer ownership from buffer contents.
 
+The shared epoch calls `qwen38.epoch.target` after proposal and before feedback
+and predictor catch-up. A model links one provider with its stage catalog and
+buffer layout. `epoch_dispatch.loom` supplies the ordinary single-command target
+and verifier paths. A model-specific provider can split that target computation
+around asynchronous input readiness while retaining the shared packet encoding,
+speculation selection, feedback, and continuation policy. The returned completion
+must cover target outputs and accepted-state publication.
+
 Each verified epoch brackets proposal and target execution with three ordered
 queue-clock captures. The samples share the normal feedback banks and retire
 before publication, so observing them adds no host wait or separate readback.

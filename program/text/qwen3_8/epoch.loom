@@ -19,7 +19,7 @@ func.decl import("runner") @execute_3(%stage: i32, %b0: hal.buffer, %b1: hal.buf
 
 func.decl import("runner") @execute_6(%stage: i32, %b0: hal.buffer, %b1: hal.buffer, %b2: hal.buffer, %b3: hal.buffer, %b4: hal.buffer, %b5: hal.buffer) -> (i64)
 
-func.decl import("runner") @execute_7(%stage: i32, %b0: hal.buffer, %b1: hal.buffer, %b2: hal.buffer, %b3: hal.buffer, %b4: hal.buffer, %b5: hal.buffer, %b6: hal.buffer) -> (i64)
+template.decl @qwen38.epoch.target(%control_state: buffer, %verify: i1, %mixed: i1, %shape: i32, %target_stage: i32, %verify_stage: i32, %residual: hal.buffer, %metadata: hal.buffer, %origins: hal.buffer, %state: hal.buffer, %tokens: hal.buffer, %outputs: hal.buffer, %committed: hal.buffer, %results: hal.buffer) -> (i64)
 
 func.decl import("runner") @feedback(%slot: i32, %source: hal.buffer, %offset: i64, %length: i64) -> (i64)
 
@@ -84,10 +84,11 @@ func.def @epoch_once(%control_state: buffer, %mixed: i1, %shape: i32, %proposes:
     %target_started = func.call @timestamp(%results, %target_offset) : (hal.buffer, i64) -> (i64)
   }
   %warm_stage = scalar.addi %warm_first, %shape : i32
+  %target_stage = scalar.addi %shape, %target_first : i32
+  %ordinary_verify_stage = scalar.addi %warm_stage, %shape_count : i32
+  %verify_stage = scf.select %alternative, %chosen_verifier, %ordinary_verify_stage : i32
+  %computed = template.apply<@qwen38.epoch.target>(%control_state, %verify, %mixed, %shape, %target_stage, %verify_stage, %residual, %metadata, %origins, %state, %tokens, %outputs, %committed, %results) : (buffer, i1, i1, i32, i32, i32, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer) -> (i64)
   %target = scf.if %verify -> (i64) {
-    %ordinary_verify_stage = scalar.addi %warm_stage, %shape_count : i32
-    %verify_stage = scf.select %alternative, %chosen_verifier, %ordinary_verify_stage : i32
-    %completion = func.call @execute_7(%verify_stage, %residual, %metadata, %origins, %state, %tokens, %committed, %results) : (i32, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer) -> (i64)
     %end_offset = scalar.constant 16 : i64
     %measured = func.call @timestamp(%results, %end_offset) : (hal.buffer, i64) -> (i64)
     %count = scalar.extui %span_count : i32 to i64
@@ -110,8 +111,6 @@ func.def @epoch_once(%control_state: buffer, %mixed: i1, %shape: i32, %proposes:
     %feedback = func.call @feedback(%feedback_slot, %results, %c0_2, %length) : (i32, hal.buffer, i64, i64) -> (i64)
     scf.yield %measured : i64
   } else {
-    %target_stage = scalar.addi %shape, %target_first : i32
-    %completion = func.call @execute_6(%target_stage, %residual, %metadata, %origins, %state, %tokens, %outputs) : (i32, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer, hal.buffer) -> (i64)
     %has_output = scalar.cmpi ne, %output_count, %c0 : i32
     scf.if %has_output {
       %count = scalar.extui %output_count : i32 to i64
@@ -119,7 +118,7 @@ func.def @epoch_once(%control_state: buffer, %mixed: i1, %shape: i32, %proposes:
       %length = scalar.muli %count, %token_bytes : i64
       %feedback = func.call @feedback(%c0, %outputs, %c0_2, %length) : (i32, hal.buffer, i64, i64) -> (i64)
     }
-    scf.yield %completion : i64
+    scf.yield %computed : i64
   }
   // Catch-up only mutates the private draft cache and committed carry. Target
   // feedback stays immutable and can transfer concurrently with this command.
