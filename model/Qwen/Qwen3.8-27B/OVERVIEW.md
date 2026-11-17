@@ -59,8 +59,8 @@ Text, checkpoint MTP, vision, and DFlash2 have native service checks for source 
 relocatable-bytecode programs. The checks exercise concurrent
 requests, exact responses, checkpoint forks and continuation, parameter
 unload/reload, disconnected clients, and joined shutdown. Vision also checks
-independent projector residency. DFlash2 retains the eight-row preset and its
-seven-proposal depth. CDNA text is checked on MI300 with the `cdna-text` preset.
+independent projector residency. DFlash2 uses the eight-row preset and a
+seven-proposal ceiling. CDNA text is checked on MI300 with the `cdna-text` preset.
 
 The original model, selected quantization, and selected draft repository declare
 Apache-2.0. Their original cards are available from
@@ -76,8 +76,16 @@ two-epoch continuation. Every preset reserves four explicit checkpoint slots
 for conversation forks and reuse across parameter unloading. These retained
 endpoints are independent of the execution rows. `target-only` disables
 drafting and continuation.
-`dflash2` uses seven proposals and the separate draft parameter scope. The
-`qwen38.draft_kind` JIT setting distinguishes checkpoint MTP (`0`) from
+`dflash2` uses the separate draft parameter scope. Its `draft_depth` is a ceiling:
+with the default of seven, a single request uses up to seven proposals, two to
+four active requests use up to three, and five to eight use one. Selection
+changes at ordinary epoch boundaries as requests arrive and finish. A smaller
+configured ceiling caps every choice. Preparation compiles only reachable
+shorter program pairs, sharing the original weights and retained state.
+Selection needs neither calibration requests nor compilation during generation.
+Prefill, media, supplied candidates, and larger cohorts retain the ordinary
+prepared programs. Target sampling and speculative verification are unchanged.
+The `qwen38.draft_kind` JIT setting distinguishes checkpoint MTP (`0`) from
 DFlash2 (`1`); a filename is not used to infer the drafting algorithm.
 
 The numerical provider set contains RDNA and CDNA text kernels. `cdna-text`
