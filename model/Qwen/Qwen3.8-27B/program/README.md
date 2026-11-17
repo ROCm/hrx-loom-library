@@ -21,17 +21,23 @@ predictor catch-up. DFlash2 uses a separate parameter scope, five target-layer
 feature taps, and proposal-private K/V. Only accepted features reach its
 retained context. Both strategies remain parts of the text service.
 
-DFlash2 supports `draft_depth` from one through seven, with seven as the
-default. Each proposal contains one anchor plus that many predicted positions.
-The selected width specializes convolution, bidirectional attention, candidate
-selection, and private storage together. Shorter blocks reduce proposal and
-verification work without changing the target's acceptance rule.
+DFlash2 supports a `draft_depth` ceiling from one through seven, with seven as
+the default. A single live request uses that ceiling; two through four use at
+most three proposals, and five through eight use one. Preparation returns the
+admitted proposal capacity from its existing shape traversal and declares only
+reachable shorter proposal/verifier pairs. The shared text encoder selects a
+pair and compacts both queued banks while preserving the native reservation and
+request identities. The selected width includes one anchor and specializes
+convolution, bidirectional attention, candidate selection, and private storage
+together. Shorter blocks reduce proposal and verification work without changing
+the target's acceptance rule.
 
 RDNA proposals containing four or eight neural positions use shared raw
 Q4_K/Q6_K register panels. Each decoded weight serves the complete row bank
 before retirement, reducing inactive matrix lanes at those sizes. Model
-composition selects that schedule from the prepared shape; changing the
-proposal length during a response remains a separate serving-policy concern.
+composition selects that schedule from the prepared shape. The shared host
+policy can change that shape during a response as peers arrive or finish;
+already queued programs retain their captured stage identities.
 
 ## Link and parameter boundaries
 
