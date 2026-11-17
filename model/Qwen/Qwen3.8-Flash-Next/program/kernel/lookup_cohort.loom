@@ -1,9 +1,9 @@
 // GPU-only proposal selection and cohort compaction. The target packet owns
-// request policy; paired origin records preserve its input and selected-output
+// request policy; origin records preserve its input, selected-output, and span
 // coordinates through recursive rounds. Greedy requests may copy a complete
 // remaining tail from accepted history. Other requests retain neural drafting.
 // Target verification remains authoritative for either proposal source.
-// Publication compacts six-word spans, paired origins, IDs, and vocabulary
+// Publication compacts six-word spans, three-word origins, IDs, and vocabulary
 // modes in ascending order. A movement map then gathers hidden state into a
 // separate buffer, while resident cache and carry remain in place.
 
@@ -52,7 +52,7 @@ kernel.def @flash_next_lookup_parameters(%round: index) {
   %identity_origin = func.call @qwen38_packet_identity_origin(%packet_capacity) : (index) -> (offset)
   %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
   %spans = buffer.view %draft[%descriptor_origin] : buffer -> view<[%capacity]x6xi32>
-  %mapping = buffer.view %origins[%origin] : buffer -> view<[%capacity]x2xi32>
+  %mapping = buffer.view %origins[%origin] : buffer -> view<[%capacity]x3xi32>
   %records = buffer.view %parameters[%origin] : buffer -> view<[%capacity]x16xi32>
   %policies = buffer.view %epoch[%policy_origin] : buffer -> view<[%packet_capacity]x6xf32>
   %identities = buffer.view %epoch[%identity_origin] : buffer -> view<[%packet_capacity]x2xi32>
@@ -73,7 +73,7 @@ kernel.def @flash_next_lookup_parameters(%round: index) {
     %row_word = view.load %spans[%slot, 3] : view<[%capacity]x6xi32> -> i32
     // Original target output identity survives every draft compaction. Its
     // policy owner is independent of both the resident row and draft slot.
-    %selection_word = view.load %mapping[%slot, 1] : view<[%capacity]x2xi32> -> i32
+    %selection_word = view.load %mapping[%slot, 1] : view<[%capacity]x3xi32> -> i32
     %selection_value = index.cast %selection_word : i32 to index
     %selection = index.assume %selection_value [ge(%selection_value, 0), lt(%selection_value, %packet_capacity)] : index
     %owner_word = view.load %identities[%selection, 0] : view<[%packet_capacity]x2xi32> -> i32
@@ -92,7 +92,7 @@ kernel.def @flash_next_lookup_parameters(%round: index) {
     view.store %tail_word, %records[%slot, 4] : i32, view<[%capacity]x16xi32>
     view.store %minimum, %records[%slot, 5] : i32, view<[%capacity]x16xi32>
     view.store %row_word, %records[%slot, 7] : i32, view<[%capacity]x16xi32>
-    %begin_word = view.load %mapping[%slot, 0] : view<[%capacity]x2xi32> -> i32
+    %begin_word = view.load %mapping[%slot, 0] : view<[%capacity]x3xi32> -> i32
     %begin = index.cast %begin_word : i32 to index
     scf.for %relative = [%c0 to %tail step %c1] {
       %input = index.add %begin, %relative : index
@@ -129,7 +129,7 @@ kernel.def @flash_next_lookup_publish(%round: index) {
   %cohort_count = func.call pure @flash_next_draft_cohorts(%capacity) : (index) -> (index)
   %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
   %spans = buffer.view %draft[%descriptor_origin] : buffer -> view<[%capacity]x6xi32>
-  %origins_view = buffer.view %origins[%origin] : buffer -> view<[%capacity]x2xi32>
+  %origins_view = buffer.view %origins[%origin] : buffer -> view<[%capacity]x3xi32>
   %inputs = buffer.view %ids[%origin] : buffer -> view<[%capacity]xi32>
   %records = buffer.view %parameters[%origin] : buffer -> view<[%capacity]x16xi32>
   %selections = buffer.view %selected[%origin] : buffer -> view<[%capacity]x2xi32>
@@ -156,7 +156,7 @@ kernel.def @flash_next_lookup_publish(%round: index) {
     %has_match = index.cmp ugt, %end, %c0 : index
     %fits = index.cmp ule, %source_limit, %committed : index
     %copied = scalar.andi %has_match, %fits : i1
-    %begin_word = view.load %origins_view[%old, 0] : view<[%capacity]x2xi32> -> i32
+    %begin_word = view.load %origins_view[%old, 0] : view<[%capacity]x3xi32> -> i32
     %begin = index.cast %begin_word : i32 to index
     %new_count = scf.if %copied -> (index) {
       %first = index.add %round, %c1 : index
@@ -173,7 +173,8 @@ kernel.def @flash_next_lookup_publish(%round: index) {
       %position = view.load %spans[%old, 1] : view<[%capacity]x6xi32> -> i32
       %row = view.load %spans[%old, 3] : view<[%capacity]x6xi32> -> i32
       %source_position = view.load %spans[%old, 4] : view<[%capacity]x6xi32> -> i32
-      %target_selection = view.load %origins_view[%old, 1] : view<[%capacity]x2xi32> -> i32
+      %target_selection = view.load %origins_view[%old, 1] : view<[%capacity]x3xi32> -> i32
+      %target_span = view.load %origins_view[%old, 2] : view<[%capacity]x3xi32> -> i32
       %slot_word = index.cast %slot : index to i32
       %id = view.load %inputs[%old] : view<[%capacity]xi32> -> i32
       %mode = view.load %modes[%old] : view<[%capacity]xi32> -> i32
@@ -184,8 +185,9 @@ kernel.def @flash_next_lookup_publish(%round: index) {
       view.store %row, %spans[%slot, 3] : i32, view<[%capacity]x6xi32>
       view.store %source_position, %spans[%slot, 4] : i32, view<[%capacity]x6xi32>
       view.store %slot_word, %spans[%slot, 5] : i32, view<[%capacity]x6xi32>
-      view.store %begin_word, %origins_view[%slot, 0] : i32, view<[%capacity]x2xi32>
-      view.store %target_selection, %origins_view[%slot, 1] : i32, view<[%capacity]x2xi32>
+      view.store %begin_word, %origins_view[%slot, 0] : i32, view<[%capacity]x3xi32>
+      view.store %target_selection, %origins_view[%slot, 1] : i32, view<[%capacity]x3xi32>
+      view.store %target_span, %origins_view[%slot, 2] : i32, view<[%capacity]x3xi32>
       view.store %id, %inputs[%slot] : i32, view<[%capacity]xi32>
       view.store %mode, %modes[%slot] : i32, view<[%capacity]xi32>
       %cohort = index.div %slot, %c4 : index
