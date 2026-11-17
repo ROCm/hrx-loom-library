@@ -1,0 +1,244 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Single-token Qwen3.5 Gated DeltaNet input projections.
+//
+// Configuration ABI: (input_size, value_heads). The input width is a multiple
+// of 256 between 1024 and 5120. Q and K each contain 16 heads of 128 channels;
+// V and Z contain value_heads*128 channels; alpha and beta contain one value
+// per value head. The launch region derives one 64-thread workgroup per V/Z
+// channel, up to 8192 workgroups.
+//
+// The input is one planar Q8_1 row. QKV weights are Q5_K, Z weights are Q4_K,
+// and alpha/beta weights are Q8_0. Each workitem retains one complete 32-code
+// activation group and reuses it across every projection row owned by the
+// workgroup. The packed integer dots and affine minimum correction match the
+// GGML reference representation; only complete group contributions become
+// F32 before the row reduction.
+
+func.decl @ggml_q4_k_load_group32(%weight: buffer, %row_origin: offset, %block: index, %group: index) -> (vector<32xi8>, f32, f32)
+
+func.decl @ggml_q5_k_load_group32(%weight: buffer, %row_origin: offset, %block: index, %group: index) -> (vector<32xi8>, f32, f32)
+
+func.decl @ggml_q8_0_load_block(%input: buffer, %scale_origin: offset, %code_origin: offset) -> (vector<32xi8>, f32)
+
+func.decl @ggml_q8_1_planar_load_block32(%row_count: index, %row: index, %block_count: index, %block: index, %input: buffer) -> (vector<32xi8>, f32, f32)
+
+template.decl @ggml.qk.affine_q8_1_planar_dot(%weight_codes: vector<32xi8>, %weight_scale: f32, %weight_minimum: f32, %q8_codes: vector<32xi8>, %q8_scale: f32, %q8_code_sum: f32) -> (f32)
+
+func.def inline @qwen35_gdn_projection_q4_group(%weight: buffer, %row_origin: offset, %block: index, %group: index, %q8_codes: vector<32xi8>, %q8_scale: f32, %q8_code_sum: f32) -> (f32) {
+  %weight_codes, %weight_scale, %weight_minimum = func.call @ggml_q4_k_load_group32(%weight, %row_origin, %block, %group) : (buffer, offset, index, index) -> (vector<32xi8>, f32, f32)
+  %contribution = template.apply<@ggml.qk.affine_q8_1_planar_dot>(%weight_codes, %weight_scale, %weight_minimum, %q8_codes, %q8_scale, %q8_code_sum) : (vector<32xi8>, f32, f32, vector<32xi8>, f32, f32) -> (f32)
+  func.return %contribution : f32
+}
+
+func.def inline @qwen35_gdn_projection_q5_group(%weight: buffer, %row_origin: offset, %block: index, %group: index, %q8_codes: vector<32xi8>, %q8_scale: f32, %q8_code_sum: f32) -> (f32) {
+  %weight_codes, %weight_scale, %weight_minimum = func.call @ggml_q5_k_load_group32(%weight, %row_origin, %block, %group) : (buffer, offset, index, index) -> (vector<32xi8>, f32, f32)
+  %contribution = template.apply<@ggml.qk.affine_q8_1_planar_dot>(%weight_codes, %weight_scale, %weight_minimum, %q8_codes, %q8_scale, %q8_code_sum) : (vector<32xi8>, f32, f32, vector<32xi8>, f32, f32) -> (f32)
+  func.return %contribution : f32
+}
+
+func.def inline @qwen35_gdn_projection_q8_group(%weight: buffer, %row_origin: offset, %block: index, %q8_codes: vector<32xi8>, %q8_scale: f32, %q8_code_sum: f32) -> (f32) {
+  %block_bytes = index.constant 34 : offset
+  %payload_bytes = index.constant 2 : offset
+  %block_add = index.scale %block, %block_bytes : index, offset -> offset
+  %scale_origin = index.add %row_origin, %block_add : offset
+  %code_origin = index.add %scale_origin, %payload_bytes : offset
+  %weight_codes, %weight_scale = func.call @ggml_q8_0_load_block(%weight, %scale_origin, %code_origin) : (buffer, offset, offset) -> (vector<32xi8>, f32)
+  %c0_f32 = scalar.constant 0.0 : f32
+  %contribution = template.apply<@ggml.qk.affine_q8_1_planar_dot>(%weight_codes, %weight_scale, %c0_f32, %q8_codes, %q8_scale, %q8_code_sum) : (vector<32xi8>, f32, f32, vector<32xi8>, f32, f32) -> (f32)
+  func.return %contribution : f32
+}
+
+// Reduces one row with the GGML kernels' fixed 16/8/4/2/1 XOR tree across each
+// 32-thread cohort and publishes two partials. The kernel performs one
+// workgroup barrier after all live rows are published.
+func.def inline @qwen35_gdn_projection_publish_partial(%slot: index, %workitem: index, %value: f32, %partials: buffer) {
+  %cluster_width = index.constant 32 : index
+  %begin = index.constant 0 : index
+  %cluster = index.div %workitem, %cluster_width : index
+  %lane = index.rem %workitem, %cluster_width : index
+  %distance_16 = scalar.constant 16 : i32
+  %distance_8 = scalar.constant 8 : i32
+  %distance_4 = scalar.constant 4 : i32
+  %distance_2 = scalar.constant 2 : i32
+  %distance_1 = scalar.constant 1 : i32
+  %width = scalar.constant 32 : i32
+  %partner_16, %valid_16 = kernel.subgroup.shuffle<xor> %value, %distance_16, %width : f32, i32, i32
+  %sum_16 = scalar.addf %value, %partner_16 : f32
+  %partner_8, %valid_8 = kernel.subgroup.shuffle<xor> %sum_16, %distance_8, %width : f32, i32, i32
+  %sum_8 = scalar.addf %sum_16, %partner_8 : f32
+  %partner_4, %valid_4 = kernel.subgroup.shuffle<xor> %sum_8, %distance_4, %width : f32, i32, i32
+  %sum_4 = scalar.addf %sum_8, %partner_4 : f32
+  %partner_2, %valid_2 = kernel.subgroup.shuffle<xor> %sum_4, %distance_2, %width : f32, i32, i32
+  %sum_2 = scalar.addf %sum_4, %partner_2 : f32
+  %partner_1, %valid_1 = kernel.subgroup.shuffle<xor> %sum_2, %distance_1, %width : f32, i32, i32
+  %sum = scalar.addf %sum_2, %partner_1 : f32
+  %leader = index.cmp eq, %lane, %begin : index
+  scf.if %leader {
+    %origin = index.constant 0 : offset
+    %partial_view = buffer.view %partials[%origin] : buffer -> view<6x2xf32>
+    view.store %sum, %partial_view[%slot, %cluster] : f32, view<6x2xf32>
+  }
+  func.return
+}
+
+func.def inline @qwen35_gdn_projection_read_partial(%slot: index, %partials: buffer) -> (f32) {
+  %origin = index.constant 0 : offset
+  %partial_view = buffer.view %partials[%origin] : buffer -> view<6x2xf32>
+  %low = view.load %partial_view[%slot, 0] : view<6x2xf32> -> f32
+  %high = view.load %partial_view[%slot, 1] : view<6x2xf32> -> f32
+  %sum = scalar.addf %low, %high : f32
+  func.return %sum : f32
+}
+
+kernel.def export("qwen35_gdn_projection_decode") @qwen35_gdn_projection_decode(%input_size_arg: index, %value_heads_arg: index) {
+  %input_size = index.assume %input_size_arg [range(%input_size_arg, 1024, 5120), multiple_of(%input_size_arg, 256)] : index
+  %value_heads = index.assume %value_heads_arg [range(%value_heads_arg, 16, 64), multiple_of(%value_heads_arg, 16)] : index
+  %channels_per_head = index.constant 128 : index
+  %value_channels = index.mul %value_heads, %channels_per_head : index
+  %unit = index.constant 1 : index
+  %workgroup_size = index.constant 64 : index
+  kernel.launch.config workgroups(%value_channels, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%input_size_arg: index, %value_heads_arg: index, %q8_input: buffer, %qkv_weight: buffer, %z_weight: buffer, %alpha_weight: buffer, %beta_weight: buffer, %qkv_output: buffer, %z_output: buffer, %alpha_output: buffer, %beta_output: buffer) {
+  %input_size = index.assume %input_size_arg [range(%input_size_arg, 1024, 5120), multiple_of(%input_size_arg, 256)] : index
+  %value_heads = index.assume %value_heads_arg [range(%value_heads_arg, 16, 64), multiple_of(%value_heads_arg, 16)] : index
+  %q8_input_noalias, %qkv_weight_noalias, %z_weight_noalias, %alpha_weight_noalias, %beta_weight_noalias, %qkv_output_noalias, %z_output_noalias, %alpha_output_noalias, %beta_output_noalias = buffer.assume.noalias %q8_input, %qkv_weight, %z_weight, %alpha_weight, %beta_weight, %qkv_output, %z_output, %alpha_output, %beta_output : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer
+  %channel_value = kernel.workgroup.id<x> : index
+  %workitem_value = kernel.workitem.id<x> : index
+  %channels_per_head = index.constant 128 : index
+  %value_channels = index.mul %value_heads, %channels_per_head : index
+  %channel = index.assume %channel_value [lt(%channel_value, %value_channels)] : index
+  %workitem = index.assume %workitem_value [range(%workitem_value, 0, 63)] : index
+  %origin = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %unit = index.constant 1 : index
+  %workgroup_size = index.constant 64 : index
+  %values_per_group = index.constant 32 : index
+  %values_per_block = index.constant 256 : index
+  %groups_per_block = index.constant 8 : index
+  %query_key_channels = index.constant 2048 : index
+  %query_key_prefix = index.constant 4096 : index
+  %q5_block_bytes = index.constant 176 : offset
+  %q4_block_bytes = index.constant 144 : offset
+  %q8_block_bytes = index.constant 34 : offset
+  %c0_f32 = scalar.constant 0.0 : f32
+  %owns_query_key = index.cmp ult, %channel, %query_key_channels : index
+  %owns_scalar = index.cmp ult, %channel, %value_heads : index
+  %weight_block_count = index.div %input_size, %values_per_block : index
+  %input_group_count = index.div %input_size, %values_per_group : index
+  %q5_row_bytes = index.scale %weight_block_count, %q5_block_bytes : index, offset -> offset
+  %q4_row_bytes = index.scale %weight_block_count, %q4_block_bytes : index, offset -> offset
+  %q8_row_bytes = index.scale %input_group_count, %q8_block_bytes : index, offset -> offset
+  %value_row_value = index.add %query_key_prefix, %channel : index
+  %qkv_row_count_value = index.add %query_key_prefix, %value_channels : index
+  %qkv_row_count = index.assume %qkv_row_count_value [range(%qkv_row_count_value, 6144, 12288), multiple_of(%qkv_row_count_value, 2048)] : index
+  %value_row = index.assume %value_row_value [lt(%value_row_value, %qkv_row_count)] : index
+  %value_row_origin = index.scale %value_row, %q5_row_bytes : index, offset -> offset
+  %z_row_origin = index.scale %channel, %q4_row_bytes : index, offset -> offset
+  %alpha_row_origin = index.scale %channel, %q8_row_bytes : index, offset -> offset
+  %beta_row_origin = index.scale %channel, %q8_row_bytes : index, offset -> offset
+  %query_row_origin, %key_row_origin = scf.if %owns_query_key -> (offset, offset) {
+    %query_row = index.assume %channel [lt(%channel, %query_key_channels)] : index
+    %key_row_value = index.add %query_key_channels, %query_row : index
+    %key_row = index.assume %key_row_value [lt(%key_row_value, %query_key_prefix)] : index
+    %query_offset = index.scale %query_row, %q5_row_bytes : index, offset -> offset
+    %key_offset = index.scale %key_row, %q5_row_bytes : index, offset -> offset
+    scf.yield %query_offset, %key_offset : offset, offset
+  } else {
+    scf.yield %origin, %origin : offset, offset
+  }
+  %value_sum, %z_sum, %query_sum, %key_sum, %alpha_sum, %beta_sum = scf.for %input_group = [%workitem to %input_group_count step %workgroup_size](%value_acc = %c0_f32 : f32, %z_acc = %c0_f32 : f32, %query_acc = %c0_f32 : f32, %key_acc = %c0_f32 : f32, %alpha_acc = %c0_f32 : f32, %beta_acc = %c0_f32 : f32) -> (f32, f32, f32, f32, f32, f32) {
+    %weight_block = index.div %input_group, %groups_per_block : index
+    %weight_group = index.rem %input_group, %groups_per_block : index
+    %q8_codes, %q8_scale, %q8_code_sum = func.call @ggml_q8_1_planar_load_block32(%unit, %begin, %input_group_count, %input_group, %q8_input_noalias) : (index, index, index, index, buffer) -> (vector<32xi8>, f32, f32)
+    %value_contribution = func.call @qwen35_gdn_projection_q5_group(%qkv_weight_noalias, %value_row_origin, %weight_block, %weight_group, %q8_codes, %q8_scale, %q8_code_sum) : (buffer, offset, index, index, vector<32xi8>, f32, f32) -> (f32)
+    %z_contribution = func.call @qwen35_gdn_projection_q4_group(%z_weight_noalias, %z_row_origin, %weight_block, %weight_group, %q8_codes, %q8_scale, %q8_code_sum) : (buffer, offset, index, index, vector<32xi8>, f32, f32) -> (f32)
+    %next_value = scalar.addf %value_acc, %value_contribution : f32
+    %next_z = scalar.addf %z_acc, %z_contribution : f32
+    %next_query, %next_key = scf.if %owns_query_key -> (f32, f32) {
+      %query_contribution = func.call @qwen35_gdn_projection_q5_group(%qkv_weight_noalias, %query_row_origin, %weight_block, %weight_group, %q8_codes, %q8_scale, %q8_code_sum) : (buffer, offset, index, index, vector<32xi8>, f32, f32) -> (f32)
+      %key_contribution = func.call @qwen35_gdn_projection_q5_group(%qkv_weight_noalias, %key_row_origin, %weight_block, %weight_group, %q8_codes, %q8_scale, %q8_code_sum) : (buffer, offset, index, index, vector<32xi8>, f32, f32) -> (f32)
+      %query_next = scalar.addf %query_acc, %query_contribution : f32
+      %key_next = scalar.addf %key_acc, %key_contribution : f32
+      scf.yield %query_next, %key_next : f32, f32
+    } else {
+      scf.yield %query_acc, %key_acc : f32, f32
+    }
+    %next_alpha, %next_beta = scf.if %owns_scalar -> (f32, f32) {
+      %alpha_contribution = func.call @qwen35_gdn_projection_q8_group(%alpha_weight_noalias, %alpha_row_origin, %input_group, %q8_codes, %q8_scale, %q8_code_sum) : (buffer, offset, index, vector<32xi8>, f32, f32) -> (f32)
+      %beta_contribution = func.call @qwen35_gdn_projection_q8_group(%beta_weight_noalias, %beta_row_origin, %input_group, %q8_codes, %q8_scale, %q8_code_sum) : (buffer, offset, index, vector<32xi8>, f32, f32) -> (f32)
+      %alpha_next = scalar.addf %alpha_acc, %alpha_contribution : f32
+      %beta_next = scalar.addf %beta_acc, %beta_contribution : f32
+      scf.yield %alpha_next, %beta_next : f32, f32
+    } else {
+      scf.yield %alpha_acc, %beta_acc : f32, f32
+    }
+    scf.yield %next_value, %next_z, %next_query, %next_key, %next_alpha, %next_beta : f32, f32, f32, f32, f32, f32
+  }
+  %partial_bytes = index.constant 48 : offset
+  %partials = buffer.alloca<workgroup> align(16) %partial_bytes : buffer
+  func.call @qwen35_gdn_projection_publish_partial(%begin, %workitem, %value_sum, %partials) : (index, index, f32, buffer)
+  func.call @qwen35_gdn_projection_publish_partial(%unit, %workitem, %z_sum, %partials) : (index, index, f32, buffer)
+  scf.if %owns_query_key {
+    %query_slot = index.constant 2 : index
+    %key_slot = index.constant 3 : index
+    func.call @qwen35_gdn_projection_publish_partial(%query_slot, %workitem, %query_sum, %partials) : (index, index, f32, buffer)
+    func.call @qwen35_gdn_projection_publish_partial(%key_slot, %workitem, %key_sum, %partials) : (index, index, f32, buffer)
+  }
+  scf.if %owns_scalar {
+    %alpha_slot = index.constant 4 : index
+    %beta_slot = index.constant 5 : index
+    func.call @qwen35_gdn_projection_publish_partial(%alpha_slot, %workitem, %alpha_sum, %partials) : (index, index, f32, buffer)
+    func.call @qwen35_gdn_projection_publish_partial(%beta_slot, %workitem, %beta_sum, %partials) : (index, index, f32, buffer)
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %write_value = index.cmp eq, %workitem, %begin : index
+  scf.if %write_value {
+    %value = func.call @qwen35_gdn_projection_read_partial(%begin, %partials) : (index, buffer) -> (f32)
+    %qkv_output_view = buffer.view %qkv_output_noalias[%origin] : buffer -> view<[%qkv_row_count]xf32>
+    view.store %value, %qkv_output_view[%value_row] : f32, view<[%qkv_row_count]xf32>
+  }
+  %write_z = index.cmp eq, %workitem, %unit : index
+  scf.if %write_z {
+    %value = func.call @qwen35_gdn_projection_read_partial(%unit, %partials) : (index, buffer) -> (f32)
+    %z_output_view = buffer.view %z_output_noalias[%origin] : buffer -> view<[%value_channels]xf32>
+    view.store %value, %z_output_view[%channel] : f32, view<[%value_channels]xf32>
+  }
+  scf.if %owns_query_key {
+    %query_slot = index.constant 2 : index
+    %key_slot = index.constant 3 : index
+    %write_query = index.cmp eq, %workitem, %query_slot : index
+    scf.if %write_query {
+      %value = func.call @qwen35_gdn_projection_read_partial(%query_slot, %partials) : (index, buffer) -> (f32)
+      %qkv_output_view = buffer.view %qkv_output_noalias[%origin] : buffer -> view<[%qkv_row_count]xf32>
+      view.store %value, %qkv_output_view[%channel] : f32, view<[%qkv_row_count]xf32>
+    }
+    %write_key = index.cmp eq, %workitem, %key_slot : index
+    scf.if %write_key {
+      %value = func.call @qwen35_gdn_projection_read_partial(%key_slot, %partials) : (index, buffer) -> (f32)
+      %key_row_value = index.add %query_key_channels, %channel : index
+      %key_row = index.assume %key_row_value [lt(%key_row_value, %query_key_prefix)] : index
+      %qkv_output_view = buffer.view %qkv_output_noalias[%origin] : buffer -> view<[%qkv_row_count]xf32>
+      view.store %value, %qkv_output_view[%key_row] : f32, view<[%qkv_row_count]xf32>
+    }
+  }
+  scf.if %owns_scalar {
+    %scalar_row = index.assume %channel [lt(%channel, %value_heads)] : index
+    %alpha_slot = index.constant 4 : index
+    %beta_slot = index.constant 5 : index
+    %write_alpha = index.cmp eq, %workitem, %alpha_slot : index
+    scf.if %write_alpha {
+      %value = func.call @qwen35_gdn_projection_read_partial(%alpha_slot, %partials) : (index, buffer) -> (f32)
+      %alpha_output_view = buffer.view %alpha_output_noalias[%origin] : buffer -> view<[%value_heads]xf32>
+      view.store %value, %alpha_output_view[%scalar_row] : f32, view<[%value_heads]xf32>
+    }
+    %write_beta = index.cmp eq, %workitem, %beta_slot : index
+    scf.if %write_beta {
+      %value = func.call @qwen35_gdn_projection_read_partial(%beta_slot, %partials) : (index, buffer) -> (f32)
+      %beta_output_view = buffer.view %beta_output_noalias[%origin] : buffer -> view<[%value_heads]xf32>
+      view.store %value, %beta_output_view[%scalar_row] : f32, view<[%value_heads]xf32>
+    }
+  }
+  kernel.return
+}

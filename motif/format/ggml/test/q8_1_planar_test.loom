@@ -3,6 +3,8 @@
 // Whole-storage comparisons cover guards, multi-row addressing, zero blocks,
 // signed values, F16 scale rounding, and immutable inputs.
 
+func.decl @ggml_q8_1_planar_load_block32(%row_count: index, %row: index, %block_count: index, %block: index, %input: buffer) -> (vector<32xi8>, f32, f32)
+
 func.decl @ggml_q8_1_planar_publish_block32(%row_count: index, %row: index, %block_count: index, %block: index, %values: vector<32xf32>, %output: buffer)
 
 func.decl @ggml_q8_1_planar_publish_packet8_cluster4(%row_count: index, %row: index, %block_count: index, %block: index, %lane_in_block: index, %values: vector<8xf32>, %output: buffer)
@@ -237,6 +239,80 @@ check.scenario public @random configure[4](%topology: index, %configuration_entr
     check.compare<@publish_topology, @publish_reference>[%topology](%input, %output) : [index](tensor<512xf32>, tensor<160xi32>) -> () {
       check.expect.bitwise actual(%output) expected(%output) : tensor<160xi32>
       check.expect.bitwise actual(%input) expected(%input) : tensor<512xf32>
+    }
+  }
+  check.return
+}
+
+func.def @initialize_load_metadata(%input: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %row_count = index.constant 2 : index
+  %block_count = index.constant 8 : index
+  %metadata_origin = index.constant 512 : offset
+  %metadata = buffer.view %input[%metadata_origin] : buffer -> view<2x8x2xf32>
+  scf.for %row = [%begin to %row_count step %step] {
+    scf.for %block = [%begin to %block_count step %step] {
+      %ordinal = index.madd %row, %block_count, %block : index
+      %integer = index.cast %ordinal : index to i32
+      %floating = scalar.uitofp %integer : i32 to f32
+      %scale_bias = scalar.constant 0.125 : f32
+      %sum_bias = scalar.constant -9.0 : f32
+      %scale = scalar.addf %floating, %scale_bias : f32
+      %sum = scalar.addf %floating, %sum_bias : f32
+      view.store %scale, %metadata[%row, %block, 0] : f32, view<2x8x2xf32>
+      view.store %sum, %metadata[%row, %block, 1] : f32, view<2x8x2xf32>
+    }
+  }
+  func.return
+}
+
+kernel.def @load_planar_kernel() {
+  %row_count = index.constant 2 : index
+  %block_count = index.constant 8 : index
+  %unit = index.constant 1 : index
+  kernel.launch.config workgroups(%block_count, %row_count, %unit) workgroup_size(%unit, %unit, %unit) : index
+} launch(%input: buffer, %output: buffer) {
+  %row_count = index.constant 2 : index
+  %block_count = index.constant 8 : index
+  %row = kernel.workgroup.id<y> : index
+  %block = kernel.workgroup.id<x> : index
+  %origin = index.constant 0 : offset
+  %begin = index.constant 0 : index
+  %metadata_origin = index.constant 512 : offset
+  %codes, %scale, %sum = func.call @ggml_q8_1_planar_load_block32(%row_count, %row, %block_count, %block, %input) : (index, index, index, index, buffer) -> (vector<32xi8>, f32, f32)
+  %words = vector.bitcast %codes : vector<32xi8> to vector<8xi32>
+  %payload = buffer.view %output[%origin] : buffer -> view<2x8x8xi32>
+  vector.store %words, %payload[%row, %block, %begin] : vector<8xi32>, view<2x8x8xi32>
+  %metadata_values = vector.from_elements %scale, %sum : vector<2xf32>
+  %metadata = buffer.view %output[%metadata_origin] : buffer -> view<2x8x2xf32>
+  vector.store %metadata_values, %metadata[%row, %block, %begin] : vector<2xf32>, view<2x8x2xf32>
+  kernel.return
+}
+
+func.def @load_planar_reference(%input: buffer, %output: buffer) {
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %word_count = index.constant 160 : index
+  %origin = index.constant 0 : offset
+  %input_words = buffer.view %input[%origin] : buffer -> view<160xi32>
+  %output_words = buffer.view %output[%origin] : buffer -> view<160xi32>
+  scf.for %word = [%begin to %word_count step %step] {
+    %value = view.load %input_words[%word] : view<160xi32> -> i32
+    view.store %value, %output_words[%word] : i32, view<160xi32>
+  }
+  func.return
+}
+
+check.scenario public @load_planar {
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %seed = check.entropy.read %entropy[0] : check.entropy -> i64
+    %input = check.generate.random.uniform seed(%seed) range(-2147483648 to 2147483647) : tensor<160xi32>
+    check.generate<@initialize_load_metadata>(%input) : (tensor<160xi32>) -> ()
+    %output = check.generate.fill value(-99) : tensor<160xi32>
+    check.compare<@load_planar_kernel, @load_planar_reference>(%input, %output) : (tensor<160xi32>, tensor<160xi32>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<160xi32>
+      check.expect.bitwise actual(%input) expected(%input) : tensor<160xi32>
     }
   }
   check.return
