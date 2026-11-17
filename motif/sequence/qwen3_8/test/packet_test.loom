@@ -1,0 +1,161 @@
+// Independent packet compaction checks for ordinary and mixed records.
+// Closed-form input and output coordinates check overlapping movement, skipped
+// copies, every retained prefix, empty epochs, and selected or unselected known
+// input before or after the generated spans.
+
+func.decl @qwen38_packet_compact_prefix(%mixed: index, %capacity: index, %epoch: buffer, %tokens: buffer)
+
+func.decl @qwen38_packet_options_origin(%capacity: index) -> (offset)
+
+func.decl @qwen38_packet_selection_origin(%capacity: index) -> (offset)
+
+func.decl @qwen38_packet_identity_origin(%capacity: index) -> (offset)
+
+// Four reserved eight-token spans: shortened generated, full generated,
+// supplied candidates, and known input with an optional final selection. Known
+// input appears first or last so token and output coordinates vary independently.
+// This constructor writes either original or packed coordinates directly;
+// the oracle never calls the compactor or copies an overlapping input range.
+func.def @packet_fixture(%trial_value: index, %packed: i1, %epoch: buffer, %tokens: buffer) {
+  %trial = index.assume %trial_value [range(%trial_value, 0, 63)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %capacity = index.constant 32 : index
+  %origin = index.constant 0 : offset
+  %descriptor_origin = index.constant 12 : offset
+  %option_origin = func.call @qwen38_packet_options_origin(%capacity) : (index) -> (offset)
+  %selection_origin = func.call @qwen38_packet_selection_origin(%capacity) : (index) -> (offset)
+  %identity_origin = func.call @qwen38_packet_identity_origin(%capacity) : (index) -> (offset)
+  %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %spans = buffer.view %epoch[%descriptor_origin] : buffer -> view<32x6xi32>
+  %options = buffer.view %epoch[%option_origin] : buffer -> view<32x2xi32>
+  %selections = buffer.view %epoch[%selection_origin] : buffer -> view<32xi32>
+  %identities = buffer.view %epoch[%identity_origin] : buffer -> view<32x2xi32>
+  %mixed = index.rem %trial, %c2 : index
+  %ordinary = index.cmp eq, %mixed, %c0 : index
+  %stride = scf.select %ordinary, %c1, %c8 : index
+  %inputs = buffer.view %tokens[%origin] : buffer -> view<32x[%stride]xi32>
+  %families = index.constant 16 : index
+  %shape = index.rem %trial, %families : index
+  %layout = index.div %trial, %families : index
+  %selected_variant = index.rem %layout, %c2 : index
+  %no_output = index.cmp ne, %selected_variant, %c0 : index
+  %known_first = index.cmp uge, %layout, %c2 : index
+  %known_row = scf.select %known_first, %c0, %c3 : index
+  %shortened_row = scf.select %known_first, %c1, %c0 : index
+  %depth_value = index.div %shape, %c2 : index
+  %depth = index.rem %depth_value, %c7 : index
+  %kept = index.add %depth, %c2 : index
+  %empty_begin = index.constant 14 : index
+  %empty = index.cmp uge, %shape, %empty_begin : index
+  %count = scf.select %empty, %c0, %c4 : index
+  %count_word = index.cast %count : index to i32
+  view.store %count_word, %header[1] : i32, view<3xi32>
+  %end, %output_end, %reserved_end = scf.for %row = [%c0 to %count step %c1](%cursor = %c0 : index, %output_cursor = %c0 : index, %reserved_cursor = %c0 : index) -> (index, index, index) {
+    %first = index.cmp eq, %row, %shortened_row : index
+    %known = index.cmp eq, %row, %known_row : index
+    %supplied = index.cmp eq, %row, %c2 : index
+    %length = scf.select %first, %kept, %c8 : index
+    %length_word = index.cast %length : index to i32
+    %original_begin = index.mul %row, %c8 : index
+    %begin = scf.select %packed, %cursor, %original_begin : index
+    %selection = scf.select %packed, %output_cursor, %reserved_cursor : index
+    %begin_word = index.cast %begin : index to i32
+    %selection_value = index.cast %selection : index to i32
+    %unselected = scalar.andi %known, %no_output : i1
+    %sentinel = scalar.constant -1 : i32
+    %selection_word = scf.select %unselected, %sentinel, %selection_value : i32
+    %mode_index = scf.select %supplied, %c1, %c2 : index
+    %mode = scf.select %known, %c0, %mode_index : index
+    %mode_word = index.cast %mode : index to i32
+    view.store %length_word, %spans[%row, 0] : i32, view<32x6xi32>
+    view.store %begin_word, %spans[%row, 2] : i32, view<32x6xi32>
+    view.store %selection_word, %spans[%row, 5] : i32, view<32x6xi32>
+    view.store %mode_word, %options[%row, 0] : i32, view<32x2xi32>
+    %known_outputs = scf.select %no_output, %c0, %c1 : index
+    %selected_count = scf.select %known, %known_outputs, %length : index
+    %initial_selections = scf.select %known, %known_outputs, %c8 : index
+    %selection_count = scf.select %packed, %selected_count, %initial_selections : index
+    scf.for %i = [%c0 to %selection_count step %c1] {
+      %slot_value = index.add %selection, %i : index
+      %slot = index.assume %slot_value [range(%slot_value, 0, 31)] : index
+      %owner_index = index.add %original_begin, %i : index
+      %owner_word = index.cast %owner_index : index to i32
+      %base = index.add %begin, %length : index
+      %first_selected = index.sub %base, %selected_count : index
+      %input = index.add %first_selected, %i : index
+      %input_word = index.cast %input : index to i32
+      view.store %input_word, %selections[%slot] : i32, view<32xi32>
+      view.store %owner_word, %identities[%slot, 0] : i32, view<32x2xi32>
+      view.store %owner_word, %identities[%slot, 1] : i32, view<32x2xi32>
+    }
+    scf.if %packed {
+      scf.for %i = [%c0 to %length step %c1] {
+        %source = index.add %original_begin, %i : index
+        %destination_value = index.add %begin, %i : index
+        %destination = index.assume %destination_value [range(%destination_value, 0, 31)] : index
+        %source_base = index.mul %source, %stride : index
+        scf.for %word = [%c0 to %stride step %c1] {
+          %source_word_index = index.add %source_base, %word : index
+          %value = index.cast %source_word_index : index to i32
+          view.store %value, %inputs[%destination, %word] : i32, view<32x[%stride]xi32>
+        }
+      }
+    }
+    %next = index.add %cursor, %length : index
+    %next_outputs = index.add %output_cursor, %selected_count : index
+    %next_reserved = index.add %reserved_cursor, %initial_selections : index
+    scf.yield %next, %next_outputs, %next_reserved : index, index, index
+  }
+  %original_extent = index.mul %count, %c8 : index
+  %token_count = scf.select %packed, %end, %original_extent : index
+  %selected_outputs = index.constant 25 : index
+  %unselected_outputs = index.constant 24 : index
+  %reserved_outputs = scf.select %no_output, %unselected_outputs, %selected_outputs : index
+  %original_outputs = scf.select %empty, %c0, %reserved_outputs : index
+  %output_count = scf.select %packed, %output_end, %original_outputs : index
+  %tokens_word = index.cast %token_count : index to i32
+  %outputs_word = index.cast %output_count : index to i32
+  view.store %tokens_word, %header[0] : i32, view<3xi32>
+  view.store %outputs_word, %header[2] : i32, view<3xi32>
+  func.return
+}
+
+kernel.def @compact_dispatch() {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%trial_value: index, %epoch: buffer, %tokens: buffer) {
+  %trial = index.assume %trial_value [range(%trial_value, 0, 63)] : index
+  %c2 = index.constant 2 : index
+  %mixed = index.rem %trial, %c2 : index
+  %capacity = index.constant 32 : index
+  func.call @qwen38_packet_compact_prefix(%mixed, %capacity, %epoch, %tokens) : (index, index, buffer, buffer)
+  kernel.return
+}
+
+func.def @compact_reference(%trial: index, %epoch: buffer, %tokens: buffer) {
+  %yes = scalar.constant true : i1
+  func.call @packet_fixture(%trial, %yes, %epoch, %tokens) : (index, i1, buffer, buffer)
+  func.return
+}
+
+check.scenario public @compact_prefixes {
+  check.trial[64](%trial: index, %entropy: check.entropy) {
+    %epoch = check.generate.fill value(-99) : tensor<934xi32>
+    %tokens = check.generate.iota offset(0) step(1) : tensor<32x8xi32>
+    %no = check.literal value(false) : i1
+    check.generate<@packet_fixture>(%trial, %no, %epoch, %tokens) : (index, i1, tensor<934xi32>, tensor<32x8xi32>) -> ()
+    check.compare<@compact_dispatch, @compact_reference>(%trial, %epoch, %tokens) : (index, tensor<934xi32>, tensor<32x8xi32>) -> () {
+      check.expect.bitwise actual(%epoch) expected(%epoch) : tensor<934xi32>
+      check.expect.bitwise actual(%tokens) expected(%tokens) : tensor<32x8xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@compact_prefixes> @compact_check

@@ -6,6 +6,8 @@ config.decl @flash_next.token_count : %value: index where [range(%value, 1, 3276
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
 
 func.decl @qwen38_input_token(%mixed: index, %capacity: index, %inputs: buffer, %input: index) -> (i32)
@@ -18,26 +20,25 @@ template.decl @flash_next.embedding(%streams: index, %mixed: index, %remapped: i
 // target streams. Each block has an F16 scale and 32 signed bytes; their product
 // is exact in F32 and only publication rounds. The controller validates IDs,
 // and the immutable weights and input/output allocations have disjoint storage.
+// Each of 320 lanes decodes eight adjacent values, sharing one scale across
+// them and publishing the complete row without a second feature traversal.
 template.def<@flash_next.embedding> device @flash_next_embedding_body(%streams: index, %mixed: index, %remapped: i1, %source_capacity: index, %mapping: buffer, %origins: buffer, %span: buffer, %token_ids: buffer, %weight: buffer, %residual: buffer) {
   %ids_buffer, %weight_buffer, %residual_buffer = buffer.assume.noalias %token_ids, %weight, %residual : buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
-  %token0 = kernel.workgroup.id<x> : index
-  %token = index.assume %token0 [lt(%token0, %tokens)] : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
+  scf.for %token = [%worker to %end step %workers] {
     %thread0 = kernel.workitem.id<x> : index
-    %thread = index.assume %thread0 [range(%thread0, 0, 255)] : index
+    %thread = index.assume %thread0 [range(%thread0, 0, 319)] : index
     %c0 = index.constant 0 : index
     %c1 = index.constant 1 : index
     %c4 = index.constant 4 : index
     %c8 = index.constant 8 : index
-    %threads = index.constant 256 : index
-    %words = index.constant 640 : index
     %origin = index.constant 0 : offset
     %row_bytes = index.constant 2720 : offset
     %block_bytes = index.constant 34 : offset
-    %word_bytes = index.constant 4 : offset
+    %word_bytes = index.constant 8 : offset
     %scale_bytes = index.constant 2 : offset
     %output = buffer.view %residual_buffer[%origin] : buffer -> view<[%tokens]x[%streams]x2560xbf16>
     %source_index = scf.if %remapped -> (index) {
@@ -61,35 +62,33 @@ template.def<@flash_next.embedding> device @flash_next_embedding_body(%streams: 
     %id0 = index.cast %id_i32 : i32 to index
     %id = index.assume %id0 [range(%id0, 0, 248319)] : index
     %row = index.scale %id, %row_bytes : index, offset -> offset
-    scf.for %word = [%thread to %words step %threads] {
-      %expanded = scf.if %has_feature -> (vector<4xf32>) {
-        %features = buffer.view %ids_buffer[%feature_origin] : buffer -> view<2560xf32>
-        %channel = index.mul %word, %c4 : index
-        %value = vector.load %features[%channel] : view<2560xf32> -> vector<4xf32>
-        scf.yield %value : vector<4xf32>
-      } else {
-        %block = index.div %word, %c8 : index
-        %block_word = index.rem %word, %c8 : index
-        %block_delta = index.scale %block, %block_bytes : index, offset -> offset
-        %block_origin = index.add %row, %block_delta : offset
-        %word_delta = index.scale %block_word, %word_bytes : index, offset -> offset
-        %payload = index.add %block_origin, %scale_bytes : offset
-        %word_origin = index.add %payload, %word_delta : offset
-        %scale_view = buffer.view %weight_buffer[%block_origin] : buffer -> view<1xf16>
-        %code_view = buffer.view %weight_buffer[%word_origin] : buffer -> view<4xi8>
-        %scale_f16 = view.load %scale_view[%c0] : view<1xf16> -> f16
-        %scale = scalar.extf %scale_f16 : f16 to f32
-        %codes = vector.load %code_view[%c0] : view<4xi8> -> vector<4xi8>
-        %values = vector.sitofp %codes : vector<4xi8> to vector<4xf32>
-        %scales = vector.splat %scale : vector<4xf32>
-        %expanded = vector.mulf %values, %scales : vector<4xf32>
-        scf.yield %expanded : vector<4xf32>
-      }
-      %packed = vector.fptrunc %expanded : vector<4xf32> to vector<4xbf16>
-      %channel = index.mul %word, %c4 : index
-      scf.for %stream = [%c0 to %streams step %c1] {
-        vector.store %packed, %output[%token, %stream, %channel] : vector<4xbf16>, view<[%tokens]x[%streams]x2560xbf16>
-      }
+    %expanded = scf.if %has_feature -> (vector<8xf32>) {
+      %features = buffer.view %ids_buffer[%feature_origin] : buffer -> view<2560xf32>
+      %channel = index.mul %thread, %c8 : index
+      %value = vector.load %features[%channel] : view<2560xf32> -> vector<8xf32>
+      scf.yield %value : vector<8xf32>
+    } else {
+      %block = index.div %thread, %c4 : index
+      %block_word = index.rem %thread, %c4 : index
+      %block_delta = index.scale %block, %block_bytes : index, offset -> offset
+      %block_origin = index.add %row, %block_delta : offset
+      %word_delta = index.scale %block_word, %word_bytes : index, offset -> offset
+      %payload = index.add %block_origin, %scale_bytes : offset
+      %word_origin = index.add %payload, %word_delta : offset
+      %scale_view = buffer.view %weight_buffer[%block_origin] : buffer -> view<1xf16>
+      %code_view = buffer.view %weight_buffer[%word_origin] : buffer -> view<8xi8>
+      %scale_f16 = view.load %scale_view[%c0] : view<1xf16> -> f16
+      %scale = scalar.extf %scale_f16 : f16 to f32
+      %codes = vector.load %code_view[%c0] : view<8xi8> -> vector<8xi8>
+      %values = vector.sitofp %codes : vector<8xi8> to vector<8xf32>
+      %scales = vector.splat %scale : vector<8xf32>
+      %expanded = vector.mulf %values, %scales : vector<8xf32>
+      scf.yield %expanded : vector<8xf32>
+    }
+    %packed = vector.fptrunc %expanded : vector<8xf32> to vector<8xbf16>
+    %channel = index.mul %thread, %c8 : index
+    scf.for %stream = [%c0 to %streams step %c1] {
+      vector.store %packed, %output[%token, %stream, %channel] : vector<8xbf16>, view<[%tokens]x[%streams]x2560xbf16>
     }
   }
   template.return
@@ -98,8 +97,10 @@ template.def<@flash_next.embedding> device @flash_next_embedding_body(%streams: 
 kernel.def @flash_next_embedding_q8_0() {
   %tokens = config.get @flash_next.token_count : index
   %c1 = index.constant 1 : index
-  %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
+  %threads = index.constant 320 : index
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span: buffer, %token_ids: buffer, %weight: buffer, %residual: buffer) {
   %streams = index.constant 4 : index
   %mixed = config.get @runner.qwen38.mixed_inputs : index
@@ -114,9 +115,11 @@ kernel.def @flash_next_embedding_q8_0() {
 kernel.def @flash_next_mtp_embedding(%neural_enabled: i1) {
   %tokens = config.get @flash_next.token_count : index
   %c1 = index.constant 1 : index
-  %threads = index.constant 256 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
+  %threads = index.constant 320 : index
   %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %tokens, %c0_index : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
   kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span: buffer, %token_ids: buffer, %weight: buffer, %residual: buffer) {
   %streams = index.constant 1 : index
@@ -132,8 +135,10 @@ kernel.def @flash_next_mtp_embedding(%neural_enabled: i1) {
 kernel.def @flash_next_mtp_embedding_warm() {
   %tokens = config.get @flash_next.token_count : index
   %c1 = index.constant 1 : index
-  %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
+  %threads = index.constant 320 : index
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%source_capacity: index, %span: buffer, %mapping: buffer, %origins: buffer, %token_ids: buffer, %weight: buffer, %residual: buffer) {
   %streams = index.constant 1 : index
   %mixed = config.get @runner.qwen38.mixed_inputs : index

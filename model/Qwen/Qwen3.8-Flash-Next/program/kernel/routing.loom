@@ -8,6 +8,8 @@ amdgpu.target<gfx11-generic> @flash_next_route_wave32 {subgroup_size = 32}
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 template.decl @flash_next.route_tile(%capacity: index, %span: buffer, %input: buffer, %route_weight: buffer, %shared_weight: buffer, %logits: buffer, %gate: buffer)
 
 // Original F32 parameters contract the same packed BF16 activation used by
@@ -210,16 +212,18 @@ kernel.def target(@flash_next_route_wave32) @route_top10(%neural_enabled: i1) {
   %tokens = config.get @flash_next.token_count : index
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
   %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %tokens, %c0_index : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
   kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %logits_arg: buffer, %ids_arg: buffer, %weights_arg: buffer) {
   %span, %logits, %ids, %weights = buffer.assume.noalias %span_arg, %logits_arg, %ids_arg, %weights_arg : buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %token = kernel.workgroup.id<x> : index
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
+  scf.for %token = [%worker to %end step %workers] {
     %thread = kernel.workitem.id<x> : index
     %c0_index = index.constant 0 : index
     %c1 = index.constant 1 : index
@@ -237,8 +241,9 @@ kernel.def target(@flash_next_route_wave32) @route_top10(%neural_enabled: i1) {
     %weights_view = buffer.view %weights[%origin] : buffer -> view<[%tokens]x10xf32>
     %first_score = view.load %logits_view[%token, %thread] : view<[%tokens]x512xf32> -> f32
     %second_score = view.load %logits_view[%token, %second] : view<[%tokens]x512xf32> -> f32
-    %leader = index.cmp eq, %thread, %c0_index : index
-    %unused_first, %unused_second = scf.for %selection = [%c0_index to %c10 step %c1](%first = %first_score : f32, %other = %second_score : f32) -> (f32, f32) {
+    // The first ten lanes retain the selected pairs until softmax finishes.
+    // Global output is publication, not temporary score/exponential storage.
+    %unused_first, %unused_second, %owned_score, %owned_id = scf.for %selection = [%c0_index to %c10 step %c1](%first = %first_score : f32, %other = %second_score : f32, %current_score = %c0 : f32, %current_id = %largest_id : i32) -> (f32, f32, f32, i32) {
       %second_precedes = scalar.cmpf ogt, %other, %first : f32
       %local_score = scf.select %second_precedes, %other, %first : f32
       %local_id = scf.select %second_precedes, %second_id, %first_id : i32
@@ -246,30 +251,35 @@ kernel.def target(@flash_next_route_wave32) @route_top10(%neural_enabled: i1) {
       %has_score = scalar.cmpf oeq, %local_score, %score : f32
       %candidate_id = scf.select %has_score, %local_id, %largest_id : i32
       %selected_id = kernel.workgroup.reduce<minui> %candidate_id : i32
-      scf.if %leader {
-        view.store %selected_id, %ids_view[%token, %selection] : i32, view<[%tokens]x10xi32>
-        view.store %score, %weights_view[%token, %selection] : f32, view<[%tokens]x10xf32>
-      }
+      %owns_selection = index.cmp eq, %thread, %selection : index
+      %next_score = scf.select %owns_selection, %score, %current_score : f32
+      %next_id = scf.select %owns_selection, %selected_id, %current_id : i32
       %selected_first = scalar.cmpi eq, %selected_id, %first_id : i32
       %selected_second = scalar.cmpi eq, %selected_id, %second_id : i32
       %next_first = scf.select %selected_first, %negative_infinity, %first : f32
       %next_second = scf.select %selected_second, %negative_infinity, %other : f32
-      scf.yield %next_first, %next_second : f32, f32
+      scf.yield %next_first, %next_second, %next_score, %next_id : f32, f32, f32, i32
     }
-    scf.if %leader {
-      %maximum = view.load %weights_view[%token, %c0_index] : view<[%tokens]x10xf32> -> f32
+    %wave_width = index.constant 32 : index
+    %first_wave = index.cmp ult, %thread, %wave_width : index
+    scf.if %first_wave {
+      %c0_i32 = scalar.constant 0 : i32
+      %maximum = kernel.subgroup.broadcast %owned_score from %c0_i32 : f32, i32
+      %shifted = scalar.subf %owned_score, %maximum : f32
+      %exponential = scalar.expf<afn> %shifted : f32
+      // Preserve the original selection-ordered F32 denominator. Every lane
+      // remains active while broadcasting the ten retained exponentials.
       %sum = scf.for %selection = [%c0_index to %c10 step %c1](%total = %c0 : f32) -> (f32) {
-        %score = view.load %weights_view[%token, %selection] : view<[%tokens]x10xf32> -> f32
-        %shifted = scalar.subf %score, %maximum : f32
-        %exponential = scalar.expf<afn> %shifted : f32
-        view.store %exponential, %weights_view[%token, %selection] : f32, view<[%tokens]x10xf32>
-        %next = scalar.addf %total, %exponential : f32
+        %source_lane = index.cast %selection : index to i32
+        %term = kernel.subgroup.broadcast %exponential from %source_lane : f32, i32
+        %next = scalar.addf %total, %term : f32
         scf.yield %next : f32
       }
-      scf.for %selection = [%c0_index to %c10 step %c1] {
-        %exponential = view.load %weights_view[%token, %selection] : view<[%tokens]x10xf32> -> f32
+      %publishes = index.cmp ult, %thread, %c10 : index
+      scf.if %publishes {
         %normalized = scalar.divf %exponential, %sum : f32
-        view.store %normalized, %weights_view[%token, %selection] : f32, view<[%tokens]x10xf32>
+        view.store %owned_id, %ids_view[%token, %thread] : i32, view<[%tokens]x10xi32>
+        view.store %normalized, %weights_view[%token, %thread] : f32, view<[%tokens]x10xf32>
       }
     }
   }

@@ -1,0 +1,104 @@
+// Every 32-channel band contains sixteen unit and sixteen magnitude-three
+// values. The mean square is exactly five at all supported head widths. Gamma
+// cancels sqrt(5 + epsilon), so the independent normalized result is the input.
+// Alternating bands exchange the magnitudes of each rotary partner pair.
+func.def @head_value(%channel: index) -> (f32) {
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c32 = index.constant 32 : index
+  %band = index.div %channel, %c32 : index
+  %seed = index.add %channel, %band : index
+  %parity = index.rem %seed, %c2 : index
+  %unit = index.cmp eq, %parity, %c0 : index
+  %c1_f32 = scalar.constant 1.0 : f32
+  %c3_f32 = scalar.constant 3.0 : f32
+  %magnitude = scf.select %unit, %c1_f32, %c3_f32 : f32
+  %triplet = index.div %channel, %c3 : index
+  %sign = index.rem %triplet, %c2 : index
+  %positive = index.cmp eq, %sign, %c0 : index
+  %negative = scalar.negf %magnitude : f32
+  %value = scf.select %positive, %magnitude, %negative : f32
+  func.return %value : f32
+}
+
+func.def @head_fixture(%input: buffer, %weight: buffer) {
+  %origin = index.constant 0 : offset
+  %inputs = buffer.view %input[%origin] : buffer -> view<256xbf16>
+  %weights = buffer.view %weight[%origin] : buffer -> view<256xf32>
+  %begin = index.constant 0 : index
+  %end = index.constant 256 : index
+  %step = index.constant 1 : index
+  %gamma = scalar.constant 2.2360682487487793 : f32
+  scf.for %channel = [%begin to %end step %step] {
+    %value = func.call @head_value(%channel) : (index) -> (f32)
+    %packed = scalar.fptrunc %value : f32 to bf16
+    view.store %packed, %inputs[%channel] : bf16, view<256xbf16>
+    view.store %gamma, %weights[%channel] : f32, view<256xf32>
+  }
+  func.return
+}
+
+func.decl @qsa_normalize_rotate(%width: index, %position: index, %input: buffer, %input_origin: offset, %weight: buffer, %output: buffer, %output_origin: offset, %output_group_stride: index)
+
+amdgpu.target<gfx11-generic> @head_wave32 {subgroup_size = 32}
+
+kernel.def target(@head_wave32) @normalize_head() {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%width: index, %position: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %stride = index.constant 16 : index
+  func.call @qsa_normalize_rotate(%width, %position, %input, %origin, %weight, %output, %origin, %stride) : (index, index, buffer, offset, buffer, buffer, offset, index)
+  kernel.return
+}
+
+func.decl @rotate_values(%channel: index, %temporal: i32, %height: i32, %width: i32, %own: f32, %partner: f32) -> (bf16)
+
+func.def @head_reference(%width_arg: index, %position: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %width = index.assume %width_arg [range(%width_arg, 128, 256), multiple_of(%width_arg, 32)] : index
+  %origin = index.constant 0 : offset
+  %outputs = buffer.view %output[%origin] : buffer -> view<288xbf16>
+  %begin = index.constant 0 : index
+  %step = index.constant 1 : index
+  %half = index.constant 32 : index
+  %position_word = index.cast %position : index to i32
+  scf.for %channel = [%begin to %width step %step] {
+    %partner_channel = index.xori %channel, %half : index
+    %own = func.call @head_value(%channel) : (index) -> (f32)
+    %partner = func.call @head_value(%partner_channel) : (index) -> (f32)
+    %value = func.call @rotate_values(%channel, %position_word, %position_word, %position_word, %own, %partner) : (index, i32, i32, i32, f32, f32) -> (bf16)
+    view.store %value, %outputs[%channel] : bf16, view<288xbf16>
+  }
+  func.return
+}
+
+func.def @head_case(%trial: index) -> (index, index) {
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c32 = index.constant 32 : index
+  %c128 = index.constant 128 : index
+  %last_position = index.constant 262143 : index
+  %shape = index.div %trial, %c2 : index
+  %width = index.madd %shape, %c32, %c128 : index
+  %mode = index.rem %trial, %c2 : index
+  %first = index.cmp eq, %mode, %c0 : index
+  %position = scf.select %first, %c0, %last_position : index
+  func.return %width, %position : index, index
+}
+
+check.scenario public @retained_head_values {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[10](%trial: index, %entropy: check.entropy) {
+    %width, %position = check.generate<@head_case>(%trial) : (index) -> (index, index)
+    %input = check.generate.fill value(0.0) : tensor<256xbf16>
+    %weight = check.generate.fill value(0.0) : tensor<256xf32>
+    %output = check.generate.fill value(-17.0) : tensor<288xbf16>
+    check.generate<@head_fixture>(%input, %weight) : (tensor<256xbf16>, tensor<256xf32>) -> ()
+    check.compare<@normalize_head, @head_reference>(%width, %position, %input, %weight, %output) : (index, index, tensor<256xbf16>, tensor<256xf32>, tensor<288xbf16>) -> () {
+      check.expect.bitwise actual(%output) expected(%output) : tensor<288xbf16>
+    }
+  }
+  check.return
+}

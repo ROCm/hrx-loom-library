@@ -60,6 +60,22 @@ accepted prefix into non-page state. Catch-up uses accepted target hidden
 rows to advance predictor state. Draft vocabulary membership is learned from
 accepted tokens and is retained with the request.
 
+Text preparation registers shorter paired proposal/verifier stages for rounded
+cohorts of four and eight requests. The shared packet owner selects both stage
+identities before enqueue; queued work keeps its captured choice while later
+cohorts can choose another. A three- or four-owner cohort uses at most two
+proposals, and a five- through eight-owner cohort uses one. One or two owners
+retain the configured ceiling. Alternative stages borrow the same parameters
+and retained storage; preparation adds no copies or model-specific host policy.
+
+Within each recursive chain, a predicted probability below 0.85 stops that
+owner's subsequent neural steps. The current prediction remains a target
+verification candidate. Stable compaction retains the original target span in
+shared proposal origins, so removing stopped owners cannot change request or
+media identity. The threshold and cohort policy do not modify target sampling
+or accepted-prefix verification. Prefill, media, supplied candidates, and
+cohorts beyond the prepared alternatives retain their ordinary stage pairing.
+
 The input-content kernels distinguish ordinary IDs from media records using
 composition facts. Target embedding reads original Q8 vocabulary rows or F32
 features and publishes BF16 residuals. Accepted predictor embedding binds the
@@ -102,6 +118,14 @@ GPU-authored count controls every remaining neural launch without a host
 readback. Hidden state gathers into a separate transient buffer to keep
 cross-workgroup reads independent of compaction writes.
 
+Neural sampling also computes the winning token's probability over the active
+draft vocabulary. A probability below 0.85 publishes that candidate but stops
+further neural proposals for its owner. The final scheduled publication packs
+the surviving target prefixes, including when all owners stopped earlier.
+Target verification still uses the full vocabulary and unchanged sampling and
+acceptance rules; the confidence threshold changes only how much draft work
+is attempted.
+
 Output-only stages at capacities of 128 tokens and above compact the final
 attention layer after every input row has been appended to its cache. Only
 selected query cohorts continue through attention and experts; results
@@ -113,11 +137,21 @@ root and keep every row. Packet and scratch extents follow the configured
 span and token capacities rather than a fixed client count.
 
 The vocabulary projection shares each decoded Q8 row across four selected
-queries for small output capacities and eight for larger ones. Query groups
-occupy the contiguous grid axis, allowing neighboring workgroups to reuse the
-same vocabulary rows. Each query retains its original block reduction order
-and BF16 logit publication; inactive queries neither read inputs nor publish
-outputs.
+queries for small output capacities and eight for larger ones. A device-sized
+worker pool traverses live query/vocabulary panels while retaining that reuse.
+Head mixing also shares weights across query panels. Each query retains its
+original block reduction order and BF16 publication; inactive queries neither
+read inputs nor publish outputs. Large residual stages reuse workers across
+live rows with fixed stream/feature ownership, while small shapes specialize
+to direct ownership without a row loop.
+
+The recurrent update shares the register-only gated-delta motif with Qwen3.8-27B.
+Four adjacent lanes retain one 128-key state column, with contiguous fragments
+of 32 keys per lane. A bounded worker pool traverses the live span/column pairs
+without multiplying the unbounded span coordinate by the column count. The
+model adapter owns BF16 publication, normalization, the near-one decay
+polynomial, and immutable-reader/private-writer selection; the retained F32
+state layout and accepted-prefix replay contract are unchanged.
 
 ## Original image and video projector
 
@@ -163,9 +197,12 @@ the next head from overwriting live values. Both schedules call one
 publication body. BF16 rounding, retained history ownership, and speculative
 capture remain at the same boundaries.
 
-Sparse scoring keeps each 64-key panel resident while two four-query phases
-consume it. Query scratch changes only after all waves finish the previous
-phase; each query retains its own reduction order and cache-page ownership.
+Sparse scoring keeps each 64-key panel resident across a 128-query window,
+consumed in four-query phases. Query scratch changes only after all waves
+finish the previous phase; each query retains its own reduction order and
+cache-page ownership. Workers retire both shared panels before advancing to
+another key panel or request. The physical worker grid scales with device
+capacity, while each worker traverses its share of the live spans and panels.
 Sparse attention exchanges eight-word lane records as two four-word planes
 so 128-bit LDS transfers use neighboring bank groups. Both BF16 probability
 components and the original peer-reduction order are retained.

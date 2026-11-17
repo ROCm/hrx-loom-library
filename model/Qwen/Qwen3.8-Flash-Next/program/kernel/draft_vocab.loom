@@ -231,7 +231,9 @@ kernel.def target(@flash_next_draft_wave32) @flash_next_draft_rare_head(%neural_
 }
 
 // Greedy proposal selection uses the same ordered-logit/ID key as target
-// sampling. Only the iteration domain differs; target sampling remains full.
+// sampling. Each output is {token ID, F32 confidence bits}; confidence is the
+// selected token probability within this proposal vocabulary. The target still
+// samples and verifies against its complete vocabulary.
 kernel.def @flash_next_draft_sample(%neural_enabled: i1) {
   %capacity = config.get @flash_next.token_count : index
   %c1_index = index.constant 1 : index
@@ -285,10 +287,33 @@ kernel.def @flash_next_draft_sample(%neural_enabled: i1) {
     %inverse = scalar.trunci %best : i64 to i32
     %cneg1_i32 = scalar.constant -1 : i32
     %selected = scalar.xori %inverse, %cneg1_i32 : i32
+    // Confidence controls further drafting; the target still verifies every
+    // proposed token using its unchanged weights, logits, and acceptance.
+    %selected_value = index.cast %selected : i32 to index
+    %selected_id = index.assume %selected_value [range(%selected_value, 0, 248076)] : index
+    %peak = view.load %values[%token, %selected_id] : view<[%capacity]x248320xf32> -> f32
+    %empty_mass = scalar.constant 0.0 : f32
+    %local_mass = scf.for %base = [%c0_index to %columns step %threads](%mass = %empty_mass : f32) -> (f32) {
+      %position = index.add %base, %thread : index
+      %live = index.cmp ult, %position, %columns : index
+      %column = index.min %position, %last : index
+      %id = func.call @qwen38_draft_vocabulary_id(%column, %full, %carry, %record) : (index, i1, buffer, offset) -> (index)
+      %value = view.load %values[%token, %id] : view<[%capacity]x248320xf32> -> f32
+      %difference = scalar.subf %value, %peak : f32
+      %exponential = scalar.expf<afn> %difference : f32
+      %contribution = scf.select %live, %exponential, %empty_mass : f32
+      %next = scalar.addf %mass, %contribution : f32
+      scf.yield %next : f32
+    }
+    %mass = kernel.workgroup.reduce<addf> %local_mass : f32
+    %unit_mass = scalar.constant 1.0 : f32
+    %probability = scalar.divf %unit_mass, %mass : f32
+    %probability_bits = scalar.bitcast %probability : f32 to i32
     %leader = index.cmp eq, %thread, %c0_index : index
     scf.if %leader {
-      %predictions = buffer.view %output[%origin] : buffer -> view<[%capacity]xi32>
-      view.store %selected, %predictions[%token] : i32, view<[%capacity]xi32>
+      %predictions = buffer.view %output[%origin] : buffer -> view<[%capacity]x2xi32>
+      view.store %selected, %predictions[%token, 0] : i32, view<[%capacity]x2xi32>
+      view.store %probability_bits, %predictions[%token, 1] : i32, view<[%capacity]x2xi32>
     }
   }
   kernel.return

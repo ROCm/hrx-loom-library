@@ -6,7 +6,9 @@ config.decl @flash_next.token_count : %value: index where [range(%value, 1, 3276
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
-func.decl @flash_next_q8_dot(%width: index, %input_origin: offset, %weight_origin: offset, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (f32)
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
+func.decl @flash_next_q8_batch_dot(%width: index, %group_size: index, %batch_size: index, %first: index, %end: index, %lane: index, %stride: index, %scale_origin: offset, %code_origin: offset, %scale_stride: offset, %code_stride: offset, %input: buffer, %weight: buffer) -> (vector<[%group_size]xf32>)
 
 amdgpu.target<gfx11-generic> @flash_next_mtp_wave32 {subgroup_size = 32}
 
@@ -61,16 +63,18 @@ kernel.def @flash_next_mtp_normalize(%neural_enabled: i1) {
   %tokens = config.get @flash_next.token_count : index
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
   %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %tokens, %c0_index : index
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
   kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%width_value: index, %epoch: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %width = index.assume %width_value [range(%width_value, 2560, 10240), multiple_of(%width_value, 256)] : index
   %tokens = config.get @flash_next.token_count : index
-  %token = kernel.workgroup.id<x> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %count = func.call @flash_next_token_count(%epoch, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %count : index
-  scf.if %active {
+  scf.for %token = [%worker to %count step %workers] {
     template.apply<@flash_next.mtp_normalize_row>(%width, %tokens, %token, %token, %input, %weight, %output) : (index, index, index, index, buffer, buffer, buffer)
   }
   kernel.return
@@ -82,14 +86,16 @@ kernel.def @flash_next_mtp_normalize_warm() {
   %tokens = config.get @flash_next.token_count : index
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%epoch: buffer, %mapping: buffer, %origins: buffer, %restored: buffer, %target: buffer, %weight: buffer, %output: buffer) {
   %width = index.constant 10240 : index
   %tokens = config.get @flash_next.token_count : index
-  %token = kernel.workgroup.id<x> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %count = func.call @flash_next_token_count(%epoch, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %count : index
-  scf.if %active {
+  scf.for %token = [%worker to %count step %workers] {
     %origin = index.constant 0 : offset
     // The mapping owns each compact span start, which indexes its original
     // target range independently of resident identity or rejection holes.
@@ -117,30 +123,50 @@ kernel.def @flash_next_mtp_normalize_warm() {
   kernel.return
 }
 
-// Each serialized row is [embedding projection | hidden projection]. Compute
-// the embedding once and share it across all four hidden streams. Parameter
-// byte origins select the two halves without transposing or duplicating it.
-// Both projections round to BF16 before the BF16 residual addition.
+// Each subgroup owns one output channel and up to four tokens. Decoded Q8
+// blocks serve the entire token panel; hidden blocks also serve all four
+// streams. Each row keeps its original block and lane reduction. Serialized
+// [embedding | hidden] halves retain separate BF16 rounding before addition.
+// Workers stride complete panels without shared storage or synchronization.
 kernel.def target(@flash_next_mtp_wave32) @flash_next_mtp_fuse(%neural_enabled: i1) {
   %groups = index.constant 640 : index
   %tokens = config.get @flash_next.token_count : index
+  %c4 = index.constant 4 : index
+  %panel = index.min %tokens, %c4 : index
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
+  %rounding = index.sub %panel, %c1 : index
+  %rounded = index.add %tokens, %rounding : index
+  %panels = index.div %rounded, %panel : index
+  %logical_workers = index.mul %panels, %groups : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%logical_workers, %c1, %units) : (index, index, index) -> (index)
   %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%epoch: buffer, %embedding: buffer, %hidden: buffer, %weight: buffer, %output: buffer) {
+  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
+  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%epoch_arg: buffer, %embedding_arg: buffer, %hidden_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
+  %epoch, %embedding, %hidden, %weight, %output = buffer.assume.noalias %epoch_arg, %embedding_arg, %hidden_arg, %weight_arg, %output_arg : buffer, buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
-  %token = kernel.workgroup.id<y> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %count = func.call @flash_next_token_count(%epoch, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %count : index
-  scf.if %active {
-    %group = kernel.workgroup.id<x> : index
+  %c4 = index.constant 4 : index
+  %panel = index.min %tokens, %c4 : index
+  %hidden_panel = index.mul %panel, %c4 : index
+  %hidden_end = index.mul %count, %c4 : index
+  %c1 = index.constant 1 : index
+  %groups = index.constant 640 : index
+  %rounding = index.sub %panel, %c1 : index
+  %rounded = index.add %count, %rounding : index
+  %panels = index.div %rounded, %panel : index
+  %logical_workers = index.mul %panels, %groups : index
+  scf.for %work = [%worker to %logical_workers step %workers] {
+    %group = index.rem %work, %groups : index
+    %token_panel = index.div %work, %groups : index
+    %first = index.mul %token_panel, %panel : index
     %wave = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
     %c0 = index.constant 0 : index
-    %c1 = index.constant 1 : index
-    %c4 = index.constant 4 : index
     %c32 = index.constant 32 : index
     %width = index.constant 2560 : index
     %row = index.madd %group, %c4, %wave : index
@@ -148,26 +174,36 @@ kernel.def target(@flash_next_mtp_wave32) @flash_next_mtp_fuse(%neural_enabled: 
     %half_bytes = index.constant 2720 : offset
     %embedding_origin = index.scale %row, %row_bytes : index, offset -> offset
     %hidden_origin = index.add %embedding_origin, %half_bytes : offset
-    %input_row_bytes = index.constant 5120 : offset
-    %embedding_input = index.scale %token, %input_row_bytes : index, offset -> offset
-    %embedding_partial = func.call @flash_next_q8_dot(%width, %embedding_input, %embedding_origin, %lane, %c32, %embedding, %weight) : (index, offset, offset, index, index, buffer, buffer) -> (f32)
-    %embedding_sum = kernel.subgroup.reduce<addf> %embedding_partial : f32
-    %embedding_packed = scalar.fptrunc %embedding_sum : f32 to bf16
-    %embedding_value = scalar.extf %embedding_packed : bf16 to f32
+    %scale_bytes = index.constant 2 : offset
+    %block_bytes = index.constant 34 : offset
+    %embedding_codes = index.add %embedding_origin, %scale_bytes : offset
+    %hidden_codes = index.add %hidden_origin, %scale_bytes : offset
+    %hidden_first = index.mul %first, %c4 : index
+    %embedding_partial = func.call @flash_next_q8_batch_dot(%width, %panel, %panel, %first, %count, %lane, %c32, %embedding_origin, %embedding_codes, %block_bytes, %block_bytes, %embedding, %weight) : (index, index, index, index, index, index, index, offset, offset, offset, offset, buffer, buffer) -> (vector<[%panel]xf32>)
+    %hidden_partial = func.call @flash_next_q8_batch_dot(%width, %hidden_panel, %hidden_panel, %hidden_first, %hidden_end, %lane, %c32, %hidden_origin, %hidden_codes, %block_bytes, %block_bytes, %hidden, %weight) : (index, index, index, index, index, index, index, offset, offset, offset, offset, buffer, buffer) -> (vector<[%hidden_panel]xf32>)
+    %embedding_sums = kernel.subgroup.reduce<addf> %embedding_partial : vector<[%panel]xf32>
+    %hidden_sums = kernel.subgroup.reduce<addf> %hidden_partial : vector<[%hidden_panel]xf32>
     %origin = index.constant 0 : offset
     %outputs = buffer.view %output[%origin] : buffer -> view<[%tokens]x4x2560xbf16>
     %leader = index.cmp eq, %lane, %c0 : index
-    scf.for %stream = [%c0 to %c4 step %c1] unroll {
-      %input_row = index.madd %token, %c4, %stream : index
-      %hidden_input = index.scale %input_row, %input_row_bytes : index, offset -> offset
-      %hidden_partial = func.call @flash_next_q8_dot(%width, %hidden_input, %hidden_origin, %lane, %c32, %hidden, %weight) : (index, offset, offset, index, index, buffer, buffer) -> (f32)
-      %hidden_sum = kernel.subgroup.reduce<addf> %hidden_partial : f32
-      %hidden_packed = scalar.fptrunc %hidden_sum : f32 to bf16
-      %hidden_value = scalar.extf %hidden_packed : bf16 to f32
-      %sum = scalar.addf %embedding_value, %hidden_value : f32
-      %packed = scalar.fptrunc %sum : f32 to bf16
-      scf.if %leader {
-        view.store %packed, %outputs[%token, %stream, %row] : bf16, view<[%tokens]x4x2560xbf16>
+    scf.if %leader {
+      scf.for %ordinal = [%c0 to %panel step %c1] unroll schedule(linear) {
+        %token = index.add %first, %ordinal : index
+        %active = index.cmp ult, %token, %count : index
+        scf.if %active {
+          %embedding_sum = vector.extract %embedding_sums[%ordinal] : vector<[%panel]xf32> -> f32
+          %embedding_packed = scalar.fptrunc %embedding_sum : f32 to bf16
+          %embedding_value = scalar.extf %embedding_packed : bf16 to f32
+          scf.for %stream = [%c0 to %c4 step %c1] unroll schedule(linear) {
+            %hidden_ordinal = index.madd %ordinal, %c4, %stream : index
+            %hidden_sum = vector.extract %hidden_sums[%hidden_ordinal] : vector<[%hidden_panel]xf32> -> f32
+            %hidden_packed = scalar.fptrunc %hidden_sum : f32 to bf16
+            %hidden_value = scalar.extf %hidden_packed : bf16 to f32
+            %sum = scalar.addf %embedding_value, %hidden_value : f32
+            %packed = scalar.fptrunc %sum : f32 to bf16
+            view.store %packed, %outputs[%token, %stream, %row] : bf16, view<[%tokens]x4x2560xbf16>
+          }
+        }
       }
     }
   }

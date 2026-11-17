@@ -8,6 +8,8 @@ amdgpu.target<gfx11-generic> @flash_next_hc_matrix_wave32 {subgroup_size = 32}
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 template.decl @tensor.matrix.store_bf16_wave32(%remaining_rows: index, %outputs: index, %fragment_row: index, %result_column: index, %result: vector<8xf32>, %output_view: view<[%remaining_rows]x[%outputs]xbf16>)
 
 // The 24 KiB operand store is reused by the bounded gate transpose after the
@@ -174,11 +176,13 @@ func.def inline @hc_matrix_up_body(%span_arg: buffer, %normalized_arg: buffer, %
   %c64 = index.constant 64 : index
   %c128 = index.constant 128 : index
   %origin = index.constant 0 : offset
-  %batch = kernel.workgroup.id<y> : index
-  %first = index.mul %batch, %c128 : index
+  %worker = kernel.workgroup.id<y> : index
+  %workers = kernel.workgroup.count<y> : index
+  %begin = index.mul %worker, %c128 : index
+  %step = index.mul %workers, %c128 : index
   %end = func.call @flash_next_token_count(%span, %capacity) : (buffer, index) -> (index)
-  %active = index.cmp ult, %first, %end : index
-  scf.if %active {
+  // Every gate transpose retires its readers before the next matrix panel.
+  scf.for %first = [%begin to %end step %step] {
     %group = kernel.workgroup.id<x> : index
     %channel_base = index.mul %group, %c64 : index
     %stage_bytes = index.constant 24576 : offset
@@ -415,9 +419,11 @@ kernel.def target(@flash_next_hc_matrix_wave32) @hc_matrix_up(%neural_enabled: i
   %threads = index.constant 256 : index
   %padded = index.add %capacity, %rounding : index
   %rows = index.div %padded, %tile_rows : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%rows, %groups, %units) : (index, index, index) -> (index)
   %c0_index = index.constant 0 : index
   %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %rows, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%active_groups, %workers, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span: buffer, %normalized: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   func.call @hc_matrix_up_body(%span, %normalized, %input, %weight, %output) : (buffer, buffer, buffer, buffer, buffer)
   kernel.return

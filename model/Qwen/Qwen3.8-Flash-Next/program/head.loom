@@ -119,6 +119,8 @@ kernel.def target(@flash_next_head_wave32) @flash_next_head_down(%neural_enabled
 
 // Selected output rows share original vocabulary codes across a constant
 // query group: four for small capacities and eight for larger capacities.
+// A device-sized worker pool traverses live query/vocabulary panels instead
+// of launching one workgroup for every reserved panel.
 // Sampling still observes the checkpoint's BF16 logit publication boundary.
 kernel.def target(@flash_next_head_wave32) @flash_next_vocabulary() {
   %groups = index.constant 62080 : index
@@ -131,23 +133,34 @@ kernel.def target(@flash_next_head_wave32) @flash_next_vocabulary() {
   %rounding = index.sub %batch_size, %c1 : index
   %padded = index.add %rows, %rounding : index
   %batches = index.div %padded, %batch_size : index
+  %panels = index.mul %batches, %groups : index
+  %units = target.execution.unit.count : index
+  %groups_per_unit = index.constant 32 : index
+  %budget = index.mul %units, %groups_per_unit : index
+  %workers = index.min %panels, %budget : index
   %threads = index.constant 128 : index
-  kernel.launch.config workgroups(%batches, %groups, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%epoch: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %rows = func.call pure @flash_next_output_capacity() : () -> (index)
-  %batch = kernel.workgroup.id<x> : index
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %c4 = index.constant 4 : index
   %c8 = index.constant 8 : index
+  %c1 = index.constant 1 : index
   %wide = index.cmp ugt, %rows, %c4 : index
   %batch_size = scf.select %wide, %c8, %c4 : index
-  %first = index.mul %batch, %batch_size : index
   %count = func.call @flash_next_token_count(%epoch, %rows) : (buffer, index) -> (index)
-  %active = index.cmp ult, %first, %count : index
-  scf.if %active {
-    %group = kernel.workgroup.id<y> : index
+  %tail = index.sub %batch_size, %c1 : index
+  %padded = index.add %count, %tail : index
+  %batches = index.div %padded, %batch_size : index
+  %groups = index.constant 62080 : index
+  %panels = index.mul %batches, %groups : index
+  scf.for %panel = [%worker to %panels step %workers] {
+    %batch = index.div %panel, %groups : index
+    %group = index.rem %panel, %groups : index
+    %first = index.mul %batch, %batch_size : index
     %wave = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
-    %c1 = index.constant 1 : index
     %row = index.madd %group, %c4, %wave : index
     %width = index.constant 2560 : index
     %stride = index.constant 32 : index

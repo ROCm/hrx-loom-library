@@ -6,6 +6,8 @@ config.decl @flash_next.token_count : %value: index where [range(%value, 1, 3276
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 template.decl @flash_next.q8_contract(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>)
 
 template.decl @tensor.matrix.store_bf16_wave32(%remaining_rows: index, %outputs: index, %fragment_row: index, %result_column: index, %result: vector<8xf32>, %output_view: view<[%remaining_rows]x[%outputs]xbf16>)
@@ -36,9 +38,11 @@ template.def<@flash_next.mtp_project> device @flash_next_mtp_project(%is_hidden:
   %batch = kernel.workgroup.id<y> : index
   %wave = kernel.subgroup.id : index
   %lane = kernel.subgroup.lane.id : index
-  %first = index.mul %batch, %c128 : index
-  %active = index.cmp ult, %first, %end : index
-  scf.if %active {
+  %batches = kernel.workgroup.count<y> : index
+  %first_row = index.mul %batch, %c128 : index
+  %row_step = index.mul %batches, %c128 : index
+  // Every contraction retires its LDS readers before the next row panel.
+  scf.for %first = [%first_row to %end step %row_step] {
     %channel_base = index.mul %group, %c128 : index
     %origin = index.constant 0 : offset
     %half_origin = index.constant 2720 : offset
@@ -107,9 +111,11 @@ kernel.def target(@flash_next_mtp_matrix_wave32) @flash_next_mtp_embedding_matri
   %threads = index.constant 256 : index
   %rounded = index.add %tokens, %c127 : index
   %batches = index.div %rounded, %c128 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%batches, %groups, %units) : (index, index, index) -> (index)
   %c0_index = index.constant 0 : index
   %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %batches, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%active_groups, %workers, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%epoch: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %is_hidden = scalar.constant false : i1
   template.apply<@flash_next.mtp_project>(%is_hidden, %epoch, %input, %weight, %input, %output) : (i1, buffer, buffer, buffer, buffer, buffer)
@@ -127,9 +133,11 @@ kernel.def target(@flash_next_mtp_matrix_wave32) @flash_next_mtp_hidden_matrix(%
   %rows = index.mul %tokens, %c4 : index
   %rounded = index.add %rows, %c127 : index
   %batches = index.div %rounded, %c128 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%batches, %groups, %units) : (index, index, index) -> (index)
   %c0_index = index.constant 0 : index
   %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %batches, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%active_groups, %workers, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%epoch: buffer, %input: buffer, %weight: buffer, %embedding: buffer, %output: buffer) {
   %is_hidden = scalar.constant true : i1
   template.apply<@flash_next.mtp_project>(%is_hidden, %epoch, %input, %weight, %embedding, %output) : (i1, buffer, buffer, buffer, buffer, buffer)

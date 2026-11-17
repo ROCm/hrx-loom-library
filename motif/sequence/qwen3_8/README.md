@@ -33,6 +33,12 @@ storage that cannot overwrite a live anchor. Continuation then advances the
 caller-owned packet, preserving original feature offsets and first-result
 identity even when source and destination records overlap.
 
+Proposal finalization can shorten each reserved candidate prefix before target
+verification. A single producer compacts those ordered intervals in place and
+keeps token coordinates, selected-output coordinates, and output identities
+consistent. Feature payloads, resident rows, and source positions remain fixed;
+already packed payloads require no copy.
+
 The [checks](test/) compare complete records with independent expectations.
 [Component authoring](../../../docs/component-authoring.md) explains the shared
 dependency and verification workflow.

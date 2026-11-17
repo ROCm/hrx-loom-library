@@ -12,6 +12,8 @@ func.decl @flash_next_span_publishes(%verification: index, %epoch: buffer, %span
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 func.decl @flash_next_span_count(%epoch: buffer) -> (index)
 
 func.decl pure @flash_next_span_workers(%capacity: index) -> (index)
@@ -39,22 +41,25 @@ func.def public inline @flash_next_ple_gate(%dot: f32) -> (f32) {
   func.return %gate : f32
 }
 
-// One workgroup owns a token/stream. Normalized key/query and gated values
-// round to BF16 before consumption; their reductions accumulate in F32.
-// GGUF has already folded 1+gamma into each original F32 norm weight.
+// Bounded stream workers traverse complete token rows. Normalized key/query
+// and gated values round to BF16 before consumption; reductions accumulate
+// in F32 and retire their shared scratch before the next row. GGUF has
+// already folded 1+gamma into each original F32 norm weight.
 kernel.def @flash_next_ple_gate_normalize() {
   %tokens = config.get @flash_next.token_count : index
   %streams = index.constant 4 : index
   %threads = index.constant 320 : index
   %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%streams, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tokens, %streams, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%streams, %workers, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %key_arg: buffer, %value_arg: buffer, %residual_arg: buffer, %key_gamma_arg: buffer, %query_gamma_arg: buffer, %conv_gamma_arg: buffer, %gated_arg: buffer, %normalized_arg: buffer) {
   %span, %key, %value, %residual, %key_gamma, %query_gamma, %conv_gamma, %gated, %normalized = buffer.assume.noalias %span_arg, %key_arg, %value_arg, %residual_arg, %key_gamma_arg, %query_gamma_arg, %conv_gamma_arg, %gated_arg, %normalized_arg : buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer
   %capacity = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%span, %capacity) : (buffer, index) -> (index)
-  %token = kernel.workgroup.id<y> : index
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
+  %worker = kernel.workgroup.id<y> : index
+  %workers = kernel.workgroup.count<y> : index
+  scf.for %token = [%worker to %end step %workers] {
     %stream = kernel.workgroup.id<x> : index
     %thread = kernel.workitem.id<x> : index
     %c8 = index.constant 8 : index

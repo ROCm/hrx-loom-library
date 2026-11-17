@@ -4,8 +4,10 @@
 // capacity six-word descriptors, capacity selections, capacity option pairs,
 // and EOS. Two banks are followed by continuation owners, sampling policies,
 // output identities, source-frontier scratch, and two mixed-input capacities.
-// Composition leaves specialize these scalar calculations; VM producers use
-// the same functions. No helper reads global configuration or buffer metadata.
+// Composition leaves and VM producers share the geometry calculations.
+// Prefix compaction preserves descriptor ownership and sampling identities
+// after proposal producers shorten spans. Callers serialize packet mutation;
+// no helper reads global configuration.
 
 func.def public inline @qwen38_packet_selection_origin(%capacity: index) -> (offset) {
   %header = index.constant 12 : offset
@@ -95,4 +97,103 @@ func.def public inline @qwen38_packet_capacity(%bytes: offset) -> (index) {
   %value = index.div %length, %stride : index
   %capacity = index.assume %value [range(%value, 2, 2147483646), multiple_of(%value, 2)] : index
   func.return %capacity : index
+}
+
+// Proposal origins survive compaction independently of draft descriptors.
+// Each slot stores three I32 coordinates in the immutable target packet:
+// input beginning, selected-output beginning, and original span index.
+func.def public pure inline @qwen38_proposal_origin_bytes(%capacity: index) -> (offset) {
+  %stride = index.constant 12 : offset
+  %bytes = index.scale %capacity, %stride : index, offset -> offset
+  func.return %bytes : offset
+}
+
+// Pack shortened span prefixes after the last proposal producer retires.
+// The original intervals are ordered, disjoint reservations; shortening keeps
+// every destination at or before its source, allowing forward in-place copies.
+// Known input selects its final token; candidate spans select their retained
+// prefix, and negative selection coordinates retain no output. Identity pairs
+// move with selections. Resident rows, positions, policies, and feature payloads
+// stay fixed. Already packed intervals require no payload copying.
+func.def public @qwen38_packet_compact_prefix(%mixed: index, %capacity: index, %epoch: buffer, %tokens: buffer) {
+  %origin = index.constant 0 : offset
+  %descriptor_origin = index.constant 12 : offset
+  %option_origin = func.call @qwen38_packet_options_origin(%capacity) : (index) -> (offset)
+  %selection_origin = func.call @qwen38_packet_selection_origin(%capacity) : (index) -> (offset)
+  %identity_origin = func.call @qwen38_packet_identity_origin(%capacity) : (index) -> (offset)
+  %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %spans = buffer.view %epoch[%descriptor_origin] : buffer -> view<[%capacity]x6xi32>
+  %options = buffer.view %epoch[%option_origin] : buffer -> view<[%capacity]x2xi32>
+  %selected = buffer.view %epoch[%selection_origin] : buffer -> view<[%capacity]xi32>
+  %identities = buffer.view %epoch[%identity_origin] : buffer -> view<[%capacity]x2xi32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %is_mixed = index.cmp ne, %mixed, %c0 : index
+  %input_words = scf.select %is_mixed, %c8, %c1 : index
+  %inputs = buffer.view %tokens[%origin] : buffer -> view<[%capacity]x[%input_words]xi32>
+  %span_word = view.load %header[1] : view<3xi32> -> i32
+  %span_value = index.cast %span_word : i32 to index
+  %count = index.assume %span_value [range(%span_value, 0, %capacity)] : index
+  %c0_i32 = scalar.constant 0 : i32
+  %token_end, %output_end = scf.for %span = [%c0 to %count step %c1](%cursor = %c0 : index, %outputs = %c0 : index) -> (index, index) {
+    %length_word = view.load %spans[%span, 0] : view<[%capacity]x6xi32> -> i32
+    %begin_word = view.load %spans[%span, 2] : view<[%capacity]x6xi32> -> i32
+    %selection_word = view.load %spans[%span, 5] : view<[%capacity]x6xi32> -> i32
+    %mode = view.load %options[%span, 0] : view<[%capacity]x2xi32> -> i32
+    %kept = index.cast %length_word : i32 to index
+    %begin = index.cast %begin_word : i32 to index
+    %selection = index.cast %selection_word : i32 to index
+    %known = scalar.cmpi eq, %mode, %c0_i32 : i32
+    %selection_count = scf.select %known, %c1, %kept : index
+    %selects = scalar.cmpi sge, %selection_word, %c0_i32 : i32
+    %active_selections = scf.select %selects, %selection_count, %c0 : index
+    %move_inputs = index.cmp ne, %begin, %cursor : index
+    scf.if %move_inputs {
+      scf.for %relative = [%c0 to %kept step %c1] {
+        %from_value = index.add %begin, %relative : index
+        %to_value = index.add %cursor, %relative : index
+        %from = index.assume %from_value [range(%from_value, 0, 2147483647), lt(%from_value, %capacity)] : index
+        %to = index.assume %to_value [range(%to_value, 0, 2147483647), lt(%to_value, %capacity)] : index
+        scf.for %word = [%c0 to %input_words step %c1] {
+          %value = view.load %inputs[%from, %word] : view<[%capacity]x[%input_words]xi32> -> i32
+          view.store %value, %inputs[%to, %word] : i32, view<[%capacity]x[%input_words]xi32>
+        }
+      }
+    }
+    %move_outputs = index.cmp ne, %selection, %outputs : index
+    %update_selections = scalar.ori %move_inputs, %move_outputs : i1
+    scf.if %update_selections {
+      scf.for %relative = [%c0 to %active_selections step %c1] {
+        %from_value = index.add %selection, %relative : index
+        %to_value = index.add %outputs, %relative : index
+        %from = index.assume %from_value [range(%from_value, 0, 2147483647), lt(%from_value, %capacity)] : index
+        %to = index.assume %to_value [range(%to_value, 0, 2147483647), lt(%to_value, %capacity)] : index
+        %base = index.add %cursor, %kept : index
+        %first = index.sub %base, %active_selections : index
+        %input = index.add %first, %relative : index
+        %input_word = index.cast %input : index to i32
+        view.store %input_word, %selected[%to] : i32, view<[%capacity]xi32>
+        scf.if %move_outputs {
+          %owner = view.load %identities[%from, 0] : view<[%capacity]x2xi32> -> i32
+          %position = view.load %identities[%from, 1] : view<[%capacity]x2xi32> -> i32
+          view.store %owner, %identities[%to, 0] : i32, view<[%capacity]x2xi32>
+          view.store %position, %identities[%to, 1] : i32, view<[%capacity]x2xi32>
+        }
+      }
+    }
+    %cursor_word = index.cast %cursor : index to i32
+    %output_word = index.cast %outputs : index to i32
+    %new_selection = scf.select %selects, %output_word, %selection_word : i32
+    view.store %cursor_word, %spans[%span, 2] : i32, view<[%capacity]x6xi32>
+    view.store %new_selection, %spans[%span, 5] : i32, view<[%capacity]x6xi32>
+    %next_cursor = index.add %cursor, %kept : index
+    %next_outputs = index.add %outputs, %active_selections : index
+    scf.yield %next_cursor, %next_outputs : index, index
+  }
+  %token_word = index.cast %token_end : index to i32
+  %output_word = index.cast %output_end : index to i32
+  view.store %token_word, %header[0] : i32, view<3xi32>
+  view.store %output_word, %header[2] : i32, view<3xi32>
+  func.return
 }

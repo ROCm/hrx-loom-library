@@ -26,15 +26,23 @@ template.def<@flash_next.q8_contract> device @flash_next_q8_contract(%capacity: 
 
 template.decl @tensor.matrix.store_bf16_wave32(%remaining_rows: index, %outputs: index, %fragment_row: index, %result_column: index, %result: vector<8xf32>, %output_view: view<[%remaining_rows]x[%outputs]xbf16>)
 
+// Full F16 panels share two original Q8 blocks per stage. The paired stage
+// preserves contraction order while halving LDS publication/retirement phases.
+template.def<@flash_next.q8_contract> device priority(20) @flash_next_q8_contract_k64(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>) where [ge(%capacity, 4096), ge(%inputs, 2560), eq(%tile_rows, 128), eq(%tile_columns, 128), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 2)] {
+  %tile = template.apply<@ggml.q8_0_f16.contract_k64>(%capacity, %inputs, %outputs, %streams, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %fragment_count, %first, %end, %channel_base, %split_scales, %row_bytes, %weight_origin, %input, %weight) : (index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%fragment_count]x8xf32>)
+  template.return %tile : vector<[%fragment_count]x8xf32>
+}
+
 template.decl @flash_next.q8_tile(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 template.decl @flash_next.q8_tile_stage(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %use_stage64: i1, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 // Dense Q8 publication rounds the contracted F32 tile once to BF16. The caller
-// launches ceil(outputs/tile_columns) by ceil(capacity/tile_rows) workgroups
-// of wave_rows*wave_columns*32 threads. Exact SSA geometry specializes before
-// fragment lowering; the immutable epoch header supplies the live row extent.
-// Operands and output are disjoint. Empty workgroups perform no memory access.
+// bounds physical workers independently of the logical panel count. Workers
+// traverse complete panels with wave_rows*wave_columns*32 threads; contraction
+// retires all shared-memory readers before the next panel. Exact SSA geometry
+// specializes before fragment lowering. The immutable epoch supplies live rows.
+// Operands and output are disjoint. Empty workers perform no operand access.
 template.def<@flash_next.q8_tile_stage> device @flash_next_q8_tiled_stage(%split_scales: i1, %capacity: index, %input_width: index, %output_width: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %use_stage64: i1, %span_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
   %span, %input, %weight, %output = buffer.assume.noalias %span_arg, %input_arg, %weight_arg, %output_arg : buffer, buffer, buffer, buffer
   %inputs = index.assume %input_width [range(%input_width, 32, 10240), multiple_of(%input_width, 32)] : index
@@ -44,8 +52,12 @@ template.def<@flash_next.q8_tile_stage> device @flash_next_q8_tiled_stage(%split
   %count_word = view.load %header[0] : view<3xi32> -> i32
   %count_value = index.cast %count_word : i32 to index
   %end = index.assume %count_value [range(%count_value, 0, %capacity)] : index
-  %group = kernel.workgroup.id<x> : index
-  %batch = kernel.workgroup.id<y> : index
+  %worker_x = kernel.workgroup.id<x> : index
+  %worker_y = kernel.workgroup.id<y> : index
+  %workers_x = kernel.workgroup.count<x> : index
+  %workers_y = kernel.workgroup.count<y> : index
+  %worker = index.madd %worker_y, %workers_x, %worker_x : index
+  %workers = index.mul %workers_x, %workers_y : index
   %wave = kernel.subgroup.id : index
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -55,9 +67,17 @@ template.def<@flash_next.q8_tile_stage> device @flash_next_q8_tiled_stage(%split
   %row_fragments = index.div %per_wave_rows, %c16 : index
   %column_fragments = index.div %per_wave_columns, %c16 : index
   %fragment_count = index.mul %row_fragments, %column_fragments : index
-  %first = index.mul %batch, %tile_rows : index
-  %active = index.cmp ult, %first, %end : index
-  scf.if %active {
+  %row_rounding = index.sub %tile_rows, %c1 : index
+  %column_rounding = index.sub %tile_columns, %c1 : index
+  %rounded_rows = index.add %end, %row_rounding : index
+  %rounded_columns = index.add %outputs, %column_rounding : index
+  %row_tiles = index.div %rounded_rows, %tile_rows : index
+  %column_tiles = index.div %rounded_columns, %tile_columns : index
+  %panels = index.mul %row_tiles, %column_tiles : index
+  scf.for %panel = [%worker to %panels step %workers] {
+    %group = index.rem %panel, %column_tiles : index
+    %batch = index.div %panel, %column_tiles : index
+    %first = index.mul %batch, %tile_rows : index
     %channel_base = index.mul %group, %tile_columns : index
     %wave_column_group = index.rem %wave, %wave_columns : index
     %wave_row_group = index.div %wave, %wave_columns : index
