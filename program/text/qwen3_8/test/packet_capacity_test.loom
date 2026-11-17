@@ -1,142 +1,44 @@
-// Packet allocation follows token capacities, independently of span and
-// resident counts. Literal expectations cover both model capacity ranges.
-// These cases use at most three shape records and no model parameters.
+// Token and request capacities come from independent catalog columns. The
+// largest token shape need not have the most spans, and only the selected
+// prefix participates. No model payload is allocated by these checks.
 
-func.decl @qwen38.packet_capacity(%shapes: buffer, %shape_count: i64, %prefill: i64) -> (i64)
+func.decl @qwen38.packet_capacities(%shapes: buffer, %shape_count: i64, %prefill: i64) -> (i64, i64)
 
-global.rodata.def @empty_shapes = bytes("")
-
-func.def @isolated_capacity(%prefill: i64) -> (i64) {
-  %shapes = global.load @empty_shapes : buffer
-  %count = scalar.constant 0 : i64
-  %capacity = func.call @qwen38.packet_capacity(%shapes, %count, %prefill) : (buffer, i64, i64) -> (i64)
-  func.return %capacity : i64
-}
-
-func.def @catalog_capacity(%first: i64, %second: i64, %third: i64, %count: i64, %prefill: i64) -> (i64) {
+func.def @capacity_answers(%trial: index) -> (i64, i64, i64, i64) {
+  %bytes = index.constant 48 : offset
+  %shapes = buffer.alloca<private> align(8) %bytes : buffer
   %origin = index.constant 0 : offset
-  %catalog_bytes = index.constant 48 : offset
-  %shapes = buffer.alloca<private> align(8) %catalog_bytes : buffer
   %records = buffer.view %shapes[%origin] : buffer -> view<3x2xi64>
-  %span_capacity = scalar.constant 1 : i64
-  view.store %first, %records[0, 0] : i64, view<3x2xi64>
-  view.store %span_capacity, %records[0, 1] : i64, view<3x2xi64>
-  view.store %second, %records[1, 0] : i64, view<3x2xi64>
-  view.store %span_capacity, %records[1, 1] : i64, view<3x2xi64>
-  view.store %third, %records[2, 0] : i64, view<3x2xi64>
-  view.store %span_capacity, %records[2, 1] : i64, view<3x2xi64>
-  %capacity = func.call @qwen38.packet_capacity(%shapes, %count, %prefill) : (buffer, i64, i64) -> (i64)
-  func.return %capacity : i64
+  %first_tokens = scalar.constant 129 : i64
+  %second_tokens = scalar.constant 64 : i64
+  %third_tokens = scalar.constant 32768 : i64
+  %first_spans = scalar.constant 8 : i64
+  %second_spans = scalar.constant 32 : i64
+  %third_spans = scalar.constant 16 : i64
+  view.store %first_tokens, %records[0, 0] : i64, view<3x2xi64>
+  view.store %first_spans, %records[0, 1] : i64, view<3x2xi64>
+  view.store %second_tokens, %records[1, 0] : i64, view<3x2xi64>
+  view.store %second_spans, %records[1, 1] : i64, view<3x2xi64>
+  view.store %third_tokens, %records[2, 0] : i64, view<3x2xi64>
+  view.store %third_spans, %records[2, 1] : i64, view<3x2xi64>
+  %counts = vector.constanti [0, 0, 0, 1, 2, 3, 2, 1] : vector<8xi64>
+  %prefills = vector.constanti [1, 127, 128, 64, 4, 128, 32768, 16385] : vector<8xi64>
+  %tokens = vector.constanti [2, 128, 128, 130, 130, 32768, 32768, 16386] : vector<8xi64>
+  %spans = vector.constanti [1, 1, 1, 8, 32, 32, 32, 8] : vector<8xi64>
+  %count = vector.extract %counts[%trial] : vector<8xi64> -> i64
+  %prefill = vector.extract %prefills[%trial] : vector<8xi64> -> i64
+  %expected_tokens = vector.extract %tokens[%trial] : vector<8xi64> -> i64
+  %expected_spans = vector.extract %spans[%trial] : vector<8xi64> -> i64
+  %actual_tokens, %actual_spans = func.call @qwen38.packet_capacities(%shapes, %count, %prefill) : (buffer, i64, i64) -> (i64, i64)
+  func.return %actual_tokens, %actual_spans, %expected_tokens, %expected_spans : i64, i64, i64, i64
 }
 
-check.case public @isolated_minimum {
-  %prefill = check.literal value(1) : i64
-  %actual = func.call @isolated_capacity(%prefill) : (i64) -> (i64)
-  %expected = check.literal value(2) : i64
-  check.expect.equal actual(%actual) expected(%expected) : i64
+check.case public @independent_packet_capacities {
+  %trial = check.param.choice values([0, 1, 2, 3, 4, 5, 6, 7]) : index
+  %tokens, %spans, %expected_tokens, %expected_spans = func.call @capacity_answers(%trial) : (index) -> (i64, i64, i64, i64)
+  check.expect.equal actual(%tokens) expected(%expected_tokens) : i64
+  check.expect.equal actual(%spans) expected(%expected_spans) : i64
   check.return
 }
 
-check.case public @isolated_odd {
-  %prefill = check.literal value(127) : i64
-  %actual = func.call @isolated_capacity(%prefill) : (i64) -> (i64)
-  %expected = check.literal value(128) : i64
-  check.expect.equal actual(%actual) expected(%expected) : i64
-  check.return
-}
-
-check.case public @isolated_even {
-  %prefill = check.literal value(128) : i64
-  %actual = func.call @isolated_capacity(%prefill) : (i64) -> (i64)
-  %expected = check.literal value(128) : i64
-  check.expect.equal actual(%actual) expected(%expected) : i64
-  check.return
-}
-
-check.case public @prefill_dominates {
-  %first = check.literal value(1) : i64
-  %second = check.literal value(3) : i64
-  %third = check.literal value(8) : i64
-  %count = check.literal value(3) : i64
-  %prefill = check.literal value(64) : i64
-  %actual = func.call @catalog_capacity(%first, %second, %third, %count, %prefill) : (i64, i64, i64, i64, i64) -> (i64)
-  %expected = check.literal value(64) : i64
-  check.expect.equal actual(%actual) expected(%expected) : i64
-  check.return
-}
-
-check.case public @odd_peak_first {
-  %first = check.literal value(129) : i64
-  %second = check.literal value(1) : i64
-  %third = check.literal value(64) : i64
-  %count = check.literal value(3) : i64
-  %prefill = check.literal value(4) : i64
-  %actual = func.call @catalog_capacity(%first, %second, %third, %count, %prefill) : (i64, i64, i64, i64, i64) -> (i64)
-  %expected = check.literal value(130) : i64
-  check.expect.equal actual(%actual) expected(%expected) : i64
-  check.return
-}
-
-check.case public @even_peak_last {
-  %first = check.literal value(1) : i64
-  %second = check.literal value(65) : i64
-  %third = check.literal value(128) : i64
-  %count = check.literal value(3) : i64
-  %prefill = check.literal value(4) : i64
-  %actual = func.call @catalog_capacity(%first, %second, %third, %count, %prefill) : (i64, i64, i64, i64, i64) -> (i64)
-  %expected = check.literal value(128) : i64
-  check.expect.equal actual(%actual) expected(%expected) : i64
-  check.return
-}
-
-check.case public @equal_buckets {
-  %first = check.literal value(16) : i64
-  %second = check.literal value(16) : i64
-  %third = check.literal value(16) : i64
-  %count = check.literal value(3) : i64
-  %prefill = check.literal value(16) : i64
-  %actual = func.call @catalog_capacity(%first, %second, %third, %count, %prefill) : (i64, i64, i64, i64, i64) -> (i64)
-  %expected = check.literal value(16) : i64
-  check.expect.equal actual(%actual) expected(%expected) : i64
-  check.return
-}
-
-check.case public @selected_prefix {
-  %first = check.literal value(4) : i64
-  %second = check.literal value(17) : i64
-  %third = check.literal value(512) : i64
-  %count = check.literal value(2) : i64
-  %prefill = check.literal value(1) : i64
-  %actual = func.call @catalog_capacity(%first, %second, %third, %count, %prefill) : (i64, i64, i64, i64, i64) -> (i64)
-  %expected = check.literal value(18) : i64
-  check.expect.equal actual(%actual) expected(%expected) : i64
-  check.return
-}
-
-check.case public @dense_limit {
-  %first = check.literal value(1) : i64
-  %second = check.literal value(256) : i64
-  %third = check.literal value(512) : i64
-  %count = check.literal value(3) : i64
-  %prefill = check.literal value(1) : i64
-  %actual = func.call @catalog_capacity(%first, %second, %third, %count, %prefill) : (i64, i64, i64, i64, i64) -> (i64)
-  %expected = check.literal value(512) : i64
-  check.expect.equal actual(%actual) expected(%expected) : i64
-  check.return
-}
-
-check.case public @flash_limit {
-  %first = check.literal value(512) : i64
-  %second = check.literal value(8192) : i64
-  %third = check.literal value(32768) : i64
-  %count = check.literal value(3) : i64
-  %prefill = check.literal value(128) : i64
-  %actual = func.call @catalog_capacity(%first, %second, %third, %count, %prefill) : (i64, i64, i64, i64, i64) -> (i64)
-  %expected = check.literal value(32768) : i64
-  check.expect.equal actual(%actual) expected(%expected) : i64
-  check.return
-}
-
-check.benchmark<@isolated_even> @isolated_prefill_capacity
-
-check.benchmark<@flash_limit> @packed_catalog_capacity
+check.benchmark<@independent_packet_capacities> @packet_catalog_capacities

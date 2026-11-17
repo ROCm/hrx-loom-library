@@ -14,7 +14,7 @@ func.decl @qwen38_packet_identity_origin(%capacity: index) -> (offset)
 
 func.decl @qwen38_packet_shape_origin(%capacity: index) -> (offset)
 
-kernel.decl @qwen38_continue_dispatch() launch(%mixed_inputs: index, %context: index, %capacity: index, %epoch: buffer, %tokens: buffer, %results: buffer)
+kernel.decl @qwen38_continue_dispatch() launch(%mixed_inputs: index, %context: index, %capacity: index, %feedback_capacity: index, %epoch: buffer, %tokens: buffer, %results: buffer)
 
 // A completed ordinary span advances causal and source coordinates from
 // different bases. Nearly a whole queued plane is compacted into the active bank,
@@ -38,7 +38,7 @@ func.def @continuation_initialize(%capacity_value: index, %epoch: buffer, %token
   %terminal = buffer.view %epoch[%eos_origin] : buffer -> view<1xi32>
   %queued = buffer.view %tokens[%queued_origin] : buffer -> view<[%capacity]xi32>
   %result_origin = index.constant 120 : offset
-  %prior = buffer.view %results[%result_origin] : buffer -> view<[%capacity]x10xi32>
+  %prior = buffer.view %results[%result_origin] : buffer -> view<8x10xi32>
   %c0_i32 = scalar.constant 0 : i32
   %c1_i32 = scalar.constant 1 : i32
   %c2_i32 = scalar.constant 2 : i32
@@ -62,9 +62,9 @@ func.def @continuation_initialize(%capacity_value: index, %epoch: buffer, %token
   view.store %c5_i32, %credits[0, 1] : i32, view<[%capacity]x2xi32>
   view.store %c0_i32, %indices[0] : i32, view<[%capacity]xi32>
   view.store %eos, %terminal[0] : i32, view<1xi32>
-  view.store %c2_i32, %prior[0, 0] : i32, view<[%capacity]x10xi32>
+  view.store %c2_i32, %prior[0, 0] : i32, view<8x10xi32>
   %packed_counts = scalar.constant 196609 : i32
-  view.store %packed_counts, %prior[0, 1] : i32, view<[%capacity]x10xi32>
+  view.store %packed_counts, %prior[0, 1] : i32, view<8x10xi32>
   %first_token = scalar.constant 900 : i32
   %c0_index = index.constant 0 : index
   %c1_index = index.constant 1 : index
@@ -77,15 +77,16 @@ func.def @continuation_initialize(%capacity_value: index, %epoch: buffer, %token
   func.return
 }
 
-func.def @continuation_oracle(%mixed_inputs: index, %context: index, %capacity_value: index, %epoch: buffer, %tokens: buffer, %results: buffer) {
+func.def @continuation_oracle(%mixed_inputs: index, %context: index, %capacity_value: index, %feedback_capacity_value: index, %epoch: buffer, %tokens: buffer, %results: buffer) {
   %capacity = index.assume %capacity_value [range(%capacity_value, 8, 32768)] : index
+  %feedback_capacity = index.assume %feedback_capacity_value [range(%feedback_capacity_value, 8, 32768)] : index
   %origin = index.constant 0 : offset
   %descriptor_origin = index.constant 12 : offset
   %selection_origin = func.call @qwen38_packet_selection_origin(%capacity) : (index) -> (offset)
   %options_origin = func.call @qwen38_packet_options_origin(%capacity) : (index) -> (offset)
   %identity_origin = func.call @qwen38_packet_identity_origin(%capacity) : (index) -> (offset)
   %result_stride = index.constant 40 : offset
-  %record_bytes = index.scale %capacity, %result_stride : index, offset -> offset
+  %record_bytes = index.scale %feedback_capacity, %result_stride : index, offset -> offset
   %headers = index.constant 240 : offset
   %next_origin = index.add %record_bytes, %headers : offset
   %tags_origin = index.add %next_origin, %record_bytes : offset
@@ -104,7 +105,7 @@ func.def @continuation_oracle(%mixed_inputs: index, %context: index, %capacity_v
   %options = buffer.view %epoch[%options_origin] : buffer -> view<[%capacity]x2xi32>
   %identities = buffer.view %epoch[%identity_origin] : buffer -> view<[%capacity]x2xi32>
   %active_tokens = buffer.view %tokens[%origin] : buffer -> view<[%capacity]xi32>
-  %tags = buffer.view %results[%tags_origin] : buffer -> view<[%capacity]xi32>
+  %tags = buffer.view %results[%tags_origin] : buffer -> view<[%feedback_capacity]xi32>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   scf.for %i = [%c0 to %capacity step %c1] {
@@ -134,14 +135,14 @@ func.def @continuation_oracle(%mixed_inputs: index, %context: index, %capacity_v
     %value = scalar.addi %first_token, %word : i32
     view.store %value, %active_tokens[%token] : i32, view<[%capacity]xi32>
   }
-  view.store %c0_i32, %tags[0] : i32, view<[%capacity]xi32>
+  view.store %c0_i32, %tags[0] : i32, view<[%feedback_capacity]xi32>
   %live_tags_origin = index.add %next_origin, %result_stride : offset
   %live_tags = buffer.view %results[%live_tags_origin] : buffer -> view<1xi32>
   view.store %c0_i32, %live_tags[0] : i32, view<1xi32>
   func.return
 }
 
-func.def @continuation_parameters(%trial: index) -> (index, index) {
+func.def @continuation_parameters(%trial: index) -> (index) {
   %first = index.constant 0 : index
   %second = index.constant 1 : index
   %small = index.constant 8 : index
@@ -151,26 +152,23 @@ func.def @continuation_parameters(%trial: index) -> (index, index) {
   %is_middle = index.cmp eq, %trial, %second : index
   %larger = scf.select %is_middle, %middle, %large : index
   %capacity = scf.select %is_small, %small, %larger : index
-  %record_words = index.constant 21 : index
-  %headers = index.constant 60 : index
-  %payload = index.mul %capacity, %record_words : index
-  %words = index.add %payload, %headers : index
-  func.return %capacity, %words : index, index
+  func.return %capacity : index
 }
 
 check.scenario public @ordinary_continuation_preserves_source_position {
   check.trial[3](%trial: index, %entropy: check.entropy) {
     %mixed_inputs = check.literal value(0) : index
     %context = check.literal value(65536) : index
-    %capacity, %feedback_words = check.generate<@continuation_parameters>(%trial) : (index) -> (index, index)
+    %capacity = check.generate<@continuation_parameters>(%trial) : (index) -> (index)
+    %feedback_capacity = check.literal value(8) : index
     %epoch = check.generate.fill value(-99) : tensor<[%capacity]x30xi32>
     %tokens = check.generate.fill value(-99) : tensor<2x[%capacity]xi32>
-    %results = check.generate.fill value(-99) : tensor<[%feedback_words]xi32>
-    check.generate<@continuation_initialize>(%capacity, %epoch, %tokens, %results) : (index, tensor<[%capacity]x30xi32>, tensor<2x[%capacity]xi32>, tensor<[%feedback_words]xi32>) -> ()
-    check.compare<@qwen38_continue_dispatch, @continuation_oracle>(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<[%capacity]x30xi32>, tensor<2x[%capacity]xi32>, tensor<[%feedback_words]xi32>) -> () {
+    %results = check.generate.fill value(-99) : tensor<228xi32>
+    check.generate<@continuation_initialize>(%capacity, %epoch, %tokens, %results) : (index, tensor<[%capacity]x30xi32>, tensor<2x[%capacity]xi32>, tensor<228xi32>) -> ()
+    check.compare<@qwen38_continue_dispatch, @continuation_oracle>(%mixed_inputs, %context, %capacity, %feedback_capacity, %epoch, %tokens, %results) : (index, index, index, index, tensor<[%capacity]x30xi32>, tensor<2x[%capacity]xi32>, tensor<228xi32>) -> () {
       check.expect.bitwise actual(%epoch) expected(%epoch) : tensor<[%capacity]x30xi32>
       check.expect.bitwise actual(%tokens) expected(%tokens) : tensor<2x[%capacity]xi32>
-      check.expect.bitwise actual(%results) expected(%results) : tensor<[%feedback_words]xi32>
+      check.expect.bitwise actual(%results) expected(%results) : tensor<228xi32>
     }
   }
   check.return
@@ -197,7 +195,7 @@ func.def @speculative_continuation_fixture(%width: index, %remaining: index, %te
   %indices = buffer.view %epoch[%indices_origin] : buffer -> view<1xi32>
   %eos = buffer.view %epoch[%eos_origin] : buffer -> view<1xi32>
   %result_origin = index.constant 120 : offset
-  %first = buffer.view %results[%result_origin] : buffer -> view<[%capacity]x10xi32>
+  %first = buffer.view %results[%result_origin] : buffer -> view<8x10xi32>
   %header = buffer.view %expected_header[%origin] : buffer -> view<3xi32>
   %inputs = buffer.view %expected_inputs[%origin] : buffer -> view<512xi32>
   %c0_i32 = scalar.constant 0 : i32
@@ -225,10 +223,10 @@ func.def @speculative_continuation_fixture(%width: index, %remaining: index, %te
   view.store %credit, %options[1] : i32, view<2xi32>
   view.store %tag, %indices[0] : i32, view<1xi32>
   view.store %stop, %eos[0] : i32, view<1xi32>
-  view.store %c2_i32, %first[5, 0] : i32, view<[%capacity]x10xi32>
+  view.store %c2_i32, %first[5, 0] : i32, view<8x10xi32>
   %packed_counts = scalar.constant 131074 : i32
-  view.store %packed_counts, %first[5, 1] : i32, view<[%capacity]x10xi32>
-  view.store %prediction, %first[5, 3] : i32, view<[%capacity]x10xi32>
+  view.store %packed_counts, %first[5, 1] : i32, view<8x10xi32>
+  view.store %prediction, %first[5, 3] : i32, view<8x10xi32>
   %result_bytes = buffer.length %results
   buffer.copy %results[%origin], %expected_results[%origin], %result_bytes
   scf.if %expected_live {
@@ -238,8 +236,8 @@ func.def @speculative_continuation_fixture(%width: index, %remaining: index, %te
     view.store %token, %inputs[0] : i32, view<512xi32>
     // One live record follows the second header. Its tag is packed directly
     // after that record, while the temporary tail retains the same owner.
-    %packed_origin = index.constant 20760 : offset
-    %temporary_origin = index.constant 41200 : offset
+    %packed_origin = index.constant 600 : offset
+    %temporary_origin = index.constant 880 : offset
     %packed = buffer.view %expected_results[%packed_origin] : buffer -> view<1xi32>
     %temporary = buffer.view %expected_results[%temporary_origin] : buffer -> view<1xi32>
     view.store %tag, %packed[0] : i32, view<1xi32>
@@ -271,7 +269,7 @@ func.def @speculative_continuation_parameters(%trial: index) -> (index, index, i
 }
 
 // The fixture above supplies the independent expected buffers.
-func.def @continuation_expected(%mixed_inputs: index, %context: index, %capacity: index, %epoch: buffer, %tokens: buffer, %results: buffer) {
+func.def @continuation_expected(%mixed_inputs: index, %context: index, %capacity: index, %feedback_capacity: index, %epoch: buffer, %tokens: buffer, %results: buffer) {
   func.return
 }
 
@@ -280,19 +278,20 @@ check.scenario public @speculative_continuation_frontiers {
     %width, %remaining, %terminal, %context, %expected_live = check.generate<@speculative_continuation_parameters>(%trial) : (index) -> (index, index, i32, index, i1)
     %epoch = check.generate.fill value(0) : tensor<14346xi32>
     %tokens = check.generate.fill value(-17) : tensor<1024xi32>
-    %results = check.generate.fill value(-99) : tensor<10812xi32>
+    %results = check.generate.fill value(-99) : tensor<228xi32>
     %expected_header = check.generate.fill value(0) : tensor<3xi32>
     %expected_inputs = check.generate.fill value(0) : tensor<512xi32>
-    %expected_results = check.generate.fill value(-99) : tensor<10812xi32>
-    check.generate<@speculative_continuation_fixture>(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_results) : (index, index, i32, i1, tensor<14346xi32>, tensor<10812xi32>, tensor<3xi32>, tensor<512xi32>, tensor<10812xi32>) -> ()
+    %expected_results = check.generate.fill value(-99) : tensor<228xi32>
+    check.generate<@speculative_continuation_fixture>(%width, %remaining, %terminal, %expected_live, %epoch, %results, %expected_header, %expected_inputs, %expected_results) : (index, index, i32, i1, tensor<14346xi32>, tensor<228xi32>, tensor<3xi32>, tensor<512xi32>, tensor<228xi32>) -> ()
     %mixed_inputs = check.literal value(0) : index
     %capacity = check.literal value(512) : index
+    %feedback_capacity = check.literal value(8) : index
     %header = check.tensor.view %epoch offset(0) : tensor<14346xi32> -> tensor<3xi32>
     %inputs = check.tensor.view %tokens offset(0) : tensor<1024xi32> -> tensor<512xi32>
-    check.compare<@qwen38_continue_dispatch, @continuation_expected>(%mixed_inputs, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<10812xi32>) -> () {
+    check.compare<@qwen38_continue_dispatch, @continuation_expected>(%mixed_inputs, %context, %capacity, %feedback_capacity, %epoch, %tokens, %results) : (index, index, index, index, tensor<14346xi32>, tensor<1024xi32>, tensor<228xi32>) -> () {
       check.expect.bitwise actual(%header) expected(%expected_header) : tensor<3xi32>
       check.expect.bitwise actual(%inputs) expected(%expected_inputs) : tensor<512xi32>
-      check.expect.bitwise actual(%results) expected(%expected_results) : tensor<10812xi32>
+      check.expect.bitwise actual(%results) expected(%expected_results) : tensor<228xi32>
     }
   }
   check.return
@@ -380,7 +379,7 @@ check.scenario public @continuation_tags_preserve_record_banks {
     %mixed = check.literal value(0) : index
     %context = check.literal value(256) : index
     %capacity = check.literal value(16) : index
-    check.compare<@qwen38_continue_dispatch, @continuation_expected>(%mixed, %context, %capacity, %epoch, %tokens, %results) : (index, index, index, tensor<480xi32>, tensor<32xi32>, tensor<396xi32>) -> () {
+    check.compare<@qwen38_continue_dispatch, @continuation_expected>(%mixed, %context, %capacity, %capacity, %epoch, %tokens, %results) : (index, index, index, index, tensor<480xi32>, tensor<32xi32>, tensor<396xi32>) -> () {
       check.expect.bitwise actual(%results) expected(%expected) : tensor<396xi32>
     }
   }

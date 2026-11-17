@@ -10,9 +10,9 @@ config.decl @storage_test.draft_page_bytes : i64
 // Per-resident working state lives after retained carry, outside snapshots.
 config.decl @storage_test.draft_working_stride : i64
 
-func.decl @qwen38.control_create(%packet_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer)
+func.decl @qwen38.control_create(%packet_capacity: i64, %feedback_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer)
 
-func.decl @qwen38.storage(%packet_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer, buffer, buffer, buffer, buffer)
+func.decl @qwen38.storage(%packet_capacity: i64, %feedback_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer, buffer, buffer, buffer, buffer)
 
 func.decl @text_resize_state_v1(%state: buffer, %rows: i64) -> (buffer, buffer, buffer, buffer, buffer, buffer)
 
@@ -27,7 +27,7 @@ func.def @page_bytes(%pool: i64) -> (i64, i64, i64) {
   %packed = scalar.constant true : i1
   %enabled = scalar.constant true : i1
   %dflash = config.get @storage_test.dflash : i1
-  %allocations, %views, %target_origins, %draft_origins, %geometry = func.call @qwen38.storage(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
+  %allocations, %views, %target_origins, %draft_origins, %geometry = func.call @qwen38.storage(%packet_capacity, %rows, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
   %regions_begin = index.constant 64 : offset
   %geometry_bytes = buffer.length %geometry
   %regions_bytes = index.sub %geometry_bytes, %regions_begin : offset
@@ -174,6 +174,27 @@ func.def @valid_draft_storage(%allocations: buffer, %draft: buffer, %geometry: b
   func.return %valid : i1
 }
 
+// Eight prepared request slots remain independent of token and resident counts.
+// Inspect the actual bootstrap allocation and bank origin used by the service.
+func.def @feedback_layout(%allocations: buffer, %geometry: buffer, %enabled: i1) -> (i1) {
+  %origin = index.constant 0 : offset
+  %records = buffer.view %allocations[%origin] : buffer -> view<11x3xi64>
+  %header = buffer.view %geometry[%origin] : buffer -> view<8xi64>
+  %bytes = view.load %records[8, 0] : view<11x3xi64> -> i64
+  %clear = view.load %records[8, 2] : view<11x3xi64> -> i64
+  %split = view.load %header[3] : view<8xi64> -> i64
+  %c0_i64 = scalar.constant 0 : i64
+  %allocated = scalar.constant 912 : i64
+  %expected = scf.select %enabled, %allocated, %c0_i64 : i64
+  %expected_split = scalar.constant 440 : i64
+  %sized = scalar.cmpi eq, %bytes, %expected : i64
+  %uninitialized = scalar.cmpi eq, %clear, %c0_i64 : i64
+  %partitioned = scalar.cmpi eq, %split, %expected_split : i64
+  %storage = scalar.andi %sized, %uninitialized : i1
+  %valid = scalar.andi %storage, %partitioned : i1
+  func.return %valid : i1
+}
+
 func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64, %context: i64, %pool: i64) -> (i1, i1) {
   %disabled = scalar.constant 0 : i32
   %enabled = scalar.cmpi ne, %draft_depth, %disabled : i32
@@ -182,10 +203,11 @@ func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64, %context:
   %intermediate_rows = scalar.constant 17 : i64
   %final_rows = scalar.constant 129 : i64
   %tokens = scalar.constant 128 : i64
+  %feedback_capacity = scalar.constant 8 : i64
   %packed = scalar.constant true : i1
   %dflash = config.get @storage_test.dflash : i1
-  %state = func.call @qwen38.control_create(%tokens, %context, %pool, %initial_rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer)
-  %allocations, %views, %target, %draft, %geometry = func.call @qwen38.storage(%tokens, %context, %pool, %initial_rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
+  %state = func.call @qwen38.control_create(%tokens, %feedback_capacity, %context, %pool, %initial_rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer)
+  %allocations, %views, %target, %draft, %geometry = func.call @qwen38.storage(%tokens, %feedback_capacity, %context, %pool, %initial_rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
   %prefix_bytes = index.constant 136 : offset
   %sentinel = scalar.constant 93 : i32
   buffer.fill %sentinel, %state[%origin], %prefix_bytes : i32
@@ -237,7 +259,11 @@ func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64, %context:
   %cd = scalar.andi %c, %empty : i1
   %layouts_equal = scalar.andi %ab, %cd : i1
   %working_valid = scalar.andi %initial_working, %grown_working : i1
-  %layout_valid = scalar.andi %layouts_equal, %working_valid : i1
+  %initial_feedback = func.call @feedback_layout(%allocations, %geometry, %enabled) : (buffer, buffer, i1) -> (i1)
+  %grown_feedback = func.call @feedback_layout(%grown_allocations, %grown_geometry, %enabled) : (buffer, buffer, i1) -> (i1)
+  %feedback_valid = scalar.andi %initial_feedback, %grown_feedback : i1
+  %state_valid = scalar.andi %layouts_equal, %working_valid : i1
+  %layout_valid = scalar.andi %state_valid, %feedback_valid : i1
   %initial_origins = buffer.view %target[%origin] : buffer -> view<4x5xi64>
   %first_payload = view.load %initial_origins[0, 0] : view<4x5xi64> -> i64
   %maximum_32_bit_offset = scalar.constant 4294967295 : i64
@@ -287,7 +313,7 @@ func.def @packet_allocation(%capacity: i64) -> (i64, i64, i64) {
   %packed = scalar.constant true : i1
   %enabled = scalar.constant false : i1
   %dflash = config.get @storage_test.dflash : i1
-  %allocations, %views, %target, %draft, %geometry = func.call @qwen38.storage(%capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
+  %allocations, %views, %target, %draft, %geometry = func.call @qwen38.storage(%capacity, %rows, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
   %origin = index.constant 0 : offset
   %records = buffer.view %allocations[%origin] : buffer -> view<11x3xi64>
   %bytes = view.load %records[2, 0] : view<11x3xi64> -> i64
