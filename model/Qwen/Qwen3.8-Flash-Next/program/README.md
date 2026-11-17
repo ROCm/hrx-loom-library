@@ -102,6 +102,14 @@ GPU-authored count controls every remaining neural launch without a host
 readback. Hidden state gathers into a separate transient buffer to keep
 cross-workgroup reads independent of compaction writes.
 
+Neural sampling also computes the winning token's probability over the active
+draft vocabulary. A probability below 0.85 publishes that candidate but stops
+further neural proposals for its owner. The final scheduled publication packs
+the surviving target prefixes, including when all owners stopped earlier.
+Target verification still uses the full vocabulary and unchanged sampling and
+acceptance rules; the confidence threshold changes only how much draft work
+is attempted.
+
 Output-only stages at capacities of 128 tokens and above compact the final
 attention layer after every input row has been appended to its cache. Only
 selected query cohorts continue through attention and experts; results

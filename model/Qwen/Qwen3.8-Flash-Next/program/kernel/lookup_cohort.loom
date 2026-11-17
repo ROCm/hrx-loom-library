@@ -58,7 +58,16 @@ kernel.def @flash_next_lookup_parameters(%round: index) {
   %identities = buffer.view %epoch[%identity_origin] : buffer -> view<[%packet_capacity]x2xi32>
   %count_word = view.load %header[1] : view<3xi32> -> i32
   %count = index.cast %count_word : i32 to index
-  %active = index.cmp ult, %slot, %count : index
+  %in_packet = index.cmp ult, %slot, %count : index
+  %active = scf.if %in_packet -> (i1) {
+    %length = view.load %spans[%slot, 0] : view<[%capacity]x6xi32> -> i32
+    %stopped_length = scalar.constant 0 : i32
+    %pending = scalar.cmpi ne, %length, %stopped_length : i32
+    scf.yield %pending : i1
+  } else {
+    %inactive = scalar.constant false : i1
+    scf.yield %inactive : i1
+  }
   %c0_i32 = scalar.constant 0 : i32
   %sentinel = scalar.constant -1 : i32
   view.store %sentinel, %records[%slot, 2] : i32, view<[%capacity]x16xi32>
@@ -122,7 +131,7 @@ kernel.def @flash_next_lookup_publish(%round: index) {
   %depth = config.get @flash_next.draft_depth : index
   %mixed = config.get @runner.qwen38.mixed_inputs : index
   %round = index.assume %round_value [range(%round_value, 0, 6)] : index
-  %remaining = index.sub %depth, %round : index
+  %unbounded_remaining = index.sub %depth, %round : index
   %origin = index.constant 0 : offset
   %descriptor_origin = index.constant 12 : offset
   %mode_origin = func.call pure @flash_next_draft_mode_origin(%capacity) : (index) -> (offset)
@@ -152,10 +161,14 @@ kernel.def @flash_next_lookup_publish(%round: index) {
     %end = index.cast %end_word : i32 to index
     %committed_word = view.load %records[%old, 0] : view<[%capacity]x16xi32> -> i32
     %committed = index.cast %committed_word : i32 to index
+    %row_length = view.load %spans[%old, 0] : view<[%capacity]x6xi32> -> i32
+    %finished = scalar.cmpi eq, %row_length, %c0_i32 : i32
+    %remaining = scf.select %finished, %c0, %unbounded_remaining : index
     %source_limit = index.add %end, %remaining : index
     %has_match = index.cmp ugt, %end, %c0 : index
     %fits = index.cmp ule, %source_limit, %committed : index
-    %copied = scalar.andi %has_match, %fits : i1
+    %matched = scalar.andi %has_match, %fits : i1
+    %copied = scalar.ori %matched, %finished : i1
     %begin_word = view.load %origins_view[%old, 0] : view<[%capacity]x3xi32> -> i32
     %begin = index.cast %begin_word : i32 to index
     %new_count = scf.if %copied -> (index) {

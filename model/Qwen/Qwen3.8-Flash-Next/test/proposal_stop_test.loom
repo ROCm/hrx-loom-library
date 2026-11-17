@@ -1,0 +1,208 @@
+// Confidence stopping followed by the production copied-history compactor.
+// Independent records distinguish target span, compact slot, resident owner,
+// and input reservation; mixed records retain their complete payload.
+
+kernel.decl @qwen38_mtp_proposal_advance_confident(%round: index) launch(%mixed_inputs: index, %round_value: index, %maximum_proposals: index, %minimum_probability: f32, %target_capacity: index, %draft_capacity: index, %draft: buffer, %origins: buffer, %predictions: buffer, %draft_tokens: buffer, %target_tokens: buffer, %results: buffer, %epoch: buffer)
+
+kernel.decl @flash_next_lookup_publish(%round: index) launch(%round_value: index, %rows: buffer, %cache: buffer, %parameters: buffer, %selected: buffer, %draft: buffer, %origins: buffer, %ids: buffer, %plan: buffer, %target_tokens: buffer, %moves: buffer, %count_buffer: buffer)
+
+config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
+
+// Slots deliberately run in reverse target-span order. Probabilities below,
+// equal to, and above the gate retain their current proposal; only slots one
+// and two can survive into the next neural cohort. Closed-form expected fields
+// preserve the untouched suffix instead of reproducing overlapping copies.
+func.def @stop_fixture(%trial_value: index, %finished: i1, %epoch: buffer, %draft: buffer, %origins: buffer, %predictions: buffer, %ids: buffer, %tokens: buffer, %results: buffer, %plan: buffer, %moves: buffer, %count_buffer: buffer) {
+  %trial = index.assume %trial_value [range(%trial_value, 0, 4)] : index
+  %origin = index.constant 0 : offset
+  %descriptor = index.constant 12 : offset
+  %mode_origin = index.constant 4 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %mixed = config.get @runner.qwen38.mixed_inputs : index
+  %is_mixed = index.cmp ne, %mixed, %c0 : index
+  %stride = scf.select %is_mixed, %c8, %c1 : index
+  %target = buffer.view %epoch[%descriptor] : buffer -> view<32x6xi32>
+  %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
+  %spans = buffer.view %draft[%descriptor] : buffer -> view<4x6xi32>
+  %mapping = buffer.view %origins[%origin] : buffer -> view<4x3xi32>
+  %proposed = buffer.view %predictions[%origin] : buffer -> view<4x2xi32>
+  %inputs = buffer.view %ids[%origin] : buffer -> view<4xi32>
+  %target_inputs = buffer.view %tokens[%origin] : buffer -> view<32x[%stride]xi32>
+  %feedback = buffer.view %results[%origin] : buffer -> view<30xi32>
+  %modes = buffer.view %plan[%mode_origin] : buffer -> view<4xi32>
+  %cohort = buffer.view %plan[%origin] : buffer -> view<1xi32>
+  %movement = buffer.view %moves[%origin] : buffer -> view<4xi32>
+  %live = buffer.view %count_buffer[%origin] : buffer -> view<1xi32>
+  %at_least_one = index.max %trial, %c1 : index
+  %possible = index.sub %at_least_one, %c1 : index
+  %survivors = index.min %possible, %c2 : index
+  %count = scf.select %finished, %survivors, %trial : index
+  %count_word = index.cast %count : index to i32
+  %trial_word = index.cast %trial : index to i32
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %c2_i32 = scalar.constant 2 : i32
+  %c4_i32 = scalar.constant 4 : i32
+  %c8_i32 = scalar.constant 8 : i32
+  view.store %count_word, %header[0] : i32, view<3xi32>
+  view.store %count_word, %header[1] : i32, view<3xi32>
+  view.store %count_word, %header[2] : i32, view<3xi32>
+  scf.for %slot = [%c0 to %c4 step %c1] {
+    %target_slot = index.sub %c3, %slot : index
+    %begin = index.mul %target_slot, %c8 : index
+    %begin_word = index.cast %begin : index to i32
+    %target_word = index.cast %target_slot : index to i32
+    %active = index.cmp ult, %slot, %trial : index
+    %first = index.cmp eq, %slot, %c0 : index
+    %last = index.cmp eq, %slot, %c3 : index
+    %low = scalar.ori %first, %last : i1
+    %stopped = scalar.andi %active, %low : i1
+    %stopped_final = scalar.andi %finished, %stopped : i1
+    %target_length = scf.select %stopped_final, %c2_i32, %c8_i32 : i32
+    view.store %target_length, %target[%target_slot, 0] : i32, view<32x6xi32>
+    %advanced = scalar.andi %active, %finished : i1
+    %increment = scf.select %advanced, %c1, %c0 : index
+    %position_base = index.constant 100 : index
+    %position = index.add %position_base, %slot : index
+    %position_final = index.add %position, %increment : index
+    %position_word = index.cast %position_final : index to i32
+    %row_base = index.constant 20 : index
+    %row = index.add %row_base, %slot : index
+    %row_word = index.cast %row : index to i32
+    %slot_word = index.cast %slot : index to i32
+    %length = scf.select %stopped_final, %c0_i32, %c1_i32 : i32
+    view.store %length, %spans[%slot, 0] : i32, view<4x6xi32>
+    view.store %position_word, %spans[%slot, 1] : i32, view<4x6xi32>
+    view.store %slot_word, %spans[%slot, 2] : i32, view<4x6xi32>
+    view.store %row_word, %spans[%slot, 3] : i32, view<4x6xi32>
+    view.store %position_word, %spans[%slot, 4] : i32, view<4x6xi32>
+    view.store %slot_word, %spans[%slot, 5] : i32, view<4x6xi32>
+    view.store %begin_word, %mapping[%slot, 0] : i32, view<4x3xi32>
+    view.store %begin_word, %mapping[%slot, 1] : i32, view<4x3xi32>
+    view.store %target_word, %mapping[%slot, 2] : i32, view<4x3xi32>
+    view.store %slot_word, %modes[%slot] : i32, view<4xi32>
+    %id_base = index.constant 700 : index
+    %id = index.add %id_base, %slot : index
+    %id_word = index.cast %id : index to i32
+    view.store %id_word, %proposed[%slot, 0] : i32, view<4x2xi32>
+    %p0 = scalar.constant 0.83999999999999997 : f32
+    %p1 = scalar.constant 0.84999999999999998 : f32
+    %p2 = scalar.constant 0.85999999999999999 : f32
+    %p3 = scalar.constant 0.20000000000000001 : f32
+    %equal = index.cmp eq, %slot, %c1 : index
+    %middle = scf.select %equal, %p1, %p2 : f32
+    %early = scf.select %first, %p0, %middle : f32
+    %probability = scf.select %last, %p3, %early : f32
+    %bits = scalar.bitcast %probability : f32 to i32
+    view.store %bits, %proposed[%slot, 1] : i32, view<4x2xi32>
+    scf.if %advanced {
+      view.store %id_word, %inputs[%slot] : i32, view<4xi32>
+      %destination = index.add %begin, %c1 : index
+      view.store %id_word, %target_inputs[%destination, 0] : i32, view<32x[%stride]xi32>
+    }
+  }
+  scf.if %finished {
+    view.store %c1_i32, %feedback[8] : i32, view<30xi32>
+    view.store %trial_word, %feedback[9] : i32, view<30xi32>
+    view.store %c4_i32, %feedback[29] : i32, view<30xi32>
+    view.store %count_word, %live[0] : i32, view<1xi32>
+    %has_two = index.cmp eq, %survivors, %c2 : index
+    %has_one = index.cmp eq, %survivors, %c1 : index
+    %c3_i32 = scalar.constant 3 : i32
+    %partial_mode = scf.select %has_one, %c1_i32, %c0_i32 : i32
+    %combined_mode = scf.select %has_two, %c3_i32, %partial_mode : i32
+    view.store %combined_mode, %cohort[0] : i32, view<1xi32>
+    scf.for %slot = [%c0 to %survivors step %c1] {
+      %old = index.add %slot, %c1 : index
+      %old_word = index.cast %old : index to i32
+      %target_slot = index.sub %c3, %old : index
+      %target_word = index.cast %target_slot : index to i32
+      %begin = index.mul %target_slot, %c8 : index
+      %begin_word = index.cast %begin : index to i32
+      %position_base = index.constant 101 : index
+      %position = index.add %position_base, %old : index
+      %position_word = index.cast %position : index to i32
+      %row_base = index.constant 20 : index
+      %row = index.add %row_base, %old : index
+      %row_word = index.cast %row : index to i32
+      %slot_word = index.cast %slot : index to i32
+      %id_base = index.constant 700 : index
+      %id = index.add %id_base, %old : index
+      %id_word = index.cast %id : index to i32
+      view.store %c1_i32, %spans[%slot, 0] : i32, view<4x6xi32>
+      view.store %position_word, %spans[%slot, 1] : i32, view<4x6xi32>
+      view.store %slot_word, %spans[%slot, 2] : i32, view<4x6xi32>
+      view.store %row_word, %spans[%slot, 3] : i32, view<4x6xi32>
+      view.store %position_word, %spans[%slot, 4] : i32, view<4x6xi32>
+      view.store %slot_word, %spans[%slot, 5] : i32, view<4x6xi32>
+      view.store %begin_word, %mapping[%slot, 0] : i32, view<4x3xi32>
+      view.store %begin_word, %mapping[%slot, 1] : i32, view<4x3xi32>
+      view.store %target_word, %mapping[%slot, 2] : i32, view<4x3xi32>
+      view.store %id_word, %inputs[%slot] : i32, view<4xi32>
+      view.store %old_word, %modes[%slot] : i32, view<4xi32>
+      view.store %old_word, %movement[%slot] : i32, view<4xi32>
+    }
+  }
+  func.return
+}
+
+command.def @stop_call() launch(%epoch: buffer, %draft: buffer, %origins: buffer, %predictions: buffer, %ids: buffer, %tokens: buffer, %results: buffer, %plan: buffer, %moves: buffer, %count_buffer: buffer, %parameters: buffer, %selected: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %capacity = index.constant 32 : index
+  %depth = index.constant 7 : index
+  %mixed = config.get @runner.qwen38.mixed_inputs : index
+  %minimum_probability = scalar.constant 0.84999999999999998 : f32
+  kernel.launch @qwen38_mtp_proposal_advance_confident[%c0](%mixed, %c0, %depth, %minimum_probability, %capacity, %c4, %draft, %origins, %predictions, %ids, %tokens, %results, %epoch) : [index](index, index, index, f32, index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_lookup_publish[%c1](%c1, %selected, %parameters, %parameters, %selected, %draft, %origins, %ids, %plan, %tokens, %moves, %count_buffer) : [index](index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+func.def @stop_reference(%epoch: buffer, %draft: buffer, %origins: buffer, %predictions: buffer, %ids: buffer, %tokens: buffer, %results: buffer, %plan: buffer, %moves: buffer, %count_buffer: buffer, %parameters: buffer, %selected: buffer) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
+  %word = view.load %header[1] : view<3xi32> -> i32
+  %count = index.cast %word : i32 to index
+  %yes = scalar.constant true : i1
+  func.call @stop_fixture(%count, %yes, %epoch, %draft, %origins, %predictions, %ids, %tokens, %results, %plan, %moves, %count_buffer) : (index, i1, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  func.return
+}
+
+check.scenario public @stop_cohort {
+  check.trial[5](%trial: index, %entropy: check.entropy) {
+    %epoch = check.generate.fill value(-99) : tensor<195xi32>
+    %draft = check.generate.fill value(-99) : tensor<27xi32>
+    %origins = check.generate.fill value(-99) : tensor<4x3xi32>
+    %predictions = check.generate.fill value(-99) : tensor<4x2xi32>
+    %ids = check.generate.fill value(-99) : tensor<4xi32>
+    %tokens = check.generate.iota offset(0) step(1) : tensor<32x8xi32>
+    %results = check.generate.fill value(-99) : tensor<30xi32>
+    %plan = check.generate.fill value(-99) : tensor<5xi32>
+    %moves = check.generate.fill value(-99) : tensor<4xi32>
+    %counts = check.generate.fill value(-99) : tensor<1xi32>
+    %parameters = check.generate.fill value(0) : tensor<4x16xi32>
+    %selected = check.generate.fill value(0) : tensor<4x2xi32>
+    %no = check.literal value(false) : i1
+    check.generate<@stop_fixture>(%trial, %no, %epoch, %draft, %origins, %predictions, %ids, %tokens, %results, %plan, %moves, %counts) : (index, i1, tensor<195xi32>, tensor<27xi32>, tensor<4x3xi32>, tensor<4x2xi32>, tensor<4xi32>, tensor<32x8xi32>, tensor<30xi32>, tensor<5xi32>, tensor<4xi32>, tensor<1xi32>) -> ()
+    check.compare<@stop_call, @stop_reference>(%epoch, %draft, %origins, %predictions, %ids, %tokens, %results, %plan, %moves, %counts, %parameters, %selected) : (tensor<195xi32>, tensor<27xi32>, tensor<4x3xi32>, tensor<4x2xi32>, tensor<4xi32>, tensor<32x8xi32>, tensor<30xi32>, tensor<5xi32>, tensor<4xi32>, tensor<1xi32>, tensor<4x16xi32>, tensor<4x2xi32>) -> () {
+      check.expect.bitwise actual(%epoch) expected(%epoch) : tensor<195xi32>
+      check.expect.bitwise actual(%draft) expected(%draft) : tensor<27xi32>
+      check.expect.bitwise actual(%origins) expected(%origins) : tensor<4x3xi32>
+      check.expect.bitwise actual(%ids) expected(%ids) : tensor<4xi32>
+      check.expect.bitwise actual(%tokens) expected(%tokens) : tensor<32x8xi32>
+      check.expect.bitwise actual(%results) expected(%results) : tensor<30xi32>
+      check.expect.bitwise actual(%plan) expected(%plan) : tensor<5xi32>
+      check.expect.bitwise actual(%moves) expected(%moves) : tensor<4xi32>
+      check.expect.bitwise actual(%counts) expected(%counts) : tensor<1xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@stop_cohort> @stop_check

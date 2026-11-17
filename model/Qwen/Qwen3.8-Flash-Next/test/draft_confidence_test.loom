@@ -1,0 +1,139 @@
+// Model sampling checks against a closed-form F64 softmax. Two explicitly
+// constructed peaks and a uniform finite tail cover common/retained and full
+// vocabularies, inactive owners, and confidence across the stopping threshold.
+
+kernel.decl @flash_next_draft_sample(%enabled: i1) launch(%epoch: buffer, %plan: buffer, %carry: buffer, %logits: buffer, %output: buffer)
+
+func.decl pure @flash_next_draft_mode_origin(%capacity: index) -> (offset)
+
+func.def @probability_fixture(%trial_value: index, %epoch: buffer, %plan: buffer, %carry: buffer, %logits: buffer) {
+  %trial = index.assume %trial_value [range(%trial_value, 0, 3)] : index
+  %origin = index.constant 0 : offset
+  %descriptor = index.constant 12 : offset
+  %mode_origin = index.constant 4 : offset
+  %record_origin = index.constant 21248 : offset
+  %table_origin = index.constant 39984 : offset
+  %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %spans = buffer.view %epoch[%descriptor] : buffer -> view<2x6xi32>
+  %modes = buffer.view %plan[%mode_origin] : buffer -> view<2xi32>
+  %retained = buffer.view %carry[%record_origin] : buffer -> view<3xi32>
+  %table = buffer.view %carry[%table_origin] : buffer -> view<991xi32>
+  %values = buffer.view %logits[%origin] : buffer -> view<2x248320xf32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %count = index.min %trial, %c2 : index
+  %count_word = index.cast %count : index to i32
+  %c1_i32 = scalar.constant 1 : i32
+  %c2_i32 = scalar.constant 2 : i32
+  %rare0 = scalar.constant 100000 : i32
+  %rare1 = scalar.constant 100001 : i32
+  view.store %count_word, %header[0] : i32, view<3xi32>
+  view.store %count_word, %header[1] : i32, view<3xi32>
+  view.store %count_word, %header[2] : i32, view<3xi32>
+  view.store %c2_i32, %retained[0] : i32, view<3xi32>
+  view.store %rare0, %table[0] : i32, view<991xi32>
+  view.store %rare1, %table[1] : i32, view<991xi32>
+  %peak = scalar.constant 0.0 : f32
+  %trial_word = index.cast %trial : index to i32
+  %trial_float = scalar.sitofp %trial_word : i32 to f32
+  %gap = scalar.negf %trial_float : f32
+  scf.for %row = [%c0 to %count step %c1] {
+    %row_word = index.cast %row : index to i32
+    view.store %c1_i32, %spans[%row, 0] : i32, view<2x6xi32>
+    view.store %row_word, %spans[%row, 2] : i32, view<2x6xi32>
+    view.store %row_word, %modes[%row] : i32, view<2xi32>
+    // Both draft slots deliberately read retained owner zero; slot and owner
+    // are different identities, and the second row uses the full vocabulary.
+    view.store %peak, %values[%row, 100000] : f32, view<2x248320xf32>
+    view.store %gap, %values[%row, 248060] : f32, view<2x248320xf32>
+  }
+  func.return
+}
+
+kernel.def @unpack_predictions() {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%epoch: buffer, %predictions: buffer, %ids: buffer, %probabilities: buffer) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %packed = buffer.view %predictions[%origin] : buffer -> view<2x2xi32>
+  %tokens = buffer.view %ids[%origin] : buffer -> view<2xi32>
+  %scores = buffer.view %probabilities[%origin] : buffer -> view<2xf32>
+  %count_word = view.load %header[0] : view<3xi32> -> i32
+  %count_value = index.cast %count_word : i32 to index
+  %count = index.assume %count_value [range(%count_value, 0, 2)] : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  scf.for %row = [%c0 to %count step %c1] {
+    %id = view.load %packed[%row, 0] : view<2x2xi32> -> i32
+    %bits = view.load %packed[%row, 1] : view<2x2xi32> -> i32
+    %score = scalar.bitcast %bits : i32 to f32
+    view.store %id, %tokens[%row] : i32, view<2xi32>
+    view.store %score, %scores[%row] : f32, view<2xf32>
+  }
+  kernel.return
+}
+
+command.def @probability_call() launch(%epoch: buffer, %plan: buffer, %carry: buffer, %logits: buffer, %ids: buffer, %probabilities: buffer) {
+  %bytes = index.constant 16 : offset
+  %predictions = buffer.alloca<global> align(16) %bytes : buffer
+  %yes = scalar.constant true : i1
+  kernel.launch @flash_next_draft_sample[%yes](%epoch, %plan, %carry, %logits, %predictions) : [i1](buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @unpack_predictions(%epoch, %predictions, %ids, %probabilities) : (buffer, buffer, buffer, buffer)
+  command.return
+}
+
+func.def @probability_reference(%epoch: buffer, %plan: buffer, %carry: buffer, %logits: buffer, %ids: buffer, %probabilities: buffer) {
+  %origin = index.constant 0 : offset
+  %tokens = buffer.view %ids[%origin] : buffer -> view<2xi32>
+  %scores = buffer.view %probabilities[%origin] : buffer -> view<2xf32>
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %count_word = view.load %header[0] : view<3xi32> -> i32
+  %count_value = index.cast %count_word : i32 to index
+  %count = index.assume %count_value [range(%count_value, 0, 2)] : index
+  %values = buffer.view %logits[%origin] : buffer -> view<2x248320xf32>
+  %gap_value = view.load %values[0, 248060] : view<2x248320xf32> -> f32
+  %gap = scalar.extf %gap_value : f32 to f64
+  %second = scalar.expf %gap : f64
+  %floor = scalar.constant -20.0 : f64
+  %tiny = scalar.expf %floor : f64
+  %unit = scalar.constant 1.0 : f64
+  %winner = scalar.constant 100000 : i32
+  scf.for %row = [%c0 to %count step %c1] {
+    %prefix = index.cmp eq, %row, %c0 : index
+    %prefix_rest = scalar.constant 98337.0 : f64
+    %full_rest = scalar.constant 248075.0 : f64
+    %rest = scf.select %prefix, %prefix_rest, %full_rest : f64
+    %tail = scalar.mulf %rest, %tiny : f64
+    %peaks = scalar.addf %unit, %second : f64
+    %mass = scalar.addf %peaks, %tail : f64
+    %probability = scalar.divf %unit, %mass : f64
+    %score = scalar.fptrunc %probability : f64 to f32
+    view.store %winner, %tokens[%row] : i32, view<2xi32>
+    view.store %score, %scores[%row] : f32, view<2xf32>
+  }
+  func.return
+}
+
+check.scenario public @proposal_probabilities {
+  check.trial[4](%trial: index, %entropy: check.entropy) {
+    %epoch = check.generate.fill value(0) : tensor<15xi32>
+    %plan = check.generate.fill value(0) : tensor<3xi32>
+    %carry = check.generate.fill value(0) : tensor<44032xi8>
+    %logits = check.generate.fill value(-20.0) : tensor<2x248320xf32>
+    check.generate<@probability_fixture>(%trial, %epoch, %plan, %carry, %logits) : (index, tensor<15xi32>, tensor<3xi32>, tensor<44032xi8>, tensor<2x248320xf32>) -> ()
+    %ids = check.generate.fill value(-17) : tensor<2xi32>
+    %probabilities = check.generate.fill value(-17.0) : tensor<2xf32>
+    check.compare<@probability_call, @probability_reference>(%epoch, %plan, %carry, %logits, %ids, %probabilities) : (tensor<15xi32>, tensor<3xi32>, tensor<44032xi8>, tensor<2x248320xf32>, tensor<2xi32>, tensor<2xf32>) -> () {
+      check.expect.bitwise actual(%ids) expected(%ids) : tensor<2xi32>
+      check.expect.approximate actual(%probabilities) expected(%probabilities) atol(2.0000000000000002e-05) rtol(2.0000000000000002e-05) nan(different) : tensor<2xf32>, tensor<2xf32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@proposal_probabilities> @probability_check

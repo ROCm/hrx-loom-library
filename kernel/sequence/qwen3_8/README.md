@@ -13,6 +13,14 @@ position, source position, and first-result identity remain separate throughout.
 The shared [sequence motifs](../../../motif/sequence/qwen3_8/) own record layouts
 and reusable continuation arithmetic; declarations here own launch ABIs.
 
+Proposal preparation captures the original target span, input beginning, and
+selected-output beginning before draft owners compact. The ordinary advance
+consumes token IDs. The confidence-aware advance consumes token/probability
+pairs and a caller-selected probability floor: it publishes the current
+candidate, then retires low-confidence owners from subsequent drafting. The
+last scheduled advance packs shortened target prefixes even if every draft
+owner has retired. Neither entry point changes target acceptance or history.
+
 Adjacent tests compare complete storage with independent frontier and
 publication oracles, including overlapping compaction. Each file explains its
 reference; scenarios own workload combinations. The
