@@ -41,6 +41,8 @@ kernel.def @flash_next_ple_cache_plan() {
   %count = index.assume %count_value [range(%count_value, 0, %requests)] : index
   %generation = view.load %header_view[1] : view<2xi64> -> i64
   %zero64 = scalar.constant 0 : i64
+  %zero32 = scalar.constant 0 : i32
+  %fill_bit = scalar.constant -2147483648 : i32
   %row_bytes = scalar.constant 90 : i64
   %ids = buffer.view %row_ids[%origin] : buffer -> view<[%requests]xi32>
   %tags = buffer.view %directory[%directory_origin] : buffer -> view<[%capacity]xi64>
@@ -59,13 +61,15 @@ kernel.def @flash_next_ple_cache_plan() {
     %slot = scf.select %resident, %selected, %spill : index
     %row = scalar.extui %row_word : i32 to i64
     %slot_word = index.cast %slot : index to i32
+    %owner_bit = scf.select %read, %fill_bit, %zero32 : i32
+    %mapping_word = scalar.ori %slot_word, %owner_bit : i32
     %slot_wide = index.cast %slot : index to i64
     %source_offset = scalar.muli %row, %row_bytes : i64
     %relative_destination = scalar.muli %slot_wide, %row_bytes : i64
     %payload_word = index.cast %payload_origin : offset to i64
     %destination_offset = scalar.addi %payload_word, %relative_destination : i64
     %length = scf.select %read, %row_bytes, %zero64 : i64
-    view.store %slot_word, %indices[%request] : i32, view<[%requests]xi32>
+    view.store %mapping_word, %indices[%request] : i32, view<[%requests]xi32>
     view.store %source_offset, %records[%request, 0] : i64, view<[%requests]x3xi64>
     view.store %destination_offset, %records[%request, 1] : i64, view<[%requests]x3xi64>
     view.store %length, %records[%request, 2] : i64, view<[%requests]x3xi64>
@@ -75,6 +79,8 @@ kernel.def @flash_next_ple_cache_plan() {
 
 // A failed transfer never reaches publication. Later cohorts reject its pending
 // tags even when their requested keys match; no speculative payload becomes a hit.
+// The device-local mapping retains the unique fill owner independently of the
+// transport descriptors. Coalesced readers never publish on another's behalf.
 kernel.def @flash_next_ple_cache_publish() {
   %packet = config.get @qwen38.packet_capacity : index
   %heads = index.constant 16 : index
@@ -89,8 +95,7 @@ kernel.def @flash_next_ple_cache_publish() {
   %groups = index.min %needed, %limit : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%header: buffer, %directory: buffer, %mapping: buffer, %descriptors: buffer) {
-  %origin = index.constant 0 : offset
+} launch(%header: buffer, %directory: buffer, %mapping: buffer) {
   %packet = config.get @qwen38.packet_capacity : index
   %heads = index.constant 16 : index
   %requests = index.mul %packet, %heads : index
@@ -103,18 +108,18 @@ kernel.def @flash_next_ple_cache_publish() {
   %count = index.assume %count_value [range(%count_value, 0, %requests)] : index
   %tags = buffer.view %directory[%directory_origin] : buffer -> view<[%capacity]xi64>
   %indices = buffer.view %mapping[%mapping_origin] : buffer -> view<[%requests]xi32>
-  %records = buffer.view %descriptors[%descriptor_origin] : buffer -> view<[%requests]x3xi64>
   %group = kernel.workgroup.id<x> : index
   %lane = kernel.workitem.id<x> : index
   %groups = kernel.workgroup.count<x> : index
   %threads = index.constant 128 : index
   %first = index.madd %group, %threads, %lane : index
   %stride = index.mul %groups, %threads : index
-  %zero64 = scalar.constant 0 : i64
+  %zero32 = scalar.constant 0 : i32
+  %slot_mask = scalar.constant 2147483647 : i32
   scf.for %request = [%first to %count step %stride] {
-    %length = view.load %records[%request, 2] : view<[%requests]x3xi64> -> i64
-    %wrote = scalar.cmpi ne, %length, %zero64 : i64
-    %slot_word = view.load %indices[%request] : view<[%requests]xi32> -> i32
+    %entry = view.load %indices[%request] : view<[%requests]xi32> -> i32
+    %wrote = scalar.cmpi slt, %entry, %zero32 : i32
+    %slot_word = scalar.andi %entry, %slot_mask : i32
     %slot_value = index.cast %slot_word : i32 to index
     %resident = index.cmp ult, %slot_value, %capacity : index
     %publish = scalar.andi %wrote, %resident : i1
