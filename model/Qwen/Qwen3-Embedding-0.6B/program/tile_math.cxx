@@ -12,6 +12,7 @@
 // SiLU preserve the round points of the qualified resident representation.
 // Portable prefix normalization and native packing are separate motif inputs.
 
+#include <loomcxx/fragment.h>
 #include <loomcxx/low.h>
 #include <loomcxx/numeric.h>
 #include <loomcxx/scalar.h>
@@ -127,7 +128,7 @@ static Float32x16 qwen3_embedding_silu_product(BFloat16x16 left, BFloat16x16 rig
 
 [[loom::symbol("qwen3_embedding.prepare_silu_lookup"), loom::force_inline]]
 void qwen3_embedding_prepare_silu_lookup(loom::type::view<loom::type::shape<4096>, std::bfloat16_t> input, loom::type::view<loom::type::shape<8192>, std::bfloat16_t> output_ab, loom::type::view<loom::type::shape<8192>, std::bfloat16_t> output_cd) {
-  for (int block = 0; block < 256; ++block) {
+  for (unsigned block = 0; block < 256; ++block) {
     loom::type::index relative = loom::index::cast(block) * loom::type::index{16};
     loom::type::index index = loom::type::index{4080} - relative;
     BFloat16x16 value = loom::vector::load<BFloat16x16>(input, loom::type::indices{index});
@@ -143,7 +144,7 @@ void qwen3_embedding_prepare_silu_lookup(loom::type::view<loom::type::shape<4096
 void qwen3_embedding_identity(loom::type::view<loom::type::shape<8, 8>, std::bfloat16_t> output) {
   BFloat16x8x8 c0 = loom::vector::splat<BFloat16x8x8>({}, std::bfloat16_t{});
   loom::vector::store(c0, output, {0, 0});
-  for (int position = 0; position < 8; ++position) {
+  for (unsigned position = 0; position < 8; ++position) {
     loom::view::store(static_cast<std::bfloat16_t>(1.0f), output, position, position);
   }
   return;
@@ -151,7 +152,7 @@ void qwen3_embedding_identity(loom::type::view<loom::type::shape<8, 8>, std::bfl
 
 [[loom::symbol("qwen3_embedding.copy_output"), loom::force_inline]]
 void qwen3_embedding_copy_output(loom::type::view<loom::type::shape<4096>, std::bfloat16_t> input, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> output) {
-  for (int position = 0; position < 4096; position += 32) {
+  for (unsigned position = 0; position < 4096; position += 32) {
     BFloat16x32 values = loom::vector::load<BFloat16x32>(input, {position});
     loom::vector::store(values, output, {position});
   }
@@ -160,14 +161,14 @@ void qwen3_embedding_copy_output(loom::type::view<loom::type::shape<4096>, std::
 
 [[loom::symbol("qwen3_embedding.block_right"), loom::force_inline]]
 void qwen3_embedding_block_right(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> output) {
-  for (int reduction = 0; reduction < 16; ++reduction) {
+  for (unsigned reduction = 0; reduction < 16; ++reduction) {
     loom::type::index column = loom::index::cast(reduction) * loom::type::index{8};
     loom::type::index reduction_base = loom::index::cast(reduction) * loom::type::index{1};
-    for (int block = 0; block < 1; ++block) {
+    for (unsigned block = 0; block < 1; ++block) {
       loom::type::index row_base = loom::index::cast(block) * loom::type::index{8};
       loom::type::index tile = reduction_base + loom::index::cast(block);
       loom::type::index tile_base = tile * loom::type::index{64};
-      for (int lane = 0; lane < 8; ++lane) {
+      for (unsigned lane = 0; lane < 8; ++lane) {
         loom::type::index row = row_base + loom::index::cast(lane);
         BFloat16x8 values = loom::vector::load<BFloat16x8>(input, loom::type::indices{row, column});
         loom::type::index lane_offset = loom::index::cast(lane) * loom::type::index{8};
@@ -181,14 +182,14 @@ void qwen3_embedding_block_right(loom::type::view<loom::type::shape<32, 128>, st
 
 [[loom::symbol("qwen3_embedding.block_left"), loom::force_inline]]
 void qwen3_embedding_block_left(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> output) {
-  for (int reduction = 0; reduction < 16; ++reduction) {
+  for (unsigned reduction = 0; reduction < 16; ++reduction) {
     loom::type::index column = loom::index::cast(reduction) * loom::type::index{8};
     loom::type::index reduction_base = loom::index::cast(reduction) * loom::type::index{4};
-    for (int block = 0; block < 4; ++block) {
+    for (unsigned block = 0; block < 4; ++block) {
       loom::type::index row_base = loom::index::cast(block) * loom::type::index{8};
       loom::type::index tile = reduction_base + loom::index::cast(block);
       loom::type::index tile_base = tile * loom::type::index{64};
-      for (int lane = 0; lane < 8; ++lane) {
+      for (unsigned lane = 0; lane < 8; ++lane) {
         loom::type::index row = row_base + loom::index::cast(lane);
         BFloat16x8 values = loom::vector::load<BFloat16x8>(input, loom::type::indices{row, column});
         loom::type::index lane_offset = loom::index::cast(lane) * loom::type::index{8};
@@ -205,7 +206,7 @@ void qwen3_embedding_three_products(loom::type::buffer<float> storage, loom::typ
   auto partials = loom::buffer::view<4, 64>(storage, loom::type::offset{9344}, {});
   Float32x64 c0 = Float32x64{};
   Float32x64 initial = loom::vector::fragment::attach<loom::vector::fragment::role::init>(c0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-  for (int panel = 0; panel < 16; ++panel) {
+  for (unsigned panel = 0; panel < 16; ++panel) {
     loom::type::offset relative = loom::index::scale(loom::index::cast(panel), loom::type::offset{1152});
     loom::type::offset high_offset = loom::type::offset{27136} + relative;
     loom::type::offset low_offset = loom::type::offset{45632} + relative;
@@ -218,7 +219,7 @@ void qwen3_embedding_three_products(loom::type::buffer<float> storage, loom::typ
     auto partial_tile2 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(partial_span2);
     auto partial_span3 = loom::view::subview<1, 64>(partials, {3, 0}, {});
     auto partial_tile3 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(partial_span3);
-    for (int product_phase = 0; product_phase < 3; ++product_phase) {
+    for (unsigned product_phase = 0; product_phase < 3; ++product_phase) {
       bool first_product = loom::index::cast(product_phase) == loom::type::index{0};
       bool left_residual_product = loom::index::cast(product_phase) == loom::type::index{1};
       bool right_residual_product = loom::index::cast(product_phase) == loom::type::index{2};
@@ -230,30 +231,30 @@ void qwen3_embedding_three_products(loom::type::buffer<float> storage, loom::typ
       Float32x64 product2 = call_result.value2;
       Float32x64 product3 = call_result.value3;
       if (first_product) {
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(product0, partial_tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(product1, partial_tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(product2, partial_tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(product3, partial_tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product0, partial_tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product1, partial_tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product2, partial_tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product3, partial_tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
       } else {
         Float32x64 previous0 = loom::vector::load<Float32x64>(partials, {0, 0});
         Float32x64 fragment0 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added0 = fragment0 + product0;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(added0, partial_tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added0, partial_tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         Float32x64 previous1 = loom::vector::load<Float32x64>(partials, {1, 0});
         Float32x64 fragment1 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added1 = fragment1 + product1;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(added1, partial_tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added1, partial_tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         Float32x64 previous2 = loom::vector::load<Float32x64>(partials, {2, 0});
         Float32x64 fragment2 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added2 = fragment2 + product2;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(added2, partial_tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added2, partial_tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         Float32x64 previous3 = loom::vector::load<Float32x64>(partials, {3, 0});
         Float32x64 fragment3 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added3 = fragment3 + product3;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(added3, partial_tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added3, partial_tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
       }
     }
-    for (int result_block = 0; result_block < 4; ++result_block) {
+    for (unsigned result_block = 0; result_block < 4; ++result_block) {
       loom::type::index result_base = loom::index::cast(result_block) * loom::type::index{8};
       Float32x64 wide = loom::vector::load<Float32x64>(partials, {result_block, 0});
       BFloat16x64 flat = loom::convert<BFloat16x64, loom::conversion::subnormal::daz>(wide);
@@ -393,7 +394,7 @@ void qwen3_embedding_softmax(loom::type::view<loom::type::shape<32, 128>, std::b
   Float32x16 c0_vector_16_f32 = Float32x16{};
   Float32x16 infinities = __builtin_bit_cast(float, 0xff800000u);
   UInt32x16 lanes = loom::vector::iota<UInt32x16>(static_cast<unsigned>(0), 1u);
-  for (int query = 0; query < 32; ++query) {
+  for (unsigned query = 0; query < 32; ++query) {
     loom::type::index absolute_query = query_base + loom::index::cast(query);
     int query_sequence = loom::view::load(sequences, absolute_query);
     bool valid = query_sequence >= 0;
@@ -402,7 +403,7 @@ void qwen3_embedding_softmax(loom::type::view<loom::type::shape<32, 128>, std::b
     unsigned query_integer = loom::index::cast<unsigned>(absolute_query);
     UInt32x16 query_indices = query_integer;
     Float32x16 maxima = infinities;
-    for (int position = 0; position < 128; position += 16) {
+    for (unsigned position = 0; position < 128; position += 16) {
       BFloat16x16 input = loom::vector::load<BFloat16x16>(matrix, {query, position});
       BFloat16x16 scaled = qwen3_embedding_scale(input, 0.08838834764831843f);
       Float32x16 wide = loom::convert<Float32x16, loom::conversion::subnormal::daz>(scaled);
@@ -422,7 +423,7 @@ void qwen3_embedding_softmax(loom::type::view<loom::type::shape<32, 128>, std::b
     float finite_maximum = valid ? maximum_1 : 0.0f;
     Float32x16 maximum_lanes = finite_maximum;
     Float32x16 sums = Float32x16{};
-    for (int position_1 = 0; position_1 < 128; position_1 += 16) {
+    for (unsigned position_1 = 0; position_1 < 128; position_1 += 16) {
       Float32x16 input_1 = loom::vector::load<Float32x16>(scores, {position_1});
       [[loom::fastmath("nnan", "nsz")]] Float32x16 shifted = input_1 - maximum_lanes;
       Float32x16 exponents = qwen3_embedding_exp(shifted);
@@ -433,7 +434,7 @@ void qwen3_embedding_softmax(loom::type::view<loom::type::shape<32, 128>, std::b
     [[loom::fastmath("reassoc", "nnan", "ninf", "nsz")]] float sum_1 = loom::vector::reduce::addf(sums, 0.0f);
     float denominator = valid ? sum_1 : 1.0f;
     [[loom::fastmath("arcp")]] float inverse = 1.0f / denominator;
-    for (int position_2 = 0; position_2 < 128; position_2 += 16) {
+    for (unsigned position_2 = 0; position_2 < 128; position_2 += 16) {
       BFloat16x16 input_2 = loom::vector::load<BFloat16x16>(matrix, {query, position_2});
       BFloat16x16 normalized = qwen3_embedding_scale(input_2, inverse);
       loom::vector::store(normalized, matrix, {query, position_2});
@@ -503,7 +504,7 @@ static void qwen3_embedding_normalize_dense_head(loom::type::index length, loom:
 static void qwen3_embedding_rotate(loom::type::view<loom::type::shape<2, 64>, std::bfloat16_t> rope, loom::type::view<loom::type::shape<128>, std::bfloat16_t> output_head) {
   Float32x16 c0 = Float32x16{};
   BFloat16x16 narrow_zero = BFloat16x16{};
-  for (int position = 0; position < 64; position += 16) {
+  for (unsigned position = 0; position < 64; position += 16) {
     loom::type::index upper = loom::index::cast(position) + loom::type::index{64};
     BFloat16x16 low = loom::vector::load<BFloat16x16>(output_head, {position});
     BFloat16x16 high = loom::vector::load<BFloat16x16>(output_head, loom::type::indices{upper});
@@ -537,7 +538,7 @@ static void qwen3_embedding_rotate(loom::type::view<loom::type::shape<2, 64>, st
 
 [[loom::symbol("qwen3_embedding.dense_accumulate"), loom::force_inline]]
 void qwen3_embedding_dense_accumulate(loom::type::buffer<unsigned char> storage, loom::type::view<loom::type::shape<16, 4, 64>, float> output, bool first_chunk) {
-  for (int panel = 0; panel < 16; ++panel) {
+  for (unsigned panel = 0; panel < 16; ++panel) {
     loom::type::offset weight_offset = loom::index::scale(loom::index::cast(panel), loom::type::offset{1152});
     Float32x64 initial0 = Float32x64{};
     Float32x64 initial1 = Float32x64{};
@@ -573,25 +574,25 @@ void qwen3_embedding_dense_accumulate(loom::type::buffer<unsigned char> storage,
     auto fragments = loom::view::bitcast<loom::type::view<loom::type::shape<4, 64>, float>>(panel_span);
     auto span0 = loom::view::subview<1, 64>(fragments, {0, 0}, {});
     auto tile0 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(span0);
-    loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(sum0, tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+    loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(sum0, tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
     auto span1 = loom::view::subview<1, 64>(fragments, {1, 0}, {});
     auto tile1 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(span1);
-    loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(sum1, tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+    loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(sum1, tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
     auto span2 = loom::view::subview<1, 64>(fragments, {2, 0}, {});
     auto tile2 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(span2);
-    loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(sum2, tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+    loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(sum2, tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
     auto span3 = loom::view::subview<1, 64>(fragments, {3, 0}, {});
     auto tile3 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(span3);
-    loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(sum3, tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+    loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(sum3, tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
   }
   return;
 }
 
 [[loom::symbol("qwen3_embedding.dense_rows"), loom::force_inline]]
 void qwen3_embedding_dense_rows(loom::type::view<loom::type::shape<16, 4, 64>, float> input, loom::type::view<loom::type::shape<16, 4, 64>, float> secondary, bool first, loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> output) {
-  for (int panel = 0; panel < 16; ++panel) {
+  for (unsigned panel = 0; panel < 16; ++panel) {
     loom::type::index feature_base = loom::index::cast(panel) * loom::type::index{8};
-    for (int block = 0; block < 4; ++block) {
+    for (unsigned block = 0; block < 4; ++block) {
       loom::type::index token_base = loom::index::cast(block) * loom::type::index{8};
       Float32x64 wide = Float32x64{};
       if (first) {
@@ -633,7 +634,7 @@ void qwen3_embedding_dense_rows(loom::type::view<loom::type::shape<16, 4, 64>, f
 
 [[loom::symbol("qwen3_embedding.dense_heads"), loom::force_inline]]
 void qwen3_embedding_dense_heads(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<128>, std::bfloat16_t> scale, loom::type::view<loom::type::shape<32, 2, 64>, std::bfloat16_t> rope) {
-  for (int row = 0; row < 32; ++row) {
+  for (unsigned row = 0; row < 32; ++row) {
     auto input_span = loom::view::subview<1, 128>(input, {row, 0}, {});
     auto values = loom::view::bitcast<loom::type::view<loom::type::shape<128>, std::bfloat16_t>>(input_span);
     auto rope_span = loom::view::subview<1, 2, 64>(rope, {row, 0, 0}, {});
@@ -646,9 +647,9 @@ void qwen3_embedding_dense_heads(loom::type::view<loom::type::shape<32, 128>, st
 
 [[loom::symbol("qwen3_embedding.dense_transpose_values"), loom::force_inline]]
 void qwen3_embedding_dense_transpose_values(loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> input, loom::type::view<loom::type::shape<128, 32>, std::bfloat16_t> output) {
-  for (int feature_block = 0; feature_block < 16; ++feature_block) {
+  for (unsigned feature_block = 0; feature_block < 16; ++feature_block) {
     loom::type::index feature_base = loom::index::cast(feature_block) * loom::type::index{8};
-    for (int token_block = 0; token_block < 4; ++token_block) {
+    for (unsigned token_block = 0; token_block < 4; ++token_block) {
       loom::type::index token_base = loom::index::cast(token_block) * loom::type::index{8};
       loom::type::index source_row0 = token_base + loom::type::index{0};
       BFloat16x8 row0 = loom::vector::load<BFloat16x8>(input, loom::type::indices{source_row0, feature_base});
@@ -769,9 +770,9 @@ void qwen3_embedding_normalize_shared(loom::type::index length, loom::type::view
 
 [[loom::symbol("qwen3_embedding.block_four_rows"), loom::force_inline]]
 void qwen3_embedding_block_four_rows(loom::type::view<loom::type::shape<4, 1024>, std::bfloat16_t> input, loom::type::view<loom::type::shape<128, 4, 8>, std::bfloat16_t> output) {
-  for (int group = 0; group < 128; ++group) {
+  for (unsigned group = 0; group < 128; ++group) {
     loom::type::index feature = loom::index::cast(group) * loom::type::index{8};
-    for (int row = 0; row < 4; ++row) {
+    for (unsigned row = 0; row < 4; ++row) {
       BFloat16x8 values = loom::vector::load<BFloat16x8>(input, loom::type::indices{loom::index::cast(row), feature});
       loom::vector::store(values, output, {group, row, 0});
     }
@@ -784,7 +785,7 @@ void qwen3_embedding_three_products_blocked(loom::type::buffer<float> storage, l
   auto partials = loom::buffer::view<4, 64>(storage, loom::type::offset{9344}, {});
   Float32x64 c0 = Float32x64{};
   Float32x64 initial = loom::vector::fragment::attach<loom::vector::fragment::role::init>(c0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-  for (int panel = 0; panel < 16; ++panel) {
+  for (unsigned panel = 0; panel < 16; ++panel) {
     loom::type::offset relative = loom::index::scale(loom::index::cast(panel), loom::type::offset{1152});
     loom::type::offset high_offset = loom::type::offset{27136} + relative;
     loom::type::offset low_offset = loom::type::offset{45632} + relative;
@@ -797,7 +798,7 @@ void qwen3_embedding_three_products_blocked(loom::type::buffer<float> storage, l
     auto partial_tile2 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(partial_span2);
     auto partial_span3 = loom::view::subview<1, 64>(partials, {3, 0}, {});
     auto partial_tile3 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(partial_span3);
-    for (int product_phase = 0; product_phase < 3; ++product_phase) {
+    for (unsigned product_phase = 0; product_phase < 3; ++product_phase) {
       bool first_product = loom::index::cast(product_phase) == loom::type::index{0};
       bool left_residual_product = loom::index::cast(product_phase) == loom::type::index{1};
       bool right_residual_product = loom::index::cast(product_phase) == loom::type::index{2};
@@ -809,30 +810,30 @@ void qwen3_embedding_three_products_blocked(loom::type::buffer<float> storage, l
       Float32x64 product2 = call_result.value2;
       Float32x64 product3 = call_result.value3;
       if (first_product) {
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(product0, partial_tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(product1, partial_tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(product2, partial_tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(product3, partial_tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product0, partial_tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product1, partial_tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product2, partial_tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product3, partial_tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
       } else {
         Float32x64 previous0 = loom::vector::load<Float32x64>(partials, {0, 0});
         Float32x64 fragment0 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added0 = fragment0 + product0;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(added0, partial_tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added0, partial_tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         Float32x64 previous1 = loom::vector::load<Float32x64>(partials, {1, 0});
         Float32x64 fragment1 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added1 = fragment1 + product1;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(added1, partial_tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added1, partial_tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         Float32x64 previous2 = loom::vector::load<Float32x64>(partials, {2, 0});
         Float32x64 fragment2 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added2 = fragment2 + product2;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(added2, partial_tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added2, partial_tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         Float32x64 previous3 = loom::vector::load<Float32x64>(partials, {3, 0});
         Float32x64 fragment3 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added3 = fragment3 + product3;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, 0, 0>(added3, partial_tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added3, partial_tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
       }
     }
-    for (int result_block = 0; result_block < 4; ++result_block) {
+    for (unsigned result_block = 0; result_block < 4; ++result_block) {
       loom::type::index result_base = loom::index::cast(result_block) * loom::type::index{8};
       Float32x64 wide = loom::vector::load<Float32x64>(partials, {result_block, 0});
       BFloat16x64 flat = loom::convert<BFloat16x64, loom::conversion::subnormal::daz>(wide);
@@ -858,7 +859,7 @@ void qwen3_embedding_swiglu_dense(loom::type::view<loom::type::shape<4096>, floa
   UInt32x16 magnitude_mask = 32767u;
   Float32x16 c0_vector_16_f32 = Float32x16{};
   BFloat16x16 narrow_zero = BFloat16x16{};
-  for (int position = 0; position < 4096; position += 16) {
+  for (unsigned position = 0; position < 4096; position += 16) {
     Float32x16 wide_values = loom::vector::load<Float32x16>(gate, {position});
     BFloat16x16 narrow_values = loom::convert<BFloat16x16, loom::conversion::subnormal::daz>(wide_values);
     UInt16x16 bits16 = __builtin_bit_cast(UInt16x16, narrow_values);
@@ -901,7 +902,7 @@ void qwen3_embedding_swiglu_dense(loom::type::view<loom::type::shape<4096>, floa
 
 [[loom::symbol("qwen3_embedding.dense_residual"), loom::force_inline]]
 void qwen3_embedding_dense_residual(loom::type::view<loom::type::shape<4096>, std::bfloat16_t> input, loom::type::view<loom::type::shape<4096>, std::bfloat16_t> skip) {
-  for (int position = 0; position < 4096; position += 16) {
+  for (unsigned position = 0; position < 4096; position += 16) {
     BFloat16x16 left = loom::vector::load<BFloat16x16>(input, {position});
     BFloat16x16 right = loom::vector::load<BFloat16x16>(skip, {position});
     Float32x16 left_wide = loom::convert<Float32x16, loom::conversion::subnormal::daz>(left);
@@ -916,11 +917,11 @@ void qwen3_embedding_dense_residual(loom::type::view<loom::type::shape<4096>, st
 [[loom::symbol("qwen3_embedding.retain_residual_panel"), loom::force_inline]]
 void qwen3_embedding_retain_residual_panel(loom::type::view<loom::type::shape<4096>, std::bfloat16_t> input, loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> output, loom::type::index record, loom::type::index feature) {
   loom::type::index output_base = record * loom::type::index{4};
-  for (int row = 0; row < 4; ++row) {
+  for (unsigned row = 0; row < 4; ++row) {
     loom::type::index input_row = loom::index::cast(row) * loom::type::index{1024};
     loom::type::index input_base = input_row + feature;
     loom::type::index output_row = output_base + loom::index::cast(row);
-    for (int word = 0; word < 128; word += 32) {
+    for (unsigned word = 0; word < 128; word += 32) {
       loom::type::index input_position = input_base + loom::index::cast(word);
       BFloat16x32 value = loom::vector::load<BFloat16x32>(input, loom::type::indices{input_position});
       loom::vector::store(value, output, loom::type::indices{output_row, loom::index::cast(word)});
@@ -931,8 +932,8 @@ void qwen3_embedding_retain_residual_panel(loom::type::view<loom::type::shape<40
 
 [[loom::symbol("qwen3_embedding.block_dense_result"), loom::force_inline]]
 void qwen3_embedding_block_dense_result(loom::type::view<loom::type::shape<16, 4, 64>, std::bfloat16_t> input, loom::type::view<loom::type::shape<16, 4, 64>, std::bfloat16_t> output) {
-  for (int panel = 0; panel < 16; ++panel) {
-    for (int block = 0; block < 4; ++block) {
+  for (unsigned panel = 0; panel < 16; ++panel) {
+    for (unsigned block = 0; block < 4; ++block) {
       BFloat16x64 flat = loom::vector::load<BFloat16x64>(input, {panel, block, 0});
       BFloat16x8x8 tile = loom::vector::bitcast<BFloat16x8x8>(flat);
       BFloat16x8x8 transposed = loom::vector::transpose<BFloat16x8x8, 1, 0>(tile);

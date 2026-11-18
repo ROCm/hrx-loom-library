@@ -26,7 +26,14 @@ LAYER_OPERATION_PATTERN = re.compile(
 LOCAL_RULES_LABEL = '"//build_tools/bazel:defs.bzl"'
 UPSTREAM_RULES_LABEL = '"@hrx//loom/build_tools/bazel:defs.bzl"'
 MAX_FIXTURE_BYTES = 32 * 1024
-TEST_SOURCE_SUFFIXES = ("_test.loom", "_stress.loom")
+CXX_SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".cxx")
+HEADER_SUFFIXES = (".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".tcc", ".def")
+SOURCE_SUFFIXES = (".loom", *CXX_SOURCE_SUFFIXES, *HEADER_SUFFIXES)
+TEST_SOURCE_SUFFIXES = tuple(
+    stem + suffix
+    for stem in ("_test", "_stress")
+    for suffix in (".loom", *CXX_SOURCE_SUFFIXES)
+)
 
 
 def _layer_operations(source: str) -> set[str]:
@@ -72,6 +79,14 @@ def check_sources(layer: str, sources: Iterable[tuple[str, str]]) -> list[str]:
         for name, operations in source_definitions
         for violation in _source_ownership_violations(name, operations)
     ]
+    return violations + _check_operations(layer, source_definitions)
+
+
+def _check_operations(
+    layer: str, source_definitions: list[tuple[str, set[str]]]
+) -> list[str]:
+    """Applies layer policy independently of source-language spelling."""
+    violations = []
     if layer != "test":
         for name, operations in source_definitions:
             if name.endswith(TEST_SOURCE_SUFFIXES):
@@ -108,6 +123,19 @@ def check_sources(layer: str, sources: Iterable[tuple[str, str]]) -> list[str]:
     return violations
 
 
+def check_module(layer: str, module: str, format_tool: str) -> list[str]:
+    """Checks owned imported IR; an empty module denotes a header-only provider."""
+    if not module:
+        return []
+    result = subprocess.run(
+        [format_tool, module, "--from=bc", "--to=text"],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    return _check_operations(layer, [(module, _layer_operations(result.stdout))])
+
+
 def check_fixture_size(paths: Iterable[Path]) -> list[str]:
     """Bounds the complete declared binary capture for one test module."""
     size = sum(path.stat().st_size for path in set(paths))
@@ -137,7 +165,11 @@ def _check_scoped_readmes(repository_root: Path) -> list[str]:
         if not source_root.is_dir():
             continue
         source_directories = sorted(
-            {source_path.parent for source_path in source_root.rglob("*.loom")}
+            {
+                path.parent
+                for path in source_root.rglob("*")
+                if path.suffix in SOURCE_SUFFIXES
+            }
         )
         for source_directory in source_directories:
             documentation_directory = source_directory
@@ -159,7 +191,9 @@ def _check_scoped_readmes(repository_root: Path) -> list[str]:
 def check_repository(repository_root: Path) -> list[str]:
     """Returns architecture-policy violations in a library checkout."""
     violations = _check_scoped_readmes(repository_root)
-    for source_path in sorted((repository_root / "target").rglob("*.loom")):
+    for source_path in sorted((repository_root / "target").rglob("*")):
+        if source_path.suffix not in SOURCE_SUFFIXES:
+            continue
         violations.append(
             f"{source_path.relative_to(repository_root)}: source-bearing "
             "target packages require a repository admission rule"
@@ -169,19 +203,29 @@ def check_repository(repository_root: Path) -> list[str]:
         if not layer_root.is_dir():
             continue
         sources_by_directory: dict[Path, list[Path]] = defaultdict(list)
-        for source_path in layer_root.rglob("*.loom"):
-            sources_by_directory[source_path.parent].append(source_path)
+        for source_path in layer_root.rglob("*"):
+            if source_path.suffix in SOURCE_SUFFIXES:
+                sources_by_directory[source_path.parent].append(source_path)
         for source_directory, source_paths in sorted(sources_by_directory.items()):
             relative_directory = source_directory.relative_to(repository_root)
             source_layer, rule_name = _package_policy(layer, relative_directory)
             sources_by_owner: dict[str, list[tuple[str, str]]] = defaultdict(list)
+            owner_rules: set[tuple[str, str]] = set()
             for path in sorted(source_paths):
                 owner = (
                     "test" if path.name.endswith(TEST_SOURCE_SUFFIXES) else source_layer
                 )
-                sources_by_owner[owner].append(
-                    (str(path.relative_to(repository_root)), path.read_text())
-                )
+                if path.suffix == ".loom":
+                    owner_rule = "loom_test" if owner == "test" else rule_name
+                else:
+                    owner_rule = (
+                        "loom_cxx_test" if owner == "test" else "loom_cxx_library"
+                    )
+                owner_rules.add((owner, owner_rule))
+                if path.suffix == ".loom":
+                    sources_by_owner[owner].append(
+                        (str(path.relative_to(repository_root)), path.read_text())
+                    )
             for owner, sources in sources_by_owner.items():
                 violations.extend(check_sources(owner, sources))
 
@@ -200,8 +244,7 @@ def check_repository(repository_root: Path) -> list[str]:
                     f"{build_path.relative_to(repository_root)}: library "
                     "packages cannot bypass repository policy wrappers"
                 )
-            for owner in sources_by_owner:
-                owner_rule = "loom_test" if owner == "test" else rule_name
+            for owner, owner_rule in sorted(owner_rules):
                 if not re.search(rf"\b{owner_rule}\s*\(", build_text):
                     violations.append(
                         f"{build_path.relative_to(repository_root)}: "
@@ -251,7 +294,7 @@ def check_repository(repository_root: Path) -> list[str]:
             )
         has_providers = any(
             re.search(
-                r"\bloom_library\s*\(",
+                r"\bloom_(?:cxx_)?library\s*\(",
                 _starlark_without_line_comments(provider_build.read_text()),
             )
             for provider_build in card_path.parent.rglob("BUILD.bazel")
@@ -290,6 +333,12 @@ def _create_parser() -> argparse.ArgumentParser:
         "--layer", choices=["kernel", "model", "motif", "program", "test"]
     )
     parser.add_argument("--repository-root", type=Path)
+    parser.add_argument(
+        "--module", help="Owned bytecode, or empty for a header-only provider."
+    )
+    parser.add_argument(
+        "--format-tool", help="Public loom-format executable for imported IR."
+    )
     parser.add_argument("--data", type=Path, nargs="+", default=[])
     parser.add_argument(
         "--staged", action="store_true", help="Check source ownership in the Git index."
@@ -302,14 +351,37 @@ def main() -> int:
     parser = _create_parser()
     args = parser.parse_args()
     if args.staged:
-        if args.layer or args.sources or args.data:
+        if (
+            args.layer
+            or args.sources
+            or args.data
+            or args.module is not None
+            or args.format_tool
+        ):
             parser.error("--staged cannot be combined with source checks")
         violations = check_staged_sources(args.repository_root or Path.cwd())
     elif args.repository_root:
-        if args.layer or args.sources or args.data:
+        if (
+            args.layer
+            or args.sources
+            or args.data
+            or args.module is not None
+            or args.format_tool
+        ):
             parser.error("--repository-root cannot be combined with source checks")
         violations = check_repository(args.repository_root.resolve())
+    elif args.module is not None:
+        if not args.layer or not args.format_tool or args.sources:
+            parser.error(
+                "--module requires --layer and --format-tool, without SOURCE inputs"
+            )
+        try:
+            violations = check_module(args.layer, args.module, args.format_tool)
+        except subprocess.CalledProcessError as error:
+            return error.returncode
     else:
+        if args.format_tool:
+            parser.error("--format-tool requires --module")
         if not args.layer or not args.sources:
             parser.error("--layer and at least one SOURCE are required")
         source_paths = [Path(path) for path in args.sources]

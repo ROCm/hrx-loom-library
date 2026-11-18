@@ -3,6 +3,8 @@
 load("@hrx//build_tools/bazel:python.bzl", "iree_py_test")
 load(
     "@hrx//loom/build_tools/bazel:defs.bzl",
+    _loom_cxx_library = "loom_cxx_library",
+    _loom_cxx_test = "loom_cxx_test",
     _loom_kernel_library = "loom_kernel_library",
     _loom_library = "loom_library",
     _loom_model = "loom_model",
@@ -94,6 +96,23 @@ def _declare_source_policy_test(name, layer, srcs, tags, data = []):
         visibility = ["//visibility:private"],
     )
 
+def _declare_module_policy_test(name, layer, module, tags, data = []):
+    iree_py_test(
+        name = name + "_source_policy_test",
+        srcs = ["//build_tools/bazel:source_policy.py"],
+        main = "source_policy.py",
+        args = [
+            "--layer=" + layer,
+            # A header-only library has no owned module. Its instantiated code
+            # is checked in the component whose importer emits it.
+            "--module=$(locations %s)" % module,
+            "--format-tool=$(location @loom_sdk//:loom-format)",
+        ] + (["--data"] + ["$(locations %s)" % item for item in data] if data else []),
+        data = [module, "@loom_sdk//:loom-format"] + data,
+        tags = tags + ["hostonly"],
+        visibility = ["//visibility:private"],
+    )
+
 def _declare_benchmark_module(name, module, tags):
     native.filegroup(
         name = name + _BENCHMARK_MODULE_SUFFIX,
@@ -122,38 +141,69 @@ def _validate_kernel_qualification(name, targets):
     if not targets:
         fail("%s requires at least one target profile" % name)
 
+def _program_layer(deps):
+    package = native.package_name()
+    shared = _is_package_or_subpackage(package, "program")
+    model = _is_package_or_subpackage(package, "model")
+    if not (shared or model) or "test" in package.split("/"):
+        fail("program libraries belong in program/ or model/ production packages, got //%s" % package)
+    if shared:
+        _validate_program_dependencies(package, deps)
+    return "program" if shared else "model"
+
 def loom_library(
         name,
         srcs = [],
         deps = [],
         data = [],
-        input_format = "",
-        inputopts = [],
         tags = [],
         visibility = None,
         target_compatible_with = []):
     """Declares shared or model-owned programs with explicit linker dependencies."""
-    package = native.package_name()
-    shared = _is_package_or_subpackage(package, "program")
-    model = _is_package_or_subpackage(package, "model")
-    if not (shared or model) or "test" in package.split("/"):
-        fail("loom_library is for program/ or model/ production programs, got //%s" % package)
-    if shared:
-        _validate_program_dependencies(package, deps)
+    layer = _program_layer(deps)
     _loom_library(
         name = name,
         srcs = srcs,
         deps = deps,
         data = data,
-        input_format = input_format,
-        inputopts = inputopts,
         tags = tags,
         visibility = visibility,
         target_compatible_with = target_compatible_with,
     )
     text_sources = [source for source in srcs if str(source).endswith(".loom")]
     if text_sources:
-        _declare_source_policy_test(name, "program" if shared else "model", text_sources, tags)
+        _declare_source_policy_test(name, layer, text_sources, tags)
+
+def loom_cxx_library(
+        name,
+        srcs = [],
+        hdrs = [],
+        deps = [],
+        copts = [],
+        defines = [],
+        local_defines = [],
+        includes = [],
+        data = [],
+        tags = [],
+        visibility = None,
+        target_compatible_with = []):
+    """Declares C++ program providers and their exported header interfaces."""
+    layer = _program_layer(deps)
+    _loom_cxx_library(
+        name = name,
+        srcs = srcs,
+        hdrs = hdrs,
+        deps = deps,
+        copts = copts,
+        defines = defines,
+        local_defines = local_defines,
+        includes = includes,
+        data = data,
+        tags = tags,
+        visibility = visibility,
+        target_compatible_with = target_compatible_with,
+    )
+    _declare_module_policy_test(name, layer, ":" + name, tags)
 
 def loom_model(
         name,
@@ -244,8 +294,9 @@ def loom_kernel_library(
     _declare_benchmark_admission(name, tags)
     _declare_source_policy_test(name, "kernel", srcs, tags)
 
-def loom_test(
+def _declare_test(
         name,
+        source_rule,
         srcs,
         deps = [],
         data = [],
@@ -255,23 +306,25 @@ def loom_test(
         execution_profiles = [],
         size = "small",
         tags = [],
-        visibility = None):
-    """Owns test sources and their production dependencies."""
+        visibility = None,
+        **source_options):
     package = native.package_name()
-    if "test" not in package.split("/") and not any([
-        str(source).endswith("_test.loom") or str(source).endswith("_stress.loom")
+    test_suffixes = ["_test." + extension for extension in ["loom", "c", "cc", "cpp", "cxx"]]
+    stress_suffixes = ["_stress." + extension for extension in ["loom", "c", "cc", "cpp", "cxx"]]
+    if srcs and "test" not in package.split("/") and not any([
+        any([str(source).endswith(suffix) for suffix in test_suffixes + stress_suffixes])
         for source in srcs
     ]):
-        fail("//%s: adjacent loom_test sources require a _test.loom or _stress.loom owner" % package)
-    if any([str(source).endswith("_stress.loom") for source in srcs]):
+        fail("//%s: adjacent test sources require a _test or _stress source owner" % package)
+    if any([any([str(source).endswith(suffix) for suffix in stress_suffixes]) for source in srcs]):
         if "manual" not in tags or "stress" not in tags:
-            fail("%s: _stress.loom tests require tags = [\"manual\", \"stress\"]" % name)
+            fail("%s: stress tests require tags = [\"manual\", \"stress\"]" % name)
     if _is_package_or_subpackage(package, "motif"):
         _validate_motif_dependencies(package, deps)
     if _is_package_or_subpackage(package, "program"):
         _validate_program_dependencies(package, deps)
     _validate_execution_profiles(name, execution_profiles)
-    _loom_test(
+    source_rule(
         name = name,
         srcs = srcs,
         data = data,
@@ -284,10 +337,32 @@ def loom_test(
         size = size,
         tags = tags,
         visibility = visibility,
+        **source_options
     )
     _declare_benchmark_module(
         name,
         ":" + name + "_module",
         tags,
     )
-    _declare_source_policy_test(name, "test", srcs, tags, data = data)
+    if source_rule == _loom_cxx_test or not srcs:
+        _declare_module_policy_test(name, "test", ":" + name + "_module", tags, data = data)
+    else:
+        _declare_source_policy_test(name, "test", srcs, tags, data = data)
+
+def loom_test(name, srcs = [], deps = [], **kwargs):
+    """Qualifies checks owned by authored Loom sources and direct libraries."""
+    _declare_test(name, _loom_test, srcs, deps = deps, **kwargs)
+
+def loom_cxx_test(name, srcs = [], deps = [], copts = [], defines = [], local_defines = [], includes = [], **kwargs):
+    """Qualifies C++ checks with the same execution and benchmark policies."""
+    _declare_test(
+        name,
+        _loom_cxx_test,
+        srcs,
+        deps = deps,
+        copts = copts,
+        defines = defines,
+        local_defines = local_defines,
+        includes = includes,
+        **kwargs
+    )

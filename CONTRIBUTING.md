@@ -24,11 +24,11 @@ This repository admits reusable compiler inputs and complete model compositions.
 | --- | --- | --- |
 | `motif/` | Target-neutral data representations and algorithms expressed as `func.def`, `template.def`, encodings, and related declarations. | Canonical and lint-clean source, scoped documentation, no launch surface, and reachability from a qualified kernel or test leaf. |
 | `kernel/` | Concrete `kernel.def` entry points implementing one operation contract and ABI. | At least one target profile, reachability from an executing benchmark test, and dependencies confined to production motifs. |
-| `program/` | Shared service policy and executable compositions used by multiple models. | Explicit `loom_library` providers, scoped documentation, real service or command callers, and dependencies that do not point back to a model. |
-| `*_test.loom` and `*_stress.loom`, adjacent to production sources or in `test/` | Test-only programs that exercise production contracts. | Private root-owned test module, scenario coverage, and an execution environment. Stress tests carry `manual` and `stress` tags. |
+| `program/` | Shared service policy and executable compositions used by multiple models. | Explicit `loom_library` or `loom_cxx_library` providers, scoped documentation, real service or command callers, and dependencies that do not point back to a model. |
+| `*_test` and `*_stress` Loom/C++ sources, adjacent to production sources or in `test/` | Test-only programs that exercise production contracts. | Source/dependency-owned test module, scenario coverage, and an execution environment. Stress tests carry `manual` and `stress` tags. |
 | `target/` | Genuinely repository-specific target or execution policy. | A concrete policy difference that cannot be expressed by canonical HRX profiles; upstream profiles are consumed directly otherwise. |
 | `model/` descriptions | Portable model facts, asset variants, service contracts, and provider composition. | A card validated through `loom_model_documentation`, a standalone overview with exact upstream links, and a precise supported-variant and hardware contract. |
-| `model/` executable ports | Model-specific programs and portable serving compositions. | Explicit `loom_library` providers, a card published through `loom_model`, and an independently checked native service output for each supported representation. |
+| `model/` executable ports | Model-specific programs and portable serving compositions. | Explicit `loom_library` or `loom_cxx_library` providers, a card published through `loom_model`, and an independently checked native service output for each supported representation. |
 
 Source-bearing `target/` packages still require their own admission rule. Model programs use the repository's `loom_library` wrapper for canonical source, lint, explicit dependencies, and relocatable bytecode. The `loom_model` wrapper selects the card's preset and exact providers and auxiliary compiler inputs through HRX's public rule. Full checkpoints retain their acquisition descriptors for `loom-fetch` and stay outside Bazel's payload graph. Model-local `test/` packages use the same `loom_test` contract as other layers; small fixtures and swatches declare their full input closure for test caching. Full-model checks consume provisioned weights, trust that they match the declared acquisition lock, and run current built programs against independent inputs and checked outputs. The card, lock, and providers participate in Bazel cache identity; full checkpoint hashing belongs to acquisition.
 
@@ -63,6 +63,13 @@ Under `motif/`, global `config.*` operations also belong only in these explicit
 test leaves; reusable motifs receive values through their arguments. The source
 policy check enforces this ownership in presubmit and on staged source contents
 in precommit.
+
+C++ program providers use `loom_cxx_library`; their checks use `loom_cxx_test`
+and the corresponding `_test.cxx` or `_stress.cxx` suffixes. Imported code has
+the same production/test ownership restrictions as authored Loom. The
+[Bazel guide](build_tools/bazel/README.md#c-programs-and-tests) describes header,
+dependency, and publication ownership. C++ implementation details do not change
+the repository's layer boundaries.
 
 Each `.loom` file stands on its own as an implementation artifact. Its leading documentation establishes the represented format or operation, public symbol contract, parameter and shape meaning, storage layout, ABI ownership, and any specification or oracle used to establish behavior. Package READMEs carry information that cannot be recovered from `ls`: scope boundaries, external specifications, ABI relationships, supported behavior, and the intended composition layer. Test overviews explain oracle independence, numerical acceptance, and non-obvious storage constraints. Scenarios and BUILD declarations own case, shape, and file inventories. Directory READMEs link to the shared development workflow instead of repeating per-test commands; model-specific asset provisioning and independent oracle provenance remain local authoring knowledge.
 

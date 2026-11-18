@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -577,6 +578,48 @@ class SourcePolicyTest(unittest.TestCase):
                 ],
             )
 
+            (program_root / "control.loom").unlink()
+            (test_root / "cases_test.loom").unlink()
+            (program_root / "records.h").write_text("struct Record { int value; };\n")
+            for suffix in source_policy.CXX_SOURCE_SUFFIXES:
+                with self.subTest(suffix=suffix):
+                    source = program_root / ("control" + suffix)
+                    checks = test_root / ("cases_test" + suffix)
+                    source.write_text(
+                        "// check.case in a comment is not imported code.\n"
+                    )
+                    checks.write_text("#include <loomcxx/check.h>\n")
+                    (program_root / "BUILD.bazel").write_text(
+                        'load("//build_tools/bazel:defs.bzl", "loom_cxx_library")\n'
+                        f'loom_cxx_library(name="control", srcs=["{source.name}"], hdrs=["records.h"])\n'
+                    )
+                    (test_root / "BUILD.bazel").write_text(
+                        'load("//build_tools/bazel:defs.bzl", "loom_cxx_test")\n'
+                        f'loom_cxx_test(name="cases", srcs=["{checks.name}"])\n'
+                    )
+                    self.assertEqual(
+                        source_policy.check_repository(repository_root), []
+                    )
+                    (program_root / "BUILD.bazel").write_text(
+                        'load("//build_tools/bazel:defs.bzl", "loom_library")\n'
+                        f'loom_library(name="control", srcs=["{source.name}"])\n'
+                    )
+                    violations = source_policy.check_repository(repository_root)
+                    self.assertTrue(
+                        any(
+                            "must declare loom_cxx_library" in entry
+                            for entry in violations
+                        )
+                    )
+                    self.assertTrue(
+                        any(
+                            "records.h is not explicitly declared" in entry
+                            for entry in violations
+                        )
+                    )
+                    source.unlink()
+                    checks.unlink()
+
     def test_repository_model_card_requires_publication_rule(self):
         with TemporaryDirectory() as temporary_directory:
             repository_root = Path(temporary_directory)
@@ -660,5 +703,24 @@ class SourcePolicyTest(unittest.TestCase):
             )
 
 
+class ImportedModulePolicyTest(unittest.TestCase):
+    def test_imported_checks_stay_test_owned(self):
+        self.assertEqual(
+            source_policy.check_module("test", self.module, self.format_tool), []
+        )
+        violations = source_policy.check_module(
+            "program", self.module, self.format_tool
+        )
+        self.assertTrue(
+            any("check.case belongs to loom_test" in entry for entry in violations)
+        )
+        self.assertEqual(
+            source_policy.check_module("program", "", self.format_tool), []
+        )
+
+
 if __name__ == "__main__":
-    unittest.main()
+    ImportedModulePolicyTest.module, ImportedModulePolicyTest.format_tool = sys.argv[
+        1:3
+    ]
+    unittest.main(argv=[sys.argv[0], *sys.argv[3:]])
