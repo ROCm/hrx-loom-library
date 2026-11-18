@@ -41,10 +41,13 @@ already queued programs retain their captured stage identities.
 
 ## Link and parameter boundaries
 
-`config` owns model defaults and concrete matrix target bindings. `kernel:numerics`
-composes shared carriers and algorithms; `commands` composes complete layers,
-epochs, and predictor execution. Host preparation and service callbacks are
-separate providers. Lower layers do not call back into a model command.
+`config` owns model defaults and concrete matrix target bindings. The
+[numerical providers](kernel/README.md) group attention, recurrent state,
+projections, predictors, and vision by their storage and algorithm contracts.
+Each names its shared carriers, algorithms, and required configuration.
+`commands` composes those providers into complete layers, epochs, and
+predictor execution. Host preparation and service callbacks are separate
+providers. Lower layers do not call back into a model command.
 
 The `weights.loom` import policy prepares target and MTP FFN gate/up tensors
 into channel-eight storage. The transform reads each disjoint group before
