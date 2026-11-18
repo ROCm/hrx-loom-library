@@ -6,6 +6,41 @@ v1 exports; each composing model supplies `text_model_name_v1`, its tokenizer,
 preparation, and numerical stages. The program chooses no physical device and
 contains no checkpoint paths.
 
+## Service ownership
+
+The host service calls three separate providers around each queued epoch.
+Their boundary is storage ownership and completion, independent of the model's
+proposal algorithm or numerical stages.
+
+| Provider | Inputs and ownership | Result |
+| --- | --- | --- |
+| `encode` | Validated ownership events, host plans, and retained host packet storage. `text_encode_state_v1` updates resident origins; `text_encode_epoch_v1` packs the first and continuation cohorts. | Borrowed, exact upload ranges. The caller retains their backing until transfer completion. |
+| `epoch` | Prepared stage IDs and retained device bindings. `text_step_v1` submits an isolated step; `text_epoch_v1` composes proposal, verification, and accepted-state catch-up for one or two cohorts. | Work completion. Feedback transfer has its own completion and can overlap catch-up. |
+| `publish` | Immutable completed feedback banks, their original host plans, and caller-owned progress arrays. `text_publish_epoch_v1` resolves continuation owner tags. | Consumed/output counts, accepted tokens, source positions, and actual proposal counts in original-request order. |
+
+```text
+host plans --encode--> retained host packets --uploads--> device stages
+                                                           |
+                                             verification / acceptance
+                                                /                  \
+                                       feedback transfer       draft catch-up
+                                                \                  /
+                                          caller joins completion
+                                                    |
+                                                 publish
+                                                    |
+                                            request progress
+```
+
+Encoding and publication contain no runner calls. Execution does not encode
+host packets or interpret neural-network weights. The native caller owns
+admission and lifetime joins; `speculation` selects the prepared proposal and
+verifier pair from source-owned policy. Composing models include all three
+providers explicitly. Each provider's existing service export signatures remain
+the linking contract.
+
+## Chat and retained history
+
 `chat.loom` consumes the native service's request records and its
 JSON, tokenizer, input-validation, and tool host imports. It owns the ChatML
 framing, optional reasoning block, XML tool syntax, media markers, and sampling
