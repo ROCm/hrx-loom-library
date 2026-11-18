@@ -20,6 +20,8 @@
 
 #include <stdfloat>
 
+namespace fragment = loom::vector::fragment;
+
 using BFloat16x16 = std::bfloat16_t __attribute__((ext_vector_type(16)));
 using BFloat16x32 = std::bfloat16_t __attribute__((ext_vector_type(32)));
 using BFloat16x64 = std::bfloat16_t __attribute__((ext_vector_type(64)));
@@ -205,7 +207,7 @@ void qwen3_embedding_block_left(loom::type::view<loom::type::shape<32, 128>, std
 void qwen3_embedding_three_products(loom::type::buffer<float> storage, loom::type::view<loom::type::shape<8, 8>, float> temporary, loom::type::view<loom::type::shape<32, 128>, std::bfloat16_t> output) {
   auto partials = loom::buffer::view<4, 64>(storage, loom::type::offset{9344}, {});
   Float32x64 c0 = Float32x64{};
-  Float32x64 initial = loom::vector::fragment::attach<loom::vector::fragment::role::init>(c0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+  Float32x64 initial = fragment::attach<fragment::role::init>(c0, fragment::shape{8, 8});
   for (unsigned panel = 0; panel < 16; ++panel) {
     loom::type::offset relative = loom::index::scale(loom::index::cast(panel), loom::type::offset{1152});
     loom::type::offset high_offset = loom::type::offset{27136} + relative;
@@ -231,27 +233,27 @@ void qwen3_embedding_three_products(loom::type::buffer<float> storage, loom::typ
       Float32x64 product2 = call_result.value2;
       Float32x64 product3 = call_result.value3;
       if (first_product) {
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product0, partial_tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product1, partial_tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product2, partial_tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product3, partial_tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        fragment::store<fragment::role::result>(product0, partial_tile0, {0, 0}, fragment::shape{8, 8});
+        fragment::store<fragment::role::result>(product1, partial_tile1, {0, 0}, fragment::shape{8, 8});
+        fragment::store<fragment::role::result>(product2, partial_tile2, {0, 0}, fragment::shape{8, 8});
+        fragment::store<fragment::role::result>(product3, partial_tile3, {0, 0}, fragment::shape{8, 8});
       } else {
         Float32x64 previous0 = loom::vector::load<Float32x64>(partials, {0, 0});
-        Float32x64 fragment0 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        Float32x64 fragment0 = fragment::attach<fragment::role::init>(previous0, fragment::shape{8, 8});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added0 = fragment0 + product0;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added0, partial_tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        fragment::store<fragment::role::result>(added0, partial_tile0, {0, 0}, fragment::shape{8, 8});
         Float32x64 previous1 = loom::vector::load<Float32x64>(partials, {1, 0});
-        Float32x64 fragment1 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        Float32x64 fragment1 = fragment::attach<fragment::role::init>(previous1, fragment::shape{8, 8});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added1 = fragment1 + product1;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added1, partial_tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        fragment::store<fragment::role::result>(added1, partial_tile1, {0, 0}, fragment::shape{8, 8});
         Float32x64 previous2 = loom::vector::load<Float32x64>(partials, {2, 0});
-        Float32x64 fragment2 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        Float32x64 fragment2 = fragment::attach<fragment::role::init>(previous2, fragment::shape{8, 8});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added2 = fragment2 + product2;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added2, partial_tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        fragment::store<fragment::role::result>(added2, partial_tile2, {0, 0}, fragment::shape{8, 8});
         Float32x64 previous3 = loom::vector::load<Float32x64>(partials, {3, 0});
-        Float32x64 fragment3 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        Float32x64 fragment3 = fragment::attach<fragment::role::init>(previous3, fragment::shape{8, 8});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added3 = fragment3 + product3;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added3, partial_tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        fragment::store<fragment::role::result>(added3, partial_tile3, {0, 0}, fragment::shape{8, 8});
       }
     }
     for (unsigned result_block = 0; result_block < 4; ++result_block) {
@@ -546,7 +548,7 @@ void qwen3_embedding_dense_accumulate(loom::type::buffer<unsigned char> storage,
     Float32x64 initial3 = Float32x64{};
     if (first_chunk) {
       Float32x64 c0 = Float32x64{};
-      Float32x64 initial = loom::vector::fragment::attach<loom::vector::fragment::role::init>(c0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+      Float32x64 initial = fragment::attach<fragment::role::init>(c0, fragment::shape{8, 8});
       auto next_initial0 = initial;
       auto next_initial1 = initial;
       auto next_initial2 = initial;
@@ -557,13 +559,13 @@ void qwen3_embedding_dense_accumulate(loom::type::buffer<unsigned char> storage,
       initial3 = next_initial3;
     } else {
       Float32x64 previous0 = loom::vector::load<Float32x64>(output, {panel, 0, 0});
-      initial0 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+      initial0 = fragment::attach<fragment::role::init>(previous0, fragment::shape{8, 8});
       Float32x64 previous1 = loom::vector::load<Float32x64>(output, {panel, 1, 0});
-      initial1 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+      initial1 = fragment::attach<fragment::role::init>(previous1, fragment::shape{8, 8});
       Float32x64 previous2 = loom::vector::load<Float32x64>(output, {panel, 2, 0});
-      initial2 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+      initial2 = fragment::attach<fragment::role::init>(previous2, fragment::shape{8, 8});
       Float32x64 previous3 = loom::vector::load<Float32x64>(output, {panel, 3, 0});
-      initial3 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+      initial3 = fragment::attach<fragment::role::init>(previous3, fragment::shape{8, 8});
     }
     qwen3_embedding_dot128_result call_result = qwen3_embedding_dot128(storage, weight_offset, storage, loom::type::offset{27008}, initial0, initial1, initial2, initial3);
     Float32x64 sum0 = call_result.value0;
@@ -574,16 +576,16 @@ void qwen3_embedding_dense_accumulate(loom::type::buffer<unsigned char> storage,
     auto fragments = loom::view::bitcast<loom::type::view<loom::type::shape<4, 64>, float>>(panel_span);
     auto span0 = loom::view::subview<1, 64>(fragments, {0, 0}, {});
     auto tile0 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(span0);
-    loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(sum0, tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+    fragment::store<fragment::role::result>(sum0, tile0, {0, 0}, fragment::shape{8, 8});
     auto span1 = loom::view::subview<1, 64>(fragments, {1, 0}, {});
     auto tile1 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(span1);
-    loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(sum1, tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+    fragment::store<fragment::role::result>(sum1, tile1, {0, 0}, fragment::shape{8, 8});
     auto span2 = loom::view::subview<1, 64>(fragments, {2, 0}, {});
     auto tile2 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(span2);
-    loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(sum2, tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+    fragment::store<fragment::role::result>(sum2, tile2, {0, 0}, fragment::shape{8, 8});
     auto span3 = loom::view::subview<1, 64>(fragments, {3, 0}, {});
     auto tile3 = loom::view::bitcast<loom::type::view<loom::type::shape<8, 8>, float>>(span3);
-    loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(sum3, tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+    fragment::store<fragment::role::result>(sum3, tile3, {0, 0}, fragment::shape{8, 8});
   }
   return;
 }
@@ -784,7 +786,7 @@ void qwen3_embedding_block_four_rows(loom::type::view<loom::type::shape<4, 1024>
 void qwen3_embedding_three_products_blocked(loom::type::buffer<float> storage, loom::type::view<loom::type::shape<8, 8>, float> temporary, loom::type::view<loom::type::shape<16, 4, 64>, std::bfloat16_t> output) {
   auto partials = loom::buffer::view<4, 64>(storage, loom::type::offset{9344}, {});
   Float32x64 c0 = Float32x64{};
-  Float32x64 initial = loom::vector::fragment::attach<loom::vector::fragment::role::init>(c0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+  Float32x64 initial = fragment::attach<fragment::role::init>(c0, fragment::shape{8, 8});
   for (unsigned panel = 0; panel < 16; ++panel) {
     loom::type::offset relative = loom::index::scale(loom::index::cast(panel), loom::type::offset{1152});
     loom::type::offset high_offset = loom::type::offset{27136} + relative;
@@ -810,27 +812,27 @@ void qwen3_embedding_three_products_blocked(loom::type::buffer<float> storage, l
       Float32x64 product2 = call_result.value2;
       Float32x64 product3 = call_result.value3;
       if (first_product) {
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product0, partial_tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product1, partial_tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product2, partial_tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(product3, partial_tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        fragment::store<fragment::role::result>(product0, partial_tile0, {0, 0}, fragment::shape{8, 8});
+        fragment::store<fragment::role::result>(product1, partial_tile1, {0, 0}, fragment::shape{8, 8});
+        fragment::store<fragment::role::result>(product2, partial_tile2, {0, 0}, fragment::shape{8, 8});
+        fragment::store<fragment::role::result>(product3, partial_tile3, {0, 0}, fragment::shape{8, 8});
       } else {
         Float32x64 previous0 = loom::vector::load<Float32x64>(partials, {0, 0});
-        Float32x64 fragment0 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        Float32x64 fragment0 = fragment::attach<fragment::role::init>(previous0, fragment::shape{8, 8});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added0 = fragment0 + product0;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added0, partial_tile0, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        fragment::store<fragment::role::result>(added0, partial_tile0, {0, 0}, fragment::shape{8, 8});
         Float32x64 previous1 = loom::vector::load<Float32x64>(partials, {1, 0});
-        Float32x64 fragment1 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        Float32x64 fragment1 = fragment::attach<fragment::role::init>(previous1, fragment::shape{8, 8});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added1 = fragment1 + product1;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added1, partial_tile1, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        fragment::store<fragment::role::result>(added1, partial_tile1, {0, 0}, fragment::shape{8, 8});
         Float32x64 previous2 = loom::vector::load<Float32x64>(partials, {2, 0});
-        Float32x64 fragment2 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        Float32x64 fragment2 = fragment::attach<fragment::role::init>(previous2, fragment::shape{8, 8});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added2 = fragment2 + product2;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added2, partial_tile2, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        fragment::store<fragment::role::result>(added2, partial_tile2, {0, 0}, fragment::shape{8, 8});
         Float32x64 previous3 = loom::vector::load<Float32x64>(partials, {3, 0});
-        Float32x64 fragment3 = loom::vector::fragment::attach<loom::vector::fragment::role::init>(previous3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        Float32x64 fragment3 = fragment::attach<fragment::role::init>(previous3, fragment::shape{8, 8});
         [[loom::fastmath("nnan", "ninf", "nsz")]] Float32x64 added3 = fragment3 + product3;
-        loom::vector::fragment::store<loom::vector::fragment::role::result, loom::memory_access::none, 0, 0>(added3, partial_tile3, loom::vector::fragment::shape{loom::type::index{8}, loom::type::index{8}});
+        fragment::store<fragment::role::result>(added3, partial_tile3, {0, 0}, fragment::shape{8, 8});
       }
     }
     for (unsigned result_block = 0; result_block < 4; ++result_block) {
