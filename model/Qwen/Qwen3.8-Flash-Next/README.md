@@ -16,7 +16,7 @@ loom-serve --model="$HOME/models/qwen3.8-flash-next/model.json" \
 
 Fetching selects the source providers and the four required GGUF shards, verifies their acquisition identities, and materializes one selected card. Shared providers follow the same checkout or published snapshot as the model card. A published card URL can replace the local card path; neither flow needs an origin override or a Bazel build.
 
-The target bank occupies approximately 103.68 GiB before request state, compiler memory, or workspace. MTP adds about 2.59 GiB. The [standalone model overview](OVERVIEW.md) explains the checkpoint layout, exact upstream links, capacities, and additional retained storage. Changing a preset does not require another copy of the same checkpoint files.
+The resident target bank occupies approximately 76.86 GiB before request state, compiler memory, or workspace. PLE rows stream from the original checkpoint into a bounded cache instead of keeping the 26.82 GiB table resident. MTP adds about 2.59 GiB. The [standalone model overview](OVERVIEW.md) explains the checkpoint layout, exact upstream links, capacities, and additional retained storage. Changing a preset does not require another copy of the same checkpoint files.
 
 | Preset | Parameter variant | Execution |
 | --- | --- | --- |

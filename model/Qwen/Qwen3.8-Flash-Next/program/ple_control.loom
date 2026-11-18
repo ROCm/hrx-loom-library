@@ -1,0 +1,112 @@
+// Finite PLE execution through the ordinary HAL file queue. Device requests
+// publish into the cached-host root declared during preparation; packed cache
+// data and activations keep device placement. Layer zero overlaps file reads,
+// and the suffix joins their completion before publishing or consuming rows.
+// Borrowed model roots remain owned by the service and accepted native work.
+
+type.decl import("hal", "buffer") @HalBuffer
+
+type.decl import("hal", "fence") @HalFence
+
+type.decl import("hal", "file") @HalFile
+
+func.decl @qwen38.control_context(%state: buffer) -> (i64, offset)
+
+func.decl pure @flash_next_ple_cache_layout(%tokens: index) -> (offset, offset, offset, offset, offset)
+
+func.decl pure @flash_next_ple_request_layout(%tokens: index) -> (offset, offset)
+
+func.decl import("storage", "buffer") @request_storage(%ordinal: i32) -> (ref<@HalBuffer>)
+
+func.decl import("storage", "fill") @fill_storage(%target: ptr<@HalBuffer>, %offset: i64, %length: i64, %pattern: i32) -> (i64)
+
+func.decl import("runner") @execute_6(%stage: i32, %b0: ptr<@HalBuffer>, %b1: ptr<@HalBuffer>, %b2: ptr<@HalBuffer>, %b3: ptr<@HalBuffer>, %b4: ptr<@HalBuffer>, %b5: ptr<@HalBuffer>) -> (i64)
+
+func.decl import("runner") @execute_7(%stage: i32, %b0: ptr<@HalBuffer>, %b1: ptr<@HalBuffer>, %b2: ptr<@HalBuffer>, %b3: ptr<@HalBuffer>, %b4: ptr<@HalBuffer>, %b5: ptr<@HalBuffer>, %b6: ptr<@HalBuffer>) -> (i64)
+
+func.decl import("runner") @fence(%work: i64) -> (ref<@HalFence>)
+
+func.decl import("runner") @join(%ready: ptr<@HalFence>)
+
+func.decl import("parameters") @file(%source: i32, %key: buffer) -> (ref<@HalFile>, i64, i64)
+
+func.decl import("hal.file") @read_indirect(%files: view<1xptr<@HalFile>> {access = read}, %file_windows: view<2xi64> {access = read}, %buffers: view<1xptr<@HalBuffer>> {access = read}, %buffer_windows: view<2xi64> {access = read}, %wait: ptr<@HalFence>, %records: ptr<@HalBuffer>, %records_offset: i64, %records_length: i64, %count: ptr<@HalBuffer>, %count_offset: i64) -> (ref<@HalFence>)
+
+template.decl @qwen38.epoch.target(%control_state: buffer, %verify: i1, %mixed: i1, %shape: i32, %target_stage: i32, %verify_stage: i32, %residual: ptr<@HalBuffer>, %metadata: ptr<@HalBuffer>, %origins: ptr<@HalBuffer>, %state: ptr<@HalBuffer>, %tokens: ptr<@HalBuffer>, %outputs: ptr<@HalBuffer>, %committed: ptr<@HalBuffer>, %results: ptr<@HalBuffer>) -> (i64)
+
+template.def<@qwen38.epoch.target> @flash_next_ple_dispatch(%control_state: buffer, %verify: i1, %mixed: i1, %shape: i32, %target_stage: i32, %verify_stage: i32, %residual: ptr<@HalBuffer>, %metadata: ptr<@HalBuffer>, %origins: ptr<@HalBuffer>, %state: ptr<@HalBuffer>, %tokens: ptr<@HalBuffer>, %outputs: ptr<@HalBuffer>, %committed: ptr<@HalBuffer>, %results: ptr<@HalBuffer>) -> (i64) {
+  %packet_word, %provider_origin = func.call @qwen38.control_context(%control_state) : (buffer) -> (i64, offset)
+  %packet_bounded = scalar.assume %packet_word [range(%packet_word, 2, 32768)] : i64
+  %packet = index.cast %packet_bounded : i64 to index
+  // Request/prefix origins for ordinary and mixed inputs, parameter source,
+  // retained request root ordinal, and one-time cache initialization state.
+  %provider = buffer.view %control_state[%provider_origin] : buffer -> view<7xi32>
+  %ordinary_requests = view.load %provider[0] : view<7xi32> -> i32
+  %ordinary_prefix = view.load %provider[1] : view<7xi32> -> i32
+  %mixed_requests = view.load %provider[2] : view<7xi32> -> i32
+  %mixed_prefix = view.load %provider[3] : view<7xi32> -> i32
+  %source = view.load %provider[4] : view<7xi32> -> i32
+  %ordinal = view.load %provider[5] : view<7xi32> -> i32
+  %initialized = view.load %provider[6] : view<7xi32> -> i32
+  %request_first = scf.select %mixed, %mixed_requests, %ordinary_requests : i32
+  %prefix_first = scf.select %mixed, %mixed_prefix, %ordinary_prefix : i32
+  %request_stage = scalar.addi %request_first, %shape : i32
+  %prefix_stage = scalar.addi %prefix_first, %shape : i32
+  %c0_i32 = scalar.constant 0 : i32
+  %c1_i32 = scalar.constant 1 : i32
+  %c0_i64 = scalar.constant 0 : i64
+  %total, %header, %directory, %payload, %mapping = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset)
+  %payload_offset = index.cast %payload : offset to i64
+  %payload_extent = index.sub %mapping, %payload : offset
+  %payload_length = index.cast %payload_extent : offset to i64
+  %fresh = scalar.cmpi eq, %initialized, %c0_i32 : i32
+  scf.if %fresh {
+    // Initialize only header/directory, never the resident/spill payload or
+    // activation prefix. Growth preserves this fixed root and provider state.
+    %clear_origin = index.cast %header : offset to i64
+    %clear_extent = index.sub %payload, %header : offset
+    %clear_length = index.cast %clear_extent : offset to i64
+    %cleared = func.call @fill_storage(%residual, %clear_origin, %clear_length, %c0_i32) : (ptr<@HalBuffer>, i64, i64, i32) -> (i64)
+    view.store %c1_i32, %provider[6] : i32, view<7xi32>
+  }
+  %requests = func.call @request_storage(%ordinal) : (i32) -> (ref<@HalBuffer>)
+  %request_pointer = ref.borrow %requests : ref<@HalBuffer> -> ptr<@HalBuffer>
+  %produced_work = func.call @execute_6(%request_stage, %residual, %metadata, %origins, %state, %tokens, %request_pointer) : (i32, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>) -> (i64)
+  %produced = func.call @fence(%produced_work) : (i64) -> (ref<@HalFence>)
+  %wait = ref.borrow %produced : ref<@HalFence> -> ptr<@HalFence>
+  %key = buffer.constant utf8("per_layer_token_embd.weight") : buffer
+  %file, %file_offset, %file_length = func.call @file(%source, %key) : (i32, buffer) -> (ref<@HalFile>, i64, i64)
+  %file_pointer = ref.borrow %file : ref<@HalFile> -> ptr<@HalFile>
+  %files = view.alloca<private> : view<1xptr<@HalFile>>
+  %file_windows = view.alloca<private> : view<2xi64>
+  %buffers = view.alloca<private> : view<1xptr<@HalBuffer>>
+  %buffer_windows = view.alloca<private> : view<2xi64>
+  view.store %file_pointer, %files[0] : ptr<@HalFile>, view<1xptr<@HalFile>>
+  view.store %file_offset, %file_windows[0] : i64, view<2xi64>
+  view.store %file_length, %file_windows[1] : i64, view<2xi64>
+  view.store %residual, %buffers[0] : ptr<@HalBuffer>, view<1xptr<@HalBuffer>>
+  view.store %payload_offset, %buffer_windows[0] : i64, view<2xi64>
+  view.store %payload_length, %buffer_windows[1] : i64, view<2xi64>
+  %request_extent, %records_origin = func.call pure @flash_next_ple_request_layout(%packet) : (index) -> (offset, offset)
+  %records_extent = index.sub %request_extent, %records_origin : offset
+  %records_offset = index.cast %records_origin : offset to i64
+  %records_length = index.cast %records_extent : offset to i64
+  %ready = func.call @read_indirect(%files, %file_windows, %buffers, %buffer_windows, %wait, %request_pointer, %records_offset, %records_length, %request_pointer, %c0_i64) : (view<1xptr<@HalFile>>, view<2xi64>, view<1xptr<@HalBuffer>>, view<2xi64>, ptr<@HalFence>, ptr<@HalBuffer>, i64, i64, ptr<@HalBuffer>, i64) -> (ref<@HalFence>)
+  ref.release %produced : ref<@HalFence>
+  ref.release %file : ref<@HalFile>
+  ref.release %requests : ref<@HalBuffer>
+  %ready_pointer = ref.borrow %ready : ref<@HalFence> -> ptr<@HalFence>
+  %completion = scf.if %verify -> (i64) {
+    // Verification owns capture, the complete target, and accepted replay.
+    func.call @join(%ready_pointer) : (ptr<@HalFence>)
+    %completion = func.call @execute_7(%verify_stage, %residual, %metadata, %origins, %state, %tokens, %committed, %results) : (i32, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>) -> (i64)
+    scf.yield %completion : i64
+  } else {
+    %prefix = func.call @execute_6(%prefix_stage, %residual, %metadata, %origins, %state, %tokens, %outputs) : (i32, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>) -> (i64)
+    func.call @join(%ready_pointer) : (ptr<@HalFence>)
+    %completion = func.call @execute_6(%target_stage, %residual, %metadata, %origins, %state, %tokens, %outputs) : (i32, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>, ptr<@HalBuffer>) -> (i64)
+    scf.yield %completion : i64
+  }
+  ref.release %ready : ref<@HalFence>
+  template.return %completion : i64
+}

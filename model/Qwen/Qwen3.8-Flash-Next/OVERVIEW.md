@@ -192,10 +192,23 @@ and the composition requires pooled cache storage. Resident rows can grow
 without redeclaring stages or changing the prepared packet capacity; cache
 space and execution shapes bound admitted work independently.
 
-The source parameter layout occupies approximately 103.68 GiB, including the
-26.82 GiB packed n-gram table; adding MTP brings it to approximately 106.26 GiB.
-The card rounds those estimates upward to 104 and 107 GiB. It does not infer a
-hardware fit or reserve memory from those figures.
+The resident target parameters occupy approximately 76.86 GiB; adding MTP
+brings them to approximately 79.44 GiB. The 26.82 GiB packed PLE n-gram table
+stays in the original checkpoint file. Missing rows are read asynchronously
+into a bounded cache while independent model work runs; decoding uses the same
+original quantized bytes. No checkpoint conversion or streaming flag is needed.
+
+The packed row cache retains 90 MiB of payload and an 8 MiB directory. Live
+spill and row mappings use 1,504 bytes per packed token; the reusable request
+list uses 1,024 bytes per packed token plus its aligned count header. These
+capacities depend on the prepared epoch size, not total context length or the
+number of conversations. Request storage is CPU-cached host memory accessible
+to the execution device. Cache data uses ordinary device placement.
+
+The card rounds resident parameter estimates upward to 77 GiB for the target
+and 80 GiB with MTP; vision presets include the on-demand projector and round
+to 78 and 81 GiB. Those figures exclude the PLE cache, request storage, and all
+other mutable storage. They do not infer a hardware fit or reserve memory.
 
 Mutable storage is additional: 25,344 bytes per pooled KV token and
 115,652,096 bytes per recurrent endpoint. MTP adds 44,032 bytes of carry per

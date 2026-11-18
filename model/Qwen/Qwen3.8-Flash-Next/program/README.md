@@ -41,6 +41,16 @@ PLE adds hashed n-gram lookup and its own token and convolution history.
 Read anchors and writable endpoints are distinct arguments, allowing forks
 to share immutable history while publishing into private state.
 
+`ple_prepare.loom` declares the request and independent-prefix catalogs plus
+one cached-host request root. `ple_control.loom` implements the shared epoch
+template with a finite HAL file batch: request dispatch, producer fence,
+independent layer-zero work, and a completion join before the suffix. The file
+resolver supplies the retained checkpoint handle and exact tensor byte window;
+ordinary queue capture retains the file and buffers through completion. The
+source stores only stable stage/parameter/storage ordinals and one cache
+initialization flag; row growth preserves them. No host request-list readback,
+per-row host submission, or model-specific runtime API is involved.
+
 The finite PLE stages separate request generation, layer zero, and the remaining
 target layers. The requester reads the old token history and writes a live byte
 range list without advancing that history. Layer zero has no PLE dependency and
