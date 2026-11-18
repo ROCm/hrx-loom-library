@@ -4,7 +4,9 @@ func.decl @cohort_cache_publish(%capacity: index, %tags: view<[%capacity]xi64>, 
 
 func.decl @cohort_cache_begin(%capacity: index, %directory: view<[%capacity]xi64>, %previous: i64) -> (i64)
 
-func.decl pure @flash_next_ple_cache_layout(%tokens: index) -> (offset, offset, offset, offset, offset, offset)
+func.decl pure @flash_next_ple_cache_layout(%tokens: index) -> (offset, offset, offset, offset, offset)
+
+func.decl pure @flash_next_ple_request_layout(%tokens: index) -> (offset, offset)
 
 config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]
 
@@ -24,7 +26,7 @@ kernel.def @flash_next_ple_cache_plan() {
   %groups = index.min %needed, %limit : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%header: buffer, %row_ids: buffer, %directory: buffer, %mapping: buffer, %descriptors: buffer) {
+} launch(%header: buffer, %row_ids: buffer, %directory: buffer, %mapping: buffer, %transfers: buffer) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -33,7 +35,7 @@ kernel.def @flash_next_ple_cache_plan() {
   %heads = index.constant 16 : index
   %requests = index.mul %packet, %heads : index
   %capacity, %ways = func.call pure @flash_next_ple_cache_dimensions() : () -> (index, index)
-  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin, %descriptor_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset, offset)
+  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset)
   %header_view = buffer.view %header[%header_origin] : buffer -> view<2xi64>
   %count_unbounded = view.load %header_view[0] : view<2xi64> -> i64
   %count_word = scalar.assume %count_unbounded [range(%count_unbounded, 0, 524288)] : i64
@@ -47,7 +49,8 @@ kernel.def @flash_next_ple_cache_plan() {
   %ids = buffer.view %row_ids[%origin] : buffer -> view<[%requests]xi32>
   %tags = buffer.view %directory[%directory_origin] : buffer -> view<[%capacity]xi64>
   %indices = buffer.view %mapping[%mapping_origin] : buffer -> view<[%requests]xi32>
-  %records = buffer.view %descriptors[%descriptor_origin] : buffer -> view<[%requests]x3xi64>
+  %transfer_bytes, %record_origin = func.call pure @flash_next_ple_request_layout(%packet) : (index) -> (offset, offset)
+  %records = buffer.view %transfers[%record_origin] : buffer -> view<[%requests]x8xi64>
   %group = kernel.workgroup.id<x> : index
   %lane = kernel.workitem.id<x> : index
   %groups = kernel.workgroup.count<x> : index
@@ -65,14 +68,14 @@ kernel.def @flash_next_ple_cache_plan() {
     %mapping_word = scalar.ori %slot_word, %owner_bit : i32
     %slot_wide = index.cast %slot : index to i64
     %source_offset = scalar.muli %row, %row_bytes : i64
-    %relative_destination = scalar.muli %slot_wide, %row_bytes : i64
-    %payload_word = index.cast %payload_origin : offset to i64
-    %destination_offset = scalar.addi %payload_word, %relative_destination : i64
+    %destination_offset = scalar.muli %slot_wide, %row_bytes : i64
     %length = scf.select %read, %row_bytes, %zero64 : i64
     view.store %mapping_word, %indices[%request] : i32, view<[%requests]xi32>
-    view.store %source_offset, %records[%request, 0] : i64, view<[%requests]x3xi64>
-    view.store %destination_offset, %records[%request, 1] : i64, view<[%requests]x3xi64>
-    view.store %length, %records[%request, 2] : i64, view<[%requests]x3xi64>
+    // Both binding indices and the linear form are zero. Their upper fields
+    // remain zero because these exact row offsets fit in the low 48 bits.
+    view.store %source_offset, %records[%request, 0] : i64, view<[%requests]x8xi64>
+    view.store %destination_offset, %records[%request, 1] : i64, view<[%requests]x8xi64>
+    view.store %length, %records[%request, 2] : i64, view<[%requests]x8xi64>
   }
   kernel.return
 }
@@ -100,7 +103,7 @@ kernel.def @flash_next_ple_cache_publish() {
   %heads = index.constant 16 : index
   %requests = index.mul %packet, %heads : index
   %capacity, %ways = func.call pure @flash_next_ple_cache_dimensions() : () -> (index, index)
-  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin, %descriptor_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset, offset)
+  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset)
   %header_view = buffer.view %header[%header_origin] : buffer -> view<2xi64>
   %count_unbounded = view.load %header_view[0] : view<2xi64> -> i64
   %count_word = scalar.assume %count_unbounded [range(%count_unbounded, 0, 524288)] : i64
@@ -139,9 +142,9 @@ kernel.def @flash_next_ple_cache_begin() {
   %one = index.constant 1 : index
   %threads = index.constant 128 : index
   kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
-} launch(%span: buffer, %cache: buffer) {
+} launch(%span: buffer, %cache: buffer, %transfers: buffer) {
   %packet = config.get @qwen38.packet_capacity : index
-  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin, %descriptor_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset, offset)
+  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset)
   %header = buffer.view %cache[%header_origin] : buffer -> view<2xi64>
   %previous = view.load %header[1] : view<2xi64> -> i64
   %capacity, %ways = func.call pure @flash_next_ple_cache_dimensions() : () -> (index, index)
@@ -156,6 +159,9 @@ kernel.def @flash_next_ple_cache_begin() {
     %heads = index.constant 16 : index
     %active = index.mul %count, %heads : index
     %active_word = index.cast %active : index to i64
+    %origin = index.constant 0 : offset
+    %transfer_count = buffer.view %transfers[%origin] : buffer -> view<1xi64>
+    view.store %active_word, %transfer_count[0] : i64, view<1xi64>
     view.store %active_word, %header[0] : i64, view<2xi64>
     view.store %generation, %header[1] : i64, view<2xi64>
   }

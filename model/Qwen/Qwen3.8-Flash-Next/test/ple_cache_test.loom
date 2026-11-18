@@ -1,11 +1,13 @@
 // Complete IQ4_NL values through the real QFN begin/plan/publish/lookup kernels.
 // Sparse row bytes have exact finite unit scales. The scalar nibble oracle
 // derives requested rows independently of physical cache slots and publication.
-func.decl pure @flash_next_ple_cache_layout(%tokens: index) -> (offset, offset, offset, offset, offset, offset)
+func.decl pure @flash_next_ple_cache_layout(%tokens: index) -> (offset, offset, offset, offset, offset)
 
-kernel.decl @flash_next_ple_cache_begin() launch(%span: buffer, %cache: buffer)
+func.decl pure @flash_next_ple_request_layout(%tokens: index) -> (offset, offset)
 
-kernel.decl @flash_next_ple_cache_plan() launch(%header: buffer, %ids: buffer, %tags: buffer, %mapping: buffer, %descriptors: buffer)
+kernel.decl @flash_next_ple_cache_begin() launch(%span: buffer, %cache: buffer, %transfers: buffer)
+
+kernel.decl @flash_next_ple_cache_plan() launch(%header: buffer, %ids: buffer, %tags: buffer, %mapping: buffer, %transfers: buffer)
 
 kernel.decl @flash_next_ple_cache_publish() launch(%header: buffer, %tags: buffer, %mapping: buffer)
 
@@ -39,12 +41,13 @@ kernel.def @seed() {
   kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
 } launch(%configuration: buffer, %epoch: buffer, %ids: buffer, %cache: buffer) {
   %packet = index.constant 2 : index
-  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin, %descriptor_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset, offset)
+  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset)
   %origin = index.constant 0 : offset
-  %config = buffer.view %configuration[%origin] : buffer -> view<3xi64>
-  %previous = view.load %config[0] : view<3xi64> -> i64
-  %state = view.load %config[1] : view<3xi64> -> i64
-  %duplicates = view.load %config[2] : view<3xi64> -> i64
+  %config = buffer.view %configuration[%origin] : buffer -> view<4xi64>
+  %previous = view.load %config[0] : view<4xi64> -> i64
+  %state = view.load %config[1] : view<4xi64> -> i64
+  %duplicates = view.load %config[2] : view<4xi64> -> i64
+  %tokens = view.load %config[3] : view<4xi64> -> i64
   %header = buffer.view %cache[%header_origin] : buffer -> view<2xi64>
   %directory = buffer.view %cache[%directory_origin] : buffer -> view<1048576xi64>
   %payload = buffer.view %cache[%payload_origin] : buffer -> view<1048608x90xi8>
@@ -95,8 +98,8 @@ kernel.def @seed() {
   }
   %leader = index.cmp eq, %first, %zero : index
   scf.if %leader {
-    %two32 = scalar.constant 2 : i32
-    view.store %two32, %span[0] : i32, view<3xi32>
+    %token_count = scalar.trunci %tokens : i64 to i32
+    view.store %token_count, %span[0] : i32, view<3xi32>
     view.store %zero64, %header[0] : i64, view<2xi64>
     view.store %previous, %header[1] : i64, view<2xi64>
   }
@@ -117,27 +120,32 @@ kernel.def @seed() {
 kernel.def @transfer() {
   %one = index.constant 1 : index
   kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%one, %one, %one) : index
-} launch(%cache: buffer) {
+} launch(%cache: buffer, %transfers: buffer) {
   %packet = index.constant 2 : index
-  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin, %descriptor_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset, offset)
+  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset)
   %origin = index.constant 0 : offset
-  %records = buffer.view %cache[%descriptor_origin] : buffer -> view<32x3xi64>
-  %cache_length = index.cast %total : offset to index
-  %bytes = buffer.view %cache[%origin] : buffer -> view<[%cache_length]xi8>
+  %transfer_bytes, %record_origin = func.call pure @flash_next_ple_request_layout(%packet) : (index) -> (offset, offset)
+  %records = buffer.view %transfers[%record_origin] : buffer -> view<32x8xi64>
+  %count_view = buffer.view %transfers[%origin] : buffer -> view<1xi64>
+  %count_unbounded = view.load %count_view[0] : view<1xi64> -> i64
+  %count_word = scalar.assume %count_unbounded [range(%count_unbounded, 0, 32)] : i64
+  %count = index.cast %count_word : i64 to index
+  %payload_slots = index.constant 1048608 : index
+  %width = index.constant 90 : index
+  %payload_length = index.mul %payload_slots, %width : index
+  %bytes = buffer.view %cache[%payload_origin] : buffer -> view<[%payload_length]xi8>
   %zero = index.constant 0 : index
   %one = index.constant 1 : index
-  %requests = index.constant 32 : index
-  %width = index.constant 90 : index
   %row_bytes = scalar.constant 90 : i64
   %zero64 = scalar.constant 0 : i64
-  scf.for %request = [%zero to %requests step %one] {
-    %length = view.load %records[%request, 2] : view<32x3xi64> -> i64
+  scf.for %request = [%zero to %count step %one] {
+    %length = view.load %records[%request, 2] : view<32x8xi64> -> i64
     %active = scalar.cmpi ne, %length, %zero64 : i64
     scf.if %active {
-      %source = view.load %records[%request, 0] : view<32x3xi64> -> i64
-      %destination_unbounded = view.load %records[%request, 1] : view<32x3xi64> -> i64
+      %source = view.load %records[%request, 0] : view<32x8xi64> -> i64
+      %destination_unbounded = view.load %records[%request, 1] : view<32x8xi64> -> i64
       %row = scalar.divui %source, %row_bytes : i64
-      %last_base = index.sub %cache_length, %width : index
+      %last_base = index.sub %payload_length, %width : index
       %maximum = index.cast %last_base : index to i64
       %destination = scalar.assume %destination_unbounded [range(%destination_unbounded, 0, %maximum)] : i64
       %base_value = index.cast %destination : i64 to index
@@ -145,12 +153,12 @@ kernel.def @transfer() {
       scf.for %column = [%zero to %width step %one] {
         %byte = func.call pure @oracle_byte(%row, %column) : (i64, index) -> (i8)
         %offset = index.add %base, %column : index
-        view.store %byte, %bytes[%offset] : i8, view<[%cache_length]xi8>
+        view.store %byte, %bytes[%offset] : i8, view<[%payload_length]xi8>
       }
     }
     // Retired transport storage can be reused before cache publication. The
     // cache must retain its own unique fill-owner decision on the device.
-    view.store %zero64, %records[%request, 2] : i64, view<32x3xi64>
+    view.store %zero64, %records[%request, 2] : i64, view<32x8xi64>
   }
   kernel.return
 }
@@ -161,40 +169,52 @@ kernel.def @observe_publication() {
   kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
 } launch(%cache: buffer, %observations: buffer) {
   %packet = index.constant 2 : index
-  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin, %descriptor_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset, offset)
+  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset)
   %origin = index.constant 0 : offset
   %indices = buffer.view %cache[%mapping_origin] : buffer -> view<32xi32>
+  %header = buffer.view %cache[%header_origin] : buffer -> view<2xi64>
+  %count = view.load %header[0] : view<2xi64> -> i64
   %directory = buffer.view %cache[%directory_origin] : buffer -> view<1048576xi64>
   %results = buffer.view %observations[%origin] : buffer -> view<32xi32>
   %request = kernel.workitem.id<x> : index
-  %entry = view.load %indices[%request] : view<32xi32> -> i32
-  %slot_mask = scalar.constant 2147483647 : i32
-  %slot_word = scalar.andi %entry, %slot_mask : i32
-  %slot = index.cast %slot_word : i32 to index
-  %capacity = index.constant 1048576 : index
-  %resident = index.cmp ult, %slot, %capacity : index
-  %one = scalar.constant 1 : i32
-  %ready = scf.if %resident -> (i32) {
-    %index = index.assume %slot [range(%slot, 0, 1048575)] : index
-    %tag = view.load %directory[%index] : view<1048576xi64> -> i64
-    %pending_mask = scalar.constant 2147483648 : i64
-    %pending = scalar.andi %tag, %pending_mask : i64
-    %zero64 = scalar.constant 0 : i64
-    %published = scalar.cmpi eq, %pending, %zero64 : i64
-    %zero = scalar.constant 0 : i32
-    %value = scf.select %published, %one, %zero : i32
-    scf.yield %value : i32
+  %request_word = index.cast %request : index to i64
+  %active = scalar.cmpi ult, %request_word, %count : i64
+  %observed = scf.if %active -> (i32) {
+    %entry = view.load %indices[%request] : view<32xi32> -> i32
+    %slot_mask = scalar.constant 2147483647 : i32
+    %slot_word = scalar.andi %entry, %slot_mask : i32
+    %slot = index.cast %slot_word : i32 to index
+    %capacity = index.constant 1048576 : index
+    %resident = index.cmp ult, %slot, %capacity : index
+    %one = scalar.constant 1 : i32
+    %ready = scf.if %resident -> (i32) {
+      %index = index.assume %slot [range(%slot, 0, 1048575)] : index
+      %tag = view.load %directory[%index] : view<1048576xi64> -> i64
+      %pending_mask = scalar.constant 2147483648 : i64
+      %pending = scalar.andi %tag, %pending_mask : i64
+      %zero64 = scalar.constant 0 : i64
+      %published = scalar.cmpi eq, %pending, %zero64 : i64
+      %zero = scalar.constant 0 : i32
+      %value = scf.select %published, %one, %zero : i32
+      scf.yield %value : i32
+    } else {
+      scf.yield %one : i32
+    }
+    scf.yield %ready : i32
   } else {
-    scf.yield %one : i32
+    %inactive = scalar.constant -1 : i32
+    scf.yield %inactive : i32
   }
-  view.store %ready, %results[%request] : i32, view<32xi32>
+  view.store %observed, %results[%request] : i32, view<32xi32>
   kernel.return
 }
 
 command.def @rounds(%configuration_ordinal: index) launch(%configuration: buffer, %output: buffer, %publication: buffer) {
   %packet = index.constant 2 : index
-  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin, %descriptor_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset, offset)
+  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset)
   %cache = buffer.alloca<global> align(256) %total : buffer
+  %transfer_bytes, %record_origin = func.call pure @flash_next_ple_request_layout(%packet) : (index) -> (offset, offset)
+  %transfers = buffer.alloca<global> align(64) %transfer_bytes : buffer
   %epoch_bytes = index.constant 12 : offset
   %id_bytes = index.constant 128 : offset
   %epoch = buffer.alloca<global> align(16) %epoch_bytes : buffer
@@ -207,13 +227,13 @@ command.def @rounds(%configuration_ordinal: index) launch(%configuration: buffer
   scf.if %abandon {
     // Simulate rejected I/O: planning is complete, but no fill/publication or
     // consumer runs. The next cohort must refill every stale pending entry.
-    kernel.launch @flash_next_ple_cache_begin(%epoch, %cache) : (buffer, buffer)
-    kernel.launch @flash_next_ple_cache_plan(%cache, %ids, %cache, %cache, %cache) : (buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_ple_cache_begin(%epoch, %cache, %transfers) : (buffer, buffer, buffer)
+    kernel.launch @flash_next_ple_cache_plan(%cache, %ids, %cache, %cache, %transfers) : (buffer, buffer, buffer, buffer, buffer)
   }
   scf.for %round = [%zero to %three step %one] unroll {
-    kernel.launch @flash_next_ple_cache_begin(%epoch, %cache) : (buffer, buffer)
-    kernel.launch @flash_next_ple_cache_plan(%cache, %ids, %cache, %cache, %cache) : (buffer, buffer, buffer, buffer, buffer)
-    kernel.launch @transfer(%cache) : (buffer)
+    kernel.launch @flash_next_ple_cache_begin(%epoch, %cache, %transfers) : (buffer, buffer, buffer)
+    kernel.launch @flash_next_ple_cache_plan(%cache, %ids, %cache, %cache, %transfers) : (buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @transfer(%cache, %transfers) : (buffer, buffer)
     kernel.launch @flash_next_ple_cache_publish(%cache, %cache, %cache) : (buffer, buffer, buffer)
     %observation_bytes = index.constant 128 : offset
     %observation_origin = index.scale %round, %observation_bytes : index, offset -> offset
@@ -231,8 +251,11 @@ command.def @rounds(%configuration_ordinal: index) launch(%configuration: buffer
 // All scales are exactly one; arbitrary nibbles retain both signs and all codes.
 func.def @reference(%configuration: buffer, %output: buffer, %publication: buffer) {
   %origin = index.constant 0 : offset
-  %config = buffer.view %configuration[%origin] : buffer -> view<3xi64>
-  %duplicates = view.load %config[2] : view<3xi64> -> i64
+  %config = buffer.view %configuration[%origin] : buffer -> view<4xi64>
+  %duplicates = view.load %config[2] : view<4xi64> -> i64
+  %tokens = view.load %config[3] : view<4xi64> -> i64
+  %heads = scalar.constant 16 : i64
+  %active_requests = scalar.muli %tokens, %heads : i64
   %zero64 = scalar.constant 0 : i64
   %duplicated = scalar.cmpi ne, %duplicates, %zero64 : i64
   %result = buffer.view %output[%origin] : buffer -> view<3x32x160xbf16>
@@ -254,29 +277,35 @@ func.def @reference(%configuration: buffer, %output: buffer, %publication: buffe
   %codebook = vector.constanti [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113] : vector<16xi32>
   scf.for %round = [%zero to %three step %one] {
     scf.for %request = [%zero to %requests step %one] {
-      view.store %published, %observations[%round, %request] : i32, view<3x32xi32>
-      %small = index.rem %request, %ways : index
-      %ordinal = scf.select %duplicated, %small, %request : index
-      %row = index.cast %ordinal : index to i32
-      scf.for %channel = [%zero to %width step %one] {
-        %block = index.div %channel, %channels : index
-        %block_origin = index.mul %block, %block_bytes : index
-        %payload_origin = index.add %block_origin, %two : index
-        %nibble_position = index.rem %channel, %half : index
-        %byte_position = index.add %payload_origin, %nibble_position : index
-        %byte_word = index.cast %byte_position : index to i32
-        %factor = scalar.muli %byte_word, %salt : i32
-        %encoded = scalar.xori %factor, %row : i32
-        %within = index.rem %channel, %channels : index
-        %upper = index.cmp uge, %within, %half : index
-        %high = scalar.shrui %encoded, %shift : i32
-        %chosen = scf.select %upper, %high, %encoded : i32
-        %code = scalar.andi %chosen, %mask : i32
-        %code_index = index.cast %code : i32 to index
-        %value_word = vector.extract %codebook[%code_index] : vector<16xi32> -> i32
-        %value = scalar.sitofp %value_word : i32 to f32
-        %packed = scalar.fptrunc %value : f32 to bf16
-        view.store %packed, %result[%round, %request, %channel] : bf16, view<3x32x160xbf16>
+      %request_word = index.cast %request : index to i64
+      %active = scalar.cmpi ult, %request_word, %active_requests : i64
+      %inactive = scalar.constant -1 : i32
+      %observation = scf.select %active, %published, %inactive : i32
+      view.store %observation, %observations[%round, %request] : i32, view<3x32xi32>
+      scf.if %active {
+        %small = index.rem %request, %ways : index
+        %ordinal = scf.select %duplicated, %small, %request : index
+        %row = index.cast %ordinal : index to i32
+        scf.for %channel = [%zero to %width step %one] {
+          %block = index.div %channel, %channels : index
+          %block_origin = index.mul %block, %block_bytes : index
+          %payload_origin = index.add %block_origin, %two : index
+          %nibble_position = index.rem %channel, %half : index
+          %byte_position = index.add %payload_origin, %nibble_position : index
+          %byte_word = index.cast %byte_position : index to i32
+          %factor = scalar.muli %byte_word, %salt : i32
+          %encoded = scalar.xori %factor, %row : i32
+          %within = index.rem %channel, %channels : index
+          %upper = index.cmp uge, %within, %half : index
+          %high = scalar.shrui %encoded, %shift : i32
+          %chosen = scf.select %upper, %high, %encoded : i32
+          %code = scalar.andi %chosen, %mask : i32
+          %code_index = index.cast %code : i32 to index
+          %value_word = vector.extract %codebook[%code_index] : vector<16xi32> -> i32
+          %value = scalar.sitofp %value_word : i32 to f32
+          %packed = scalar.fptrunc %value : f32 to bf16
+          view.store %packed, %result[%round, %request, %channel] : bf16, view<3x32x160xbf16>
+        }
       }
     }
   }
@@ -289,8 +318,11 @@ func.def @configure(%trial: index, %configuration: buffer) {
   %two = index.constant 2 : index
   %three = index.constant 3 : index
   %six = index.constant 6 : index
-  %group = index.div %trial, %six : index
-  %pair = index.div %trial, %two : index
+  %eighteen = index.constant 18 : index
+  %state_trial = index.rem %trial, %eighteen : index
+  %tokens = index.div %trial, %eighteen : index
+  %group = index.div %state_trial, %six : index
+  %pair = index.div %state_trial, %two : index
   %state = index.rem %pair, %three : index
   %duplicates = index.rem %trial, %two : index
   %initial = index.cmp eq, %group, %zero : index
@@ -301,23 +333,25 @@ func.def @configure(%trial: index, %configuration: buffer) {
   %boundary = scf.select %before, %before64, %limit64 : i64
   %previous = scf.select %initial, %zero64, %boundary : i64
   %origin = index.constant 0 : offset
-  %view = buffer.view %configuration[%origin] : buffer -> view<3xi64>
+  %view = buffer.view %configuration[%origin] : buffer -> view<4xi64>
   %state_word = index.cast %state : index to i64
   %duplicate_word = index.cast %duplicates : index to i64
-  view.store %previous, %view[0] : i64, view<3xi64>
-  view.store %state_word, %view[1] : i64, view<3xi64>
-  view.store %duplicate_word, %view[2] : i64, view<3xi64>
+  %token_word = index.cast %tokens : index to i64
+  view.store %previous, %view[0] : i64, view<4xi64>
+  view.store %state_word, %view[1] : i64, view<4xi64>
+  view.store %duplicate_word, %view[2] : i64, view<4xi64>
+  view.store %token_word, %view[3] : i64, view<4xi64>
   func.return
 }
 
 check.scenario public @cache_decoded_retirement configure[2](%configuration_ordinal: index, %configuration_entropy: check.entropy) {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
-  check.trial[18](%trial: index, %entropy: check.entropy) {
-    %configuration = check.generate.fill value(0) : tensor<3xi64>
+  check.trial[54](%trial: index, %entropy: check.entropy) {
+    %configuration = check.generate.fill value(0) : tensor<4xi64>
     %output = check.generate.fill value(-99.0) : tensor<3x32x160xbf16>
     %publication = check.generate.fill value(-1) : tensor<3x32xi32>
-    check.generate<@configure>(%trial, %configuration) : (index, tensor<3xi64>) -> ()
-    check.compare<@rounds, @reference>[%configuration_ordinal](%configuration, %output, %publication) : [index](tensor<3xi64>, tensor<3x32x160xbf16>, tensor<3x32xi32>) -> () {
+    check.generate<@configure>(%trial, %configuration) : (index, tensor<4xi64>) -> ()
+    check.compare<@rounds, @reference>[%configuration_ordinal](%configuration, %output, %publication) : [index](tensor<4xi64>, tensor<3x32x160xbf16>, tensor<3x32xi32>) -> () {
       check.expect.bitwise actual(%output) expected(%output) : tensor<3x32x160xbf16>
       check.expect.bitwise actual(%publication) expected(%publication) : tensor<3x32xi32>
     }
