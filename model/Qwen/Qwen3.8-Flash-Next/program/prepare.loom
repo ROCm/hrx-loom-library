@@ -26,7 +26,7 @@ func.decl import("prepare") @source_scope(%scope: buffer) -> (i32)
 
 func.decl import("prepare") @parameter(%stage: i32, %binding: i32, %input: i32, %source: i32, %policy: buffer)
 
-func.decl @qwen38.packet_capacity(%shapes: buffer, %shape_count: i64, %prefill: i64) -> (i64)
+func.decl @qwen38.packet_capacities(%shapes: buffer, %shape_count: i64, %prefill: i64) -> (i64, i64)
 
 func.decl @qwen38.allocation(%records: buffer, %slot: index, %bytes: i64, %initial_zero_bytes: i64)
 
@@ -34,9 +34,9 @@ func.decl @qwen38.row_view(%records: buffer, %row_count: index, %row: index, %sl
 
 func.decl @qwen38_packet_bytes(%capacity: index) -> (offset)
 
-func.decl @qwen38.control_create(%packet_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer)
+func.decl @qwen38.control_create(%packet_capacity: i64, %feedback_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer)
 
-func.decl @qwen38.control_resize(%state: buffer, %rows: i64) -> (buffer, i64, i64, i64, i64, i1, i1, i1)
+func.decl @qwen38.control_resize(%state: buffer, %rows: i64) -> (buffer, i64, i64, i64, i64, i64, i1, i1, i1)
 
 func.decl @qwen38.proposal_level(%count: i32) -> (i32)
 
@@ -45,8 +45,8 @@ func.decl @qwen38.speculation_configure(%state: buffer, %ceiling: i32, %capacity
 func.decl @qwen38.speculation_register(%state: buffer, %level: index, %width: i32, %proposal: i32, %verifier: i32)
 
 func.def public @text_resize_state_v1(%state: buffer, %rows: i64) -> (buffer, buffer, buffer, buffer, buffer, buffer) {
-  %grown, %packet_capacity, %context, %pool, %pins, %packed, %enabled, %dflash = func.call @qwen38.control_resize(%state, %rows) : (buffer, i64) -> (buffer, i64, i64, i64, i64, i1, i1, i1)
-  %allocations, %views, %target, %draft, %geometry = func.call @qwen38.storage(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
+  %grown, %packet_capacity, %feedback_capacity, %context, %pool, %pins, %packed, %enabled, %dflash = func.call @qwen38.control_resize(%state, %rows) : (buffer, i64) -> (buffer, i64, i64, i64, i64, i64, i1, i1, i1)
+  %allocations, %views, %target, %draft, %geometry = func.call @qwen38.storage(%packet_capacity, %feedback_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
   func.return %grown, %allocations, %views, %target, %draft, %geometry : buffer, buffer, buffer, buffer, buffer, buffer
 }
 
@@ -99,6 +99,9 @@ global.rodata.def @terminal = bytes("3c7c696d5f656e647c3e")
 // Flash-Next requires pooled packed epochs, draft depth zero through seven, at most 32768 tokens per epoch, and context capacity divisible by 64.
 global.rodata.def @limits_error = bytes("466c6173682d4e65787420726571756972657320706f6f6c6564207061636b65642065706f6368732c206472616674206465707468207a65726f207468726f75676820736576656e2c206174206d6f737420333237363820746f6b656e73207065722065706f63682c20616e6420636f6e7465787420636170616369747920646976697369626c652062792036342e")
 
+// qwen38.feedback_capacity
+global.rodata.def @feedback_capacity_key = bytes("7177656e33382e666565646261636b5f6361706163697479")
+
 // qwen38.packet_capacity
 global.rodata.def @packet_capacity_key = bytes("7177656e33382e7061636b65745f6361706163697479")
 
@@ -149,7 +152,7 @@ func.def @declare_stage(%root: buffer, %tokens: i64, %spans: i64, %context: i64,
 // Fresh kernels synthesize empty state; these arenas need no initial fill.
 // One recurrent slot contains 36 GDN states, PLE token/convolution history, and
 // twelve QSA incomplete-block tails. KV and index pages share physical page IDs.
-func.def @qwen38.storage(%tokens: i64, %context: i64, %pool: i64, %rows_arg: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer, buffer, buffer, buffer, buffer) {
+func.def @qwen38.storage(%tokens: i64, %feedback_capacity: i64, %context: i64, %pool: i64, %rows_arg: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1) -> (buffer, buffer, buffer, buffer, buffer) {
   %rows = scalar.assume %rows_arg [range(%rows_arg, 1, 2147483647)] : i64
   %packet_capacity = scalar.assume %tokens [range(%tokens, 2, 2147483646)] : i64
   %origin = index.constant 0 : offset
@@ -229,8 +232,8 @@ func.def @qwen38.storage(%tokens: i64, %context: i64, %pool: i64, %rows_arg: i64
     %descriptor_header = scalar.constant 12 : i64
     %descriptor_bytes = scalar.muli %packet_capacity, %descriptor_stride : i64
     %committed_bytes = scalar.addi %descriptor_bytes, %descriptor_header : i64
-    %feedback_capacity = index.cast %packet_capacity : i64 to index
-    %feedback_extent = func.call @qwen38_feedback_bytes(%feedback_capacity) : (index) -> (offset)
+    %feedback_count = index.cast %feedback_capacity : i64 to index
+    %feedback_extent = func.call @qwen38_feedback_bytes(%feedback_count) : (index) -> (offset)
     %result_bytes = index.cast %feedback_extent : offset to i64
     func.call @qwen38.allocation(%allocations, %c7, %committed_bytes, %c0_i64) : (buffer, index, i64, i64)
     func.call @qwen38.allocation(%allocations, %c8, %result_bytes, %c0_i64) : (buffer, index, i64, i64)
@@ -280,7 +283,7 @@ func.def @qwen38.storage(%tokens: i64, %context: i64, %pool: i64, %rows_arg: i64
   %geometry_bytes = scf.select %enabled, %draft_geometry_bytes, %target_geometry_bytes : offset
   %geometry = buffer.alloca<private> align(8) %geometry_bytes : buffer
   %geometry_view = buffer.view %geometry[%origin] : buffer -> view<8xi64>
-  %bank_capacity = index.cast %packet_capacity : i64 to index
+  %bank_capacity = index.cast %feedback_capacity : i64 to index
   %bank_extent = func.call @qwen38_feedback_bank_bytes(%bank_capacity) : (index) -> (offset)
   %feedback_split = index.cast %bank_extent : offset to i64
   view.store %block_tokens, %geometry_view[0] : i64, view<8xi64>
@@ -348,7 +351,7 @@ func.def @qwen38.storage(%tokens: i64, %context: i64, %pool: i64, %rows_arg: i64
 // Each catalog has consecutive target shapes, proposal cohorts, warm shapes,
 // verification shapes, and one continuation. Only the input representation
 // differs; every stage binds the same immutable checkpoint source handles.
-func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %enabled: i1, %depth: i64, %mixed: i64, %packet_capacity: i64) -> (i32, i32, i32, i64, i64) {
+func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %enabled: i1, %depth: i64, %mixed: i64, %packet_capacity: i64, %feedback_capacity: i64) -> (i32, i32, i32, i64, i64) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -426,6 +429,8 @@ func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i6
     func.call @config_i64(%continuation, %mixed_key, %mixed) : (i32, buffer, i64)
     %packet_key = global.load @packet_capacity_key : buffer
     func.call @config_i64(%continuation, %packet_key, %packet_capacity) : (i32, buffer, i64)
+    %feedback_key = global.load @feedback_capacity_key : buffer
+    func.call @config_i64(%continuation, %feedback_key, %feedback_capacity) : (i32, buffer, i64)
     %context_key = global.load @context_key : buffer
     func.call @config_i64(%continuation, %context_key, %context) : (i32, buffer, i64)
     func.call @config_i64(%continuation, %epoch_capacity_key, %packet_capacity) : (i32, buffer, i64)
@@ -487,7 +492,7 @@ func.def @declare_cohort_stages(%state: buffer, %depth: i64, %proposal_capacity:
 }
 
 func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %draft_depth: i32, %shapes: buffer, %shape_count: i64, %weights: buffer, %options: buffer) -> (i64, i32, buffer, buffer, buffer, buffer, buffer, buffer, buffer) {
-  %packet_capacity = func.call @qwen38.packet_capacity(%shapes, %shape_count, %prefill) : (buffer, i64, i64) -> (i64)
+  %packet_capacity, %feedback_capacity = func.call @qwen38.packet_capacities(%shapes, %shape_count, %prefill) : (buffer, i64, i64) -> (i64, i64)
   %origin = index.constant 0 : offset
   %c0_i64 = scalar.constant 0 : i64
   %c0_i32 = scalar.constant 0 : i32
@@ -518,11 +523,11 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
     scf.yield %c0_i32 : i32
   }
   %depth = scalar.extui %draft_depth : i32 to i64
-  %target_first, %proposal, %warm_first, %maximum, %proposal_capacity = func.call @declare_packed_stages(%shapes, %shape_count, %context, %pool, %model_source, %draft_source, %enabled, %depth, %c0_i64, %packet_capacity) : (buffer, i64, i64, i64, i32, i32, i1, i64, i64, i64) -> (i32, i32, i32, i64, i64)
+  %target_first, %proposal, %warm_first, %maximum, %proposal_capacity = func.call @declare_packed_stages(%shapes, %shape_count, %context, %pool, %model_source, %draft_source, %enabled, %depth, %c0_i64, %packet_capacity, %feedback_capacity) : (buffer, i64, i64, i64, i32, i32, i1, i64, i64, i64, i64) -> (i32, i32, i32, i64, i64)
   %images = config.get @flash_next.image_inputs : i1
   %mixed_target, %mixed_proposal, %mixed_warm = scf.if %images -> (i32, i32, i32) {
     %mixed = scalar.constant 1 : i64
-    %target, %proposal, %warm, %maximum, %proposal_capacity = func.call @declare_packed_stages(%shapes, %shape_count, %context, %pool, %model_source, %draft_source, %enabled, %depth, %mixed, %packet_capacity) : (buffer, i64, i64, i64, i32, i32, i1, i64, i64, i64) -> (i32, i32, i32, i64, i64)
+    %target, %proposal, %warm, %maximum, %proposal_capacity = func.call @declare_packed_stages(%shapes, %shape_count, %context, %pool, %model_source, %draft_source, %enabled, %depth, %mixed, %packet_capacity, %feedback_capacity) : (buffer, i64, i64, i64, i32, i32, i1, i64, i64, i64, i64) -> (i32, i32, i32, i64, i64)
     scf.yield %target, %proposal, %warm : i32, i32, i32
   } else {
     scf.yield %c0_i32, %c0_i32, %c0_i32 : i32, i32, i32
@@ -531,7 +536,7 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
   // The shared controller selects explicit ordinary/mixed catalog origins.
   // Sampling follows these ten control words at byte 40.
   %dflash = scalar.constant false : i1
-  %state = func.call @qwen38.control_create(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer)
+  %state = func.call @qwen38.control_create(%packet_capacity, %feedback_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer)
   %state_view = buffer.view %state[%origin] : buffer -> view<10xi32>
   view.store %shared, %state_view[2] : i32, view<10xi32>
   view.store %proposal, %state_view[3] : i32, view<10xi32>
@@ -546,6 +551,6 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
   %less = scalar.cmpi ult, %maximum, %prefill : i64
   %effective = scf.select %less, %maximum, %prefill : i64
   %terminal = global.load @terminal : buffer
-  %allocations, %views, %target_origins, %draft_origins, %geometry = func.call @qwen38.storage(%packet_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
+  %allocations, %views, %target_origins, %draft_origins, %geometry = func.call @qwen38.storage(%packet_capacity, %feedback_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
   func.return %effective, %shared, %state, %terminal, %allocations, %views, %target_origins, %draft_origins, %geometry : i64, i32, buffer, buffer, buffer, buffer, buffer, buffer, buffer
 }

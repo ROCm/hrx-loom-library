@@ -140,7 +140,6 @@ func.def @accept_oracle(%mixed_inputs: index, %width_value: index, %token_capaci
   %replay_header = buffer.view %replay[%origin] : buffer -> view<3xi32>
   %replayed = buffer.view %replay[%descriptor_origin] : buffer -> view<[%packet_capacity]x6xi32>
   %feedback_origin = index.constant 120 : offset
-  %records = buffer.view %results[%feedback_origin] : buffer -> view<[%packet_capacity]x10xi32>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
@@ -158,6 +157,7 @@ func.def @accept_oracle(%mixed_inputs: index, %width_value: index, %token_capaci
   view.store %span_word, %counts[1] : i32, view<2xi32>
   %span_value = index.cast %span_word : i32 to index
   %span_count = index.assume %span_value [range(%span_value, 0, %packet_capacity)] : index
+  %records = buffer.view %results[%feedback_origin] : buffer -> view<[%span_count]x10xi32>
   // Count the causal keys one query at a time, independently of the kernel's
   // closed-form sum. Long prompt fixtures exceed 32-bit pair counts.
   %observation_origin = index.constant 64 : offset
@@ -269,13 +269,13 @@ func.def @accept_oracle(%mixed_inputs: index, %width_value: index, %token_capaci
       %emitted = scf.select %has_output, %c1_2, %c0_2 : i32
       scf.yield %count_word, %emitted : i32, i32
     }
-    view.store %consumed, %records[%span, 0] : i32, view<[%packet_capacity]x10xi32>
+    view.store %consumed, %records[%span, 0] : i32, view<[%span_count]x10xi32>
     %candidates = scalar.subi %count_word, %c1_2 : i32
     %proposed = scf.select %speculative, %candidates, %c0_2 : i32
     %halfword = scalar.constant 65536 : i32
     %proposal_bits = scalar.muli %proposed, %halfword : i32
     %counts = scalar.addi %emitted, %proposal_bits : i32
-    view.store %counts, %records[%span, 1] : i32, view<[%packet_capacity]x10xi32>
+    view.store %counts, %records[%span, 1] : i32, view<[%span_count]x10xi32>
     %output_count = index.cast %emitted : i32 to index
     scf.for %token = [%c0 to %capacity step %c1] {
       %valid = index.cmp ult, %token, %output_count : index
@@ -288,7 +288,7 @@ func.def @accept_oracle(%mixed_inputs: index, %width_value: index, %token_capaci
         scf.yield %c0_2 : i32
       }
       %field = index.add %token, %c2 : index
-      view.store %value, %records[%span, %field] : i32, view<[%packet_capacity]x10xi32>
+      view.store %value, %records[%span, %field] : i32, view<[%span_count]x10xi32>
     }
     scf.for %field = [%c0 to %c4 step %c1] {
       %input_word = view.load %descriptors[%span, %field] : view<[%packet_capacity]x6xi32> -> i32
@@ -350,12 +350,20 @@ func.def @accept_parameters(%trial: index) -> (index, index, index, index, index
   func.return %mixed, %width, %span_count, %position, %token_capacity, %input_words : index, index, index, index, index, index
 }
 
+func.def @accept_feedback_words(%spans: index) -> (index) {
+  %header = index.constant 30 : index
+  %stride = index.constant 10 : index
+  %records = index.mul %spans, %stride : index
+  %words = index.add %header, %records : index
+  func.return %words : index
+}
+
 check.scenario public @accept_frontiers {
   check.trial[16](%trial: index, %entropy: check.entropy) {
     %mixed_inputs, %width, %span_count, %position, %token_capacity, %input_words = check.generate<@accept_parameters>(%trial) : (index) -> (index, index, index, index, index, index)
     %maximum_width = check.literal value(8) : index
     %packet_capacity = check.literal value(128) : index
-    %feedback_words = check.literal value(1310) : index
+    %feedback_words = check.generate<@accept_feedback_words>(%span_count) : (index) -> (index)
     %epoch = check.generate.fill value(-99) : tensor<[%packet_capacity]x29xi32>
     %inputs = check.generate.iota offset(1000) step(1) : tensor<[%input_words]xi32>
     %predictions = check.generate.fill value(-99) : tensor<[%packet_capacity]xi32>
@@ -385,7 +393,7 @@ check.scenario public @accept_empty_epoch {
     %token_capacity = check.literal value(1) : index
     %input_words = check.generate<@sequence_input_words>(%trial, %token_capacity) : (index, index) -> (index)
     %packet_capacity = check.literal value(128) : index
-    %feedback_words = check.literal value(1310) : index
+    %feedback_words = check.generate<@accept_feedback_words>(%span_count) : (index) -> (index)
     %epoch = check.generate.fill value(-99) : tensor<[%packet_capacity]x29xi32>
     %inputs = check.generate.iota offset(1000) step(1) : tensor<[%input_words]xi32>
     %predictions = check.generate.fill value(-99) : tensor<[%packet_capacity]xi32>

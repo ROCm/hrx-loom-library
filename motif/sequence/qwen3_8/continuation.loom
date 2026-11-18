@@ -1,8 +1,9 @@
 // Qwen queued continuation compaction. Capacity bounds the retained packet and
-// ordinary input planes, independently of current epoch width. Mixed records
-// carry their own two input-plane capacities. Results contain two ten-word
-// records and one first-owner tag per capacity entry, with a 120-byte timing/work
-// header before each record bank. Immutable queued plans
+// ordinary input planes, independently of current epoch width. Feedback capacity
+// bounds prepared request spans, independently of those token planes. Mixed records
+// carry their own two input-plane capacities. Results contain two banks of
+// ten-word records, with a 120-byte timing/work header before each bank. The
+// second bank's first-owner tags follow its live records. Immutable queued plans
 // and first results survive in-place compaction. Source-frontier scratch lives
 // in the retained packet; no dynamic private allocation is required.
 
@@ -33,8 +34,9 @@ func.decl @qwen38_feedback_outputs(%counts: i32) -> (i32)
 // boundary establishes first-plan indices and worst-case shape/page capacity.
 // Device acceptance resolves actual positions, credit and generated anchors;
 // compaction preserves both known input and speculative survivors.
-func.def public @qwen38_continue_spans(%mixed_inputs: index, %context: index, %capacity_value: index, %epoch: buffer, %tokens: buffer, %results: buffer) {
+func.def public @qwen38_continue_spans(%mixed_inputs: index, %context: index, %capacity_value: index, %feedback_capacity_value: index, %epoch: buffer, %tokens: buffer, %results: buffer) {
   %capacity = index.assume %capacity_value [range(%capacity_value, 2, 2147483646), multiple_of(%capacity_value, 2)] : index
+  %feedback_capacity = index.assume %feedback_capacity_value [range(%feedback_capacity_value, 1, %capacity)] : index
   %origin = index.constant 0 : offset
   %descriptor_origin = index.constant 12 : offset
   %selection_origin = func.call @qwen38_packet_selection_origin(%capacity) : (index) -> (offset)
@@ -50,8 +52,7 @@ func.def public @qwen38_continue_spans(%mixed_inputs: index, %context: index, %c
   %word_bytes = index.constant 4 : offset
   %queued_origin = index.scale %capacity, %word_bytes : index, offset -> offset
   %result_origin = func.call @qwen38_feedback_records_origin() : () -> (offset)
-  %next_bank = func.call @qwen38_feedback_bank_bytes(%capacity) : (index) -> (offset)
-  %next_origin = index.add %next_bank, %result_origin : offset
+  %next_bank = func.call @qwen38_feedback_bank_bytes(%feedback_capacity) : (index) -> (offset)
   %tags_origin = index.add %next_bank, %next_bank : offset
   %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
   %spans = buffer.view %epoch[%descriptor_origin] : buffer -> view<[%capacity]x6xi32>
@@ -63,13 +64,10 @@ func.def public @qwen38_continue_spans(%mixed_inputs: index, %context: index, %c
   %credits = buffer.view %epoch[%plan_options] : buffer -> view<[%capacity]x2xi32>
   %indices = buffer.view %epoch[%indices_origin] : buffer -> view<[%capacity]xi32>
   %identities = buffer.view %epoch[%identity_origin] : buffer -> view<[%capacity]x2xi32>
-  %prior = buffer.view %results[%result_origin] : buffer -> view<[%capacity]x10xi32>
-  %record_words = index.constant 10 : index
-  %result_words = index.mul %capacity, %record_words : index
-  %packet_words = index.constant 4 : index
-  %result_packets = index.div %result_words, %packet_words : index
-  %next = buffer.view %results[%next_origin] : buffer -> view<[%result_packets]x4xi32>
-  %tags = buffer.view %results[%tags_origin] : buffer -> view<[%capacity]xi32>
+  %prior = buffer.view %results[%result_origin] : buffer -> view<[%feedback_capacity]x10xi32>
+  // This tail is temporary tag storage until compaction establishes the live
+  // record count. It is disjoint from both record banks and first feedback.
+  %tags = buffer.view %results[%tags_origin] : buffer -> view<[%feedback_capacity]xi32>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c4 = index.constant 4 : index
@@ -106,10 +104,10 @@ func.def public @qwen38_continue_spans(%mixed_inputs: index, %context: index, %c
   scf.if %mixed {
     %first_count_word = view.load %header[1] : view<3xi32> -> i32
     %first_count_value = index.cast %first_count_word : i32 to index
-    %first_count = index.assume %first_count_value [range(%first_count_value, 1, %capacity)] : index
+    %first_count = index.assume %first_count_value [range(%first_count_value, 1, %feedback_capacity)] : index
     scf.for %i = [%c0 to %first_count step %c1] {
       %begin_word = view.load %spans[%i, 2] : view<[%capacity]x6xi32> -> i32
-      %consumed_word = view.load %prior[%i, 0] : view<[%capacity]x10xi32> -> i32
+      %consumed_word = view.load %prior[%i, 0] : view<[%feedback_capacity]x10xi32> -> i32
       %end_word = scalar.addi %begin_word, %consumed_word : i32
       %last_word = scalar.subi %end_word, %c1_2 : i32
       %last_value = index.cast %last_word : i32 to index
@@ -128,23 +126,17 @@ func.def public @qwen38_continue_spans(%mixed_inputs: index, %context: index, %c
       view.store %c0_2, %inputs[%i] : i32, view<[%next_capacity]xi32>
     }
   }
-  scf.for %i = [%c0 to %result_packets step %c1] {
-    vector.store %c0_3, %next[%i, 0] : vector<4xi32>, view<[%result_packets]x4xi32>
-  }
-  scf.for %i = [%c0 to %capacity step %c1] {
-    view.store %none, %tags[%i] : i32, view<[%capacity]xi32>
-  }
   %eos = view.load %terminal[0] : view<1xi32> -> i32
   %context_word = index.cast %context : index to i32
   %count_word = view.load %plan[1] : view<3xi32> -> i32
   %count_value = index.cast %count_word : i32 to index
-  %count = index.assume %count_value [range(%count_value, 0, %capacity)] : index
+  %count = index.assume %count_value [range(%count_value, 0, %feedback_capacity)] : index
   %live_count, %total, %output_count = scf.for %span = [%c0 to %count step %c1](%live = %c0 : index, %begin = %c0 : index, %selected = %c0 : index) -> (index, index, index) {
     %tag = view.load %indices[%span] : view<[%capacity]xi32> -> i32
     %tag_value = index.cast %tag : i32 to index
-    %first = index.assume %tag_value [ge(%tag_value, 0), lt(%tag_value, %capacity)] : index
-    %consumed = view.load %prior[%first, 0] : view<[%capacity]x10xi32> -> i32
-    %counts = view.load %prior[%first, 1] : view<[%capacity]x10xi32> -> i32
+    %first = index.assume %tag_value [ge(%tag_value, 0), lt(%tag_value, %feedback_capacity)] : index
+    %consumed = view.load %prior[%first, 0] : view<[%feedback_capacity]x10xi32> -> i32
+    %counts = view.load %prior[%first, 1] : view<[%feedback_capacity]x10xi32> -> i32
     %emitted = func.call @qwen38_feedback_outputs(%counts) : (i32) -> (i32)
     %length_word = view.load %planned[%span, 0] : view<[%capacity]x6xi32> -> i32
     %position = view.load %planned[%span, 1] : view<[%capacity]x6xi32> -> i32
@@ -168,7 +160,7 @@ func.def public @qwen38_continue_spans(%mixed_inputs: index, %context: index, %c
       %last_word = scalar.addi %emitted, %c1_2 : i32
       %last_value = index.cast %last_word : i32 to index
       %last = index.assume %last_value [range(%last_value, 2, 9)] : index
-      %prediction = view.load %prior[%first, %last] : view<[%capacity]x10xi32> -> i32
+      %prediction = view.load %prior[%first, %last] : view<[%feedback_capacity]x10xi32> -> i32
       %extent = scalar.addi %advanced, %length_word : i32
       %fits = scalar.cmpi ule, %extent, %context_word : i32
       // A final single output uses ordinary decode. Admission reserves the
@@ -182,7 +174,7 @@ func.def public @qwen38_continue_spans(%mixed_inputs: index, %context: index, %c
       scf.yield %true, %c0_2 : i1, i32
     }
     %next_live, %next_begin, %next_selected = scf.if %continues -> (index, index, index) {
-      %slot = index.assume %live [ge(%live, 0), lt(%live, %capacity)] : index
+      %slot = index.assume %live [ge(%live, 0), lt(%live, %feedback_capacity)] : index
       %begin_word = index.cast %begin : index to i32
       %has_output = scalar.cmpi sge, %selection, %c0_2 : i32
       %selected_word = index.cast %selected : index to i32
@@ -197,7 +189,7 @@ func.def public @qwen38_continue_spans(%mixed_inputs: index, %context: index, %c
       view.store %output, %spans[%slot, 5] : i32, view<[%capacity]x6xi32>
       view.store %flag, %options[%slot, 0] : i32, view<[%capacity]x2xi32>
       view.store %remaining, %options[%slot, 1] : i32, view<[%capacity]x2xi32>
-      view.store %tag, %tags[%slot] : i32, view<[%capacity]xi32>
+      view.store %tag, %tags[%slot] : i32, view<[%feedback_capacity]xi32>
       scf.if %speculative {
         %anchor = index.assume %begin [ge(%begin, 0), lt(%begin, %next_capacity)] : index
         scf.if %mixed {
@@ -278,6 +270,18 @@ func.def public @qwen38_continue_spans(%mixed_inputs: index, %context: index, %c
       vector.store %c0_3, %records[%record, 0] : vector<4xi32>, view<[%record_capacity]x8xi32>
       vector.store %c0_3, %records[%record, 4] : vector<4xi32>, view<[%record_capacity]x8xi32>
     }
+  }
+  // Acceptance writes every live record and publishes this same span count.
+  // Pack tags directly after those records; unused feedback remains untouched.
+  // The destination is at or below the temporary tail, so forward movement is
+  // valid even when the two tag ranges overlap.
+  %live_extent = index.assume %live_count [range(%live_count, 0, %feedback_capacity), le(%live_count, %count)] : index
+  %live_bank_bytes = func.call @qwen38_feedback_bank_bytes(%live_extent) : (index) -> (offset)
+  %live_tags_origin = index.add %next_bank, %live_bank_bytes : offset
+  %live_tags = buffer.view %results[%live_tags_origin] : buffer -> view<[%live_extent]xi32>
+  scf.for %i = [%c0 to %live_extent step %c1] {
+    %tag = view.load %tags[%i] : view<[%feedback_capacity]xi32> -> i32
+    view.store %tag, %live_tags[%i] : i32, view<[%live_extent]xi32>
   }
   %total_word = index.cast %total : index to i32
   %live_word = index.cast %live_count : index to i32

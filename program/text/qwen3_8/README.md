@@ -84,6 +84,13 @@ control allocation; packet encoding returns only live upload ranges. Resident
 growth preserves stage handles and existing sampling policies without deriving
 packet capacity from the resident count.
 
+Token and request-span capacities come from separate columns of the prepared
+shape catalog. Token capacity sizes input packets; span capacity sizes feedback
+and fixes its two bank offsets. Live counts determine the records written and
+consumed. The queued bank packs owner tags immediately after its live records,
+so the host can download the admitted request bound without another count
+readback. Unused feedback requires no initialization and is never consumed.
+
 Shared storage writers describe allocations and row views in caller-owned
 tables. Model preparation computes extents, and the native materializer owns
 the actual allocations. Each source documents its record layout and update
