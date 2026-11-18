@@ -10,8 +10,9 @@ owned by this repository:
   entry points as leaf launch surfaces, confines dependencies to motifs,
   requires at least one typed target profile, and checks production source
   formatting and final-product compilation. Its archive excludes test inputs.
-- `loom_test` owns `*_test.loom` and `*_stress.loom` sources and delegates to
-  HRX's root-owned linked test module. Test leaves declare execution profiles
+- `loom_test` composes checks from `srcs` and directly listed `deps` into
+  one linked test module. Multiple sources and dependencies-only declarations
+  use the same interface. Test leaves declare execution profiles
   and depend on production providers. Scenarios own configuration and trial
   fanout. `--config=loom-asan`, `--config=loom-tsan`, and `--config=loom-ubsan`
   instrument the same test targets independently of native tool instrumentation;
@@ -21,6 +22,11 @@ owned by this repository:
   It delegates source verification, lint, strict linking, and relocatable bytecode to HRX,
   and applies the model source policy without requiring host/control programs
   to masquerade as individually benchmarkable kernels.
+- `loom_cxx_library` provides the same program/model ownership for C/C++
+  sources, with explicit public `hdrs`, implementation headers in `srcs`, and
+  local `copts`. Its imported module receives the same layer-policy check.
+- `loom_cxx_test` imports C/C++ checks and delegates to the same test,
+  benchmark-discovery, execution-profile, and fixture-budget policies.
 - `loom_model` is confined to `model/` and selects a card preset with an
   exact mapping of providers and their auxiliary compiler inputs. Runtime
   parameter and tokenizer files retain their acquisition descriptors for
@@ -36,23 +42,30 @@ owned by this repository:
 
 Each test declaration emits a private filegroup carrying the stable
 `loom-benchmark-module` tag. It forwards HRX's linked test module, which retains
-cases and benchmarks owned by the root while excluding test-only symbols from
-dependencies. The marker adds discovery metadata without introducing another
+cases and benchmarks owned by sources and direct dependency libraries.
+Transitive dependencies supply code without selecting their checks. Separate
+libraries retain their private symbols. The marker adds discovery metadata without introducing another
 link or re-export boundary. Generated format, compile, and execution tests do
 not carry benchmark-discovery metadata. Correctness tests run cases and
 scenarios; benchmark execution is selected separately with `dev.py benchmark`.
 
 [`source_policy.py`](source_policy.py) verifies the filesystem-level portion of
 the contract. Every motif, kernel, and model source package has an adjacent `BUILD.bazel`,
-explicitly declares each `.loom` source, loads the repository wrappers, and has
+explicitly declares each Loom or C/C++ source and header, loads the repository wrappers, and has
 a scoped README chain up to its layer root. Motif sources contain no
 `kernel.def`, `config.*`, or concrete target records; kernel packages contain
 at least one `kernel.def`. External target declarations and contextual target
-queries remain valid in motifs. Only `*_test.loom` and `*_stress.loom` sources
-may contain `check.*` operations, or `config.*` operations under `motif/`.
-They use `loom_test` and may declare private wrapper kernels without weakening
-the production motif contract. Production declarations reject test source files.
+queries remain valid in motifs. Authored Loom checks live in `*_test.loom` or `*_stress.loom` sources.
+These test sources may also contain `config.*` under `motif/` and declare
+private wrapper kernels without weakening the production motif contract.
+C++ checks use the corresponding `_test` or `_stress` suffix and
+`loom_cxx_test`. Production declarations reject test source files.
 The pre-commit source-policy check enforces operation ownership on staged files.
+C++ operation policy examines the imported component through `loom-format`,
+using the same operation checks without interpreting C++ spelling. This is a
+test-side inspection: compilation and publication consume the original bytecode.
+Header-only providers have no owned code to inspect; instantiated bodies belong
+to their importing consumer.
 
 A `model.json` has an adjacent repository `loom_model` or
 `loom_model_documentation` declaration. A description can precede its executable
@@ -82,6 +95,40 @@ private rule kind participates.
 
 The complete admission and review contract is documented in
 [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
+
+## C++ programs and tests
+
+```starlark
+load("@hrx//loom/target/vm:execution_profiles.bzl", "VM_REFERENCE_PROFILE")
+load("//build_tools/bazel:defs.bzl", "loom_cxx_library", "loom_cxx_test")
+
+loom_cxx_library(
+    name = "publication",
+    srcs = ["publication.cxx", "publication_private.h"],
+    hdrs = ["publication.h"],
+    deps = [":records"],
+    copts = ["std=c++23"],
+)
+
+loom_cxx_test(
+    name = "publication_checks",
+    srcs = ["ordinary_test.cxx", "continuation_test.cxx"],
+    deps = [":publication"],
+    execution_profiles = [VM_REFERENCE_PROFILE],
+)
+```
+
+`hdrs`, `defines`, and package-relative `includes` form the exported source
+interface. `copts` and `local_defines` apply only to the owning component.
+`copts` uses Loom importer options such as `std=c++23`, rather than host compiler
+flags. Runtime fixtures belong in `data`. A header-only component uses `hdrs`
+without manufacturing an empty bytecode module.
+
+Imports and test linking precede workload and execution-profile expansion.
+Normal builds strip diagnostic metadata; `-c dbg` retains it. Comment-only
+header edits rerun import but can preserve downstream bytecode and cached test
+results. Source packages include the declared headers; normalized bytecode
+packages retain runtime data without carrying unused compiler headers.
 
 ## Toolchain selection
 

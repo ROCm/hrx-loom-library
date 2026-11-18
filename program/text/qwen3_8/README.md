@@ -39,6 +39,13 @@ verifier pair from source-owned policy. Composing models include all three
 providers explicitly. Each provider's existing service export signatures remain
 the linking contract.
 
+`publish.cxx` implements publication using the shared
+[`EpochPublication`](../publication.h) argument record. The importer flattens its
+members into the native v1 signature, so existing Loom callers and tests consume
+the same ABI. Feedback origins and packed counts remain calls to the shared
+Qwen feedback motif. The provider imports once into bytecode; source publications
+carry its declared header, while bytecode publications omit compiler-only inputs.
+
 ## Chat and retained history
 
 `chat.loom` consumes the native service's request records and its
