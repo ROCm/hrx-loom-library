@@ -13,6 +13,18 @@ kernel.def @qwen38_token_embedding_q5k_f32_reference(%token_count0: index) {
   %workitem0 = kernel.workitem.id<x> : index
   %workitem = index.assume %workitem0 [range(%workitem0, 0, 255)] : index
   %workgroup_size = index.constant 256 : index
+  %origin = index.constant 0 : offset
+  %ids = buffer.view %token_ids[%origin] : buffer -> view<[%token_count]xi32>
+  %token_id = view.load %ids[%token] : view<[%token_count]xi32> -> i32
+  %row_bytes = index.constant 20480 : offset
+  %output_origin = index.scale %token, %row_bytes : index, offset -> offset
+  func.call @qwen38_embedding_reference_row(%token_id, %output_origin, %workitem, %workgroup_size, %weight, %output) : (i32, offset, index, index, buffer, buffer)
+  kernel.return
+}
+
+// The same independent physical-layout oracle runs serially in the VM or
+// partitioned across a reference kernel's lanes.
+func.def @qwen38_embedding_reference_row(%token_id_i32: i32, %output_origin: offset, %first_channel: index, %channel_stride: index, %weight: buffer, %output: buffer) {
   %hidden_size = index.constant 5120 : index
   %c0_offset = index.constant 0 : offset
   %c1 = index.constant 1 : index
@@ -34,14 +46,12 @@ kernel.def @qwen38_token_embedding_q5k_f32_reference(%token_count0: index) {
   %c15_i32 = scalar.constant 15 : i32
   %c16_i32 = scalar.constant 16 : i32
   %c63_i32 = scalar.constant 63 : i32
-  %token_ids_noalias, %weight_noalias, %output_noalias = buffer.assume.noalias %token_ids, %weight, %output : buffer, buffer, buffer
-  %token_ids_view = buffer.view %token_ids_noalias[%c0_offset] : buffer -> view<[%token_count]xi32>
-  %output_view = buffer.view %output_noalias[%c0_offset] : buffer -> view<[%token_count]x5120xf32>
-  %token_id_i32 = view.load %token_ids_view[%token] : view<[%token_count]xi32> -> i32
+  %weight_noalias, %output_noalias = buffer.assume.noalias %weight, %output : buffer, buffer
+  %output_view = buffer.view %output_noalias[%output_origin] : buffer -> view<5120xf32>
   %token_id0 = index.cast %token_id_i32 : i32 to index
   %token_id = index.assume %token_id0 [range(%token_id0, 0, 248319)] : index
   %weight_row_byte_base = index.scale %token_id, %row_bytes : index, offset -> offset
-  scf.for %channel0 = [%workitem to %hidden_size step %workgroup_size] {
+  scf.for %channel0 = [%first_channel to %hidden_size step %channel_stride] {
     %channel = index.assume %channel0 [range(%channel0, 0, 5119)] : index
     %q5_block = index.div %channel, %c256 : index
     %block_channel = index.rem %channel, %c256 : index
@@ -122,7 +132,7 @@ kernel.def @qwen38_token_embedding_q5k_f32_reference(%token_count0: index) {
     %scaled_code = scalar.mulf %scaled_code0, %code_f32 : f32
     %minimum0 = scalar.mulf %dmin, %minimum_f32 : f32
     %value = scalar.subf %scaled_code, %minimum0 : f32
-    view.store %value, %output_view[%token, %channel] : f32, view<[%token_count]x5120xf32>
+    view.store %value, %output_view[%channel] : f32, view<5120xf32>
   }
-  kernel.return
+  func.return
 }

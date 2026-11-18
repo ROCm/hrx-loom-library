@@ -1,0 +1,173 @@
+func.decl @cohort_cache_reserve(%capacity: index, %ways: index, %tags: view<[%capacity]xi64>, %generation: i64, %row_word: i32) -> (index, i1)
+
+func.decl @cohort_cache_publish(%capacity: index, %tags: view<[%capacity]xi64>, %slot: index)
+
+func.decl @cohort_cache_begin(%capacity: index, %directory: view<[%capacity]xi64>, %previous: i64) -> (i64)
+
+func.decl pure @flash_next_ple_cache_layout(%tokens: index) -> (offset, offset, offset, offset, offset)
+
+func.decl pure @flash_next_ple_request_layout(%tokens: index) -> (offset, offset)
+
+config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]
+
+func.decl pure @flash_next_ple_cache_dimensions() -> (index, index)
+
+kernel.def @flash_next_ple_cache_plan() {
+  %units = target.execution.unit.count : index
+  %per_unit = index.constant 4 : index
+  %limit = index.mul %units, %per_unit : index
+  %packet = config.get @qwen38.packet_capacity : index
+  %heads = index.constant 16 : index
+  %requests = index.mul %packet, %heads : index
+  %threads = index.constant 128 : index
+  %padding = index.constant 127 : index
+  %rounded = index.add %requests, %padding : index
+  %needed = index.div %rounded, %threads : index
+  %groups = index.min %needed, %limit : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%header: buffer, %row_ids: buffer, %directory: buffer, %mapping: buffer, %transfers: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  %packet = config.get @qwen38.packet_capacity : index
+  %heads = index.constant 16 : index
+  %requests = index.mul %packet, %heads : index
+  %capacity, %ways = func.call pure @flash_next_ple_cache_dimensions() : () -> (index, index)
+  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset)
+  %header_view = buffer.view %header[%header_origin] : buffer -> view<2xi64>
+  %count_unbounded = view.load %header_view[0] : view<2xi64> -> i64
+  %count_word = scalar.assume %count_unbounded [range(%count_unbounded, 0, 524288)] : i64
+  %count_value = index.cast %count_word : i64 to index
+  %count = index.assume %count_value [range(%count_value, 0, %requests)] : index
+  %generation = view.load %header_view[1] : view<2xi64> -> i64
+  %zero64 = scalar.constant 0 : i64
+  %zero32 = scalar.constant 0 : i32
+  %fill_bit = scalar.constant -2147483648 : i32
+  %row_bytes = scalar.constant 90 : i64
+  %ids = buffer.view %row_ids[%origin] : buffer -> view<[%requests]xi32>
+  %tags = buffer.view %directory[%directory_origin] : buffer -> view<[%capacity]xi64>
+  %indices = buffer.view %mapping[%mapping_origin] : buffer -> view<[%requests]xi32>
+  %transfer_bytes, %record_origin = func.call pure @flash_next_ple_request_layout(%packet) : (index) -> (offset, offset)
+  %records = buffer.view %transfers[%record_origin] : buffer -> view<[%requests]x8xi64>
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %groups = kernel.workgroup.count<x> : index
+  %first = index.madd %group, %threads, %lane : index
+  %stride = index.mul %groups, %threads : index
+  scf.for %request = [%first to %count step %stride] {
+    %row_word = view.load %ids[%request] : view<[%requests]xi32> -> i32
+    %selected, %read = func.call @cohort_cache_reserve(%capacity, %ways, %tags, %generation, %row_word) : (index, index, view<[%capacity]xi64>, i64, i32) -> (index, i1)
+    %resident = index.cmp ult, %selected, %capacity : index
+    %spill = index.add %capacity, %request : index
+    %slot = scf.select %resident, %selected, %spill : index
+    %row = scalar.extui %row_word : i32 to i64
+    %slot_word = index.cast %slot : index to i32
+    %owner_bit = scf.select %read, %fill_bit, %zero32 : i32
+    %mapping_word = scalar.ori %slot_word, %owner_bit : i32
+    %slot_wide = index.cast %slot : index to i64
+    %source_offset = scalar.muli %row, %row_bytes : i64
+    %destination_offset = scalar.muli %slot_wide, %row_bytes : i64
+    %length = scf.select %read, %row_bytes, %zero64 : i64
+    view.store %mapping_word, %indices[%request] : i32, view<[%requests]xi32>
+    // Both binding indices and the linear form are zero. Their upper fields
+    // remain zero because these exact row offsets fit in the low 48 bits.
+    view.store %source_offset, %records[%request, 0] : i64, view<[%requests]x8xi64>
+    view.store %destination_offset, %records[%request, 1] : i64, view<[%requests]x8xi64>
+    view.store %length, %records[%request, 2] : i64, view<[%requests]x8xi64>
+  }
+  kernel.return
+}
+
+// A failed transfer never reaches publication. Later cohorts reject its pending
+// tags even when their requested keys match; no speculative payload becomes a hit.
+// The device-local mapping retains the unique fill owner independently of the
+// transport descriptors. Coalesced readers never publish on another's behalf.
+kernel.def @flash_next_ple_cache_publish() {
+  %packet = config.get @qwen38.packet_capacity : index
+  %heads = index.constant 16 : index
+  %requests = index.mul %packet, %heads : index
+  %threads = index.constant 128 : index
+  %padding = index.constant 127 : index
+  %rounded = index.add %requests, %padding : index
+  %needed = index.div %rounded, %threads : index
+  %units = target.execution.unit.count : index
+  %c4 = index.constant 4 : index
+  %limit = index.mul %units, %c4 : index
+  %groups = index.min %needed, %limit : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%header: buffer, %directory: buffer, %mapping: buffer) {
+  %packet = config.get @qwen38.packet_capacity : index
+  %heads = index.constant 16 : index
+  %requests = index.mul %packet, %heads : index
+  %capacity, %ways = func.call pure @flash_next_ple_cache_dimensions() : () -> (index, index)
+  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset)
+  %header_view = buffer.view %header[%header_origin] : buffer -> view<2xi64>
+  %count_unbounded = view.load %header_view[0] : view<2xi64> -> i64
+  %count_word = scalar.assume %count_unbounded [range(%count_unbounded, 0, 524288)] : i64
+  %count_value = index.cast %count_word : i64 to index
+  %count = index.assume %count_value [range(%count_value, 0, %requests)] : index
+  %tags = buffer.view %directory[%directory_origin] : buffer -> view<[%capacity]xi64>
+  %indices = buffer.view %mapping[%mapping_origin] : buffer -> view<[%requests]xi32>
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %groups = kernel.workgroup.count<x> : index
+  %threads = index.constant 128 : index
+  %first = index.madd %group, %threads, %lane : index
+  %stride = index.mul %groups, %threads : index
+  %zero32 = scalar.constant 0 : i32
+  %slot_mask = scalar.constant 2147483647 : i32
+  scf.for %request = [%first to %count step %stride] {
+    %entry = view.load %indices[%request] : view<[%requests]xi32> -> i32
+    %wrote = scalar.cmpi slt, %entry, %zero32 : i32
+    %slot_word = scalar.andi %entry, %slot_mask : i32
+    %slot_value = index.cast %slot_word : i32 to index
+    %resident = index.cmp ult, %slot_value, %capacity : index
+    %publish = scalar.andi %wrote, %resident : i1
+    scf.if %publish {
+      %slot = index.assume %slot_value [ge(%slot_value, 0), lt(%slot_value, %capacity)] : index
+      func.call @cohort_cache_publish(%capacity, %tags, %slot) : (index, view<[%capacity]xi64>, index)
+    }
+  }
+  kernel.return
+}
+
+// The execution owner retires the previous cohort before this dispatch. One
+// workgroup snapshots its generation before the leader advances the header;
+// rollover clears only the directory. Retained payload becomes readable again
+// only after the new cohort publishes successful fills.
+kernel.def @flash_next_ple_cache_begin() {
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%span: buffer, %cache: buffer, %transfers: buffer) {
+  %packet = config.get @qwen38.packet_capacity : index
+  %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset)
+  %header = buffer.view %cache[%header_origin] : buffer -> view<2xi64>
+  %previous = view.load %header[1] : view<2xi64> -> i64
+  %capacity, %ways = func.call pure @flash_next_ple_cache_dimensions() : () -> (index, index)
+  %directory = buffer.view %cache[%directory_origin] : buffer -> view<[%capacity]xi64>
+  %generation = func.call @cohort_cache_begin(%capacity, %directory, %previous) : (index, view<[%capacity]xi64>, i64) -> (i64)
+  %lane = kernel.workitem.id<x> : index
+  %c0 = index.constant 0 : index
+  %leader = index.cmp eq, %lane, %c0 : index
+  scf.if %leader {
+    %token_capacity = config.get @flash_next.token_count : index
+    %count = func.call @flash_next_token_count(%span, %token_capacity) : (buffer, index) -> (index)
+    %heads = index.constant 16 : index
+    %active = index.mul %count, %heads : index
+    %active_word = index.cast %active : index to i64
+    %origin = index.constant 0 : offset
+    %transfer_count = buffer.view %transfers[%origin] : buffer -> view<1xi64>
+    view.store %active_word, %transfer_count[0] : i64, view<1xi64>
+    view.store %active_word, %header[0] : i64, view<2xi64>
+    view.store %generation, %header[1] : i64, view<2xi64>
+  }
+  kernel.return
+}
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)

@@ -1,0 +1,73 @@
+// Decode cached PLE rows after the file transfer and publication complete.
+// Payload remains in the exact IQ4_NL checkpoint representation.
+
+func.decl pure @flash_next_ple_cache_layout(%tokens: index) -> (offset, offset, offset, offset, offset)
+
+func.decl pure @flash_next_ple_cache_dimensions() -> (index, index)
+
+func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
+
+func.decl @flash_next_ple_decode_iq4_block(%weight: buffer, %block_origin: offset) -> (vector<32xbf16>)
+
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+kernel.def @flash_next_ple_lookup_stream() {
+  %tokens = config.get @flash_next.token_count : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  %execution_units = target.execution.unit.count : index
+  %groups_per_unit = index.constant 8 : index
+  %group_budget = index.mul %execution_units, %groups_per_unit : index
+  %row_workers = index.min %tokens, %group_budget : index
+  kernel.launch.config workgroups(%row_workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%span_arg: buffer, %ids_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
+  %span, %ids, %weight, %output = buffer.assume.noalias %span_arg, %ids_arg, %weight_arg, %output_arg : buffer, buffer, buffer, buffer
+  %capacity = config.get @flash_next.token_count : index
+  %end = func.call @flash_next_token_count(%span, %capacity) : (buffer, index) -> (index)
+  %thread = kernel.workitem.id<x> : index
+  %blocks = index.constant 80 : index
+  %is_block = index.cmp ult, %thread, %blocks : index
+  scf.if %is_block {
+    %row_worker = kernel.workgroup.id<x> : index
+    %row_workers = kernel.workgroup.count<x> : index
+    %row_step = index.constant 1 : index
+    %panel_rounding = index.sub %row_workers, %row_step : index
+    %rounded_rows = index.add %capacity, %panel_rounding : index
+    %panel_rows = index.div %rounded_rows, %row_workers : index
+    %panel_begin = index.mul %row_worker, %panel_rows : index
+    %panel_limit = index.add %panel_begin, %panel_rows : index
+    %panel_end = index.min %end, %panel_limit : index
+    scf.for %token = [%panel_begin to %panel_end step %row_step] {
+      %c5 = index.constant 5 : index
+      %width = index.constant 32 : index
+      %head = index.div %thread, %c5 : index
+      %block = index.rem %thread, %c5 : index
+      %channel = index.mul %block, %width : index
+      %origin = index.constant 0 : offset
+      %row_bytes = index.constant 90 : offset
+      %block_bytes = index.constant 18 : offset
+      %output_view = buffer.view %output[%origin] : buffer -> view<[%capacity]x16x160xbf16>
+      %heads = index.constant 16 : index
+      %packet = config.get @qwen38.packet_capacity : index
+      %total, %header_origin, %directory_origin, %payload_origin, %mapping_origin = func.call pure @flash_next_ple_cache_layout(%packet) : (index) -> (offset, offset, offset, offset, offset)
+      %indices = buffer.view %weight[%mapping_origin] : buffer -> view<[%packet]x16xi32>
+      %entry = view.load %indices[%token, %head] : view<[%packet]x16xi32> -> i32
+      %slot_mask = scalar.constant 2147483647 : i32
+      %id_word = scalar.andi %entry, %slot_mask : i32
+      %id_value = index.cast %id_word : i32 to index
+      %resident_slots, %ways = func.call pure @flash_next_ple_cache_dimensions() : () -> (index, index)
+      %spill_slots = index.mul %capacity, %heads : index
+      %slot_limit = index.add %resident_slots, %spill_slots : index
+      %id = index.assume %id_value [ge(%id_value, 0), lt(%id_value, %slot_limit)] : index
+      %relative_row_origin = index.scale %id, %row_bytes : index, offset -> offset
+      %row_origin = index.add %payload_origin, %relative_row_origin : offset
+      %block_delta = index.scale %block, %block_bytes : index, offset -> offset
+      %block_origin = index.add %row_origin, %block_delta : offset
+      %packed = func.call @flash_next_ple_decode_iq4_block(%weight, %block_origin) : (buffer, offset) -> (vector<32xbf16>)
+      vector.store %packed, %output_view[%token, %head, %channel] : vector<32xbf16>, view<[%capacity]x16x160xbf16>
+    }
+  }
+  kernel.return
+}
+
+config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]

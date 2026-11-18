@@ -133,6 +133,14 @@ consumed. The queued bank packs owner tags immediately after its live records,
 so the host can download the admitted request bound without another count
 readback. Unused feedback requires no initialization and is never consumed.
 
+Model preparation can reserve an eight-byte-aligned payload in that same
+control allocation. `qwen38.control_context` supplies its origin and the prepared
+packet capacity; the model defines the payload's contents, such as source and
+stage identities used by its target provider. Growth moves these facts and the
+speculation catalog past the enlarged policy directory, preserves existing
+policies, and leaves newly admitted policies empty. A zero-byte payload keeps
+the ordinary layout. This adds no device allocation or runtime-side model schema.
+
 Shared storage writers describe allocations and row views in caller-owned
 tables. Model preparation computes extents, and the native materializer owns
 the actual allocations. Each source documents its record layout and update
@@ -143,6 +151,14 @@ work. Completion edges determine when mutable work has retired and when
 immutable feedback may be published. Continuations preserve their first-cohort
 owner while compacting live rows. Neither policy transforms nor packet writers
 wait for a device or infer ownership from buffer contents.
+
+The shared epoch calls `qwen38.epoch.target` after proposal and before feedback
+and predictor catch-up. A model links one provider with its stage catalog and
+buffer layout. `epoch_dispatch.loom` supplies the ordinary single-command target
+and verifier paths. A model-specific provider can split that target computation
+around asynchronous input readiness while retaining the shared packet encoding,
+speculation selection, feedback, and continuation policy. The returned completion
+must cover target outputs and accepted-state publication.
 
 Each verified epoch brackets proposal and target execution with three ordered
 queue-clock captures. The samples share the normal feedback banks and retire
