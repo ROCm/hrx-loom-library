@@ -328,7 +328,7 @@ def check_staged_sources(repository_root: Path) -> list[str]:
 
 
 def _create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, fromfile_prefix_chars="@")
     parser.add_argument(
         "--layer", choices=["kernel", "model", "motif", "program", "test"]
     )

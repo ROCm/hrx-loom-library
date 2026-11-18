@@ -96,19 +96,37 @@ def _declare_source_policy_test(name, layer, srcs, tags, data = []):
         visibility = ["//visibility:private"],
     )
 
+def _module_policy_arguments_impl(ctx):
+    arguments = ctx.actions.declare_file(ctx.label.name + ".args")
+    # Header-only providers have no module. Resolve the configured output here,
+    # where generated sources and filegroups have already supplied their files.
+    module = ctx.files.module[0].short_path if ctx.files.module else ""
+    ctx.actions.write(arguments, "--module=" + module + "\n")
+    return [DefaultInfo(files = depset([arguments]))]
+
+_module_policy_arguments = rule(
+    implementation = _module_policy_arguments_impl,
+    attrs = {"module": attr.label(mandatory = True, allow_files = True)},
+)
+
 def _declare_module_policy_test(name, layer, module, tags, data = []):
+    arguments = name + "_source_policy_arguments"
+    _module_policy_arguments(
+        name = arguments,
+        testonly = True,
+        module = module,
+        visibility = ["//visibility:private"],
+    )
     iree_py_test(
         name = name + "_source_policy_test",
         srcs = ["//build_tools/bazel:source_policy.py"],
         main = "source_policy.py",
         args = [
             "--layer=" + layer,
-            # A header-only library has no owned module. Its instantiated code
-            # is checked in the component whose importer emits it.
-            "--module=$(locations %s)" % module,
+            "@$(location :%s)" % arguments,
             "--format-tool=$(location @loom_sdk//:loom-format)",
         ] + (["--data"] + ["$(locations %s)" % item for item in data] if data else []),
-        data = [module, "@loom_sdk//:loom-format"] + data,
+        data = [":" + arguments, module, "@loom_sdk//:loom-format"] + data,
         tags = tags + ["hostonly"],
         visibility = ["//visibility:private"],
     )
