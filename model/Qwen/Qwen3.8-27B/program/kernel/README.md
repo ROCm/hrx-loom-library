@@ -6,6 +6,28 @@ target contracts; model commands own complete layer ordering and intermediate
 lifetimes. A projection's packed representation and rounding boundaries remain
 part of its contract when selecting a native matrix implementation.
 
+The BUILD providers separate the numerical ownership boundaries. A consumer
+names the families it calls; there is no aggregate numerical provider.
+
+| Provider | Contract |
+| --- | --- |
+| `attention` | Query/key preparation, paged or contiguous history traversal, and partial-state merge. |
+| `gdn` | Recurrent state, span traversal, and accepted-prefix replay. |
+| `linear` | Model-shaped quantized contractions, panel staging, and split reductions. |
+| `normalization` | Row normalization, activation, and residual publication. |
+| `embedding` | Token or immutable image-feature inputs expanded into residual rows. |
+| `generation` | Device-resident token publication and generation control. |
+| `mtp` | NextN input pairing and accepted hidden-carry transitions. |
+| `dflash` | Target feature capture, draft attention/convolution, candidate selection, and private proposal state. |
+| `output` | Vocabulary projection, sampling, and selected-output ownership. It consumes the normalization provider. |
+| `vision` | Checkpoint-shaped adapters for shared encoder algorithms. Resize has its own `vision_resize` provider. |
+
+These providers stay model-local because they bind checkpoint geometry and
+storage contracts. Their shared motif and kernel dependencies own reusable
+algorithms. Splitting the providers does not add dispatch boundaries or change
+their arithmetic. Existing tests link the required family directly; command
+tests also name the composing program that owns ordering and intermediates.
+
 Small Q5 projections use the shared GGML 16/32-row matrix family. The model
 passes its physical stage capacity and weight order to the command adapter;
 raw and channel-eight operands share the same contraction. The shared kernel
