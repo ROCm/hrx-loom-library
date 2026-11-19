@@ -2,13 +2,13 @@ template.decl @flash_next.draft_update(%position: index, %begin: index, %length:
 
 kernel.decl @flash_next_draft_plan() launch(%epoch: buffer, %ids: buffer, %carry: buffer, %plan: buffer)
 
-kernel.decl @flash_next_draft_common_head(%neural_enabled: i1) launch(%epoch: buffer, %plan: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @flash_next_draft_common_head(%neural_enabled: i1) launch(%expanded: i1, %epoch: buffer, %plan: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
-kernel.decl @flash_next_draft_rare_head(%neural_enabled: i1) launch(%epoch: buffer, %plan: buffer, %carry: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @flash_next_draft_rare_head(%neural_enabled: i1) launch(%expanded: i1, %epoch: buffer, %plan: buffer, %carry: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 kernel.decl @flash_next_draft_sample(%neural_enabled: i1) launch(%epoch: buffer, %plan: buffer, %carry: buffer, %logits: buffer, %output: buffer)
 
-kernel.decl @flash_next_vocabulary() launch(%epoch: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @flash_next_vocabulary() launch(%expanded: i1, %epoch: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 func.decl @flash_next_q8_reference_dot(%inputs: index, %token: index, %row: index, %input: buffer, %weight: buffer) -> (f64)
 
@@ -44,7 +44,7 @@ kernel.def @setup() {
   %spans = buffer.view %epoch[%records] : buffer -> view<16x6xi32>
   %history = buffer.view %history_ids[%origin] : buffer -> view<4xi32>
   %tokens = buffer.view %anchors[%origin] : buffer -> view<4xi32>
-  %scores = buffer.view %logits[%origin] : buffer -> view<4x248320xf32>
+  %scores = buffer.view %logits[%origin] : buffer -> view<4x248320xbf16>
   %expected = buffer.view %expected_ids[%origin] : buffer -> view<4xi32>
   %c0_index = index.constant 0 : index
   %c1_index = index.constant 1 : index
@@ -79,17 +79,17 @@ kernel.def @setup() {
   %full = index.cmp ne, %fallback, %c0_index : index
   %anchor = scf.select %full, %unknown, %lower : i32
   view.store %anchor, %tokens[1] : i32, view<4xi32>
-  %nine_score = scalar.constant 9.0 : f32
-  %c11_f32 = scalar.constant 11.0 : f32
-  %c20_f32 = scalar.constant 20.0 : f32
+  %nine_score = scalar.constant 9.0 : bf16
+  %control_score = scalar.constant 11.0 : bf16
+  %unseen_score = scalar.constant 20.0 : bf16
   // Unselected large scores must not participate in subset sampling. Two
   // equally good learned IDs must resolve by canonical ID, not table order.
   scf.for %row = [%c0_index to %c3_index step %c1_index] {
-    view.store %nine_score, %scores[%row, 100000] : f32, view<4x248320xf32>
-    view.store %nine_score, %scores[%row, 110000] : f32, view<4x248320xf32>
-    view.store %c20_f32, %scores[%row, 200000] : f32, view<4x248320xf32>
+    view.store %nine_score, %scores[%row, 100000] : bf16, view<4x248320xbf16>
+    view.store %nine_score, %scores[%row, 110000] : bf16, view<4x248320xbf16>
+    view.store %unseen_score, %scores[%row, 200000] : bf16, view<4x248320xbf16>
   }
-  view.store %c11_f32, %scores[2, 248076] : f32, view<4x248320xf32>
+  view.store %control_score, %scores[2, 248076] : bf16, view<4x248320xbf16>
   view.store %lower, %expected[0] : i32, view<4xi32>
   view.store %anchor, %expected[1] : i32, view<4xi32>
   view.store %control, %expected[2] : i32, view<4xi32>
@@ -106,7 +106,7 @@ kernel.def @select_reference() {
 } launch(%fallback: index, %reference: buffer, %expected: buffer) {
   %origin = index.constant 0 : offset
   %source = buffer.view %reference[%origin] : buffer -> view<4x248320xf32>
-  %output = buffer.view %expected[%origin] : buffer -> view<4x248320xf32>
+  %output = buffer.view %expected[%origin] : buffer -> view<4x248320xbf16>
   %group = kernel.workgroup.id<x> : index
   %thread = kernel.workitem.id<x> : index
   %threads = index.constant 128 : index
@@ -132,8 +132,9 @@ kernel.def @select_reference() {
     %selected = scalar.ori %full, %subset : i1
     scf.if %selected {
       scf.for %row = [%c0_index to %c3_index step %c1_index] {
-        %value = view.load %source[%row, %id] : view<4x248320xf32> -> f32
-        view.store %value, %output[%row, %id] : f32, view<4x248320xf32>
+        %wide = view.load %source[%row, %id] : view<4x248320xf32> -> f32
+        %value = scalar.fptrunc %wide : f32 to bf16
+        view.store %value, %output[%row, %id] : bf16, view<4x248320xbf16>
       }
     }
   }
@@ -167,17 +168,32 @@ kernel.def @numerical_reference() {
   %id = scf.select %small, %slot, %large : index
   %width = index.constant 2560 : index
   %origin = index.constant 0 : offset
-  %source = buffer.view %logits[%origin] : buffer -> view<4x248320xf32>
+  %source = buffer.view %logits[%origin] : buffer -> view<4x248320xbf16>
   %actuals = buffer.view %actual[%origin] : buffer -> view<3x8xf32>
   %references = buffer.view %expected[%origin] : buffer -> view<3x8xf32>
   scf.for %row = [%c0_index to %c3_index step %c1_index] {
     %sum = func.call @flash_next_q8_reference_dot(%width, %row, %id, %input, %weight) : (index, index, index, buffer, buffer) -> (f64)
     %packed = scalar.fptrunc %sum : f64 to bf16
     %reference = scalar.extf %packed : bf16 to f32
-    %observed = view.load %source[%row, %id] : view<4x248320xf32> -> f32
+    %value = view.load %source[%row, %id] : view<4x248320xbf16> -> bf16
+    %observed = scalar.extf %value : bf16 to f32
     view.store %observed, %actuals[%row, %slot] : f32, view<3x8xf32>
     view.store %reference, %references[%row, %slot] : f32, view<3x8xf32>
   }
+  kernel.return
+}
+
+kernel.def @prediction_ids() {
+  %c1_index = index.constant 1 : index
+  %rows = index.constant 4 : index
+  kernel.launch.config workgroups(%c1_index, %c1_index, %c1_index) workgroup_size(%rows, %c1_index, %c1_index) : index
+} launch(%predictions: buffer, %ids: buffer) {
+  %row = kernel.workitem.id<x> : index
+  %origin = index.constant 0 : offset
+  %pairs = buffer.view %predictions[%origin] : buffer -> view<4x2xi32>
+  %output = buffer.view %ids[%origin] : buffer -> view<4xi32>
+  %id = view.load %pairs[%row, 0] : view<4x2xi32> -> i32
+  view.store %id, %output[%row] : i32, view<4xi32>
   kernel.return
 }
 
@@ -195,26 +211,30 @@ check.case public @draft_heads_and_canonical_sampling {
   %anchors = check.generate.fill value(-7) : tensor<4xi32>
   %carry = check.generate.fill value(-7) : tensor<16x11008xi32>
   %plan = check.generate.fill value(-7) : tensor<5xi32>
-  %sample_logits = check.generate.fill value(-4.0) : tensor<4x248320xf32>
-  %predictions = check.generate.fill value(-7) : tensor<4xi32>
+  %sample_logits = check.generate.fill value(-4.0) : tensor<4x248320xbf16>
+  %predictions = check.generate.fill value(-7) : tensor<4x2xi32>
+  %ids = check.generate.fill value(-7) : tensor<4xi32>
   %expected_ids = check.generate.fill value(-7) : tensor<4xi32>
-  kernel.launch @setup(%fallback, %epoch, %history, %anchors, %sample_logits, %expected_ids) : (index, tensor<99xi32>, tensor<4xi32>, tensor<4xi32>, tensor<4x248320xf32>, tensor<4xi32>)
+  kernel.launch @setup(%fallback, %epoch, %history, %anchors, %sample_logits, %expected_ids) : (index, tensor<99xi32>, tensor<4xi32>, tensor<4xi32>, tensor<4x248320xbf16>, tensor<4xi32>)
   kernel.launch @seed_histories(%history, %carry) : (tensor<4xi32>, tensor<16x11008xi32>)
   kernel.launch @flash_next_draft_plan(%epoch, %anchors, %carry, %plan) : (tensor<99xi32>, tensor<4xi32>, tensor<16x11008xi32>, tensor<5xi32>)
   %reference = check.generate.fill value(-17.0) : tensor<4x248320xf32>
-  %expected = check.generate.fill value(-17.0) : tensor<4x248320xf32>
-  %actual = check.generate.fill value(-17.0) : tensor<4x248320xf32>
-  kernel.launch @flash_next_vocabulary(%epoch, %input, %weight, %reference) : (tensor<99xi32>, tensor<4x2560xbf16>, tensor<248320x80x34xi8>, tensor<4x248320xf32>)
-  kernel.launch @select_reference(%fallback, %reference, %expected) : (index, tensor<4x248320xf32>, tensor<4x248320xf32>)
-  kernel.launch @flash_next_draft_common_head[%neural_enabled](%epoch, %plan, %input, %weight, %actual) : [i1](tensor<99xi32>, tensor<5xi32>, tensor<4x2560xbf16>, tensor<248320x80x34xi8>, tensor<4x248320xf32>)
-  kernel.launch @flash_next_draft_rare_head[%neural_enabled](%epoch, %plan, %carry, %input, %weight, %actual) : [i1](tensor<99xi32>, tensor<5xi32>, tensor<16x11008xi32>, tensor<4x2560xbf16>, tensor<248320x80x34xi8>, tensor<4x248320xf32>)
-  check.expect.bitwise actual(%actual) expected(%expected) : tensor<4x248320xf32>
+  %expected = check.generate.fill value(-17.0) : tensor<4x248320xbf16>
+  %actual = check.generate.fill value(-17.0) : tensor<4x248320xbf16>
+  %expanded = check.literal value(true) : i1
+  %compact = check.literal value(false) : i1
+  kernel.launch @flash_next_vocabulary(%expanded, %epoch, %input, %weight, %reference) : (i1, tensor<99xi32>, tensor<4x2560xbf16>, tensor<248320x80x34xi8>, tensor<4x248320xf32>)
+  kernel.launch @select_reference(%fallback, %reference, %expected) : (index, tensor<4x248320xf32>, tensor<4x248320xbf16>)
+  kernel.launch @flash_next_draft_common_head[%neural_enabled](%compact, %epoch, %plan, %input, %weight, %actual) : [i1](i1, tensor<99xi32>, tensor<5xi32>, tensor<4x2560xbf16>, tensor<248320x80x34xi8>, tensor<4x248320xbf16>)
+  kernel.launch @flash_next_draft_rare_head[%neural_enabled](%compact, %epoch, %plan, %carry, %input, %weight, %actual) : [i1](i1, tensor<99xi32>, tensor<5xi32>, tensor<16x11008xi32>, tensor<4x2560xbf16>, tensor<248320x80x34xi8>, tensor<4x248320xbf16>)
+  check.expect.bitwise actual(%actual) expected(%expected) : tensor<4x248320xbf16>
   %numerical = check.generate.fill value(0.0) : tensor<3x8xf32>
   %numerical_expected = check.generate.fill value(0.0) : tensor<3x8xf32>
-  kernel.launch @numerical_reference(%input, %weight, %actual, %numerical, %numerical_expected) : (tensor<4x2560xbf16>, tensor<248320x80x34xi8>, tensor<4x248320xf32>, tensor<3x8xf32>, tensor<3x8xf32>)
+  kernel.launch @numerical_reference(%input, %weight, %actual, %numerical, %numerical_expected) : (tensor<4x2560xbf16>, tensor<248320x80x34xi8>, tensor<4x248320xbf16>, tensor<3x8xf32>, tensor<3x8xf32>)
   check.expect.approximate actual(%numerical) expected(%numerical_expected) atol(1.0000000000000001e-05) rtol(0.0080000000000000002) nan(different) : tensor<3x8xf32>, tensor<3x8xf32>
-  kernel.launch @flash_next_draft_sample[%neural_enabled](%epoch, %plan, %carry, %sample_logits, %predictions) : [i1](tensor<99xi32>, tensor<5xi32>, tensor<16x11008xi32>, tensor<4x248320xf32>, tensor<4xi32>)
-  check.expect.bitwise actual(%predictions) expected(%expected_ids) : tensor<4xi32>
+  kernel.launch @flash_next_draft_sample[%neural_enabled](%epoch, %plan, %carry, %sample_logits, %predictions) : [i1](tensor<99xi32>, tensor<5xi32>, tensor<16x11008xi32>, tensor<4x248320xbf16>, tensor<4x2xi32>)
+  kernel.launch @prediction_ids(%predictions, %ids) : (tensor<4x2xi32>, tensor<4xi32>)
+  check.expect.bitwise actual(%ids) expected(%expected_ids) : tensor<4xi32>
   check.return
 }
 

@@ -32,24 +32,27 @@ command.decl @qwen38_dispatch_greedy_argmax_partial_rows_f32(%dispatch_token_cou
 
 command.decl @qwen38_dispatch_greedy_argmax_reduce_rows_f32(%dispatch_token_count: index, %dispatch_output_size: index, %token_count_argument: index, %output_size_argument: index) launch(%partial_logits: buffer, %partial_token_ids: buffer, %token_ids: buffer)
 
-kernel.decl @qwen38_sample_rows(%rows: index) launch(%rows_argument: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer, %outputs: buffer)
+kernel.decl @qwen38_sample_rows(%rows: index) launch(%rows_argument: index, %first: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer, %outputs: buffer)
 
-kernel.decl @qwen38_sampling_partial_rows(%rows: index, %workgroup_budget: index) launch(%rows_argument: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer)
+kernel.decl @qwen38_sampling_partial_rows(%rows: index, %workgroup_budget: index) launch(%rows_argument: index, %first: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer)
 
-// Projects normalized hidden rows into caller-owned device-local logits.
-// Greedy and chained selection share packing and vocabulary contractions.
-command.def public target(@qwen38_execution) @qwen38_output_projection_logits(%token_count: index, %normalized_origin: offset, %output_origin: offset) launch(%parameters: buffer, %normalized: buffer, %logits: buffer) where [range(%token_count, 1, 512)] {
-  %workgroup_budget = func.call pure @qwen38_output_workgroup_budget() : () -> (index)
+// Quantize the normalized batch once, including when several vocabulary
+// contractions reuse the same score storage.
+command.def target(@qwen38_execution) @qwen38_pack_head_input(%rows: index, %input_origin: offset, %budget: index) launch(%normalized: buffer, %packed: buffer) {
+  %width = index.constant 5120 : index
+  %input = buffer.view %normalized[%input_origin] : buffer -> view<[%rows]x5120xf32>
+  kernel.launch @ggml_quantize_q8_1_x4_f32_bounded[%rows, %width, %budget](%rows, %width, %input, %packed) : [index, index, index](index, index, view<[%rows]x5120xf32>, buffer)
+  command.return
+}
+
+// Each contraction publishes whole F32 scores. The caller supplies either
+// its dense result or a reusable window for selection.
+command.def target(@qwen38_execution) @qwen38_project_packed_head(%token_count: index, %input_base: offset, %output_base: offset, %workgroup_budget: index) launch(%parameters: buffer, %normalized_q8: buffer, %logits: buffer) {
   %hidden_size = index.constant 5120 : index
   %vocabulary_size = index.constant 248320 : index
   %output_weight = command.parameter %parameters, "output.weight" : view<1042944000xi8>
   %hidden_q8_row_bytes = index.constant 5760 : offset
   %logits_row_bytes = index.constant 993280 : offset
-  %hidden_q8_bytes = index.scale %token_count, %hidden_q8_row_bytes : index, offset -> offset
-  %normalized_q8 = buffer.alloca<global> align(256) %hidden_q8_bytes : buffer
-  %normalized_rows = buffer.view %normalized[%normalized_origin] : buffer -> view<[%token_count]x5120xf32>
-
-  kernel.launch @ggml_quantize_q8_1_x4_f32_bounded[%token_count, %hidden_size, %workgroup_budget](%token_count, %hidden_size, %normalized_rows, %normalized_q8) : [index, index, index](index, index, view<[%token_count]x5120xf32>, buffer)
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c4 = index.constant 4 : index
@@ -58,9 +61,10 @@ command.def public target(@qwen38_execution) @qwen38_output_projection_logits(%t
   %wide_groups = index.div %token_count, %c32 : index
   scf.for %group = [%c0 to %wide_groups step %c1] unroll {
     %row = index.mul %group, %c32 : index
-    %input_origin = index.scale %row, %hidden_q8_row_bytes : index, offset -> offset
-    %logits_offset = index.scale %row, %logits_row_bytes : index, offset -> offset
-    %logits_origin = index.add %output_origin, %logits_offset : offset
+    %input_delta = index.scale %row, %hidden_q8_row_bytes : index, offset -> offset
+    %input_origin = index.add %input_base, %input_delta : offset
+    %score_delta = index.scale %row, %logits_row_bytes : index, offset -> offset
+    %logits_origin = index.add %output_base, %score_delta : offset
     %input_group = buffer.view %normalized_q8[%input_origin] : buffer -> view<32x5760xi8>
     %logits_group = buffer.view %logits[%logits_origin] : buffer -> view<32x248320xf32>
     kernel.launch @ggml_linear_q6k_q8_1_x4_panels_m32[%hidden_size, %vocabulary_size, %workgroup_budget](%hidden_size, %vocabulary_size, %input_group, %output_weight, %logits_group) : [index, index, index](index, index, view<32x5760xi8>, view<1042944000xi8>, view<32x248320xf32>)
@@ -70,9 +74,10 @@ command.def public target(@qwen38_execution) @qwen38_output_projection_logits(%t
   %groups = index.div %token_count, %c8 : index
   scf.for %group = [%first_group to %groups step %c1] unroll {
     %row = index.mul %group, %c8 : index
-    %input_origin = index.scale %row, %hidden_q8_row_bytes : index, offset -> offset
-    %logits_offset = index.scale %row, %logits_row_bytes : index, offset -> offset
-    %logits_origin = index.add %output_origin, %logits_offset : offset
+    %input_delta = index.scale %row, %hidden_q8_row_bytes : index, offset -> offset
+    %input_origin = index.add %input_base, %input_delta : offset
+    %score_delta = index.scale %row, %logits_row_bytes : index, offset -> offset
+    %logits_origin = index.add %output_base, %score_delta : offset
     %input_group = buffer.view %normalized_q8[%input_origin] : buffer -> view<8x5760xi8>
     %logits_group = buffer.view %logits[%logits_origin] : buffer -> view<8x248320xf32>
     kernel.launch @ggml_linear_q6k_q8_1_x4_panels_m8[%hidden_size, %vocabulary_size, %workgroup_budget](%hidden_size, %vocabulary_size, %input_group, %output_weight, %logits_group) : [index, index, index](index, index, view<8x5760xi8>, view<1042944000xi8>, view<8x248320xf32>)
@@ -81,9 +86,10 @@ command.def public target(@qwen38_execution) @qwen38_output_projection_logits(%t
   scf.for %row = [%tail_begin to %token_count step %c4] unroll {
     %remaining = index.sub %token_count, %row : index
     %count = index.min %remaining, %c4 : index
-    %input_origin = index.scale %row, %hidden_q8_row_bytes : index, offset -> offset
-    %logits_offset = index.scale %row, %logits_row_bytes : index, offset -> offset
-    %logits_origin = index.add %output_origin, %logits_offset : offset
+    %input_delta = index.scale %row, %hidden_q8_row_bytes : index, offset -> offset
+    %input_origin = index.add %input_base, %input_delta : offset
+    %score_delta = index.scale %row, %logits_row_bytes : index, offset -> offset
+    %logits_origin = index.add %output_base, %score_delta : offset
     %input_group = buffer.view %normalized_q8[%input_origin] : buffer -> view<[%count]x5760xi8>
     %logits_group = buffer.view %logits[%logits_origin] : buffer -> view<[%count]x248320xf32>
     scf.switch %count {
@@ -104,42 +110,71 @@ command.def public target(@qwen38_execution) @qwen38_output_projection_logits(%t
   command.return
 }
 
-// Only selected token IDs escape greedy projection; its logits and partial
-// winners remain transient and can be reclaimed after the final reduction.
-command.def public target(@qwen38_execution) @qwen38_output_projection_greedy(%token_count: index, %normalized_origin: offset, %output_origin: offset) launch(%parameters: buffer, %normalized: buffer, %token_id: buffer) where [range(%token_count, 1, 512)] {
-  %logit_stride = index.constant 248320 : index
-  %vocabulary_size = index.constant 248077 : index
-  %logits_row_bytes = index.constant 993280 : offset
-  %partial_row_bytes = index.constant 244 : offset
-  %logits_bytes = index.scale %token_count, %logits_row_bytes : index, offset -> offset
-  %partial_bytes = index.scale %token_count, %partial_row_bytes : index, offset -> offset
-  %logits = buffer.alloca<global> align(256) %logits_bytes : buffer
-  %partial_logits = buffer.alloca<global> align(256) %partial_bytes : buffer
-  %partial_token_ids = buffer.alloca<global> align(256) %partial_bytes : buffer
-  %output_rows = buffer.view %token_id[%output_origin] : buffer -> view<[%token_count]xi32>
-  %origin = index.constant 0 : offset
-  command.launch @qwen38_output_projection_logits[%token_count, %normalized_origin, %origin](%parameters, %normalized, %logits) : [index, offset, offset](buffer, buffer, buffer)
-  command.launch @qwen38_dispatch_greedy_argmax_partial_rows_f32[%token_count, %logit_stride, %vocabulary_size, %token_count, %logit_stride, %vocabulary_size](%logits, %partial_logits, %partial_token_ids) : [index, index, index, index, index, index](buffer, buffer, buffer)
-  command.launch @qwen38_dispatch_greedy_argmax_reduce_rows_f32[%token_count, %vocabulary_size, %token_count, %vocabulary_size](%partial_logits, %partial_token_ids, %output_rows) : [index, index, index, index](buffer, buffer, view<[%token_count]xi32>)
+// Explicit logits requests publish every row at the caller's offset.
+command.def public target(@qwen38_execution) @qwen38_output_projection_logits(%token_count: index, %normalized_origin: offset, %output_origin: offset) launch(%parameters: buffer, %normalized: buffer, %logits: buffer) where [range(%token_count, 1, 512)] {
+  %budget = func.call pure @qwen38_output_workgroup_budget() : () -> (index)
+  %stride = index.constant 5760 : offset
+  %length = index.scale %token_count, %stride : index, offset -> offset
+  %packed = buffer.alloca<global> align(256) %length : buffer
+  %packed_origin = index.constant 0 : offset
+  command.launch @qwen38_pack_head_input[%token_count, %normalized_origin, %budget](%normalized, %packed) : [index, offset, index](buffer, buffer)
+  command.launch @qwen38_project_packed_head[%token_count, %packed_origin, %output_origin, %budget](%parameters, %packed, %logits) : [index, offset, offset, index](buffer, buffer, buffer)
   command.return
 }
 
-// Target generation and verification share request-owned device sampling.
-// Draft proposals retain their own selection policy and never consume target
-// random draws. Only selected IDs escape this transient workspace.
+// The widest projection shares a weight panel across 32 hidden rows. Finish
+// selection for those rows before reusing their score and winner buffers.
+// Packet identities remain relative to the complete epoch.
+command.def target(@qwen38_execution) @qwen38_select_projection(%rows: index, %normalized_origin: offset, %output_origin: offset, %request_policy: i1) launch(%parameters: buffer, %normalized: buffer, %epoch: buffer, %token_ids: buffer) {
+  %budget = func.call pure @qwen38_output_workgroup_budget() : () -> (index)
+  %cohort = index.constant 32 : index
+  %window = index.min %rows, %cohort : index
+  %input_stride = index.constant 5760 : offset
+  %score_stride = index.constant 993280 : offset
+  %winner_stride = index.constant 244 : offset
+  %id_stride = index.constant 4 : offset
+  %input_bytes = index.scale %rows, %input_stride : index, offset -> offset
+  %score_bytes = index.scale %window, %score_stride : index, offset -> offset
+  %winner_bytes = index.scale %window, %winner_stride : index, offset -> offset
+  %packed = buffer.alloca<global> align(256) %input_bytes : buffer
+  %scores = buffer.alloca<global> align(256) %score_bytes : buffer
+  %partial_scores = buffer.alloca<global> align(256) %winner_bytes : buffer
+  %partial_ids = buffer.alloca<global> align(256) %winner_bytes : buffer
+  command.launch @qwen38_pack_head_input[%rows, %normalized_origin, %budget](%normalized, %packed) : [index, offset, index](buffer, buffer)
+  %c0 = index.constant 0 : index
+  scf.for %first = [%c0 to %rows step %cohort] unroll {
+    %remaining = index.sub %rows, %first : index
+    %count = index.min %remaining, %cohort : index
+    %input_offset = index.scale %first, %input_stride : index, offset -> offset
+    %origin = index.constant 0 : offset
+    %id_offset = index.scale %first, %id_stride : index, offset -> offset
+    %id_origin = index.add %output_origin, %id_offset : offset
+    %ids = buffer.view %token_ids[%id_origin] : buffer -> view<[%count]xi32>
+    command.launch @qwen38_project_packed_head[%count, %input_offset, %origin, %budget](%parameters, %packed, %scores) : [index, offset, offset, index](buffer, buffer, buffer)
+    scf.if %request_policy {
+      kernel.launch @qwen38_sampling_partial_rows[%count, %budget](%count, %first, %epoch, %scores, %partial_scores, %partial_ids) : [index, index](index, index, buffer, buffer, buffer, buffer)
+      kernel.launch @qwen38_sample_rows[%count](%count, %first, %epoch, %scores, %partial_scores, %partial_ids, %ids) : [index](index, index, buffer, buffer, buffer, buffer, view<[%count]xi32>)
+    } else {
+      %stride = index.constant 248320 : index
+      %vocabulary = index.constant 248077 : index
+      command.launch @qwen38_dispatch_greedy_argmax_partial_rows_f32[%count, %stride, %vocabulary, %count, %stride, %vocabulary](%scores, %partial_scores, %partial_ids) : [index, index, index, index, index, index](buffer, buffer, buffer)
+      command.launch @qwen38_dispatch_greedy_argmax_reduce_rows_f32[%count, %vocabulary, %count, %vocabulary](%partial_scores, %partial_ids, %ids) : [index, index, index, index](buffer, buffer, view<[%count]xi32>)
+    }
+  }
+  command.return
+}
+
+command.def public target(@qwen38_execution) @qwen38_output_projection_greedy(%token_count: index, %normalized_origin: offset, %output_origin: offset) launch(%parameters: buffer, %normalized: buffer, %token_id: buffer) where [range(%token_count, 1, 512)] {
+  %request_policy = scalar.constant false : i1
+  %epoch = buffer.null : buffer
+  command.launch @qwen38_select_projection[%token_count, %normalized_origin, %output_origin, %request_policy](%parameters, %normalized, %epoch, %token_id) : [index, offset, offset, i1](buffer, buffer, buffer, buffer)
+  command.return
+}
+
 command.def public target(@qwen38_execution) @qwen38_output_projection_sampled(%token_count: index) launch(%parameters: buffer, %epoch: buffer, %normalized: buffer, %token_ids: buffer) where [range(%token_count, 1, 2147483647)] {
-  %logits_row_bytes = index.constant 993280 : offset
-  %partial_row_bytes = index.constant 244 : offset
-  %logits_bytes = index.scale %token_count, %logits_row_bytes : index, offset -> offset
-  %partial_bytes = index.scale %token_count, %partial_row_bytes : index, offset -> offset
-  %logits = buffer.alloca<global> align(256) %logits_bytes : buffer
-  %partial_logits = buffer.alloca<global> align(256) %partial_bytes : buffer
-  %partial_ids = buffer.alloca<global> align(256) %partial_bytes : buffer
+  %request_policy = scalar.constant true : i1
   %origin = index.constant 0 : offset
-  command.launch @qwen38_output_projection_logits[%token_count, %origin, %origin](%parameters, %normalized, %logits) : [index, offset, offset](buffer, buffer, buffer)
-  %workgroup_budget = func.call pure @qwen38_output_workgroup_budget() : () -> (index)
-  kernel.launch @qwen38_sampling_partial_rows[%token_count, %workgroup_budget](%token_count, %epoch, %logits, %partial_logits, %partial_ids) : [index, index](index, buffer, buffer, buffer, buffer)
-  kernel.launch @qwen38_sample_rows[%token_count](%token_count, %epoch, %logits, %partial_logits, %partial_ids, %token_ids) : [index](index, buffer, buffer, buffer, buffer, buffer)
+  command.launch @qwen38_select_projection[%token_count, %origin, %origin, %request_policy](%parameters, %normalized, %epoch, %token_ids) : [index, offset, offset, i1](buffer, buffer, buffer, buffer)
   command.return
 }
 

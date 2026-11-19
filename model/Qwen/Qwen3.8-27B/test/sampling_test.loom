@@ -1,6 +1,6 @@
-kernel.decl @qwen38_sample_rows(%rows: index) launch(%rows_argument: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer, %outputs: buffer)
+kernel.decl @qwen38_sample_rows(%rows: index) launch(%rows_argument: index, %first: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer, %outputs: buffer)
 
-kernel.decl @qwen38_sampling_partial_rows(%rows: index, %workgroup_budget: index) launch(%rows_argument: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer)
+kernel.decl @qwen38_sampling_partial_rows(%rows: index, %workgroup_budget: index) launch(%rows_argument: index, %first: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer)
 
 template.decl @random.philox4x32(%counter0: i32, %counter1: i32, %counter2: i32, %counter3: i32, %seed0: i32, %seed1: i32) -> (i32, i32, i32, i32)
 
@@ -51,7 +51,7 @@ func.def @sampling_packet(%seed: i64, %epoch: buffer) {
 // Gumbel score is monotone in the uniform variate, so the reference selects
 // that variate directly without calling the sampler or evaluating logarithms.
 // Philox's known-answer contract is checked by the shared random provider.
-func.def @sampling_rows_reference(%rows: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer, %outputs: buffer) {
+func.def @sampling_rows_reference(%rows: index, %first: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer, %outputs: buffer) {
   %origin = index.constant 0 : offset
   %seed_origin = index.constant 9824 : offset
   %seeds = buffer.view %epoch[%seed_origin] : buffer -> view<1xi64>
@@ -93,6 +93,7 @@ func.def @sampling_rows_reference(%rows: index, %epoch: buffer, %logits: buffer,
 check.scenario public @sampling_rows {
   check.trial[8](%trial: index, %entropy: check.entropy) {
     %rows = check.literal value(4) : index
+    %first = check.literal value(0) : index
     %seed = check.entropy.read %entropy[0] : check.entropy -> i64
     %epoch = check.generate.fill value(-1) : tensor<3594xi32>
     check.generate<@sampling_packet>(%seed, %epoch) : (i64, tensor<3594xi32>) -> ()
@@ -100,7 +101,7 @@ check.scenario public @sampling_rows {
     %partial_logits = check.generate.fill value(1.0) : tensor<4x61xf32>
     %partial_ids = check.generate.iota offset(0) step(4096) period(61) : tensor<4x61xi32>
     %outputs = check.generate.fill value(-99) : tensor<4xi32>
-    check.compare<@qwen38_sample_rows, @sampling_rows_reference>[%rows](%rows, %epoch, %logits, %partial_logits, %partial_ids, %outputs) : [index](index, tensor<3594xi32>, tensor<4x248320xf32>, tensor<4x61xf32>, tensor<4x61xi32>, tensor<4xi32>) -> () {
+    check.compare<@qwen38_sample_rows, @sampling_rows_reference>[%rows](%rows, %first, %epoch, %logits, %partial_logits, %partial_ids, %outputs) : [index](index, index, tensor<3594xi32>, tensor<4x248320xf32>, tensor<4x61xf32>, tensor<4x61xi32>, tensor<4xi32>) -> () {
       check.expect.equal actual(%outputs) expected(%outputs) : tensor<4xi32>
     }
   }
@@ -123,8 +124,8 @@ kernel.def @tool_permission_packet() {
   %identities = buffer.view %epoch[%identity_origin] : buffer -> view<128x2xi32>
   %values = buffer.view %logits[%origin] : buffer -> view<8x248320xf32>
   %outputs = buffer.view %expected[%origin] : buffer -> view<8xi32>
-  %c6_2 = scalar.constant 6 : i32
-  view.store %c6_2, %header[2] : i32, view<3xi32>
+  %packet_end = scalar.constant 38 : i32
+  view.store %packet_end, %header[2] : i32, view<3xi32>
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c6 = index.constant 6 : index
@@ -159,8 +160,10 @@ kernel.def @tool_permission_packet() {
     %nucleus = scalar.cmpi eq, %row_word, %c3 : i32
     %top_k = scf.select %single, %c1_2, %c0_2 : i32
     %top_p = scf.select %nucleus, %half, %c1_0 : f32
-    view.store %owner_word, %identities[%row, 0] : i32, view<128x2xi32>
-    view.store %row_word, %identities[%row, 1] : i32, view<128x2xi32>
+    %first = index.constant 32 : index
+    %packet_row = index.add %first, %row : index
+    view.store %owner_word, %identities[%packet_row, 0] : i32, view<128x2xi32>
+    view.store %row_word, %identities[%packet_row, 1] : i32, view<128x2xi32>
     view.store %row_temperature, %floats[%owner, 0] : f32, view<16x6xf32>
     view.store %top_p, %floats[%owner, 1] : f32, view<16x6xf32>
     view.store %top_k, %policies[%owner, 2] : i32, view<16x6xi32>
@@ -177,6 +180,7 @@ kernel.def @tool_permission_packet() {
 
 check.case public @sampling_tool_permissions {
   %rows = check.literal value(8) : index
+  %first = check.literal value(32) : index
   %epoch = check.generate.fill value(-1) : tensor<3594xi32>
   %logits = check.generate.fill value(-1000.0) : tensor<8x248320xf32>
   %expected = check.generate.fill value(-99) : tensor<8xi32>
@@ -185,8 +189,8 @@ check.case public @sampling_tool_permissions {
   %partial_ids = check.generate.fill value(-99) : tensor<8x61xi32>
   %outputs = check.generate.fill value(-99) : tensor<8xi32>
   %workgroup_budget = check.literal value(2) : index
-  kernel.launch @qwen38_sampling_partial_rows[%rows, %workgroup_budget](%rows, %epoch, %logits, %partials, %partial_ids) : [index, index](index, tensor<3594xi32>, tensor<8x248320xf32>, tensor<8x61xf32>, tensor<8x61xi32>)
-  kernel.launch @qwen38_sample_rows[%rows](%rows, %epoch, %logits, %partials, %partial_ids, %outputs) : [index](index, tensor<3594xi32>, tensor<8x248320xf32>, tensor<8x61xf32>, tensor<8x61xi32>, tensor<8xi32>)
+  kernel.launch @qwen38_sampling_partial_rows[%rows, %workgroup_budget](%rows, %first, %epoch, %logits, %partials, %partial_ids) : [index, index](index, index, tensor<3594xi32>, tensor<8x248320xf32>, tensor<8x61xf32>, tensor<8x61xi32>)
+  kernel.launch @qwen38_sample_rows[%rows](%rows, %first, %epoch, %logits, %partials, %partial_ids, %outputs) : [index](index, index, tensor<3594xi32>, tensor<8x248320xf32>, tensor<8x61xf32>, tensor<8x61xi32>, tensor<8xi32>)
   check.expect.equal actual(%outputs) expected(%expected) : tensor<8xi32>
   check.return
 }

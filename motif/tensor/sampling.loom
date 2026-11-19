@@ -7,13 +7,31 @@
 
 template.decl @random.philox4x32(%counter0: i32, %counter1: i32, %counter2: i32, %counter3: i32, %seed0: i32, %seed1: i32) -> (i32, i32, i32, i32)
 
-template.decl @sampling.cutoff_f32(%columns: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %minimum: i64, %maximum: i64, %target: f32, %weighted: i1, %maximum_logit: f32, %temperature: f32) -> (i64)
+template.decl @sampling.cutoff(%bf16_storage: i1, %columns: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %minimum: i64, %maximum: i64, %target: f32, %weighted: i1, %maximum_logit: f32, %temperature: f32) -> (i64)
 
 template.decl @sampling.categorical_f32(%columns: index, %logits: buffer, %logits_origin: offset, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64) -> (i32)
 
 template.decl @sampling.categorical_excluding_f32(%columns: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64) -> (i32)
 
+template.decl @sampling.categorical_excluding(%bf16_storage: i1, %columns: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64) -> (i32)
+
 template.decl @sampling.reduce_key(%key: i64, %minimum: i1) -> (i64)
+
+// Each categorical entry specializes the score storage at its call site.
+// Ranking, probability mass, and random selection all consume F32 values.
+func.def inline @sampling_load_logit(%bf16_storage: i1, %columns: index, %column: index, %logits: buffer, %origin: offset) -> (f32) {
+  %value = scf.if %bf16_storage -> (f32) {
+    %input = buffer.view %logits[%origin] : buffer -> view<[%columns]xbf16>
+    %packed = view.load %input[%column] : view<[%columns]xbf16> -> bf16
+    %score = scalar.extf %packed : bf16 to f32
+    scf.yield %score : f32
+  } else {
+    %input = buffer.view %logits[%origin] : buffer -> view<[%columns]xf32>
+    %score = view.load %input[%column] : view<[%columns]xf32> -> f32
+    scf.yield %score : f32
+  }
+  func.return %value : f32
+}
 
 // Unsigned greater keys select larger finite F32 logits, then smaller
 // nonnegative I32 vocabulary IDs. Both signed zeros compare equally. The low
@@ -106,7 +124,7 @@ template.def<@sampling.reduce_key> device @sampling_reduce_key(%key: i64, %minim
 // containing the requested rank or cumulative probability. Retaining actual
 // extrema skips empty key ranges; strict progress bounds the loop by 64 bits.
 // One 256-thread workgroup owns a row. All threads receive the same result.
-template.def<@sampling.cutoff_f32> device @sampling_cutoff_f32(%columns_value: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %minimum: i64, %maximum: i64, %target: f32, %weighted: i1, %maximum_logit: f32, %temperature: f32) -> (i64) {
+template.def<@sampling.cutoff> device @sampling_cutoff(%bf16_storage: i1, %columns_value: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %minimum: i64, %maximum: i64, %target: f32, %weighted: i1, %maximum_logit: f32, %temperature: f32) -> (i64) {
   %columns = index.assume %columns_value [range(%columns_value, 1, 16777216)] : index
   %origin = index.constant 0 : offset
   %begin = index.constant 0 : index
@@ -121,7 +139,6 @@ template.def<@sampling.cutoff_f32> device @sampling_cutoff_f32(%columns_value: i
   %c1 = scalar.constant 1.0 : f32
   %true = scalar.constant true : i1
   %false = scalar.constant false : i1
-  %input = buffer.view %logits[%logits_origin] : buffer -> view<[%columns]xf32>
   %cutoff, %last_high, %last_target = scf.while(%low = %minimum : i64, %high = %maximum : i64, %remaining = %target : f32) -> (i64, i64, f32) {
     %more = scalar.cmpi ult, %low, %high : i64
     scf.condition %more, %low, %high, %remaining : i1, i64, i64, f32
@@ -134,7 +151,7 @@ template.def<@sampling.cutoff_f32> device @sampling_cutoff_f32(%columns_value: i
       %live = index.cmp ult, %candidate, %columns : index
       %clamped = index.min %candidate, %last : index
       %column = index.assume %clamped [ge(%clamped, 0), lt(%clamped, %columns)] : index
-      %value = view.load %input[%column] : view<[%columns]xf32> -> f32
+      %value = func.call @sampling_load_logit(%bf16_storage, %columns, %column, %logits, %logits_origin) : (i1, index, index, buffer, offset) -> (f32)
       %id = index.cast %column : index to i32
       %key = func.call @sampling_key(%value, %id) : (f32, i32) -> (i64)
       %after = scalar.cmpi uge, %key, %low : i64
@@ -201,7 +218,13 @@ template.def<@sampling.categorical_f32> device @sampling_categorical_f32(%column
 // A turn may exclude one vocabulary ID before any support or winner selection.
 // -1 excludes nothing; callers guarantee at least one permitted finite logit.
 // The immutable logit storage and counter-based random draws remain unchanged.
-template.def<@sampling.categorical_excluding_f32> device @sampling_categorical_excluding_f32(%columns_value: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64) -> (i32) {
+template.def<@sampling.categorical_excluding_f32> device @sampling_categorical_excluding_f32(%columns: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64) -> (i32) {
+  %bf16_storage = scalar.constant false : i1
+  %selected = template.apply<@sampling.categorical_excluding>(%bf16_storage, %columns, %logits, %logits_origin, %excluded_id, %temperature, %top_p, %top_k, %seed, %position) : (i1, index, buffer, offset, i32, f32, f32, i32, i64, i64) -> (i32)
+  template.return %selected : i32
+}
+
+template.def<@sampling.categorical_excluding> device @sampling_categorical_excluding(%bf16_storage: i1, %columns_value: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64) -> (i32) {
   %columns = index.assume %columns_value [range(%columns_value, 1, 16777216)] : index
   %origin = index.constant 0 : offset
   %begin = index.constant 0 : index
@@ -217,13 +240,12 @@ template.def<@sampling.categorical_excluding_f32> device @sampling_categorical_e
   %c0 = scalar.constant 0.0 : f32
   %c1 = scalar.constant 1.0 : f32
   %negative = scalar.constant -inf : f32
-  %input = buffer.view %logits[%logits_origin] : buffer -> view<[%columns]xf32>
   %local_min, %local_max, %local_logit = scf.for %base = [%begin to %columns step %threads](%minimum = %ones64 : i64, %maximum = %zero64 : i64, %greatest = %negative : f32) -> (i64, i64, f32) {
     %candidate = index.add %base, %thread : index
     %live = index.cmp ult, %candidate, %columns : index
     %clamped = index.min %candidate, %last : index
     %column = index.assume %clamped [ge(%clamped, 0), lt(%clamped, %columns)] : index
-    %value = view.load %input[%column] : view<[%columns]xf32> -> f32
+    %value = func.call @sampling_load_logit(%bf16_storage, %columns, %column, %logits, %logits_origin) : (i1, index, index, buffer, offset) -> (f32)
     %id = index.cast %column : index to i32
     %key = func.call @sampling_key(%value, %id) : (f32, i32) -> (i64)
     %permitted = scalar.cmpi ne, %id, %excluded_id : i32
@@ -258,7 +280,7 @@ template.def<@sampling.categorical_excluding_f32> device @sampling_categorical_e
     %effective_k = scalar.minui %top_k, %eligible_count : i32
     %rank = scalar.uitofp %effective_k : i32 to f32
     %topk_cutoff = scf.if %bounded -> (i64) {
-      %cutoff = template.apply<@sampling.cutoff_f32>(%columns, %logits, %logits_origin, %excluded_id, %minimum, %maximum, %rank, %false, %maximum_logit, %temperature) : (index, buffer, offset, i32, i64, i64, f32, i1, f32, f32) -> (i64)
+      %cutoff = template.apply<@sampling.cutoff>(%bf16_storage, %columns, %logits, %logits_origin, %excluded_id, %minimum, %maximum, %rank, %false, %maximum_logit, %temperature) : (i1, index, buffer, offset, i32, i64, i64, f32, i1, f32, f32) -> (i64)
       scf.yield %cutoff : i64
     } else {
       scf.yield %minimum : i64
@@ -270,7 +292,7 @@ template.def<@sampling.categorical_excluding_f32> device @sampling_categorical_e
         %live = index.cmp ult, %candidate, %columns : index
         %clamped = index.min %candidate, %last : index
         %column = index.assume %clamped [ge(%clamped, 0), lt(%clamped, %columns)] : index
-        %value = view.load %input[%column] : view<[%columns]xf32> -> f32
+        %value = func.call @sampling_load_logit(%bf16_storage, %columns, %column, %logits, %logits_origin) : (i1, index, index, buffer, offset) -> (f32)
         %id = index.cast %column : index to i32
         %key = func.call @sampling_key(%value, %id) : (f32, i32) -> (i64)
         %included = scalar.cmpi uge, %key, %topk_cutoff : i64
@@ -286,7 +308,7 @@ template.def<@sampling.categorical_excluding_f32> device @sampling_categorical_e
       }
       %mass = kernel.workgroup.reduce<addf> %local_mass : f32
       %target = scalar.mulf %mass, %top_p : f32
-      %cutoff = template.apply<@sampling.cutoff_f32>(%columns, %logits, %logits_origin, %excluded_id, %topk_cutoff, %maximum, %target, %true, %maximum_logit, %temperature) : (index, buffer, offset, i32, i64, i64, f32, i1, f32, f32) -> (i64)
+      %cutoff = template.apply<@sampling.cutoff>(%bf16_storage, %columns, %logits, %logits_origin, %excluded_id, %topk_cutoff, %maximum, %target, %true, %maximum_logit, %temperature) : (i1, index, buffer, offset, i32, i64, i64, f32, i1, f32, f32) -> (i64)
       scf.yield %cutoff : i64
     } else {
       scf.yield %topk_cutoff : i64
@@ -296,7 +318,7 @@ template.def<@sampling.categorical_excluding_f32> device @sampling_categorical_e
       %live = index.cmp ult, %candidate, %columns : index
       %clamped = index.min %candidate, %last : index
       %column = index.assume %clamped [ge(%clamped, 0), lt(%clamped, %columns)] : index
-      %value = view.load %input[%column] : view<[%columns]xf32> -> f32
+      %value = func.call @sampling_load_logit(%bf16_storage, %columns, %column, %logits, %logits_origin) : (i1, index, index, buffer, offset) -> (f32)
       %id = index.cast %column : index to i32
       %key = func.call @sampling_key(%value, %id) : (f32, i32) -> (i64)
       %included = scalar.cmpi uge, %key, %cutoff : i64

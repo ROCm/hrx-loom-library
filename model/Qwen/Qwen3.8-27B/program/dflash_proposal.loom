@@ -26,7 +26,7 @@ kernel.decl @qwen38_dflash_selection_rows(%blocks: index) launch(%blocks_argumen
 
 kernel.decl @qwen38_dflash_proposal_publish() launch(%draft: buffer, %origins: buffer, %proposals: buffer, %target_tokens: buffer, %results: buffer)
 
-kernel.decl @qwen38_dflash_topk_partial(%rows: index) launch(%rows_argument: index, %draft: buffer, %control: buffer, %carry: buffer, %logits: buffer, %table: buffer, %scores: buffer, %ids: buffer)
+kernel.decl @qwen38_dflash_topk_partial(%rows: index) launch(%rows_argument: index, %first: index, %total: index, %draft: buffer, %control: buffer, %carry: buffer, %logits: buffer, %table: buffer, %scores: buffer, %ids: buffer)
 
 kernel.decl @qwen38_dflash_topk_merge(%rows: index) launch(%rows_argument: index, %control: buffer, %partial_scores: buffer, %partial_ids: buffer, %scores: buffer, %ids: buffer)
 
@@ -52,7 +52,10 @@ command.def public target(@qwen38_execution) @qwen38_dflash_candidates(%spans: i
   %partial_stride = index.constant 3904 : offset
   %candidate_stride = index.constant 64 : offset
   %hidden_stride = index.constant 1024 : offset
-  %logit_bytes = index.scale %rows, %logit_stride : index, offset -> offset
+  // Two native 32-row contractions can share the window concurrently.
+  %two_cohorts = index.constant 64 : index
+  %window = index.min %rows, %two_cohorts : index
+  %logit_bytes = index.scale %window, %logit_stride : index, offset -> offset
   %partial_bytes = index.scale %rows, %partial_stride : index, offset -> offset
   %candidate_bytes = index.scale %rows, %candidate_stride : index, offset -> offset
   %hidden_bytes = index.scale %rows, %hidden_stride : index, offset -> offset
@@ -70,15 +73,15 @@ command.def public target(@qwen38_execution) @qwen38_dflash_candidates(%spans: i
   %successors = command.parameter %draft_parameters, "selector_successor.weight" : view<35758080xi8>
   %c65 = index.constant 65 : index
   %narrow = index.cmp ult, %rows, %c65 : index
+  %reduce = scalar.constant true : i1
   command.concurrent {
-    command.launch @qwen38_dflash_vocabulary_logits[%spans](%target_parameters, %draft, %control, %carry, %normalized, %logits, %table) : [index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    command.launch @qwen38_dflash_project_vocabulary[%spans, %window, %reduce](%target_parameters, %draft, %control, %carry, %normalized, %logits, %table, %partial_scores, %partial_ids) : [index, index, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
     scf.if %narrow {
       kernel.launch @qwen38_linear_q4k_f16_wmma_x64[%rows, %hidden_size, %rank](%control, %hidden_size, %rank, %normalized, %projection, %hidden) : [index, index, index](buffer, index, index, buffer, view<737280xi8>, buffer)
     } else {
       kernel.launch @qwen38_linear_q4k_f16_wmma_x128[%rows, %hidden_size, %rank](%control, %hidden_size, %rank, %normalized, %projection, %hidden) : [index, index, index](buffer, index, index, buffer, view<737280xi8>, buffer)
     }
   }
-  kernel.launch @qwen38_dflash_topk_partial[%rows](%rows, %draft, %control, %carry, %logits, %table, %partial_scores, %partial_ids) : [index](index, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.launch @qwen38_dflash_topk_merge[%rows](%rows, %control, %partial_scores, %partial_ids, %scores, %candidates) : [index](index, buffer, buffer, buffer, buffer, buffer)
   kernel.launch @qwen38_dflash_select[%spans](%spans, %control, %anchors, %candidates, %scores, %hidden, %predecessors, %successors, %proposals) : [index](index, buffer, buffer, buffer, buffer, buffer, view<35758080xi8>, view<35758080xi8>, buffer)
   command.return
@@ -126,6 +129,20 @@ command.def public target(@qwen38_execution) @qwen38_dflash_propose() launch(%em
 }
 
 command.def public target(@qwen38_execution) @qwen38_dflash_vocabulary_logits(%spans: index) launch(%parameters: buffer, %draft: buffer, %control: buffer, %carry: buffer, %normalized: buffer, %logits: buffer, %table: buffer) {
+  %width = config.get @runner.qwen38.verification_width : index
+  %anchor_count = index.constant 1 : index
+  %depth = index.sub %width, %anchor_count : index
+  %rows = index.mul %spans, %depth : index
+  %reduce = scalar.constant false : i1
+  %unused = buffer.null : buffer
+  command.launch @qwen38_dflash_project_vocabulary[%spans, %rows, %reduce](%parameters, %draft, %control, %carry, %normalized, %logits, %table, %unused, %unused) : [index, index, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+// The sparse table covers all live spans and independent weight cohorts
+// within a score window can run concurrently. Candidate construction retains
+// their partial top-16 lists before the next window overwrites the logits.
+command.def target(@qwen38_execution) @qwen38_dflash_project_vocabulary(%spans: index, %window: index, %reduce: i1) launch(%parameters: buffer, %draft: buffer, %control: buffer, %carry: buffer, %normalized: buffer, %logits: buffer, %table: buffer, %partial_scores: buffer, %partial_ids: buffer) {
   %budget = func.call pure @qwen38_output_workgroup_budget() : () -> (index)
   %width = config.get @runner.qwen38.verification_width : index
   %c0 = index.constant 0 : index
@@ -141,21 +158,32 @@ command.def public target(@qwen38_execution) @qwen38_dflash_vocabulary_logits(%s
   %packed = buffer.alloca<global> align(256) %input_bytes : buffer
   %weight = command.parameter %parameters, "output.weight" : view<1042944000xi8>
   kernel.launch @ggml_quantize_q8_1_x4_f32_bounded[%tokens, %hidden, %budget](%tokens, %hidden, %normalized, %packed) : [index, index, index](index, index, buffer, buffer)
-  command.concurrent {
-    scf.for %first = [%c0 to %tokens step %cohort] unroll {
-      %remaining = index.sub %tokens, %first : index
-      %rows = index.min %remaining, %cohort : index
-      %input_origin = index.scale %first, %input_stride : index, offset -> offset
-      %input = buffer.view %packed[%input_origin] : buffer -> view<[%rows]x5760xi8>
-      %full_stride = index.constant 993280 : offset
-      %prefix_stride = index.constant 393216 : offset
-      %full_origin = index.scale %first, %full_stride : index, offset -> offset
-      %prefix_origin = index.scale %first, %prefix_stride : index, offset -> offset
-      %full_output = buffer.view %logits[%full_origin] : buffer -> view<[%rows]x248320xf32>
-      %prefix_output = buffer.view %logits[%prefix_origin] : buffer -> view<[%rows]x98304xf32>
-      kernel.launch @qwen38_dflash_vocabulary_head[%rows, %hidden, %full_columns, %prefix_columns, %budget](%rows, %first, %hidden, %full_columns, %prefix_columns, %control, %input, %weight, %full_output, %prefix_output) : [index, index, index, index, index](index, index, index, index, index, buffer, view<[%rows]x5760xi8>, view<1042944000xi8>, view<[%rows]x248320xf32>, view<[%rows]x98304xf32>)
+  scf.for %begin = [%c0 to %tokens step %window] unroll {
+    %rest = index.sub %tokens, %begin : index
+    %count = index.min %rest, %window : index
+    command.concurrent {
+      scf.for %row = [%c0 to %count step %cohort] unroll {
+        %first = index.add %begin, %row : index
+        %remaining = index.sub %count, %row : index
+        %rows = index.min %remaining, %cohort : index
+        %input_origin = index.scale %first, %input_stride : index, offset -> offset
+        %input = buffer.view %packed[%input_origin] : buffer -> view<[%rows]x5760xi8>
+        %full_stride = index.constant 993280 : offset
+        %prefix_stride = index.constant 393216 : offset
+        %full_origin = index.scale %row, %full_stride : index, offset -> offset
+        %prefix_origin = index.scale %row, %prefix_stride : index, offset -> offset
+        %full_output = buffer.view %logits[%full_origin] : buffer -> view<[%rows]x248320xf32>
+        %prefix_output = buffer.view %logits[%prefix_origin] : buffer -> view<[%rows]x98304xf32>
+        kernel.launch @qwen38_dflash_vocabulary_head[%rows, %hidden, %full_columns, %prefix_columns, %budget](%rows, %first, %hidden, %full_columns, %prefix_columns, %control, %input, %weight, %full_output, %prefix_output) : [index, index, index, index, index](index, index, index, index, index, buffer, view<[%rows]x5760xi8>, view<1042944000xi8>, view<[%rows]x248320xf32>, view<[%rows]x98304xf32>)
+      }
+      %first_window = index.cmp eq, %begin, %c0 : index
+      scf.if %first_window {
+        kernel.launch @qwen38_dflash_vocabulary_table[%spans](%spans, %draft, %control, %carry, %packed, %weight, %table) : [index](index, buffer, buffer, buffer, buffer, view<1042944000xi8>, buffer)
+      }
     }
-    kernel.launch @qwen38_dflash_vocabulary_table[%spans](%spans, %draft, %control, %carry, %packed, %weight, %table) : [index](index, buffer, buffer, buffer, buffer, view<1042944000xi8>, buffer)
+    scf.if %reduce {
+      kernel.launch @qwen38_dflash_topk_partial[%count](%count, %begin, %tokens, %draft, %control, %carry, %logits, %table, %partial_scores, %partial_ids) : [index](index, index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    }
   }
   command.return
 }
