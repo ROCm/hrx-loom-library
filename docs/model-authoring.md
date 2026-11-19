@@ -139,16 +139,18 @@ the listed bytecode. The normal authoring test command and commit hook check
 managed cards. Hook checks require complete staged build/card changes and a
 matching file inventory, so they cannot validate an unstaged glob addition.
 
-Only `inputs`, `libraries`, and their compiler annotations are generated.
-Origins and per-file acquisition locations, model facts, services, variants,
-presets, execution configuration, and asset locks remain authored. Several
+Synchronization writes `inputs`, `libraries`, and their compiler annotations.
+Authors control explicit origins, per-file acquisition locations, model facts,
+services, variants, presets, execution configuration, and asset locks. Several
 preset targets may name one program set only when they describe the same
 compiler closure. Explicit `files`/`data` mappings remain available for
 compositions whose cards are maintained by hand.
 
-Generated paths are relative to the repository root. A nested checked-in card
-uses a program-set `"origin": "../../../"` to acquire those paths from its
-own checkout or published snapshot, without pinning another library revision.
+Generated paths are relative to the repository root. For a nested card,
+synchronization supplies the relative path back to that root when a managed
+program set has no explicit origin. For example, the Qwen embedding card at
+`model/Qwen/Qwen3-Embedding-0.6B/model.json` gets `"origin": "../../../"`
+and acquires providers from the same published snapshot.
 Fetch places `model.json` at the installation root and preserves the selected
 repository-relative tree beneath it. The authored
 `directory` follows that layout, such as `model/Qwen/Qwen3.8-27B/program`.
