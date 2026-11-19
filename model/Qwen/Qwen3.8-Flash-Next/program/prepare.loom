@@ -35,11 +35,9 @@ func.decl @qwen38.control_create(%packet_capacity: i64, %feedback_capacity: i64,
 
 func.decl @qwen38.control_resize(%state: buffer, %rows: i64) -> (buffer, i64, i64, i64, i64, i64, i1, i1, i1)
 
-func.decl @qwen38.proposal_level(%count: i32) -> (i32)
-
 func.decl @qwen38.speculation_configure(%state: buffer, %ceiling: i32, %capacity: i32)
 
-func.decl @qwen38.speculation_register(%state: buffer, %level: index, %width: i32, %proposal: i32, %verifier: i32)
+func.decl @qwen38.speculation_register_width(%state: buffer, %level: index, %width: i32)
 
 func.def public @text_resize_state_v1(%state: buffer, %rows: i64) -> (buffer, buffer, buffer, buffer, buffer, buffer) {
   %grown, %packet_capacity, %feedback_capacity, %context, %pool, %pins, %packed, %enabled, %dflash = func.call @qwen38.control_resize(%state, %rows) : (buffer, i64) -> (buffer, i64, i64, i64, i64, i64, i1, i1, i1)
@@ -338,11 +336,9 @@ func.def @qwen38.storage(%tokens: i64, %feedback_capacity: i64, %context: i64, %
   func.return %allocations, %views, %target_origins, %draft_origins, %geometry : buffer, buffer, buffer, buffer, buffer
 }
 
-// Shapes are scheduler-owned little-endian {token capacity, span capacity}
-// pairs. Every bucket executes the same model over its active packed prefix.
-// Each catalog has consecutive target shapes, proposal cohorts, warm shapes,
-// verification shapes, and one continuation. Only the input representation
-// differs; every stage binds the same immutable checkpoint source handles.
+// The service supplies physical token and span envelopes. Target, warm, and
+// verification phases consume live packed prefixes. A single proposal phase
+// covers every reservation; all phases bind the same checkpoint handles.
 func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %enabled: i1, %depth: i64, %mixed: i64, %packet_capacity: i64, %feedback_capacity: i64) -> (i32, i32, i32, i64, i64) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
@@ -422,52 +418,26 @@ func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i6
   func.return %target_first, %proposal, %warm_first, %maximum, %proposal_capacity : i32, i32, i32, i64, i64
 }
 
-// Text cohorts use at most two proposals for three or four owners, and one
-// for five through eight owners. The shared packet owner captures each paired
-// stage selection before enqueue, retaining all original request identities.
-// One/two-owner work retains the configured ceiling. Every alternative borrows
-// the same target/draft parameter handles and retained state.
-func.def @declare_cohort_stages(%state: buffer, %depth: i64, %proposal_capacity: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %packet_capacity: i64) {
-  %c0_i64 = scalar.constant 0 : i64
-  %c1_i64 = scalar.constant 1 : i64
-  %c2_i64 = scalar.constant 2 : i64
-  %limit = scalar.constant 8 : i64
-  %c0_i32 = scalar.constant 0 : i32
-  %c1_i32 = scalar.constant 1 : i32
-  %c2_i32 = scalar.constant 2 : i32
-  %admitted = scalar.minui %proposal_capacity, %limit : i64
-  %ceiling = scalar.addi %depth, %c1_i64 : i64
+// The width policy reserves fewer tokens for larger text cohorts. Draft and
+// target both consume the encoded span lengths in their ordinary recordings.
+func.def @configure_cohort_widths(%state: buffer, %depth: i64, %proposal_capacity: i64) {
+  %one = scalar.constant 1 : i64
+  %two = scalar.constant 2 : i64
+  %ceiling = scalar.addi %depth, %one : i64
   %ceiling_word = scalar.trunci %ceiling : i64 to i32
-  %capacity_word = scalar.trunci %admitted : i64 to i32
+  %capacity_word = scalar.trunci %proposal_capacity : i64 to i32
   func.call @qwen38.speculation_configure(%state, %ceiling_word, %capacity_word) : (buffer, i32, i32)
-  %nonempty_capacity = scalar.maxui %capacity_word, %c1_i32 : i32
-  %last_word = func.call @qwen38.proposal_level(%nonempty_capacity) : (i32) -> (i32)
-  %last = index.cast %last_word : i32 to index
-  %begin = index.constant 2 : index
-  %step = index.constant 1 : index
-  %end = index.add %last, %step : index
-  %wide_level = index.constant 3 : index
-  %proposal_root = global.load @proposal_root : buffer
-  %verify_root = buffer.constant utf8("flash_next_verify_stream") : buffer
-  %depth_key = global.load @draft_depth_key : buffer
-  %capacity_key = global.load @epoch_capacity_key : buffer
-  scf.for %level = [%begin to %end step %step] {
-    %wide = index.cmp eq, %level, %wide_level : index
-    %selected_depth = scf.select %wide, %c1_i64, %c2_i64 : i64
-    %shorter = scalar.cmpi ult, %selected_depth, %depth : i64
-    scf.if %shorter {
-      %width = scalar.addi %selected_depth, %c1_i64 : i64
-      %shift = index.cast %level : index to i64
-      %rounded = scalar.shli %c1_i64, %shift : i64
-      %spans = scalar.minui %rounded, %admitted : i64
-      %tokens = scalar.muli %spans, %width : i64
-      %proposal = func.call @declare_stage(%proposal_root, %spans, %spans, %context, %pool, %model_source, %draft_source, %c1_i32, %c2_i32, %c0_i64, %packet_capacity, %c0_i64) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
-      func.call @config_i64(%proposal, %depth_key, %selected_depth) : (i32, buffer, i64)
-      func.call @config_i64(%proposal, %capacity_key, %packet_capacity) : (i32, buffer, i64)
-      %verifier = func.call @declare_stage(%verify_root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %c0_i32, %c2_i32, %width, %packet_capacity, %c0_i64) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
-      %width_word = scalar.trunci %width : i64 to i32
-      func.call @qwen38.speculation_register(%state, %level, %width_word, %proposal, %verifier) : (buffer, index, i32, i32, i32)
-    }
+  %shorten_four = scalar.cmpi ugt, %depth, %two : i64
+  scf.if %shorten_four {
+    %four_owners = index.constant 2 : index
+    %anchor_and_two = scalar.constant 3 : i32
+    func.call @qwen38.speculation_register_width(%state, %four_owners, %anchor_and_two) : (buffer, index, i32)
+  }
+  %shorten_eight = scalar.cmpi ugt, %depth, %one : i64
+  scf.if %shorten_eight {
+    %eight_owners = index.constant 3 : index
+    %anchor_and_one = scalar.constant 2 : i32
+    func.call @qwen38.speculation_register_width(%state, %eight_owners, %anchor_and_one) : (buffer, index, i32)
   }
   func.return
 }
@@ -532,7 +502,7 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
   view.store %warm_first, %state_view[8] : i32, view<10xi32>
   view.store %mixed_warm, %state_view[9] : i32, view<10xi32>
   scf.if %enabled {
-    func.call @declare_cohort_stages(%state, %depth, %proposal_capacity, %context, %pool, %model_source, %draft_source, %packet_capacity) : (buffer, i64, i64, i64, i64, i32, i32, i64)
+    func.call @configure_cohort_widths(%state, %depth, %proposal_capacity) : (buffer, i64, i64)
   }
   func.call @flash_next_ple_prepare(%shapes, %shape_count, %context, %pool, %model_source, %packet_capacity, %images, %state) : (buffer, i64, i64, i64, i32, i64, i1, buffer)
   %less = scalar.cmpi ult, %maximum, %prefill : i64
