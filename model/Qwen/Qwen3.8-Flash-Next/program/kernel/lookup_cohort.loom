@@ -11,8 +11,6 @@ config.decl @flash_next.token_count : %value: index where [range(%value, 1, 3276
 
 config.decl @flash_next.epoch_capacity : %value: index where [range(%value, 1, 32768)]
 
-config.decl @flash_next.draft_depth : %value: index where [range(%value, 1, 7)]
-
 config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
 
 func.decl @qwen38_input_token(%mixed: index, %capacity: index, %inputs: buffer, %input: index) -> (i32)
@@ -126,19 +124,18 @@ kernel.def @flash_next_lookup_parameters(%round_owners: index) {
 kernel.def @flash_next_lookup_publish(%round: index) {
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
-} launch(%round_value: index, %rows: buffer, %cache: buffer, %parameters: buffer, %selected: buffer, %draft: buffer, %origins: buffer, %ids: buffer, %plan: buffer, %target_tokens: buffer, %moves: buffer, %count_buffer: buffer) {
+} launch(%round_value: index, %epoch: buffer, %rows: buffer, %cache: buffer, %parameters: buffer, %selected: buffer, %draft: buffer, %origins: buffer, %ids: buffer, %plan: buffer, %target_tokens: buffer, %moves: buffer, %count_buffer: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %target_capacity = config.get @flash_next.epoch_capacity : index
-  %depth = config.get @flash_next.draft_depth : index
   %mixed = config.get @runner.qwen38.mixed_inputs : index
   %round = index.assume %round_value [range(%round_value, 0, 6)] : index
-  %unbounded_remaining = index.sub %depth, %round : index
   %origin = index.constant 0 : offset
   %descriptor_origin = index.constant 12 : offset
   %mode_origin = func.call pure @flash_next_draft_mode_origin(%capacity) : (index) -> (offset)
   %cohort_count = func.call pure @flash_next_draft_cohorts(%capacity) : (index) -> (index)
   %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
   %spans = buffer.view %draft[%descriptor_origin] : buffer -> view<[%capacity]x6xi32>
+  %reservations = buffer.view %epoch[%descriptor_origin] : buffer -> view<[%target_capacity]x6xi32>
   %origins_view = buffer.view %origins[%origin] : buffer -> view<[%capacity]x3xi32>
   %inputs = buffer.view %ids[%origin] : buffer -> view<[%capacity]xi32>
   %records = buffer.view %parameters[%origin] : buffer -> view<[%capacity]x16xi32>
@@ -157,14 +154,24 @@ kernel.def @flash_next_lookup_publish(%round: index) {
   scf.for %cohort = [%c0 to %cohort_count step %c1] {
     view.store %c0_i32, %cohorts[%cohort] : i32, view<[%cohort_count]xi32>
   }
+  %first = index.add %round, %c1 : index
   %remaining_count = scf.for %old = [%c0 to %count step %c1](%next = %c0 : index) -> (index) {
     %end_word = view.load %selections[%old, 0] : view<[%capacity]x2xi32> -> i32
     %end = index.cast %end_word : i32 to index
     %committed_word = view.load %records[%old, 0] : view<[%capacity]x16xi32> -> i32
     %committed = index.cast %committed_word : i32 to index
     %row_length = view.load %spans[%old, 0] : view<[%capacity]x6xi32> -> i32
-    %finished = scalar.cmpi eq, %row_length, %c0_i32 : i32
-    %remaining = scf.select %finished, %c0, %unbounded_remaining : index
+    %stopped = scalar.cmpi eq, %row_length, %c0_i32 : i32
+    %owner_word = view.load %origins_view[%old, 2] : view<[%capacity]x3xi32> -> i32
+    %owner_value = index.cast %owner_word : i32 to index
+    %owner = index.assume %owner_value [ge(%owner_value, 0), lt(%owner_value, %target_capacity)] : index
+    %width_word = view.load %reservations[%owner, 0] : view<[%target_capacity]x6xi32> -> i32
+    %width = index.cast %width_word : i32 to index
+    // The accepted prefix and the next owner's reservation are adjacent in
+    // the target packet. Both copying and neural drafting end at this span.
+    %available = index.sub %width, %first : index
+    %remaining = scf.select %stopped, %c0, %available : index
+    %finished = index.cmp eq, %remaining, %c0 : index
     %source_limit = index.add %end, %remaining : index
     %has_match = index.cmp ugt, %end, %c0 : index
     %fits = index.cmp ule, %source_limit, %committed : index
@@ -173,7 +180,6 @@ kernel.def @flash_next_lookup_publish(%round: index) {
     %begin_word = view.load %origins_view[%old, 0] : view<[%capacity]x3xi32> -> i32
     %begin = index.cast %begin_word : i32 to index
     %new_count = scf.if %copied -> (index) {
-      %first = index.add %round, %c1 : index
       scf.for %relative = [%c0 to %remaining step %c1] {
         %position = index.add %end, %relative : index
         %id = func.call @flash_next_lookup_id(%rows, %cache, %parameters, %old, %position) : (buffer, buffer, buffer, index, index) -> (i32)
@@ -188,7 +194,6 @@ kernel.def @flash_next_lookup_publish(%round: index) {
       %row = view.load %spans[%old, 3] : view<[%capacity]x6xi32> -> i32
       %source_position = view.load %spans[%old, 4] : view<[%capacity]x6xi32> -> i32
       %target_selection = view.load %origins_view[%old, 1] : view<[%capacity]x3xi32> -> i32
-      %target_span = view.load %origins_view[%old, 2] : view<[%capacity]x3xi32> -> i32
       %slot_word = index.cast %slot : index to i32
       %id = view.load %inputs[%old] : view<[%capacity]xi32> -> i32
       %mode = view.load %modes[%old] : view<[%capacity]xi32> -> i32
@@ -201,7 +206,7 @@ kernel.def @flash_next_lookup_publish(%round: index) {
       view.store %slot_word, %spans[%slot, 5] : i32, view<[%capacity]x6xi32>
       view.store %begin_word, %origins_view[%slot, 0] : i32, view<[%capacity]x3xi32>
       view.store %target_selection, %origins_view[%slot, 1] : i32, view<[%capacity]x3xi32>
-      view.store %target_span, %origins_view[%slot, 2] : i32, view<[%capacity]x3xi32>
+      view.store %owner_word, %origins_view[%slot, 2] : i32, view<[%capacity]x3xi32>
       view.store %id, %inputs[%slot] : i32, view<[%capacity]xi32>
       view.store %mode, %modes[%slot] : i32, view<[%capacity]xi32>
       %cohort = index.div %slot, %c4 : index
