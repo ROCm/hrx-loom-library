@@ -146,6 +146,18 @@ class ModelCardTest(unittest.TestCase):
             self.run_sync()
         self.assertEqual(self.path.read_text(), self.original)
 
+    def test_nested_card_fetches_generated_paths_from_repository_root(self):
+        del self.document["programs"]["source"]["origin"]
+        self.path.write_text(json.dumps(self.document))
+        self.run_sync(fix=True)
+        files = ModelCard.parse(self.path.read_text()).select("chat").files
+        for path in ("motif/new.loom", "program/include.h"):
+            self.assertEqual(
+                (self.path.parent / files[path].origin).resolve(), self.root / path
+            )
+        self.assertEqual(files["program/start.cxx"].origin, "@code/custom/start.cxx")
+        self.assertIn("0 stale", self.run_sync())
+
     def test_conflicting_preset_compositions_do_not_write(self):
         conflict = copy.deepcopy(self.record)
         conflict["target"] = "//model/example:alternate"

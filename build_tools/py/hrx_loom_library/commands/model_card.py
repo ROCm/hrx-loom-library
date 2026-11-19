@@ -173,6 +173,9 @@ def synchronize(
         path = _card_path(context.repository_root, name)
         original = path.read_text(encoding="utf-8")
         document = _load_json(original, name)
+        # Bazel provider paths start at the repository root. Fetch resolves
+        # them from the published card unless the author supplies an origin.
+        repository_origin = "../" * len(PurePosixPath(name).parent.parts)
         changed = False
         for key, declarations in sorted(programs.items()):
             if key not in document.get("programs", {}):
@@ -190,6 +193,9 @@ def synchronize(
                 ]
                 changed |= program[role] != generated
                 program[role] = generated
+            if repository_origin and "origin" not in program:
+                program["origin"] = repository_origin
+                changed = True
         if changed:
             replacement = json.dumps(document, indent=2) + "\n"
             changes.append((path, original, replacement))
