@@ -151,15 +151,17 @@ Target verification still uses the full vocabulary and unchanged sampling and
 acceptance rules; the confidence threshold changes only how much draft work
 is attempted.
 
-Output-only stages at capacities of 128 tokens and above compact the final
-attention layer after every input row has been appended to its cache. Only
-selected query cohorts continue through attention and experts; results
-scatter back to their original packed rows.
-The normalized path retains its separate normalization and injection below
-2,048-token capacity, while larger shapes retain the fused arithmetic.
-Speculative verification and predictor catch-up consume the full hidden-state
-root and keep every row. Packet and scratch extents follow the configured
-span and token capacities rather than a fixed client count.
+Output-only stages append every input row to the attention cache, then compact
+the final layer to the query cohorts that need outputs. Their results scatter
+back to the original packed rows. Verification and predictor catch-up keep
+every row because they consume the full hidden state.
+
+The original packet's live token count selects the hyperconnection projection.
+Up to 64 tokens use dot products. Larger packets use matrix instructions, with
+integer activation packing for 1,025 through 2,048 tokens in the intermediate
+projections. The final feed-forward projection always uses floating-point
+inputs. Compaction changes the number of rows it computes while preserving the
+arithmetic it would have used on the full packet.
 
 The vocabulary projection shares each decoded Q8 row across four selected
 queries for small output capacities and eight for larger ones. A device-sized

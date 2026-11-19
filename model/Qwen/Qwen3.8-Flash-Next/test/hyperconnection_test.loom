@@ -1,4 +1,4 @@
-kernel.decl @hc_matrix_down_half(%neural_enabled: i1) launch(%epoch: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @hc_matrix_down_half(%active_rows: index) launch(%epoch: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
@@ -10,13 +10,19 @@ kernel.decl @hc_down_inject_q8(%neural_enabled: i1) launch(%epoch: buffer, %inpu
 
 kernel.decl @hc_up_mix(%neural_enabled: i1, %row_capacity: index) launch(%capacity_argument: index, %epoch: buffer, %normalized: buffer, %lowrank: buffer, %weight: buffer, %output: buffer)
 
-kernel.decl @hc_matrix_down(%neural_enabled: i1) launch(%epoch: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @hc_matrix_down(%active_rows: index) launch(%epoch: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
-kernel.decl @hc_matrix_up(%neural_enabled: i1) launch(%epoch: buffer, %normalized: buffer, %lowrank: buffer, %weight: buffer, %output: buffer)
+kernel.decl @hc_matrix_up(%active_rows: index) launch(%epoch: buffer, %normalized: buffer, %lowrank: buffer, %weight: buffer, %output: buffer)
 
 func.decl @flash_next_q8_fixture(%count: index, %inputs: index, %outputs: index, %epoch: buffer, %input: buffer, %weight: buffer)
 
 func.decl @flash_next_q8_reference_dot_arithmetic(%half_coefficients: i1, %inputs: index, %token: index, %row: index, %input: buffer, %weight: buffer) -> (f64)
+
+func.def pure @fixture_rows(%requested: index) -> (index) {
+  %capacity = config.get @flash_next.token_count : index
+  %count = index.min %requested, %capacity : index
+  func.return %count : index
+}
 
 // The existing Q8 fixture assigns finite scales and poisons inactive inputs.
 // All schedules use 133-row backing allocations. This covers the largest
@@ -24,11 +30,9 @@ func.decl @flash_next_q8_reference_dot_arithmetic(%half_coefficients: i1, %input
 kernel.def @fixture() {
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
-} launch(%requested: index, %input_width: index, %output_width: index, %epoch: buffer, %input: buffer, %weight: buffer) {
+} launch(%count: index, %input_width: index, %output_width: index, %epoch: buffer, %input: buffer, %weight: buffer) {
   %inputs = index.assume %input_width [range(%input_width, 320, 10240), multiple_of(%input_width, 32)] : index
   %outputs = index.assume %output_width [range(%output_width, 320, 10240)] : index
-  %capacity = config.get @flash_next.token_count : index
-  %count = index.min %requested, %capacity : index
   func.call @flash_next_q8_fixture(%count, %inputs, %outputs, %epoch, %input, %weight) : (index, index, index, buffer, buffer, buffer)
   kernel.return
 }
@@ -42,9 +46,8 @@ kernel.def @down_reference() {
   %threads = index.constant 64 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%half_coefficients: i1, %requested: index, %input: buffer, %weight: buffer, %output: buffer, %injection: buffer) {
+} launch(%half_coefficients: i1, %count: index, %input: buffer, %weight: buffer, %output: buffer, %injection: buffer) {
   %capacity = config.get @flash_next.token_count : index
-  %count = index.min %requested, %capacity : index
   %token = kernel.workgroup.id<y> : index
   %active = index.cmp ult, %token, %count : index
   scf.if %active {
@@ -85,9 +88,8 @@ kernel.def @up_reference() {
   %threads = index.constant 64 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%half_coefficients: i1, %requested: index, %normalized: buffer, %lowrank: buffer, %weight: buffer, %output: buffer) {
+} launch(%half_coefficients: i1, %count: index, %normalized: buffer, %lowrank: buffer, %weight: buffer, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
-  %count = index.min %requested, %capacity : index
   %token = kernel.workgroup.id<y> : index
   %active = index.cmp ult, %token, %count : index
   scf.if %active {
@@ -136,6 +138,7 @@ check.case public @hyperconnection_publications {
   %capacity = check.literal value(133) : index
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   %requested = check.param.choice values([0, 1, 2, 3, 4, 128, 131]) name("active") : index
+  %active = func.call pure @fixture_rows(%requested) : (index) -> (index)
   %full = check.literal value(false) : i1
   %half = check.literal value(true) : i1
   %width = check.literal value(10240) : index
@@ -144,7 +147,7 @@ check.case public @hyperconnection_publications {
   %epoch = check.generate.fill value(0) : tensor<3xi32>
   %normalized = check.generate.random.uniform seed(%seed) range(-0.5 to 0.5) : tensor<133x10240xbf16>
   %down = check.generate.random.uniform seed(%seed) range(-127 to 127) : tensor<320x320x34xi8>
-  kernel.launch @fixture(%requested, %width, %rank, %epoch, %normalized, %down) : (index, index, index, tensor<3xi32>, tensor<133x10240xbf16>, tensor<320x320x34xi8>)
+  kernel.launch @fixture(%active, %width, %rank, %epoch, %normalized, %down) : (index, index, index, tensor<3xi32>, tensor<133x10240xbf16>, tensor<320x320x34xi8>)
   %f32_weight = check.generate.fill value(0.0) : tensor<4x10240xf32>
   %q8_weight = check.generate.fill value(0) : tensor<4x320x34xi8>
   %lowrank_f32 = check.generate.fill value(-17.0) : tensor<133x320xbf16>
@@ -155,11 +158,11 @@ check.case public @hyperconnection_publications {
   %injection_f32 = check.generate.fill value(-17.0) : tensor<133x4xf32>
   %injection_q8 = check.generate.fill value(-17.0) : tensor<133x4xf32>
   %injection_expected = check.generate.fill value(-17.0) : tensor<133x4xf32>
-  kernel.launch @down_reference(%full, %requested, %normalized, %down, %lowrank_expected, %injection_expected) : (i1, index, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<133x320xbf16>, tensor<133x4xf32>)
-  kernel.launch @hc_down[%requested](%capacity, %epoch, %normalized, %down, %lowrank_dot) : [index](index, tensor<3xi32>, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<133x320xbf16>)
-  kernel.launch @hc_down_inject[%requested](%epoch, %normalized, %down, %f32_weight, %lowrank_f32, %injection_f32) : [index](tensor<3xi32>, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<4x10240xf32>, tensor<133x320xbf16>, tensor<133x4xf32>)
+  kernel.launch @down_reference(%full, %active, %normalized, %down, %lowrank_expected, %injection_expected) : (i1, index, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<133x320xbf16>, tensor<133x4xf32>)
+  kernel.launch @hc_down[%active](%capacity, %epoch, %normalized, %down, %lowrank_dot) : [index](index, tensor<3xi32>, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<133x320xbf16>)
+  kernel.launch @hc_down_inject[%active](%epoch, %normalized, %down, %f32_weight, %lowrank_f32, %injection_f32) : [index](tensor<3xi32>, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<4x10240xf32>, tensor<133x320xbf16>, tensor<133x4xf32>)
   kernel.launch @hc_down_inject_q8[%neural_enabled](%epoch, %normalized, %down, %q8_weight, %lowrank_q8, %injection_q8) : [i1](tensor<3xi32>, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<4x320x34xi8>, tensor<133x320xbf16>, tensor<133x4xf32>)
-  kernel.launch @hc_matrix_down[%neural_enabled](%epoch, %normalized, %down, %lowrank_matrix) : [i1](tensor<3xi32>, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<133x320xbf16>)
+  kernel.launch @hc_matrix_down[%active](%epoch, %normalized, %down, %lowrank_matrix) : [index](tensor<3xi32>, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<133x320xbf16>)
   check.expect.approximate actual(%lowrank_dot) expected(%lowrank_expected) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<133x320xbf16>, tensor<133x320xbf16>
   check.expect.approximate actual(%lowrank_matrix) expected(%lowrank_expected) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<133x320xbf16>, tensor<133x320xbf16>
   check.expect.approximate actual(%lowrank_f32) expected(%lowrank_expected) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<133x320xbf16>, tensor<133x320xbf16>
@@ -168,21 +171,21 @@ check.case public @hyperconnection_publications {
   check.expect.bitwise actual(%injection_q8) expected(%injection_expected) : tensor<133x4xf32>
   %lowrank_half = check.generate.fill value(-17.0) : tensor<133x320xbf16>
   %lowrank_half_expected = check.generate.fill value(-17.0) : tensor<133x320xbf16>
-  kernel.launch @down_reference(%half, %requested, %normalized, %down, %lowrank_half_expected, %injection_expected) : (i1, index, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<133x320xbf16>, tensor<133x4xf32>)
-  kernel.launch @hc_matrix_down_half[%neural_enabled](%epoch, %normalized, %down, %lowrank_half) : [i1](tensor<3xi32>, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<133x320xbf16>)
+  kernel.launch @down_reference(%half, %active, %normalized, %down, %lowrank_half_expected, %injection_expected) : (i1, index, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<133x320xbf16>, tensor<133x4xf32>)
+  kernel.launch @hc_matrix_down_half[%active](%epoch, %normalized, %down, %lowrank_half) : [index](tensor<3xi32>, tensor<133x10240xbf16>, tensor<320x320x34xi8>, tensor<133x320xbf16>)
   check.expect.approximate actual(%lowrank_half) expected(%lowrank_half_expected) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<133x320xbf16>, tensor<133x320xbf16>
   %up = check.generate.random.uniform seed(%seed) range(-127 to 127) : tensor<10240x10x34xi8>
   %lowrank = check.generate.random.uniform seed(%seed) range(-0.5 to 0.5) : tensor<133x320xbf16>
-  kernel.launch @fixture(%requested, %rank, %width, %epoch, %lowrank, %up) : (index, index, index, tensor<3xi32>, tensor<133x320xbf16>, tensor<10240x10x34xi8>)
+  kernel.launch @fixture(%active, %rank, %width, %epoch, %lowrank, %up) : (index, index, index, tensor<3xi32>, tensor<133x320xbf16>, tensor<10240x10x34xi8>)
   %mixed = check.generate.fill value(-17.0) : tensor<133x2560xbf16>
   %mixed_matrix = check.generate.fill value(-17.0) : tensor<133x2560xbf16>
   %mixed_expected = check.generate.fill value(-17.0) : tensor<133x2560xbf16>
-  kernel.launch @up_reference(%full, %requested, %normalized, %lowrank, %up, %mixed_expected) : (i1, index, tensor<133x10240xbf16>, tensor<133x320xbf16>, tensor<10240x10x34xi8>, tensor<133x2560xbf16>)
+  kernel.launch @up_reference(%full, %active, %normalized, %lowrank, %up, %mixed_expected) : (i1, index, tensor<133x10240xbf16>, tensor<133x320xbf16>, tensor<10240x10x34xi8>, tensor<133x2560xbf16>)
   kernel.launch @hc_up_mix[%neural_enabled, %capacity](%capacity, %epoch, %normalized, %lowrank, %up, %mixed) : [i1, index](index, tensor<3xi32>, tensor<133x10240xbf16>, tensor<133x320xbf16>, tensor<10240x10x34xi8>, tensor<133x2560xbf16>)
   check.expect.approximate actual(%mixed) expected(%mixed_expected) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<133x2560xbf16>, tensor<133x2560xbf16>
   %mixed_half_expected = check.generate.fill value(-17.0) : tensor<133x2560xbf16>
-  kernel.launch @up_reference(%half, %requested, %normalized, %lowrank, %up, %mixed_half_expected) : (i1, index, tensor<133x10240xbf16>, tensor<133x320xbf16>, tensor<10240x10x34xi8>, tensor<133x2560xbf16>)
-  kernel.launch @hc_matrix_up[%neural_enabled](%epoch, %normalized, %lowrank, %up, %mixed_matrix) : [i1](tensor<3xi32>, tensor<133x10240xbf16>, tensor<133x320xbf16>, tensor<10240x10x34xi8>, tensor<133x2560xbf16>)
+  kernel.launch @up_reference(%half, %active, %normalized, %lowrank, %up, %mixed_half_expected) : (i1, index, tensor<133x10240xbf16>, tensor<133x320xbf16>, tensor<10240x10x34xi8>, tensor<133x2560xbf16>)
+  kernel.launch @hc_matrix_up[%active](%epoch, %normalized, %lowrank, %up, %mixed_matrix) : [index](tensor<3xi32>, tensor<133x10240xbf16>, tensor<133x320xbf16>, tensor<10240x10x34xi8>, tensor<133x2560xbf16>)
   check.expect.approximate actual(%mixed_matrix) expected(%mixed_half_expected) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<133x2560xbf16>, tensor<133x2560xbf16>
   check.return
 }

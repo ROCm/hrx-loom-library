@@ -850,6 +850,56 @@ kernel.def target(@flash_next_hc_wave32) @hc_combine_normalize_inject(%live_rows
   kernel.return
 }
 
+// Choose precision from the original packet. Compact final-layer outputs
+// compute fewer rows with the same arithmetic as their full-hidden peers.
+func.def public pure inline @flash_next_hc_projection_rows(%packet: index, %active: index, %allow_quantized: i1) -> (index, index, index, index) {
+  %zero = index.constant 0 : index
+  %dot_limit = index.constant 64 : index
+  %float_limit, %quantized_limit = func.call pure @hc_quantized_range() : () -> (index, index)
+  %short = index.cmp ule, %packet, %dot_limit : index
+  %large = index.cmp ugt, %packet, %quantized_limit : index
+  %above_float = index.cmp ugt, %packet, %float_limit : index
+  %quantize = scalar.andi %allow_quantized, %above_float : i1
+  %dot = scf.select %short, %active, %zero : index
+  %matrix = scf.select %short, %zero, %active : index
+  %medium = scf.select %large, %zero, %matrix : index
+  %full = scf.select %quantize, %zero, %medium : index
+  %integer = scf.select %quantize, %medium, %zero : index
+  %half = scf.select %large, %matrix, %zero : index
+  func.return %dot, %full, %integer, %half : index, index, index, index
+}
+
+func.def pure inline @hc_quantized_range() -> (index, index) {
+  %lower_exclusive = index.constant 1024 : index
+  %upper_inclusive = index.constant 2048 : index
+  func.return %lower_exclusive, %upper_inclusive : index, index
+}
+
+// The integer producer publishes BF16 rows and packed input together. At
+// larger capacities their combined storage fits inside the normal BF16 array.
+// One packed tile holds 320 records of 512 codes and 16 F32 scales apiece.
+func.def public pure inline @flash_next_hc_workspace(%capacity: index, %allow_quantized: i1) -> (index, index, offset, offset) {
+  %lower, %upper = func.call pure @hc_quantized_range() : () -> (index, index)
+  %reachable = index.cmp ugt, %capacity, %lower : index
+  %quantize = scalar.andi %allow_quantized, %reachable : i1
+  %limit = index.min %capacity, %upper : index
+  %zero = index.constant 0 : index
+  %bound = scf.select %quantize, %limit, %zero : index
+  %sixteen = index.constant 16 : index
+  %rounding = index.constant 15 : index
+  %padded = index.add %bound, %rounding : index
+  %tiles = index.div %padded, %sixteen : index
+  %tile_bytes = index.constant 184320 : offset
+  %row_bytes = index.constant 20480 : offset
+  %packed = index.scale %tiles, %tile_bytes : index, offset -> offset
+  %origin = index.scale %bound, %row_bytes : index, offset -> offset
+  %combined = index.add %origin, %packed : offset
+  %normalized = index.scale %capacity, %row_bytes : index, offset -> offset
+  %fits = index.cmp uge, %normalized, %combined : offset
+  %workspace = scf.select %fits, %normalized, %combined : offset
+  func.return %bound, %tiles, %origin, %workspace : index, index, offset, offset
+}
+
 amdgpu.target<gfx11-generic> @hc_int8_wave32 {subgroup_size = 32}
 
 func.def inline @hc_quantize_chunk(%token: index, %stream: index, %channel: index, %values: vector<8xbf16>, %output: buffer) {
@@ -935,12 +985,11 @@ func.def inline @hc_int8_record(%input: buffer, %record_base: index, %first_bloc
   func.return %codes, %scale : vector<4xi32>, f32
 }
 
-kernel.def target(@hc_int8_wave32) @hc_matrix_down_int8() {
-  %capacity = config.get @flash_next.token_count : index
+kernel.def target(@hc_int8_wave32) @hc_matrix_down_int8(%active_rows: index) {
   %c1 = index.constant 1 : index
   %c128 = index.constant 128 : index
   %rounding = index.constant 127 : index
-  %padded = index.add %capacity, %rounding : index
+  %padded = index.add %active_rows, %rounding : index
   %panels = index.div %padded, %c128 : index
   %groups = index.constant 5 : index
   %threads = index.constant 256 : index
@@ -1145,7 +1194,7 @@ kernel.def target(@flash_next_hc_wave32) @hc_normalize_inject_int8(%live_rows: i
     %first = index.mul %lane, %c8 : index
     %input_view = buffer.view %residual[%origin] : buffer -> view<[%tokens]x4x2560xbf16>
     %gamma_view = buffer.view %gamma[%origin] : buffer -> view<4x2560xf32>
-    %output_view = buffer.view %normalized[%origin] : buffer -> view<[%tokens]x4x2560xbf16>
+    %output_view = buffer.view %normalized[%origin] : buffer -> view<[%end]x4x2560xbf16>
     %c0 = scalar.constant 0.0 : f32
     %c0_vector = vector.splatf 0.0 : vector<8xf32>
     %partial = scf.for %channel = [%first to %width step %stride](%accumulator = %c0_vector : vector<8xf32>) -> (vector<8xf32>) {
@@ -1170,7 +1219,7 @@ kernel.def target(@flash_next_hc_wave32) @hc_normalize_inject_int8(%live_rows: i
       %unit = vector.mulf %values, %inverse_vector : vector<8xf32>
       %scaled = vector.mulf %unit, %scales : vector<8xf32>
       %packed = vector.fptrunc %scaled : vector<8xf32> to vector<8xbf16>
-      vector.store %packed, %output_view[%token, %stream, %channel] : vector<8xbf16>, view<[%tokens]x4x2560xbf16>
+      vector.store %packed, %output_view[%token, %stream, %channel] : vector<8xbf16>, view<[%end]x4x2560xbf16>
       func.call @hc_quantize_chunk(%token, %stream, %channel, %packed, %quantized) : (index, index, index, vector<8xbf16>, buffer)
       %next_dots = func.call @hc_injection_chunk(%stream, %channel, %packed, %next_weight, %current_dots) : (index, index, vector<8xbf16>, buffer, vector<4x8xf32>) -> (vector<4x8xf32>)
       scf.yield %next_dots : vector<4x8xf32>
@@ -1204,7 +1253,7 @@ kernel.def target(@flash_next_hc_wave32) @hc_combine_normalize_inject_int8(%live
     %first = index.mul %lane, %c8 : index
     %input_view = buffer.view %residual[%origin] : buffer -> view<[%tokens]x4x2560xbf16>
     %gamma_view = buffer.view %gamma[%origin] : buffer -> view<4x2560xf32>
-    %output_view = buffer.view %normalized[%origin] : buffer -> view<[%tokens]x4x2560xbf16>
+    %output_view = buffer.view %normalized[%origin] : buffer -> view<[%end]x4x2560xbf16>
     %c0 = scalar.constant 0.0 : f32
     %c0_vector = vector.splatf 0.0 : vector<8xf32>
     %projected_view = buffer.view %projected[%origin] : buffer -> view<[%tokens]x2560xbf16>
@@ -1248,7 +1297,7 @@ kernel.def target(@flash_next_hc_wave32) @hc_combine_normalize_inject_int8(%live
       %unit = vector.mulf %values, %inverse_vector : vector<8xf32>
       %scaled = vector.mulf %unit, %scales : vector<8xf32>
       %packed = vector.fptrunc %scaled : vector<8xf32> to vector<8xbf16>
-      vector.store %packed, %output_view[%token, %stream, %channel] : vector<8xbf16>, view<[%tokens]x4x2560xbf16>
+      vector.store %packed, %output_view[%token, %stream, %channel] : vector<8xbf16>, view<[%end]x4x2560xbf16>
       func.call @hc_quantize_chunk(%token, %stream, %channel, %packed, %quantized) : (index, index, index, vector<8xbf16>, buffer)
       %next_dots = func.call @hc_injection_chunk(%stream, %channel, %packed, %next_weight, %current_dots) : (index, index, vector<8xbf16>, buffer, vector<4x8xf32>) -> (vector<4x8xf32>)
       scf.yield %next_dots : vector<4x8xf32>

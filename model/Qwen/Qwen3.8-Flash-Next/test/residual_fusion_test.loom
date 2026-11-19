@@ -1,7 +1,10 @@
+func.decl pure @flash_next_hc_projection_rows(%packet: index, %active: index, %allow_quantized: i1) -> (index, index, index, index)
+
+func.decl pure @flash_next_hc_workspace(%capacity: index, %allow_quantized: i1) -> (index, index, offset, offset)
+
 // Fused publication must preserve the residual/normalization boundary and
 // injection values of separate dispatches. Quantized panels are checked from
 // the published BF16 values with an independent scalar layout and arithmetic.
-
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
 kernel.decl @hc_normalize(%neural_enabled: i1, %row_capacity: index) launch(%capacity_argument: index, %epoch: buffer, %residual: buffer, %gamma: buffer, %normalized: buffer)
@@ -205,3 +208,67 @@ check.case public @residual_publication {
 }
 
 check.benchmark<@residual_publication> @residual_publication_benchmark
+
+// Compacting a medium packet to three rows keeps the packet's precision.
+// The final mixer keeps its floating input in both full and compact forms.
+check.case public @compact_projection_precision {
+  %packet = check.param.choice values([1025, 1998, 2048]) name("packet") : index
+  %active = check.literal value(3) : index
+  %zero = check.literal value(0) : index
+  %enabled = check.literal value(true) : i1
+  %dot, %full, %integer, %half = func.call pure @flash_next_hc_projection_rows(%packet, %active, %enabled) : (index, index, i1) -> (index, index, index, index)
+  check.expect.equal actual(%dot) expected(%zero) : index
+  check.expect.equal actual(%full) expected(%zero) : index
+  check.expect.equal actual(%integer) expected(%active) : index
+  check.expect.equal actual(%half) expected(%zero) : index
+  %final = check.literal value(false) : i1
+  %final_dot, %final_full, %final_integer, %final_half = func.call pure @flash_next_hc_projection_rows(%packet, %active, %final) : (index, index, i1) -> (index, index, index, index)
+  check.expect.equal actual(%final_dot) expected(%zero) : index
+  check.expect.equal actual(%final_full) expected(%active) : index
+  check.expect.equal actual(%final_integer) expected(%zero) : index
+  check.expect.equal actual(%final_half) expected(%zero) : index
+  check.return
+}
+
+// The neighboring packets exercise both sides of every arithmetic transition.
+check.case public @projection_packet_boundaries {
+  %dot_end = check.literal value(64) : index
+  %full_start = check.literal value(65) : index
+  %full_end = check.literal value(1024) : index
+  %half_start = check.literal value(2049) : index
+  %active = check.literal value(1) : index
+  %enabled = check.literal value(true) : i1
+  %dot, %d1, %d2, %d3 = func.call pure @flash_next_hc_projection_rows(%dot_end, %active, %enabled) : (index, index, i1) -> (index, index, index, index)
+  %f0, %full_first, %f2, %f3 = func.call pure @flash_next_hc_projection_rows(%full_start, %active, %enabled) : (index, index, i1) -> (index, index, index, index)
+  %e0, %full_last, %e2, %e3 = func.call pure @flash_next_hc_projection_rows(%full_end, %active, %enabled) : (index, index, i1) -> (index, index, index, index)
+  %h0, %h1, %h2, %half = func.call pure @flash_next_hc_projection_rows(%half_start, %active, %enabled) : (index, index, i1) -> (index, index, index, index)
+  check.expect.equal actual(%dot) expected(%active) : index
+  check.expect.equal actual(%full_first) expected(%active) : index
+  check.expect.equal actual(%full_last) expected(%active) : index
+  check.expect.equal actual(%half) expected(%active) : index
+  check.return
+}
+
+check.case public @normalized_and_packed_storage {
+  %enabled = check.literal value(true) : i1
+  %capacity = check.literal value(16384) : index
+  %bound, %tiles, %origin, %bytes = func.call pure @flash_next_hc_workspace(%capacity, %enabled) : (index, i1) -> (index, index, offset, offset)
+  %expected_bound = check.literal value(2048) : index
+  %expected_tiles = check.literal value(128) : index
+  %expected_origin = check.literal value(41943040) : offset
+  %normalized_bytes = check.literal value(335544320) : offset
+  check.expect.equal actual(%bound) expected(%expected_bound) : index
+  check.expect.equal actual(%tiles) expected(%expected_tiles) : index
+  check.expect.equal actual(%origin) expected(%expected_origin) : offset
+  check.expect.equal actual(%bytes) expected(%normalized_bytes) : offset
+  %odd_capacity = check.literal value(1025) : index
+  %odd_bound, %odd_tiles, %odd_origin, %odd_bytes = func.call pure @flash_next_hc_workspace(%odd_capacity, %enabled) : (index, i1) -> (index, index, offset, offset)
+  %partial_tiles = check.literal value(65) : index
+  %partial_origin = check.literal value(20992000) : offset
+  %combined = check.literal value(32972800) : offset
+  check.expect.equal actual(%odd_bound) expected(%odd_capacity) : index
+  check.expect.equal actual(%odd_tiles) expected(%partial_tiles) : index
+  check.expect.equal actual(%odd_origin) expected(%partial_origin) : offset
+  check.expect.equal actual(%odd_bytes) expected(%combined) : offset
+  check.return
+}
