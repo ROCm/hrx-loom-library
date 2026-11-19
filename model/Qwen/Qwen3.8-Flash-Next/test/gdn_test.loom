@@ -1,8 +1,8 @@
-kernel.decl @gdn_convolve() launch(%span: buffer, %origins: buffer, %layer_origin: offset, %qkv: buffer, %weight: buffer, %history: buffer, %convolved: buffer, %norm: buffer)
+kernel.decl @gdn_convolve(%active_spans: index) launch(%row_capacity: index, %span: buffer, %origins: buffer, %layer_origin: offset, %qkv: buffer, %weight: buffer, %history: buffer, %convolved: buffer, %norm: buffer)
 
-kernel.decl @gdn_recur() launch(%span: buffer, %origins: buffer, %layer_origin: offset, %qkv: buffer, %norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer)
+kernel.decl @gdn_recur(%active_spans: index) launch(%span: buffer, %origins: buffer, %layer_origin: offset, %qkv: buffer, %norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer)
 
-kernel.decl @gdn_recur_window() launch(%span: buffer, %origins: buffer, %layer_origin: offset, %qkv: buffer, %norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer)
+kernel.decl @gdn_recur_window(%active_spans: index) launch(%span: buffer, %origins: buffer, %layer_origin: offset, %qkv: buffer, %norm: buffer, %alpha: buffer, %beta: buffer, %a: buffer, %bias: buffer, %state: buffer, %output: buffer)
 
 kernel.decl @gdn_gate() launch(%span: buffer, %raw: buffer, %z: buffer, %weight: buffer, %output: buffer)
 
@@ -235,6 +235,8 @@ kernel.def @prepare_single_span() {
 
 check.case public @gdn_state_continuation {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  %capacity = check.literal value(5) : index
+  %span_workers = check.literal value(1) : index
   %rows = check.generate.fill value(0) : tensor<4xi64>
   %layer_origin = check.literal value(0) : offset
 
@@ -271,7 +273,7 @@ check.case public @gdn_state_continuation {
   %norm_ref = check.generate.fill value(19.0) : tensor<5x32xf32>
   %norm_split = check.generate.fill value(23.0) : tensor<5x32xf32>
   kernel.launch @reference_convolution(%qkv, %weight, %history_ref, %convolved_ref, %norm_ref) : (tensor<5x10240xbf16>, tensor<10240x4xf32>, tensor<3x10240xbf16>, tensor<5x10240xbf16>, tensor<5x32xf32>)
-  kernel.launch @gdn_convolve(%whole, %rows, %layer_origin, %qkv, %weight, %history, %convolved, %norm) : (tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<10240x4xf32>, tensor<3x10240xbf16>, tensor<5x10240xbf16>, tensor<5x32xf32>)
+  kernel.launch @gdn_convolve[%span_workers](%capacity, %whole, %rows, %layer_origin, %qkv, %weight, %history, %convolved, %norm) : [index](index, tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<10240x4xf32>, tensor<3x10240xbf16>, tensor<5x10240xbf16>, tensor<5x32xf32>)
   check.expect.approximate actual(%convolved) expected(%convolved_ref) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<5x10240xbf16>, tensor<5x10240xbf16>
   check.expect.approximate actual(%norm) expected(%norm_ref) atol(1.9999999999999999e-06) rtol(2.0000000000000002e-05) nan(different) : tensor<5x32xf32>, tensor<5x32xf32>
   check.expect.bitwise actual(%history) expected(%history_ref) : tensor<3x10240xbf16>
@@ -287,7 +289,7 @@ check.case public @gdn_state_continuation {
   %raw_ref = check.generate.fill value(19.0) : tensor<5x6144xbf16>
   %raw_split = check.generate.fill value(23.0) : tensor<5x6144xbf16>
   kernel.launch @reference_recurrence(%convolved, %norm, %alpha, %beta, %a, %bias, %state_ref, %raw_ref) : (tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
-  kernel.launch @gdn_recur(%whole, %rows, %layer_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %state, %raw) : (tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
+  kernel.launch @gdn_recur[%span_workers](%whole, %rows, %layer_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %state, %raw) : [index](tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
   check.expect.approximate actual(%raw) expected(%raw_ref) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<5x6144xbf16>, tensor<5x6144xbf16>
   check.expect.approximate actual(%state) expected(%state_ref) atol(1.9999999999999999e-06) rtol(2.0000000000000002e-05) nan(different) : tensor<48x128x128xf32>, tensor<48x128x128xf32>
 
@@ -297,12 +299,12 @@ check.case public @gdn_state_continuation {
   %state_window_split = check.generate.random.uniform seed(%seed4) range(-0.02 to 0.02) : tensor<48x128x128xf32>
   %raw_window = check.generate.fill value(-17.0) : tensor<5x6144xbf16>
   %raw_window_split = check.generate.fill value(23.0) : tensor<5x6144xbf16>
-  kernel.launch @gdn_recur_window(%whole, %rows, %layer_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %state_window, %raw_window) : (tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
+  kernel.launch @gdn_recur_window[%span_workers](%whole, %rows, %layer_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %state_window, %raw_window) : [index](tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
   check.expect.approximate actual(%raw_window) expected(%raw_ref) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<5x6144xbf16>, tensor<5x6144xbf16>
   check.expect.approximate actual(%state_window) expected(%state_ref) atol(1.9999999999999999e-06) rtol(2.0000000000000002e-05) nan(different) : tensor<48x128x128xf32>, tensor<48x128x128xf32>
-  kernel.launch @gdn_recur_window(%first, %rows, %layer_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %state_window_split, %raw_window_split) : (tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
-  kernel.launch @gdn_recur_window(%second, %rows, %layer_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %state_window_split, %raw_window_split) : (tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
-  kernel.launch @gdn_recur_window(%decode, %rows, %layer_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %state_window_split, %raw_window_split) : (tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
+  kernel.launch @gdn_recur_window[%span_workers](%first, %rows, %layer_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %state_window_split, %raw_window_split) : [index](tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
+  kernel.launch @gdn_recur_window[%span_workers](%second, %rows, %layer_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %state_window_split, %raw_window_split) : [index](tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
+  kernel.launch @gdn_recur_window[%span_workers](%decode, %rows, %layer_origin, %convolved, %norm, %alpha, %beta, %a, %bias, %state_window_split, %raw_window_split) : [index](tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
   check.expect.bitwise actual(%raw_window_split) expected(%raw_window) : tensor<5x6144xbf16>
   check.expect.bitwise actual(%state_window_split) expected(%state_window) : tensor<48x128x128xf32>
 
@@ -315,14 +317,14 @@ check.case public @gdn_state_continuation {
   kernel.launch @gdn_gate(%whole, %raw, %z, %gamma, %gated) : (tensor<9xi32>, tensor<5x6144xbf16>, tensor<5x6144xbf16>, tensor<128xf32>, tensor<5x6144xbf16>)
   check.expect.approximate actual(%gated) expected(%gated_ref) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<5x6144xbf16>, tensor<5x6144xbf16>
 
-  kernel.launch @gdn_convolve(%first, %rows, %layer_origin, %qkv, %weight, %history_split, %convolved_split, %norm_split) : (tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<10240x4xf32>, tensor<3x10240xbf16>, tensor<5x10240xbf16>, tensor<5x32xf32>)
-  kernel.launch @gdn_recur(%first, %rows, %layer_origin, %convolved_split, %norm_split, %alpha, %beta, %a, %bias, %state_split, %raw_split) : (tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
+  kernel.launch @gdn_convolve[%span_workers](%capacity, %first, %rows, %layer_origin, %qkv, %weight, %history_split, %convolved_split, %norm_split) : [index](index, tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<10240x4xf32>, tensor<3x10240xbf16>, tensor<5x10240xbf16>, tensor<5x32xf32>)
+  kernel.launch @gdn_recur[%span_workers](%first, %rows, %layer_origin, %convolved_split, %norm_split, %alpha, %beta, %a, %bias, %state_split, %raw_split) : [index](tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
   kernel.launch @gdn_gate(%first, %raw_split, %z, %gamma, %gated_split) : (tensor<9xi32>, tensor<5x6144xbf16>, tensor<5x6144xbf16>, tensor<128xf32>, tensor<5x6144xbf16>)
-  kernel.launch @gdn_convolve(%second, %rows, %layer_origin, %qkv, %weight, %history_split, %convolved_split, %norm_split) : (tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<10240x4xf32>, tensor<3x10240xbf16>, tensor<5x10240xbf16>, tensor<5x32xf32>)
-  kernel.launch @gdn_recur(%second, %rows, %layer_origin, %convolved_split, %norm_split, %alpha, %beta, %a, %bias, %state_split, %raw_split) : (tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
+  kernel.launch @gdn_convolve[%span_workers](%capacity, %second, %rows, %layer_origin, %qkv, %weight, %history_split, %convolved_split, %norm_split) : [index](index, tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<10240x4xf32>, tensor<3x10240xbf16>, tensor<5x10240xbf16>, tensor<5x32xf32>)
+  kernel.launch @gdn_recur[%span_workers](%second, %rows, %layer_origin, %convolved_split, %norm_split, %alpha, %beta, %a, %bias, %state_split, %raw_split) : [index](tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
   kernel.launch @gdn_gate(%second, %raw_split, %z, %gamma, %gated_split) : (tensor<9xi32>, tensor<5x6144xbf16>, tensor<5x6144xbf16>, tensor<128xf32>, tensor<5x6144xbf16>)
-  kernel.launch @gdn_convolve(%decode, %rows, %layer_origin, %qkv, %weight, %history_split, %convolved_split, %norm_split) : (tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<10240x4xf32>, tensor<3x10240xbf16>, tensor<5x10240xbf16>, tensor<5x32xf32>)
-  kernel.launch @gdn_recur(%decode, %rows, %layer_origin, %convolved_split, %norm_split, %alpha, %beta, %a, %bias, %state_split, %raw_split) : (tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
+  kernel.launch @gdn_convolve[%span_workers](%capacity, %decode, %rows, %layer_origin, %qkv, %weight, %history_split, %convolved_split, %norm_split) : [index](index, tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<10240x4xf32>, tensor<3x10240xbf16>, tensor<5x10240xbf16>, tensor<5x32xf32>)
+  kernel.launch @gdn_recur[%span_workers](%decode, %rows, %layer_origin, %convolved_split, %norm_split, %alpha, %beta, %a, %bias, %state_split, %raw_split) : [index](tensor<9xi32>, tensor<4xi64>, offset, tensor<5x10240xbf16>, tensor<5x32xf32>, tensor<5x48xf32>, tensor<5x48xf32>, tensor<48xf32>, tensor<48xf32>, tensor<48x128x128xf32>, tensor<5x6144xbf16>)
   kernel.launch @gdn_gate(%decode, %raw_split, %z, %gamma, %gated_split) : (tensor<9xi32>, tensor<5x6144xbf16>, tensor<5x6144xbf16>, tensor<128xf32>, tensor<5x6144xbf16>)
   check.expect.bitwise actual(%convolved_split) expected(%convolved) : tensor<5x10240xbf16>
   check.expect.bitwise actual(%norm_split) expected(%norm) : tensor<5x32xf32>

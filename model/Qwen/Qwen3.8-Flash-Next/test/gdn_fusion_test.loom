@@ -1,10 +1,18 @@
 kernel.decl @flash_next_prepare_q8_channels(%configured_inputs: index, %configured_outputs: index) launch(%input_width: index, %weight: buffer)
 
-kernel.decl @gdn_fused_projection() launch(%epoch: buffer, %input: buffer, %weight: buffer, %conv: buffer, %halo: buffer, %output: buffer, %norm: buffer, %capture: buffer, %capture_origin: offset)
+kernel.decl @gdn_fused_projection(%active_rows: index) launch(%epoch: buffer, %input: buffer, %weight: buffer, %conv: buffer, %halo: buffer, %output: buffer, %norm: buffer, %capture: buffer, %capture_origin: offset)
 
-kernel.decl @gdn_fused_boundary() launch(%epoch: buffer, %rows: buffer, %history_origin: offset, %halo: buffer, %weight: buffer, %arena: buffer, %output: buffer, %norm: buffer)
+kernel.decl @gdn_fused_boundary(%active_spans: index) launch(%epoch: buffer, %rows: buffer, %history_origin: offset, %halo: buffer, %weight: buffer, %arena: buffer, %output: buffer, %norm: buffer)
 
-kernel.decl @gdn_convolve() launch(%epoch: buffer, %rows: buffer, %history_origin: offset, %qkv: buffer, %weight: buffer, %arena: buffer, %output: buffer, %norm: buffer)
+kernel.decl @gdn_convolve(%active_spans: index) launch(%row_capacity: index, %epoch: buffer, %rows: buffer, %history_origin: offset, %qkv: buffer, %weight: buffer, %arena: buffer, %output: buffer, %norm: buffer)
+
+func.def pure @packed_span_count(%tokens: index) -> (index) {
+  %zero = index.constant 0 : index
+  %eighteen = index.constant 18 : index
+  %empty = index.cmp eq, %tokens, %zero : index
+  %count = scf.select %empty, %zero, %eighteen : index
+  func.return %count : index
+}
 
 // Eighteen spans share sixteen workers. The first five have lengths 125, 1,
 // 2, 3, and 109. Twelve singleton spans follow, then an eight-token verifier
@@ -23,7 +31,6 @@ kernel.def @packed_sessions() {
   %c3 = index.constant 3 : index
   %c4 = index.constant 4 : index
   %last_span = index.constant 17 : index
-  %packed_spans = index.constant 18 : index
   %c8 = index.constant 8 : index
   %fifth_length = index.constant 109 : index
   %c125 = index.constant 125 : index
@@ -32,8 +39,7 @@ kernel.def @packed_sessions() {
   %descriptors = buffer.view %epoch[%descriptor_origin] : buffer -> view<20x6xi32>
   %modes = buffer.view %epoch[%mode_origin] : buffer -> view<20x2xi32>
   %origins = buffer.view %rows[%origin] : buffer -> view<20x5xi64>
-  %empty = index.cmp eq, %count, %c0 : index
-  %span_count = scf.select %empty, %c0, %packed_spans : index
+  %span_count = func.call pure @packed_span_count(%count) : (index) -> (index)
   %count_word = index.cast %count : index to i32
   %span_word = index.cast %span_count : index to i32
   view.store %count_word, %header[0] : i32, view<3xi32>
@@ -211,6 +217,7 @@ check.case public @packed_projection_convolution {
   %capacity = check.literal value(4096) : index
   %capture_capacity = check.literal value(4098) : index
   %count = check.param.choice values([0, 260]) name("active") : index
+  %active_spans = func.call pure @packed_span_count(%count) : (index) -> (index)
   %seed = check.literal value(711261) : i64
   %epoch = check.generate.fill value(0) : tensor<10762xi32>
   %rows = check.generate.fill value(0) : tensor<20x5xi64>
@@ -234,9 +241,9 @@ check.case public @packed_projection_convolution {
   %capture = check.generate.fill value(-23.0) : tensor<[%capture_capacity]x10240xbf16>
   %history_origin = check.literal value(0) : offset
   %capture_origin = check.literal value(20480) : offset
-  kernel.launch @gdn_convolve(%epoch, %rows, %history_origin, %raw, %conv, %expected_arena, %expected, %expected_norm) : (tensor<10762xi32>, tensor<20x5xi64>, offset, tensor<[%capacity]x10240xbf16>, tensor<10240x4xf32>, tensor<20x8x10240xbf16>, tensor<[%capacity]x10240xbf16>, tensor<[%capacity]x32xf32>)
-  kernel.launch @gdn_fused_projection(%epoch, %input, %weight, %conv, %halo, %output, %norm, %capture, %capture_origin) : (tensor<10762xi32>, tensor<[%capacity]x2560xbf16>, tensor<10240x80x34xi8>, tensor<10240x4xf32>, tensor<22x6x10240xbf16>, tensor<[%capacity]x10240xbf16>, tensor<[%capacity]x32xf32>, tensor<[%capture_capacity]x10240xbf16>, offset)
-  kernel.launch @gdn_fused_boundary(%epoch, %rows, %history_origin, %halo, %conv, %arena, %output, %norm) : (tensor<10762xi32>, tensor<20x5xi64>, offset, tensor<22x6x10240xbf16>, tensor<10240x4xf32>, tensor<20x8x10240xbf16>, tensor<[%capacity]x10240xbf16>, tensor<[%capacity]x32xf32>)
+  kernel.launch @gdn_convolve[%active_spans](%capacity, %epoch, %rows, %history_origin, %raw, %conv, %expected_arena, %expected, %expected_norm) : [index](index, tensor<10762xi32>, tensor<20x5xi64>, offset, tensor<[%capacity]x10240xbf16>, tensor<10240x4xf32>, tensor<20x8x10240xbf16>, tensor<[%capacity]x10240xbf16>, tensor<[%capacity]x32xf32>)
+  kernel.launch @gdn_fused_projection[%count](%epoch, %input, %weight, %conv, %halo, %output, %norm, %capture, %capture_origin) : [index](tensor<10762xi32>, tensor<[%capacity]x2560xbf16>, tensor<10240x80x34xi8>, tensor<10240x4xf32>, tensor<22x6x10240xbf16>, tensor<[%capacity]x10240xbf16>, tensor<[%capacity]x32xf32>, tensor<[%capture_capacity]x10240xbf16>, offset)
+  kernel.launch @gdn_fused_boundary[%active_spans](%epoch, %rows, %history_origin, %halo, %conv, %arena, %output, %norm) : [index](tensor<10762xi32>, tensor<20x5xi64>, offset, tensor<22x6x10240xbf16>, tensor<10240x4xf32>, tensor<20x8x10240xbf16>, tensor<[%capacity]x10240xbf16>, tensor<[%capacity]x32xf32>)
   check.expect.bitwise actual(%output) expected(%expected) : tensor<[%capacity]x10240xbf16>
   check.expect.bitwise actual(%norm) expected(%expected_norm) : tensor<[%capacity]x32xf32>
   check.expect.bitwise actual(%arena) expected(%expected_arena) : tensor<20x8x10240xbf16>
