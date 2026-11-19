@@ -64,11 +64,13 @@ kernel.decl @qsa_merge_cohorts(%cohort_tokens: index) launch(%epoch: buffer, %se
 
 kernel.decl @qsa_cohort_attention(%cohort_tokens: index) launch(%key_origin: offset, %value_origin: offset, %epoch: buffer, %rows: buffer, %queries: buffer, %gates: buffer, %arena: buffer, %cohorts: buffer, %output: buffer)
 
-kernel.decl @qsa_score_blocks(%neural_enabled: i1) launch(%query_begin_arg: index, %index_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
+func.decl pure @qsa_tile_rows(%end: index, %begin: index, %capacity: index) -> (index)
 
-kernel.decl @qsa_score_tiled(%neural_enabled: i1) launch(%query_begin_arg: index, %index_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
+kernel.decl @qsa_score_blocks(%tile_rows: index) launch(%query_begin_arg: index, %index_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
 
-kernel.decl @qsa_select_blocks(%neural_enabled: i1) launch(%query_begin_arg: index, %span: buffer, %mapping: buffer, %scores: buffer, %selected: buffer)
+kernel.decl @qsa_score_tiled(%tile_rows: index) launch(%query_begin_arg: index, %index_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
+
+kernel.decl @qsa_select_blocks(%tile_rows: index) launch(%query_begin_arg: index, %span: buffer, %mapping: buffer, %scores: buffer, %selected: buffer)
 
 template.decl @flash_next.project_dense_q8(%split_scales: i1, %workload_count: index, %inputs: index, %outputs: index, %blocks: index, %span: buffer, %input: buffer, %weight: view<[%outputs]x[%blocks]x34xi8>, %output: buffer)
 
@@ -237,13 +239,13 @@ command.def public @flash_next_qsa_queries(%workload_count: index, %layer: index
   // larger cohort needed to amortize the final attention union.
   %matrix_score = index.cmp uge, %query_capacity, %c4 : index
   scf.for %query_begin = [%query_zero to %tokens step %query_capacity] unroll {
-    %tile_live = index.cmp ult, %query_begin, %workload_count : index
+    %tile_rows = func.call pure @qsa_tile_rows(%workload_count, %query_begin, %query_capacity) : (index, index, index) -> (index)
     scf.if %matrix_score {
-      kernel.launch @qsa_score_tiled[%tile_live](%query_begin, %index_origin, %span, %mapping, %rows, %index_query, %arena, %scores) : [i1](index, offset, buffer, buffer, buffer, buffer, buffer, buffer)
+      kernel.launch @qsa_score_tiled[%tile_rows](%query_begin, %index_origin, %span, %mapping, %rows, %index_query, %arena, %scores) : [index](index, offset, buffer, buffer, buffer, buffer, buffer, buffer)
     } else {
-      kernel.launch @qsa_score_blocks[%tile_live](%query_begin, %index_origin, %span, %mapping, %rows, %index_query, %arena, %scores) : [i1](index, offset, buffer, buffer, buffer, buffer, buffer, buffer)
+      kernel.launch @qsa_score_blocks[%tile_rows](%query_begin, %index_origin, %span, %mapping, %rows, %index_query, %arena, %scores) : [index](index, offset, buffer, buffer, buffer, buffer, buffer, buffer)
     }
-    kernel.launch @qsa_select_blocks[%tile_live](%query_begin, %span, %mapping, %scores, %selected) : [i1](index, buffer, buffer, buffer, buffer)
+    kernel.launch @qsa_select_blocks[%tile_rows](%query_begin, %span, %mapping, %scores, %selected) : [index](index, buffer, buffer, buffer, buffer)
   }
   // Consecutive queries reuse a selected-key union. Small epochs instead
   // partition keys across waves. Both paths publish the same attended rows.

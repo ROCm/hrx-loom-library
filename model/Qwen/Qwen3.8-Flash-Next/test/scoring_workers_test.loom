@@ -4,18 +4,18 @@
 // Dyadic, channel-constant operands give exact closed-form scores independent
 // of matrix partitioning. The small scoring scenarios own the F64 dot oracle.
 
-kernel.decl @qsa_score_tiled(%enabled: i1) launch(%query_begin: index, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
+kernel.decl @qsa_score_tiled(%tile_rows: index) launch(%query_begin: index, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
 
 kernel.def @scoring_worker_fixture() {
   %groups = index.constant 64 : index
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%empty_value: index, %epoch: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %expected: buffer) {
+} launch(%tile_rows: index, %epoch: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %expected: buffer) {
   %group = kernel.workgroup.id<x> : index
   %thread = kernel.workitem.id<x> : index
   %c0 = index.constant 0 : index
-  %empty = index.cmp ne, %empty_value, %c0 : index
+  %empty = index.cmp eq, %tile_rows, %c0 : index
   %c1 = index.constant 1 : index
   %c3 = index.constant 3 : index
   %c4 = index.constant 4 : index
@@ -174,7 +174,7 @@ kernel.def @scoring_worker_fixture() {
 
 check.case public @scoring_worker_ownership {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
-  %empty = check.param.choice values([0, 1]) name("empty") : index
+  %tile_rows = check.param.choice values([504, 0]) name("tile_rows") : index
   %epoch = check.generate.fill value(0) : tensor<105xi32>
   %rows = check.generate.fill value(0) : tensor<35496xi8>
   %mapping = check.generate.fill value(0) : tensor<1xi32>
@@ -182,13 +182,86 @@ check.case public @scoring_worker_ownership {
   %arena = check.generate.fill value(0.0) : tensor<17825824xbf16>
   %actual = check.generate.fill value(-99.0) : tensor<514x8192xf32>
   %expected = check.generate.fill value(-99.0) : tensor<514x8192xf32>
-  kernel.launch @scoring_worker_fixture(%empty, %epoch, %rows, %queries, %arena, %expected) : (index, tensor<105xi32>, tensor<35496xi8>, tensor<513x4x128xbf16>, tensor<17825824xbf16>, tensor<514x8192xf32>)
-  %enabled = check.literal value(true) : i1
+  kernel.launch @scoring_worker_fixture(%tile_rows, %epoch, %rows, %queries, %arena, %expected) : (index, tensor<105xi32>, tensor<35496xi8>, tensor<513x4x128xbf16>, tensor<17825824xbf16>, tensor<514x8192xf32>)
   %query_begin = check.literal value(5) : index
   %index_origin = check.literal value(64) : offset
-  kernel.launch @qsa_score_tiled[%enabled](%query_begin, %index_origin, %epoch, %mapping, %rows, %queries, %arena, %actual) : [i1](index, offset, tensor<105xi32>, tensor<1xi32>, tensor<35496xi8>, tensor<513x4x128xbf16>, tensor<17825824xbf16>, tensor<514x8192xf32>)
+  kernel.launch @qsa_score_tiled[%tile_rows](%query_begin, %index_origin, %epoch, %mapping, %rows, %queries, %arena, %actual) : [index](index, offset, tensor<105xi32>, tensor<1xi32>, tensor<35496xi8>, tensor<513x4x128xbf16>, tensor<17825824xbf16>, tensor<514x8192xf32>)
   check.expect.bitwise actual(%actual) expected(%expected) : tensor<514x8192xf32>
   check.return
 }
 
 check.benchmark<@scoring_worker_ownership> @scoring_workers
+
+kernel.decl @qsa_select_blocks(%tile_rows: index) launch(%query_begin: index, %epoch: buffer, %mapping: buffer, %scores: buffer, %selected: buffer)
+
+// Alternating short and sparse histories span multiple rows per resident
+// selection worker. A late winner displaces the last zero-score tie.
+func.def @selection_worker_fixture(%epoch: buffer, %mapping: buffer, %scores: buffer) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %map = buffer.view %mapping[%origin] : buffer -> view<513x4xi32>
+  %values = buffer.view %scores[%origin] : buffer -> view<513x8192xf32>
+  %end = scalar.constant 509 : i32
+  view.store %end, %header[0] : i32, view<3xi32>
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %two = index.constant 2 : index
+  %first = index.constant 5 : index
+  %period = index.constant 7 : index
+  %rows = index.constant 504 : index
+  %short_position = scalar.constant 7 : i32
+  %long_position = scalar.constant 2051 : i32
+  %winner = scalar.constant 1.0 : f32
+  scf.for %row = [%zero to %rows step %one] {
+    %token = index.add %first, %row : index
+    %phase = index.rem %row, %period : index
+    %sparse = index.cmp ult, %phase, %two : index
+    %position = scf.select %sparse, %long_position, %short_position : i32
+    view.store %position, %map[%token, 0] : i32, view<513x4xi32>
+    view.store %winner, %values[%row, 512] : f32, view<513x8192xf32>
+  }
+  func.return
+}
+
+func.def @selection_worker_reference(%begin_arg: index, %epoch: buffer, %mapping: buffer, %scores: buffer, %selected: buffer) {
+  %begin = index.assume %begin_arg [range(%begin_arg, 0, 513)] : index
+  %origin = index.constant 0 : offset
+  %map = buffer.view %mapping[%origin] : buffer -> view<513x4xi32>
+  %output = buffer.view %selected[%origin] : buffer -> view<513x512xi32>
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %two = index.constant 2 : index
+  %end = index.constant 509 : index
+  %last = index.constant 511 : index
+  %budget = index.constant 512 : index
+  %long_position = scalar.constant 2051 : i32
+  scf.for %token = [%begin to %end step %one] {
+    %position = view.load %map[%token, 0] : view<513x4xi32> -> i32
+    %sparse = scalar.cmpi eq, %position, %long_position : i32
+    %count = scf.select %sparse, %budget, %two : index
+    scf.for %slot = [%zero to %count step %one] {
+      %final = index.cmp eq, %slot, %last : index
+      %block = scf.select %final, %budget, %slot : index
+      %word = index.cast %block : index to i32
+      view.store %word, %output[%token, %slot] : i32, view<513x512xi32>
+    }
+  }
+  func.return
+}
+
+check.scenario public @selection_worker_ownership {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %begin = check.literal value(5) : index
+    %rows = check.literal value(504) : index
+    %epoch = check.generate.fill value(0) : tensor<3xi32>
+    %mapping = check.generate.fill value(0) : tensor<513x4xi32>
+    %scores = check.generate.fill value(0.0) : tensor<513x8192xf32>
+    %selected = check.generate.fill value(-99) : tensor<513x512xi32>
+    check.generate<@selection_worker_fixture>(%epoch, %mapping, %scores) : (tensor<3xi32>, tensor<513x4xi32>, tensor<513x8192xf32>) -> ()
+    check.compare<@qsa_select_blocks, @selection_worker_reference>[%rows](%begin, %epoch, %mapping, %scores, %selected) : [index](index, tensor<3xi32>, tensor<513x4xi32>, tensor<513x8192xf32>, tensor<513x512xi32>) -> () {
+      check.expect.bitwise actual(%selected) expected(%selected) : tensor<513x512xi32>
+    }
+  }
+  check.return
+}
