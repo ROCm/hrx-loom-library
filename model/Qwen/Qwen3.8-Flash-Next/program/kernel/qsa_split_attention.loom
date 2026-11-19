@@ -18,17 +18,14 @@ func.decl @flash_next_cache_origin(%rows: buffer, %row: index, %plane_origin: of
 
 amdgpu.target<gfx11-generic> @qsa_split_wave32 {subgroup_size = 32}
 
-kernel.def target(@qsa_split_wave32) @qsa_attention_partial(%neural_enabled: i1) {
+kernel.def target(@qsa_split_wave32) @qsa_attention_partial(%query_count: index) {
   %heads = index.constant 24 : index
-  %tokens = config.get @flash_next.token_count : index
   %waves = index.constant 8 : index
   %wave_size = index.constant 32 : index
   %threads = index.mul %waves, %wave_size : index
   %c1 = index.constant 1 : index
   %splits = index.constant 8 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %heads, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %splits) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%heads, %query_count, %splits) workgroup_size(%threads, %c1, %c1) : index
 } launch(%key_origin: offset, %value_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %query_gate: buffer, %arena: buffer, %selected_blocks: buffer, %output: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %capacity = config.get @flash_next.context_capacity : index
@@ -38,6 +35,7 @@ kernel.def target(@qsa_split_wave32) @qsa_attention_partial(%neural_enabled: i1)
   %count_value = index.cast %count_word : i32 to index
   %end = index.assume %count_value [range(%count_value, 0, %tokens)] : index
   %token = kernel.workgroup.id<y> : index
+  %partial_rows = kernel.workgroup.count<y> : index
   %active = index.cmp ult, %token, %end : index
   scf.if %active {
     %head = kernel.workgroup.id<x> : index
@@ -72,7 +70,7 @@ kernel.def target(@qsa_split_wave32) @qsa_attention_partial(%neural_enabled: i1)
     %value_layout = encoding.layout.strided [4096, 2048, 1, 4] : encoding<layout>
     %value_view = buffer.view %arena[%value_base] : buffer -> view<[%blocks]x2x4x256xbf16, %value_layout>
     %ids_view = buffer.view %selected_blocks[%origin] : buffer -> view<[%tokens]x512xi32>
-    %output_view = buffer.view %output[%origin] : buffer -> view<[%tokens]x24x8x258xf32>
+    %output_view = buffer.view %output[%origin] : buffer -> view<[%partial_rows]x24x8x258xf32>
     %query = vector.load %query_view[%token, %head, %channel] : view<[%tokens]x24x256xbf16> -> vector<8xbf16>
     %budget = index.constant 512 : index
     %complete = index.div %visible, %c4 : index
@@ -225,28 +223,26 @@ kernel.def target(@qsa_split_wave32) @qsa_attention_partial(%neural_enabled: i1)
         %next_accumulated = vector.fmaf %part_accumulated, %part_scale_vector, %previous : vector<8xf32>
         scf.yield %next_maximum, %next_denominator, %next_accumulated : f32, f32, vector<8xf32>
       }
-      vector.store %merged_accumulated, %output_view[%token, %head, %split, %channel] : vector<8xf32>, view<[%tokens]x24x8x258xf32>
+      vector.store %merged_accumulated, %output_view[%token, %head, %split, %channel] : vector<8xf32>, view<[%partial_rows]x24x8x258xf32>
       scf.if %leader {
-        view.store %merged_maximum, %output_view[%token, %head, %split, 256] : f32, view<[%tokens]x24x8x258xf32>
-        view.store %merged_denominator, %output_view[%token, %head, %split, 257] : f32, view<[%tokens]x24x8x258xf32>
+        view.store %merged_maximum, %output_view[%token, %head, %split, 256] : f32, view<[%partial_rows]x24x8x258xf32>
+        view.store %merged_denominator, %output_view[%token, %head, %split, 257] : f32, view<[%partial_rows]x24x8x258xf32>
       }
     }
   }
   kernel.return
 }
 
-kernel.def target(@qsa_split_wave32) @qsa_attention_merge(%neural_enabled: i1) {
+kernel.def target(@qsa_split_wave32) @qsa_attention_merge(%query_count: index) {
   %heads = index.constant 24 : index
-  %tokens = config.get @flash_next.token_count : index
   %threads = index.constant 32 : index
   %c1 = index.constant 1 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %heads, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %tokens, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%heads, %query_count, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span: buffer, %query_gate: buffer, %partial_buffer: buffer, %output: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
   %token = kernel.workgroup.id<y> : index
+  %partial_rows = kernel.workgroup.count<y> : index
   %active = index.cmp ult, %token, %end : index
   scf.if %active {
     %head = kernel.workgroup.id<x> : index
@@ -259,16 +255,16 @@ kernel.def target(@qsa_split_wave32) @qsa_attention_merge(%neural_enabled: i1) {
     %gate_channel = index.add %width, %channel : index
     %splits = index.constant 8 : index
     %origin = index.constant 0 : offset
-    %partials = buffer.view %partial_buffer[%origin] : buffer -> view<[%tokens]x24x8x258xf32>
+    %partials = buffer.view %partial_buffer[%origin] : buffer -> view<[%partial_rows]x24x8x258xf32>
     %gate_view = buffer.view %query_gate[%origin] : buffer -> view<[%tokens]x24x512xbf16>
     %output_view = buffer.view %output[%origin] : buffer -> view<[%tokens]x24x256xbf16>
     %c0 = scalar.constant 0.0 : f32
     %initial_maximum = scalar.constant -3.4028234660000002e+38 : f32
     %c0v = vector.splatf 0.0 : vector<8xf32>
     %merged_maximum, %merged_denominator, %merged_accumulated = scf.for %part = [%c0_index to %splits step %c1](%old_maximum = %initial_maximum : f32, %old_denominator = %c0 : f32, %old_accumulated = %c0v : vector<8xf32>) -> (f32, f32, vector<8xf32>) {
-      %part_maximum = view.load %partials[%token, %head, %part, 256] : view<[%tokens]x24x8x258xf32> -> f32
-      %part_denominator = view.load %partials[%token, %head, %part, 257] : view<[%tokens]x24x8x258xf32> -> f32
-      %part_accumulated = vector.load %partials[%token, %head, %part, %channel] : view<[%tokens]x24x8x258xf32> -> vector<8xf32>
+      %part_maximum = view.load %partials[%token, %head, %part, 256] : view<[%partial_rows]x24x8x258xf32> -> f32
+      %part_denominator = view.load %partials[%token, %head, %part, 257] : view<[%partial_rows]x24x8x258xf32> -> f32
+      %part_accumulated = vector.load %partials[%token, %head, %part, %channel] : view<[%partial_rows]x24x8x258xf32> -> vector<8xf32>
       %next_maximum = scalar.maxnumf %old_maximum, %part_maximum : f32
       %old_delta = scalar.subf %old_maximum, %next_maximum : f32
       %part_delta = scalar.subf %part_maximum, %next_maximum : f32
