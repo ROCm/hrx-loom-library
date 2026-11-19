@@ -37,7 +37,7 @@ kernel.def @qwen38_sampling_partial_rows(%rows_value: index, %workgroup_budget: 
   %c1_index = index.constant 1 : index
   %threads = index.constant 256 : index
   kernel.launch.config workgroups(%groups, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
-} launch(%rows_value: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer) {
+} launch(%rows_value: index, %first: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer) {
   %packet_capacity = config.get @qwen38.packet_capacity : index
   %rows = index.assume %rows_value [range(%rows_value, 1, 2147483647)] : index
   %origin = index.constant 0 : offset
@@ -50,10 +50,11 @@ kernel.def @qwen38_sampling_partial_rows(%rows_value: index, %workgroup_budget: 
   scf.for %tile = [%group to %tiles step %groups] {
     %row = index.div %tile, %partials : index
     %partial = index.rem %tile, %partials : index
-    %row_word = index.cast %row : index to i32
+    %packet_row = index.add %first, %row : index
+    %row_word = index.cast %packet_row : index to i32
     %live = scalar.cmpi ult, %row_word, %count : i32
     scf.if %live {
-      %bounded_row = index.assume %row [ge(%row, 0), lt(%row, %packet_capacity)] : index
+      %bounded_row = index.assume %packet_row [ge(%packet_row, 0), lt(%packet_row, %packet_capacity)] : index
       %identity_origin = func.call @qwen38_packet_identity_origin(%packet_capacity) : (index) -> (offset)
       %identities = buffer.view %epoch[%identity_origin] : buffer -> view<[%packet_capacity]x2xi32>
       %owner_word = view.load %identities[%bounded_row, 0] : view<[%packet_capacity]x2xi32> -> i32
@@ -80,23 +81,25 @@ kernel.def @qwen38_sample_rows(%rows_value: index) {
   %c1_index = index.constant 1 : index
   %threads = index.constant 256 : index
   kernel.launch.config workgroups(%rows, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
-} launch(%rows_value: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer, %outputs: buffer) {
+} launch(%rows_value: index, %first: index, %epoch: buffer, %logits: buffer, %partial_logits: buffer, %partial_ids: buffer, %outputs: buffer) {
   %packet_capacity = config.get @qwen38.packet_capacity : index
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %thread = kernel.workitem.id<x> : index
   %row_value = kernel.workgroup.id<x> : index
   %rows = index.assume %rows_value [range(%rows_value, 1, 2147483647)] : index
-  %row = index.assume %row_value [ge(%row_value, 0), lt(%row_value, %rows), lt(%row_value, %packet_capacity)] : index
+  %row = index.assume %row_value [ge(%row_value, 0), lt(%row_value, %rows)] : index
   %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
   %count = view.load %header[2] : view<3xi32> -> i32
-  %row_word = index.cast %row : index to i32
+  %packet_row = index.add %first, %row : index
+  %row_word = index.cast %packet_row : index to i32
   %live = scalar.cmpi ult, %row_word, %count : i32
   scf.if %live {
+    %identity_row = index.assume %packet_row [ge(%packet_row, 0), lt(%packet_row, %packet_capacity)] : index
     %identity_origin = func.call @qwen38_packet_identity_origin(%packet_capacity) : (index) -> (offset)
     %identity = buffer.view %epoch[%identity_origin] : buffer -> view<[%packet_capacity]x2xi32>
-    %owner_word = view.load %identity[%row, 0] : view<[%packet_capacity]x2xi32> -> i32
-    %position_word = view.load %identity[%row, 1] : view<[%packet_capacity]x2xi32> -> i32
+    %owner_word = view.load %identity[%identity_row, 0] : view<[%packet_capacity]x2xi32> -> i32
+    %position_word = view.load %identity[%identity_row, 1] : view<[%packet_capacity]x2xi32> -> i32
     %position = scalar.extui %position_word : i32 to i64
     %owner_value = index.cast %owner_word : i32 to index
     %owner = index.assume %owner_value [ge(%owner_value, 0), lt(%owner_value, %packet_capacity)] : index
