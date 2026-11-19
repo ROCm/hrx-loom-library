@@ -6,6 +6,8 @@ config.decl @flash_next.token_count : %value: index where [range(%value, 1, 3276
 
 config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 func.decl @qwen38_packet_selection_origin(%capacity: index) -> (offset)
 
 func.decl @qwen38_packet_identity_origin(%capacity: index) -> (offset)
@@ -30,32 +32,44 @@ kernel.decl @hc_up_mix(%neural_enabled: i1, %row_capacity: index) launch(%capaci
 
 template.decl @sampling.categorical_excluding(%bf16_storage: i1, %columns: index, %logits: buffer, %logits_origin: offset, %excluded_id: i32, %temperature: f32, %top_p: f32, %top_k: i32, %seed: i64, %position: i64) -> (i32)
 
-// The controller has already selected each requested last span row. Gather
-// only those rows before the final hyperconnection and vocabulary projection.
-kernel.def @flash_next_select_output_rows() {
-  %rows = func.call pure @flash_next_output_capacity() : () -> (index)
-  %threads = index.constant 128 : index
-  %c1 = index.constant 1 : index
-  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%epoch: buffer, %residual: buffer, %head_epoch: buffer, %selected: buffer) {
-  %row = kernel.workgroup.id<x> : index
-  %thread = kernel.workitem.id<x> : index
+// The epoch carries separate counts for packed input tokens and sampled rows.
+func.def readonly inline @flash_next_selected_count(%epoch: buffer) -> (index) {
   %origin = index.constant 0 : offset
   %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
-  %count_word = view.load %header[2] : view<3xi32> -> i32
-  %count_value = index.cast %count_word : i32 to index
+  %word = view.load %header[2] : view<3xi32> -> i32
+  %value = index.cast %word : i32 to index
+  %capacity = func.call pure @flash_next_output_capacity() : () -> (index)
+  %count = index.assume %value [range(%value, 0, %capacity)] : index
+  func.return %count : index
+}
+
+// The controller has already selected each requested last span row. Gather
+// only those rows before the final hyperconnection and vocabulary projection.
+kernel.def @flash_next_select_output_rows(%output_count: index) {
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%output_count, %c1, %units) : (index, index, index) -> (index)
+  // The first workgroup also publishes an empty projection header.
+  %groups = index.max %workers, %c1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%epoch: buffer, %residual: buffer, %head_epoch: buffer, %selected: buffer) {
+  %first = kernel.workgroup.id<x> : index
+  %stride_row = kernel.workgroup.count<x> : index
+  %thread = kernel.workitem.id<x> : index
+  %origin = index.constant 0 : offset
   %rows = func.call pure @flash_next_output_capacity() : () -> (index)
-  %count = index.assume %count_value [range(%count_value, 0, %rows)] : index
+  %count = func.call readonly @flash_next_selected_count(%epoch) : (buffer) -> (index)
   %c0 = index.constant 0 : index
-  %first_row = index.cmp eq, %row, %c0 : index
+  %first_row = index.cmp eq, %first, %c0 : index
   %first_thread = index.cmp eq, %thread, %c0 : index
   %publishes = scalar.andi %first_row, %first_thread : i1
   scf.if %publishes {
     %output_header = buffer.view %head_epoch[%origin] : buffer -> view<3xi32>
+    %count_word = index.cast %count : index to i32
     view.store %count_word, %output_header[0] : i32, view<3xi32>
   }
-  %active = index.cmp ult, %row, %count : index
-  scf.if %active {
+  scf.for %row = [%first to %count step %stride_row] {
     %tokens = config.get @flash_next.token_count : index
     %packet_capacity = config.get @qwen38.packet_capacity : index
     %selection_origin = func.call @qwen38_packet_selection_origin(%packet_capacity) : (index) -> (offset)
@@ -83,13 +97,15 @@ kernel.def target(@flash_next_head_wave32) @flash_next_head_down(%neural_enabled
   %threads = index.constant 128 : index
   %c0_index = index.constant 0 : index
   %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %row_capacity, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%row_capacity, %groups, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%active_groups, %workers, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%capacity_argument: index, %epoch: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %tokens = index.assume %capacity_argument [range(%capacity_argument, 1, 32768)] : index
-  %token = kernel.workgroup.id<y> : index
+  %first = kernel.workgroup.id<y> : index
+  %stride_token = kernel.workgroup.count<y> : index
   %count = func.call @flash_next_token_count(%epoch, %tokens) : (buffer, index) -> (index)
-  %active = index.cmp ult, %token, %count : index
-  scf.if %active {
+  scf.for %token = [%first to %count step %stride_token] {
     %group = kernel.workgroup.id<x> : index
     %wave = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
@@ -183,20 +199,19 @@ kernel.def target(@flash_next_head_wave32) @flash_next_vocabulary() {
   kernel.return
 }
 
-kernel.def @flash_next_sample() {
-  %rows = func.call pure @flash_next_output_capacity() : () -> (index)
+kernel.def @flash_next_sample(%output_count: index) {
   %c1 = index.constant 1 : index
   %threads = index.constant 256 : index
-  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%output_count, %c1, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%epoch: buffer, %logits: buffer, %output: buffer) {
-  %row = kernel.workgroup.id<x> : index
+  %first = kernel.workgroup.id<x> : index
+  %stride_row = kernel.workgroup.count<x> : index
   %thread = kernel.workitem.id<x> : index
   %origin = index.constant 0 : offset
-  %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
-  %count_word = view.load %header[2] : view<3xi32> -> i32
-  %count = index.cast %count_word : i32 to index
-  %active = index.cmp ult, %row, %count : index
-  scf.if %active {
+  %count = func.call readonly @flash_next_selected_count(%epoch) : (buffer) -> (index)
+  scf.for %row = [%first to %count step %stride_row] {
     %packet_capacity = config.get @qwen38.packet_capacity : index
     %identity_origin = func.call @qwen38_packet_identity_origin(%packet_capacity) : (index) -> (offset)
     %identities = buffer.view %epoch[%identity_origin] : buffer -> view<[%packet_capacity]x2xi32>
@@ -241,6 +256,8 @@ kernel.def @flash_next_sample() {
       %ids = buffer.view %output[%origin] : buffer -> view<[%rows]xi32>
       view.store %selected, %ids[%output_row] : i32, view<[%rows]xi32>
     }
+    // Release sampling scratch before any wave starts its next row.
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   }
   kernel.return
 }
@@ -322,10 +339,11 @@ command.def public @flash_next_output_head() launch(%parameters: buffer, %epoch:
   %selected = buffer.alloca<global> align(256) %residual_bytes : buffer
   %head_epoch = buffer.alloca<global> align(16) %header_bytes : buffer
   %logits = buffer.alloca<global> align(256) %logit_bytes : buffer
-  kernel.launch @flash_next_select_output_rows(%epoch, %residual, %head_epoch, %selected) : (buffer, buffer, buffer, buffer)
+  %count = func.call readonly @flash_next_selected_count(%epoch) : (buffer) -> (index)
+  kernel.launch @flash_next_select_output_rows[%count](%epoch, %residual, %head_epoch, %selected) : [index](buffer, buffer, buffer, buffer)
   %target = index.constant 0 : index
   %expanded = scalar.constant false : i1
   command.launch @flash_next_project_logits[%target, %expanded](%parameters, %parameters, %head_epoch, %selected, %logits) : [index, i1](buffer, buffer, buffer, buffer, buffer)
-  kernel.launch @flash_next_sample(%epoch, %logits, %outputs) : (buffer, buffer, buffer)
+  kernel.launch @flash_next_sample[%count](%epoch, %logits, %outputs) : [index](buffer, buffer, buffer)
   command.return
 }
