@@ -14,22 +14,25 @@ func.decl @flash_next_q8_batch_partial(%width: index, %group_size: index, %batch
 
 // One wave normalizes each residual stream. GGUF already folded 1+gamma;
 // multiplication retains that F32 value until the BF16 output publication.
+// Each stream has its own norm. Independent wave workgroups distribute the
+// four streams of even one live token across available compute units.
 kernel.def target(@flash_next_hc_wave32) @hc_normalize(%neural_enabled: i1, %row_capacity: index) {
   %c1 = index.constant 1 : index
+  %streams = index.constant 4 : index
   %units = target.execution.unit.count : index
-  %workers = func.call pure @flash_next_token_workers(%row_capacity, %c1, %units) : (index, index, index) -> (index)
-  %threads = index.constant 128 : index
+  %workers = func.call pure @flash_next_token_workers(%row_capacity, %streams, %units) : (index, index, index) -> (index)
+  %threads = index.constant 32 : index
   %c0_index = index.constant 0 : index
   %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%active_groups, %streams, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%capacity_argument: index, %span_arg: buffer, %residual_arg: buffer, %gamma_arg: buffer, %normalized_arg: buffer) {
   %span, %residual, %gamma, %normalized = buffer.assume.noalias %span_arg, %residual_arg, %gamma_arg, %normalized_arg : buffer, buffer, buffer, buffer
   %tokens = index.assume %capacity_argument [range(%capacity_argument, 1, 32768)] : index
   %worker = kernel.workgroup.id<x> : index
   %workers = kernel.workgroup.count<x> : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
+  %stream = kernel.workgroup.id<y> : index
   scf.for %token = [%worker to %end step %workers] {
-    %stream = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
     %origin = index.constant 0 : offset
     %c8 = index.constant 8 : index
@@ -573,18 +576,19 @@ template.def<@flash_next.hc_combine.panel> device @hc_combine_panel(%tokens: ind
 
 kernel.def target(@flash_next_hc_wave32) @hc_combine_normalize(%live_rows: index) {
   %c1 = index.constant 1 : index
+  %streams = index.constant 4 : index
   %units = target.execution.unit.count : index
-  %workers = func.call pure @flash_next_token_workers(%live_rows, %c1, %units) : (index, index, index) -> (index)
-  %threads = index.constant 128 : index
-  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %workers = func.call pure @flash_next_token_workers(%live_rows, %streams, %units) : (index, index, index) -> (index)
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%workers, %streams, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %residual_arg: buffer, %projected_arg: buffer, %injection_arg: buffer, %gamma_arg: buffer, %output_arg: buffer, %normalized_arg: buffer) {
   %span, %residual, %projected, %injection, %gamma, %output, %normalized = buffer.assume.noalias %span_arg, %residual_arg, %projected_arg, %injection_arg, %gamma_arg, %output_arg, %normalized_arg : buffer, buffer, buffer, buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
   %worker = kernel.workgroup.id<x> : index
   %workers = kernel.workgroup.count<x> : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
+  %stream = kernel.workgroup.id<y> : index
   scf.for %token = [%worker to %end step %workers] {
-    %stream = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
     %origin = index.constant 0 : offset
     %c8 = index.constant 8 : index
