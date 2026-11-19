@@ -22,6 +22,26 @@ config.decl @qsa.query_tile : %value: index where [range(%value, 1, 32768)]
 
 amdgpu.target<gfx11-generic> @qsa_selection_wave32 {subgroup_size = 32}
 
+// Each packed query needs 6144 bf16 outputs after selection. Its scores use
+// one f32 per four context positions, or context_capacity bytes per query.
+// Tile as many rows as the output can hold, with room for up to 512 rows even
+// at long contexts. The configured row limit can further subdivide the tile.
+func.def public pure inline @qsa_score_layout(%tokens: index, %context: index) -> (index, offset, offset) where [range(%tokens, 1, 32768), range(%context, 64, 262144), multiple_of(%context, 64)] {
+  %limit = config.get @qsa.query_tile : index
+  %output_row_bytes = index.constant 12288 : index
+  %output_length = index.mul %tokens, %output_row_bytes : index
+  %reusable_rows = index.div %output_length, %context : index
+  %minimum_tile = index.constant 512 : index
+  %available = index.max %reusable_rows, %minimum_tile : index
+  %bounded = index.min %available, %limit : index
+  %rows = index.min %tokens, %bounded : index
+  %output_bytes = index.cast %output_length : index to offset
+  %score_length = index.mul %rows, %context : index
+  %workspace_length = index.max %output_length, %score_length : index
+  %workspace_bytes = index.cast %workspace_length : index to offset
+  func.return %rows, %output_bytes, %workspace_bytes : index, offset, offset
+}
+
 // The intersection of the packed prefix with a score tile, in query rows.
 func.def public pure inline @qsa_tile_rows(%end: index, %begin: index, %capacity: index) -> (index) {
   %live_begin = index.min %begin, %end : index
@@ -46,10 +66,8 @@ kernel.def target(@qsa_selection_wave32) @qsa_score_blocks(%tile_rows: index) {
   kernel.launch.config workgroups(%key_workers, %row_workers, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%query_begin_arg: index, %index_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer) {
   %tokens = config.get @flash_next.token_count : index
-  %tile_limit = config.get @qsa.query_tile : index
-  %short = index.cmp ult, %tokens, %tile_limit : index
-  %query_capacity = scf.select %short, %tokens, %tile_limit : index
   %capacity = config.get @flash_next.context_capacity : index
+  %query_capacity, %output_bytes, %workspace_bytes = func.call pure @qsa_score_layout(%tokens, %capacity) : (index, index) -> (index, offset, offset)
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
   %query_begin = index.assume %query_begin_arg [range(%query_begin_arg, 0, %tokens)] : index
   %live_rows = func.call pure @qsa_tile_rows(%end, %query_begin, %query_capacity) : (index, index, index) -> (index)
@@ -107,11 +125,7 @@ kernel.def target(@qsa_selection_wave32) @qsa_score_blocks(%tile_rows: index) {
 }
 
 // A narrow cohort exposes few independent rows, so each row uses more waves.
-func.def pure inline @qsa_histogram_threads() -> (index) {
-  %tokens = config.get @flash_next.token_count : index
-  %limit = config.get @qsa.query_tile : index
-  %short = index.cmp ult, %tokens, %limit : index
-  %queries = scf.select %short, %tokens, %limit : index
+func.def pure inline @qsa_histogram_threads(%queries: index) -> (index) {
   %narrow_capacity = index.constant 4 : index
   %narrow = index.cmp ule, %queries, %narrow_capacity : index
   %small = index.constant 256 : index
@@ -419,7 +433,10 @@ func.def pure inline @qsa_first_set_bits(%mask: i32, %count: i32) -> (i32) {
 // top-512 threshold; final compaction preserves logical order and earliest
 // ties. Bounded LDS candidates replace repeated full-row threshold scans.
 kernel.def target(@qsa_selection_wave32) @qsa_select_blocks(%tile_rows: index) {
-  %threads = func.call pure @qsa_histogram_threads() : () -> (index)
+  %tokens = config.get @flash_next.token_count : index
+  %capacity = config.get @flash_next.context_capacity : index
+  %query_capacity, %output_bytes, %workspace_bytes = func.call pure @qsa_score_layout(%tokens, %capacity) : (index, index) -> (index, offset, offset)
+  %threads = func.call pure @qsa_histogram_threads(%query_capacity) : (index) -> (index)
   %c1_index = index.constant 1 : index
   %wave_size = index.constant 32 : index
   %waves = index.div %threads, %wave_size : index
@@ -429,11 +446,11 @@ kernel.def target(@qsa_selection_wave32) @qsa_select_blocks(%tile_rows: index) {
 } launch(%query_begin_arg: index, %span: buffer, %mapping: buffer, %scores: buffer, %selected: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %capacity = config.get @flash_next.context_capacity : index
-  %threads = func.call pure @qsa_histogram_threads() : () -> (index)
+  %query_capacity, %output_bytes, %workspace_bytes = func.call pure @qsa_score_layout(%tokens, %capacity) : (index, index) -> (index, offset, offset)
+  %threads = func.call pure @qsa_histogram_threads(%query_capacity) : (index) -> (index)
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
   %query_begin = index.assume %query_begin_arg [range(%query_begin_arg, 0, %tokens)] : index
-  %tile_limit = config.get @qsa.query_tile : index
-  %rows = func.call pure @qsa_tile_rows(%end, %query_begin, %tile_limit) : (index, index, index) -> (index)
+  %rows = func.call pure @qsa_tile_rows(%end, %query_begin, %query_capacity) : (index, index, index) -> (index)
   %worker = kernel.workgroup.id<x> : index
   %workers = kernel.workgroup.count<x> : index
   scf.for %row = [%worker to %rows step %workers] {
