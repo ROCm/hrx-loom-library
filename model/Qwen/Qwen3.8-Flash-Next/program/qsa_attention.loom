@@ -15,7 +15,20 @@ config.decl @qsa.query_tile : %value: index where [range(%value, 1, 32768)]
 
 command.decl @flash_next_capture_inputs(%neural_enabled: i1, %prefix_bytes: offset, %row_bytes: offset) launch(%epoch: buffer, %input: buffer, %capture: buffer)
 
-kernel.decl @qsa_linear_bf16(%neural_enabled: i1, %output_capacity: index) launch(%width: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+func.decl pure @qsa_index_projection_rows(%count: index) -> (index, index)
+
+kernel.decl @qsa_index_dot(%count: index, %width: index) launch(%width_arg: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qsa_index_matrix(%count: index, %width: index) launch(%width_arg: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+
+command.def @qsa_index_projection(%count: index, %width: index) launch(%span: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+  %dots, %matrix = func.call pure @qsa_index_projection_rows(%count) : (index) -> (index, index)
+  command.concurrent {
+    kernel.launch @qsa_index_dot[%dots, %width](%width, %input, %weight, %output) : [index, index](index, buffer, buffer, buffer)
+    kernel.launch @qsa_index_matrix[%matrix, %width](%width, %span, %input, %weight, %output) : [index, index](index, buffer, buffer, buffer, buffer)
+  }
+  command.return
+}
 
 kernel.decl @qsa_prepare_queries(%neural_enabled: i1, %head_capacity: index) launch(%width: index, %heads: index, %head_stride: index, %span: buffer, %mapping: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
@@ -92,7 +105,7 @@ command.def public @flash_next_qsa_append(%workload_count: index, %layer: index,
   %key_weight = command.parameter %parameters, "blk.{}.attn_k.weight"[%layer] : view<512x80x34xi8>
   %value_weight = command.parameter %parameters, "blk.{}.attn_v.weight"[%layer] : view<512x80x34xi8>
   %key_norm = command.parameter %parameters, "blk.{}.attn_k_norm.weight"[%layer] : view<256xf32>
-  kernel.launch @qsa_linear_bf16[%neural_enabled, %index_width](%index_width, %span, %input, %index_key_weight, %index_key_raw) : [i1, index](index, buffer, buffer, view<128x2560xbf16>, buffer)
+  command.launch @qsa_index_projection[%workload_count, %index_width](%span, %input, %index_key_weight, %index_key_raw) : [index, index](buffer, buffer, view<128x2560xbf16>, buffer)
   %capture_base = index.constant 771584 : offset
   %ordinal = index.div %layer, %c4 : index
   %capture_relative = index.scale %ordinal, %index_key_bytes : index, offset -> offset
@@ -193,7 +206,7 @@ command.def public @flash_next_qsa_queries(%workload_count: index, %layer: index
   %query_weight = command.parameter %parameters, "blk.{}.attn_q.weight"[%layer] : view<12288x80x34xi8>
   %query_norm = command.parameter %parameters, "blk.{}.attn_q_norm.weight"[%layer] : view<256xf32>
   %output_weight = command.parameter %parameters, "blk.{}.attn_output.weight"[%layer] : view<2560x192x34xi8>
-  kernel.launch @qsa_linear_bf16[%neural_enabled, %small_width](%small_width, %span, %input, %index_query_weight, %index_query_raw) : [i1, index](index, buffer, buffer, view<512x2560xbf16>, buffer)
+  command.launch @qsa_index_projection[%workload_count, %small_width](%span, %input, %index_query_weight, %index_query_raw) : [index, index](buffer, buffer, view<512x2560xbf16>, buffer)
   scf.if %mixed {
     scf.if %remapped {
       kernel.launch @qsa_prepare_queries_remapped[%neural_enabled, %c4](%tokens, %origin_capacity, %inputs, %origins, %index_width, %c4, %index_width, %span, %mapping, %index_query_raw, %index_query_norm, %index_query) : [i1, index](index, index, buffer, buffer, index, index, index, buffer, buffer, buffer, view<128xf32>, buffer)
