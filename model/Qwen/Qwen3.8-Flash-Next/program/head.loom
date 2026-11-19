@@ -18,7 +18,7 @@ func.decl pure @flash_next_output_capacity() -> (index)
 
 amdgpu.target<gfx11-generic> @flash_next_head_wave32 {subgroup_size = 32}
 
-func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
+func.decl readonly @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
 func.decl @flash_next_store_logit(%expanded: i1, %rows: index, %row: index, %id: index, %sum: f32, %output: buffer)
 
@@ -217,7 +217,7 @@ kernel.def @flash_next_sample(%output_count: index) {
   kernel.return
 }
 
-command.def @flash_next_head_mix(%neural_enabled: i1, %predictor: index, %rows: index) launch(%parameters: buffer, %epoch: buffer, %residual: buffer, %hidden: buffer) {
+command.def @flash_next_head_mix(%live_rows: index, %predictor: index, %rows: index) launch(%parameters: buffer, %epoch: buffer, %residual: buffer, %hidden: buffer) {
   %residual_stride = index.constant 20480 : offset
   %rank_stride = index.constant 640 : offset
   %residual_bytes = index.scale %rows, %residual_stride : index, offset -> offset
@@ -237,51 +237,56 @@ command.def @flash_next_head_mix(%neural_enabled: i1, %predictor: index, %rows: 
     %up = command.parameter %parameters, "output_hc_up.weight" : view<3481600xi8>
     scf.yield %gamma, %down, %up : view<4x2560xf32>, view<3481600xi8>, view<3481600xi8>
   }
-  kernel.launch @hc_normalize[%neural_enabled, %rows](%rows, %epoch, %residual, %gamma, %normalized) : [i1, index](index, buffer, buffer, view<4x2560xf32>, buffer)
-  %active_rows = scf.select %neural_enabled, %rows, %c0 : index
-  kernel.launch @hc_down[%active_rows](%rows, %epoch, %normalized, %down, %lowrank) : [index](index, buffer, buffer, view<3481600xi8>, buffer)
-  kernel.launch @hc_up_mix[%neural_enabled, %rows](%rows, %epoch, %normalized, %lowrank, %up, %hidden) : [i1, index](index, buffer, buffer, buffer, view<3481600xi8>, buffer)
+  %enabled = scalar.constant true : i1
+  kernel.launch @hc_normalize[%enabled, %live_rows](%rows, %epoch, %residual, %gamma, %normalized) : [i1, index](index, buffer, buffer, view<4x2560xf32>, buffer)
+  kernel.launch @hc_down[%live_rows](%rows, %epoch, %normalized, %down, %lowrank) : [index](index, buffer, buffer, view<3481600xi8>, buffer)
+  kernel.launch @hc_up_mix[%enabled, %live_rows](%rows, %epoch, %normalized, %lowrank, %up, %hidden) : [i1, index](index, buffer, buffer, buffer, view<3481600xi8>, buffer)
   command.return
 }
 
 command.def public @flash_next_head_logits(%predictor: index) launch(%parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %residual: buffer, %logits: buffer) {
   %expanded = scalar.constant true : i1
-  command.launch @flash_next_project_logits[%predictor, %expanded](%parameters, %vocabulary_parameters, %epoch, %residual, %logits) : [index, i1](buffer, buffer, buffer, buffer, buffer)
+  %capacity = func.call pure @flash_next_output_capacity() : () -> (index)
+  %count = func.call readonly @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
+  command.launch @flash_next_project_logits[%count, %predictor, %expanded](%parameters, %vocabulary_parameters, %epoch, %residual, %logits) : [index, index, i1](buffer, buffer, buffer, buffer, buffer)
   command.return
 }
 
-command.def @flash_next_project_logits(%predictor: index, %expanded: i1) launch(%parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %residual: buffer, %logits: buffer) {
-  %neural_enabled = scalar.constant true : i1
+command.def @flash_next_project_logits(%live_rows: index, %predictor: index, %expanded: i1) launch(%parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %residual: buffer, %logits: buffer) {
   %rows = func.call pure @flash_next_output_capacity() : () -> (index)
   %hidden_stride = index.constant 5120 : offset
   %hidden_bytes = index.scale %rows, %hidden_stride : index, offset -> offset
   %hidden = buffer.alloca<global> align(256) %hidden_bytes : buffer
-  command.launch @flash_next_head_mix[%neural_enabled, %predictor, %rows](%parameters, %epoch, %residual, %hidden) : [i1, index, index](buffer, buffer, buffer, buffer)
+  command.launch @flash_next_head_mix[%live_rows, %predictor, %rows](%parameters, %epoch, %residual, %hidden) : [index, index, index](buffer, buffer, buffer, buffer)
   %head = command.parameter %vocabulary_parameters, "output.weight" : view<675430400xi8>
   kernel.launch @flash_next_vocabulary(%expanded, %epoch, %hidden, %head, %logits) : (i1, buffer, buffer, view<675430400xi8>, buffer)
   command.return
 }
 
-kernel.decl @flash_next_draft_common_head(%neural_enabled: i1) launch(%expanded: i1, %epoch: buffer, %plan: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @flash_next_draft_common_head(%live_rows: index) launch(%expanded: i1, %epoch: buffer, %plan: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
-kernel.decl @flash_next_draft_rare_head(%neural_enabled: i1) launch(%expanded: i1, %epoch: buffer, %plan: buffer, %carry: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @flash_next_draft_rare_head(%live_rows: index) launch(%expanded: i1, %epoch: buffer, %plan: buffer, %carry: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 command.def public @flash_next_draft_head(%neural_enabled: i1) launch(%parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %plan: buffer, %carry: buffer, %residual: buffer, %logits: buffer) {
   %expanded = scalar.constant true : i1
-  command.launch @flash_next_project_draft_logits[%neural_enabled, %expanded](%parameters, %vocabulary_parameters, %epoch, %plan, %carry, %residual, %logits) : [i1, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  %tokens = config.get @flash_next.token_count : index
+  %count = func.call readonly @flash_next_token_count(%epoch, %tokens) : (buffer, index) -> (index)
+  %zero = index.constant 0 : index
+  %live_rows = scf.select %neural_enabled, %count, %zero : index
+  command.launch @flash_next_project_draft_logits[%live_rows, %expanded](%parameters, %vocabulary_parameters, %epoch, %plan, %carry, %residual, %logits) : [index, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   command.return
 }
 
-command.def public @flash_next_project_draft_logits(%neural_enabled: i1, %expanded: i1) launch(%parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %plan: buffer, %carry: buffer, %residual: buffer, %logits: buffer) {
+command.def public @flash_next_project_draft_logits(%live_rows: index, %expanded: i1) launch(%parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %plan: buffer, %carry: buffer, %residual: buffer, %logits: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %hidden_stride = index.constant 5120 : offset
   %hidden_bytes = index.scale %tokens, %hidden_stride : index, offset -> offset
   %hidden = buffer.alloca<global> align(256) %hidden_bytes : buffer
   %predictor = index.constant 1 : index
-  command.launch @flash_next_head_mix[%neural_enabled, %predictor, %tokens](%parameters, %epoch, %residual, %hidden) : [i1, index, index](buffer, buffer, buffer, buffer)
+  command.launch @flash_next_head_mix[%live_rows, %predictor, %tokens](%parameters, %epoch, %residual, %hidden) : [index, index, index](buffer, buffer, buffer, buffer)
   %head = command.parameter %vocabulary_parameters, "output.weight" : view<675430400xi8>
-  kernel.launch @flash_next_draft_common_head[%neural_enabled](%expanded, %epoch, %plan, %hidden, %head, %logits) : [i1](i1, buffer, buffer, buffer, view<675430400xi8>, buffer)
-  kernel.launch @flash_next_draft_rare_head[%neural_enabled](%expanded, %epoch, %plan, %carry, %hidden, %head, %logits) : [i1](i1, buffer, buffer, buffer, buffer, view<675430400xi8>, buffer)
+  kernel.launch @flash_next_draft_common_head[%live_rows](%expanded, %epoch, %plan, %hidden, %head, %logits) : [index](i1, buffer, buffer, buffer, view<675430400xi8>, buffer)
+  kernel.launch @flash_next_draft_rare_head[%live_rows](%expanded, %epoch, %plan, %carry, %hidden, %head, %logits) : [index](i1, buffer, buffer, buffer, buffer, view<675430400xi8>, buffer)
   command.return
 }
 
@@ -299,7 +304,7 @@ command.def public @flash_next_output_head() launch(%parameters: buffer, %epoch:
   kernel.launch @flash_next_select_output_rows[%count](%epoch, %residual, %head_epoch, %selected) : [index](buffer, buffer, buffer, buffer)
   %target = index.constant 0 : index
   %expanded = scalar.constant false : i1
-  command.launch @flash_next_project_logits[%target, %expanded](%parameters, %parameters, %head_epoch, %selected, %logits) : [index, i1](buffer, buffer, buffer, buffer, buffer)
+  command.launch @flash_next_project_logits[%count, %target, %expanded](%parameters, %parameters, %head_epoch, %selected, %logits) : [index, index, i1](buffer, buffer, buffer, buffer, buffer)
   kernel.launch @flash_next_sample[%count](%epoch, %logits, %outputs) : [index](buffer, buffer, buffer)
   command.return
 }

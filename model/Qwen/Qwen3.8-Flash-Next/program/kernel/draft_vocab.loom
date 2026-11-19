@@ -5,6 +5,8 @@
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 func.decl pure @flash_next_draft_cohorts(%capacity: index) -> (index)
 
 func.decl pure @flash_next_draft_mode_origin(%capacity: index) -> (offset)
@@ -75,7 +77,8 @@ kernel.def @flash_next_draft_plan() {
   %c1_index = index.constant 1 : index
   %c4_index = index.constant 4 : index
   %c0_i32 = scalar.constant 0 : i32
-  scf.for %cohort = [%c0_index to %cohort_count step %c1_index] {
+  %live_cohorts = func.call pure @flash_next_draft_cohorts(%count) : (index) -> (index)
+  scf.for %cohort = [%c0_index to %live_cohorts step %c1_index] {
     view.store %c0_i32, %cohorts[%cohort] : i32, view<[%cohort_count]xi32>
   }
   scf.for %span = [%c0_index to %count step %c1_index] {
@@ -96,27 +99,24 @@ kernel.def @flash_next_draft_plan() {
   kernel.return
 }
 
-kernel.def target(@flash_next_draft_wave32) @flash_next_draft_common_head(%neural_enabled: i1) {
-  %capacity = config.get @flash_next.token_count : index
-  %c1_index = index.constant 1 : index
-  %c3_index = index.constant 3 : index
-  %c4_index = index.constant 4 : index
-  %rounded = index.add %capacity, %c3_index : index
-  %batches = index.div %rounded, %c4_index : index
-  %workers = index.constant 1280 : index
+kernel.def target(@flash_next_draft_wave32) @flash_next_draft_common_head(%live_rows: index) {
+  %one = index.constant 1 : index
+  %units = target.execution.unit.count : index
+  %groups_per_unit = index.constant 32 : index
+  %groups = index.mul %units, %groups_per_unit : index
   %threads = index.constant 128 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %batches, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
+  %enabled = index.min %live_rows, %one : index
+  kernel.launch.config workgroups(%groups, %enabled, %one) workgroup_size(%threads, %one, %one) : index
 } launch(%expanded: i1, %epoch: buffer, %plan: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %count_value = func.call @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
   %count = index.assume %count_value [range(%count_value, 0, %capacity)] : index
-  %batch = kernel.workgroup.id<y> : index
   %c4_index = index.constant 4 : index
-  %first = index.mul %batch, %c4_index : index
-  %active = index.cmp ult, %first, %count : index
-  scf.if %active {
+  %first_batch = index.constant 0 : index
+  %step = index.constant 1 : index
+  %batches = func.call pure @flash_next_draft_cohorts(%count) : (index) -> (index)
+  scf.for %batch = [%first_batch to %batches step %step] {
+    %first = index.mul %batch, %c4_index : index
     %origin = index.constant 0 : offset
     %cohort_count = func.call pure @flash_next_draft_cohorts(%capacity) : (index) -> (index)
     %cohorts = buffer.view %plan[%origin] : buffer -> view<[%cohort_count]xi32>
@@ -130,7 +130,7 @@ kernel.def target(@flash_next_draft_wave32) @flash_next_draft_common_head(%neura
     %padded = index.add %rows, %c3_index : index
     %groups = index.div %padded, %c4_index : index
     %worker = kernel.workgroup.id<x> : index
-    %workers = index.constant 1280 : index
+    %workers = kernel.workgroup.count<x> : index
     %wave = kernel.subgroup.id : index
     %lane = kernel.subgroup.lane.id : index
     %c0_index = index.constant 0 : index
@@ -172,21 +172,20 @@ kernel.def target(@flash_next_draft_wave32) @flash_next_draft_common_head(%neura
   kernel.return
 }
 
-kernel.def target(@flash_next_draft_wave32) @flash_next_draft_rare_head(%neural_enabled: i1) {
-  %capacity = config.get @flash_next.token_count : index
-  %c1_index = index.constant 1 : index
+kernel.def target(@flash_next_draft_wave32) @flash_next_draft_rare_head(%live_rows: index) {
+  %one = index.constant 1 : index
   %groups = index.constant 248 : index
   %threads = index.constant 128 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %capacity, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%live_rows, %groups, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%groups, %workers, %one) workgroup_size(%threads, %one, %one) : index
 } launch(%expanded: i1, %epoch: buffer, %plan: buffer, %carry: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %count_value = func.call @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
   %count = index.assume %count_value [range(%count_value, 0, %capacity)] : index
-  %token = kernel.workgroup.id<y> : index
-  %active = index.cmp ult, %token, %count : index
-  scf.if %active {
+  %first = kernel.workgroup.id<y> : index
+  %workers = kernel.workgroup.count<y> : index
+  scf.for %token = [%first to %count step %workers] {
     %origin = index.constant 0 : offset
     %c4_index = index.constant 4 : index
     %batch = index.div %token, %c4_index : index
@@ -230,20 +229,19 @@ kernel.def target(@flash_next_draft_wave32) @flash_next_draft_rare_head(%neural_
 // sampling. Each output is {token ID, F32 confidence bits}; confidence is the
 // selected token probability within this proposal vocabulary. The target still
 // samples and verifies against its complete vocabulary.
-kernel.def @flash_next_draft_sample(%neural_enabled: i1) {
-  %capacity = config.get @flash_next.token_count : index
-  %c1_index = index.constant 1 : index
+kernel.def @flash_next_draft_sample(%live_rows: index) {
+  %one = index.constant 1 : index
   %threads = index.constant 256 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %capacity, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%live_rows, %one, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%workers, %one, %one) workgroup_size(%threads, %one, %one) : index
 } launch(%epoch: buffer, %plan: buffer, %carry: buffer, %logits: buffer, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %count_value = func.call @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
   %count = index.assume %count_value [range(%count_value, 0, %capacity)] : index
-  %token = kernel.workgroup.id<x> : index
-  %active = index.cmp ult, %token, %count : index
-  scf.if %active {
+  %first = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
+  scf.for %token = [%first to %count step %workers] {
     %length, %position, %begin, %owner = func.call @flash_next_mtp_span(%epoch, %token) : (buffer, index) -> (index, index, index, index)
     %record = func.call pure @flash_next_draft_record(%owner) : (index) -> (offset)
     %header = buffer.view %carry[%record] : buffer -> view<3xi32>
@@ -314,6 +312,8 @@ kernel.def @flash_next_draft_sample(%neural_enabled: i1) {
       view.store %selected, %predictions[%token, 0] : i32, view<[%capacity]x2xi32>
       view.store %probability_bits, %predictions[%token, 1] : i32, view<[%capacity]x2xi32>
     }
+    // Both reductions reuse workgroup scratch on the next proposal.
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   }
   kernel.return
 }
