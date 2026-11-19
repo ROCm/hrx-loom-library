@@ -31,13 +31,16 @@ kernel.def @qwen38_dflash_topk_partial(%rows: index) {
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%rows: index, %draft: buffer, %control: buffer, %carry: buffer, %logits: buffer, %table: buffer, %scores: buffer, %ids: buffer) {
+} launch(%rows: index, %first: index, %total: index, %draft: buffer, %control: buffer, %carry: buffer, %logits: buffer, %table: buffer, %scores: buffer, %ids: buffer) {
   %origin = index.constant 0 : offset
   %header = buffer.view %control[%origin] : buffer -> view<4xi32>
   %live_word = view.load %header[0] : view<4xi32> -> i32
   %mode = view.load %header[3] : view<4xi32> -> i32
   %live_value = index.cast %live_word : i32 to index
-  %live = index.assume %live_value [ge(%live_value, 0), le(%live_value, %rows)] : index
+  %epoch_live = index.assume %live_value [ge(%live_value, 0), le(%live_value, %total)] : index
+  %before = index.min %epoch_live, %first : index
+  %remaining = index.sub %epoch_live, %before : index
+  %live = index.min %remaining, %rows : index
   %c0_i32 = scalar.constant 0 : i32
   %full = scalar.cmpi ne, %mode, %c0_i32 : i32
   %full_partitions = index.constant 61 : index
@@ -58,7 +61,7 @@ kernel.def @qwen38_dflash_topk_partial(%rows: index) {
   %depth = index.sub %width, %c1 : index
   %dense = buffer.view %logits[%origin] : buffer -> view<[%rows]x248320xf32>
   %prefix = buffer.view %logits[%origin] : buffer -> view<[%rows]x98304xf32>
-  %extra = buffer.view %table[%origin] : buffer -> view<[%rows]x1024xf32>
+  %extra = buffer.view %table[%origin] : buffer -> view<[%total]x1024xf32>
   %negative = scalar.constant -inf : f32
   %largest = scalar.constant 2147483647 : i32
   %negative_vector = vector.splatf -inf : vector<16xf32>
@@ -66,6 +69,8 @@ kernel.def @qwen38_dflash_topk_partial(%rows: index) {
   scf.for %task = [%group to %tasks step %groups] {
     %row_value = index.div %task, %partitions : index
     %row = index.assume %row_value [ge(%row_value, 0), lt(%row_value, %rows)] : index
+    %packet_value = index.add %first, %row : index
+    %packet_row = index.assume %packet_value [ge(%packet_value, 0), lt(%packet_value, %total)] : index
     %partition = index.rem %task, %partitions : index
     %begin = index.mul %partition, %tile_width : index
     %prefix_tile = index.cmp ult, %partition, %table_partition : index
@@ -90,7 +95,7 @@ kernel.def @qwen38_dflash_topk_partial(%rows: index) {
           %id = index.cast %bounded : index to i32
           scf.yield %value, %id : f32, i32
         } else {
-          %span = index.div %row, %depth : index
+          %span = index.div %packet_row, %depth : index
           %descriptor_origin, %unused_begin, %owner = func.call @qwen38_span_binding(%draft, %span) : (buffer, index) -> (offset, index, index)
           %record = func.call pure @qwen38_dflash_vocabulary_record(%owner) : (index) -> (offset)
           %record_header = buffer.view %carry[%record] : buffer -> view<3xi32>
@@ -105,7 +110,7 @@ kernel.def @qwen38_dflash_topk_partial(%rows: index) {
           %valid = scalar.andi %within, %present : i1
           %value, %id = scf.if %valid -> (f32, i32) {
             %entry = index.assume %column [range(%column, 0, 1023)] : index
-            %value = view.load %extra[%row, %entry] : view<[%rows]x1024xf32> -> f32
+            %value = view.load %extra[%packet_row, %entry] : view<[%total]x1024xf32> -> f32
             %token = func.call @qwen38_dflash_vocabulary_table_id(%entry, %carry, %record) : (index, buffer, offset) -> (index)
             %id = index.cast %token : index to i32
             scf.yield %value, %id : f32, i32
@@ -120,8 +125,9 @@ kernel.def @qwen38_dflash_topk_partial(%rows: index) {
       %next_tokens = vector.insert %id into %tokens[%slot] : i32, vector<16xi32>
       scf.yield %next_values, %next_tokens : vector<16xf32>, vector<16xi32>
     }
-    %output_rows = index.mul %rows, %partitions : index
-    %output_row = index.assume %task [ge(%task, 0), lt(%task, %output_rows)] : index
+    %output_rows = index.mul %total, %partitions : index
+    %slot = index.madd %packet_row, %partitions, %partition : index
+    %output_row = index.assume %slot [ge(%slot, 0), lt(%slot, %output_rows)] : index
     template.apply<@selection.topk_tile_f32>(%c16, %output_row, %output_rows, %values, %tokens, %scores, %ids) : (index, index, index, vector<16xf32>, vector<16xi32>, buffer, buffer)
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   }

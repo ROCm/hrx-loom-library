@@ -5,7 +5,7 @@
 
 target.decl @qwen38_execution
 
-kernel.decl @qwen38_dflash_topk_partial(%rows: index) launch(%rows_argument: index, %draft: buffer, %control: buffer, %carry: buffer, %logits: buffer, %table: buffer, %scores: buffer, %ids: buffer)
+kernel.decl @qwen38_dflash_topk_partial(%rows: index) launch(%rows_argument: index, %first: index, %total: index, %draft: buffer, %control: buffer, %carry: buffer, %logits: buffer, %table: buffer, %scores: buffer, %ids: buffer)
 
 kernel.decl @qwen38_dflash_topk_merge(%rows: index) launch(%rows_argument: index, %control: buffer, %partial_scores: buffer, %partial_ids: buffer, %scores: buffer, %ids: buffer)
 
@@ -113,13 +113,25 @@ func.def @dflash_topk_reference(%draft: buffer, %control: buffer, %carry: buffer
   func.return
 }
 
-command.def target(@qwen38_execution) @dflash_topk() launch(%draft: buffer, %control: buffer, %carry: buffer, %logits: buffer, %table: buffer, %scores: buffer, %ids: buffer) {
+command.def target(@qwen38_execution) @dflash_topk(%configuration: index) launch(%draft: buffer, %control: buffer, %carry: buffer, %logits: buffer, %table: buffer, %scores: buffer, %ids: buffer) {
   %rows = index.constant 3 : index
   %partial_stride = index.constant 3904 : offset
   %partial_bytes = index.scale %rows, %partial_stride : index, offset -> offset
   %partial_scores = buffer.alloca<global> align(256) %partial_bytes : buffer
   %partial_ids = buffer.alloca<global> align(256) %partial_bytes : buffer
-  kernel.launch @qwen38_dflash_topk_partial[%rows](%rows, %draft, %control, %carry, %logits, %table, %partial_scores, %partial_ids) : [index](index, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  // Split inside the live prefix. Both windows contribute to one ranked
+  // result, including the retained tokens from each row's global owner.
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %two = index.constant 2 : index
+  %mode = index.rem %configuration, %two : index
+  %full = index.cmp ne, %mode, %zero : index
+  %full_stride = index.constant 993280 : offset
+  %prefix_stride = index.constant 393216 : offset
+  %next = scf.select %full, %full_stride, %prefix_stride : offset
+  %tail = buffer.view %logits[%next] : buffer -> view<2x248320xf32>
+  kernel.launch @qwen38_dflash_topk_partial[%one](%one, %zero, %rows, %draft, %control, %carry, %logits, %table, %partial_scores, %partial_ids) : [index](index, index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @qwen38_dflash_topk_partial[%two](%two, %one, %rows, %draft, %control, %carry, %tail, %table, %partial_scores, %partial_ids) : [index](index, index, index, buffer, buffer, buffer, view<2x248320xf32>, buffer, buffer, buffer)
   kernel.launch @qwen38_dflash_topk_merge[%rows](%rows, %control, %partial_scores, %partial_ids, %scores, %ids) : [index](index, buffer, buffer, buffer, buffer, buffer)
   command.return
 }
@@ -134,7 +146,7 @@ check.scenario public @dflash_topk_canonical_ids configure[4](%configuration: in
     check.generate<@dflash_topk_fixture>(%configuration, %draft, %control, %carry, %logits, %table) : (index, tensor<21xi32>, tensor<4xi32>, tensor<3x5696xi32>, tensor<3x248320xf32>, tensor<3x1024xf32>) -> ()
     %scores = check.generate.fill value(-99.0) : tensor<3x16xf32>
     %ids = check.generate.fill value(-99) : tensor<3x16xi32>
-    check.compare<@dflash_topk, @dflash_topk_reference>(%draft, %control, %carry, %logits, %table, %scores, %ids) : (tensor<21xi32>, tensor<4xi32>, tensor<3x5696xi32>, tensor<3x248320xf32>, tensor<3x1024xf32>, tensor<3x16xf32>, tensor<3x16xi32>) -> () {
+    check.compare<@dflash_topk, @dflash_topk_reference>[%configuration](%draft, %control, %carry, %logits, %table, %scores, %ids) : [index](tensor<21xi32>, tensor<4xi32>, tensor<3x5696xi32>, tensor<3x248320xf32>, tensor<3x1024xf32>, tensor<3x16xf32>, tensor<3x16xi32>) -> () {
       check.expect.bitwise actual(%scores) expected(%scores) : tensor<3x16xf32>
       check.expect.bitwise actual(%ids) expected(%ids) : tensor<3x16xi32>
       check.expect.bitwise actual(%carry) expected(%carry) : tensor<3x5696xi32>
