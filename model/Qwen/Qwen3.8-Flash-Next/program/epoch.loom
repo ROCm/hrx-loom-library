@@ -322,11 +322,9 @@ command.def public @flash_next_body_range(%outputs_only: i1, %begin: index, %end
   command.return
 }
 
-kernel.decl @hc_normalize_inject(%live_rows: index) launch(%span: buffer, %residual: buffer, %gamma: buffer, %normalized: buffer, %weight: buffer, %injection: buffer)
+command.decl @flash_next_hc_normalize_mix(%workload_count: index, %gamma: view<4x2560xf32>, %down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>, %injection_weight: view<4x10240xf32>) launch(%span: buffer, %residual: buffer, %injection: buffer, %mixed: buffer)
 
-kernel.decl @hc_combine_normalize_inject(%live_rows: index) launch(%span: buffer, %residual: buffer, %projected: buffer, %injection: buffer, %gamma: buffer, %output: buffer, %normalized: buffer, %weight: buffer, %next_injection: buffer)
-
-command.decl @flash_next_hc_mix_normalized(%workload_count: index, %down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>) launch(%span: buffer, %normalized: buffer, %mixed: buffer)
+command.decl @flash_next_hc_combine_mix(%workload_count: index, %gamma: view<4x2560xf32>, %down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>, %injection_weight: view<4x10240xf32>) launch(%span: buffer, %residual: buffer, %projected: buffer, %previous_injection: buffer, %output: buffer, %injection: buffer, %mixed: buffer)
 
 command.def public @flash_next_body_injection_fused(%outputs_only: i1, %begin_layer: index, %end_layer: index, %stream: i1) launch(%parameters: buffer, %residual: buffer, %epoch: buffer, %rows: buffer, %state: buffer, %input_tokens: buffer, %capture: buffer) {
   %neural_enabled = scalar.constant true : i1
@@ -383,37 +381,35 @@ command.def public @flash_next_body_injection_fused(%outputs_only: i1, %begin_la
   } else {
     scf.yield %residual : buffer
   }
-  %initial_normalized = buffer.alloca<global> align(256) %activation_bytes : buffer
+  %initial_mixed = buffer.alloca<global> align(256) %hidden_bytes : buffer
   %initial_injection = buffer.alloca<global> align(256) %injection_bytes : buffer
   %initial_gamma = command.parameter %parameters, "blk.{}.hc_attn_norm.weight"[%begin_layer] : view<4x2560xf32>
   %initial_down = command.parameter %parameters, "blk.{}.hc_attn_down.weight"[%begin_layer] : view<3481600xi8>
   %initial_up = command.parameter %parameters, "blk.{}.hc_attn_up.weight"[%begin_layer] : view<3481600xi8>
   %initial_weight = command.parameter %parameters, "blk.{}.hc_attn_inject.weight"[%begin_layer] : view<4x10240xf32>
-  kernel.launch @hc_normalize_inject[%workload_count](%epoch, %initial_residual, %initial_gamma, %initial_normalized, %initial_weight, %initial_injection) : [index](buffer, buffer, view<4x2560xf32>, buffer, view<4x10240xf32>, buffer)
+  command.launch @flash_next_hc_normalize_mix[%workload_count, %initial_gamma, %initial_down, %initial_up, %initial_weight](%epoch, %initial_residual, %initial_injection, %initial_mixed) : [index, view<4x2560xf32>, view<3481600xi8>, view<3481600xi8>, view<4x10240xf32>](buffer, buffer, buffer, buffer)
 
-  %final, %final_normalized, %final_injection, %final_down, %final_up = scf.for %layer = [%begin_layer to %end_layer step %c1](%current = %initial_residual : buffer, %current_normalized = %initial_normalized : buffer, %current_injection = %initial_injection : buffer, %current_down = %initial_down : view<3481600xi8>, %current_up = %initial_up : view<3481600xi8>) -> (buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>) unroll {
+  %final, %final_mixed, %final_injection = scf.for %layer = [%begin_layer to %end_layer step %c1](%current = %initial_residual : buffer, %current_mixed = %initial_mixed : buffer, %current_injection = %initial_injection : buffer) -> (buffer, buffer, buffer) unroll {
     %at_ple = index.cmp eq, %layer, %c1 : index
     %following = index.cmp ne, %layer, %begin_layer : index
     %has_ple = scalar.andi %at_ple, %following : i1
-    %input, %input_normalized, %attention_injection, %attention_down, %attention_up = scf.if %has_ple -> (buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>) {
+    %input, %attention_mixed, %attention_injection = scf.if %has_ple -> (buffer, buffer, buffer) {
       %ple = buffer.alloca<global> align(256) %activation_bytes : buffer
       command.launch @flash_next_ple_residual[%stream, %workload_count, %layer, %token_history, %conv_history](%parameters, %epoch, %mapping, %rows, %input_tokens, %current, %state, %ple, %capture, %residual) : [i1, index, index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
-      %ple_normalized = buffer.alloca<global> align(256) %activation_bytes : buffer
+      %ple_mixed = buffer.alloca<global> align(256) %hidden_bytes : buffer
       %ple_injection = buffer.alloca<global> align(256) %injection_bytes : buffer
       %ple_gamma = command.parameter %parameters, "blk.{}.hc_attn_norm.weight"[%layer] : view<4x2560xf32>
       %ple_down = command.parameter %parameters, "blk.{}.hc_attn_down.weight"[%layer] : view<3481600xi8>
       %ple_up = command.parameter %parameters, "blk.{}.hc_attn_up.weight"[%layer] : view<3481600xi8>
       %ple_weight = command.parameter %parameters, "blk.{}.hc_attn_inject.weight"[%layer] : view<4x10240xf32>
-      kernel.launch @hc_normalize_inject[%workload_count](%epoch, %ple, %ple_gamma, %ple_normalized, %ple_weight, %ple_injection) : [index](buffer, buffer, view<4x2560xf32>, buffer, view<4x10240xf32>, buffer)
-      scf.yield %ple, %ple_normalized, %ple_injection, %ple_down, %ple_up : buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>
+      command.launch @flash_next_hc_normalize_mix[%workload_count, %ple_gamma, %ple_down, %ple_up, %ple_weight](%epoch, %ple, %ple_injection, %ple_mixed) : [index, view<4x2560xf32>, view<3481600xi8>, view<3481600xi8>, view<4x10240xf32>](buffer, buffer, buffer, buffer)
+      scf.yield %ple, %ple_mixed, %ple_injection : buffer, buffer, buffer
     } else {
-      scf.yield %current, %current_normalized, %current_injection, %current_down, %current_up : buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>
+      scf.yield %current, %current_mixed, %current_injection : buffer, buffer, buffer
     }
-    %attention_mixed = buffer.alloca<global> align(256) %hidden_bytes : buffer
-    command.launch @flash_next_hc_mix_normalized[%workload_count, %attention_down, %attention_up](%epoch, %input_normalized, %attention_mixed) : [index, view<3481600xi8>, view<3481600xi8>](buffer, buffer, buffer)
     %is_last = index.cmp eq, %layer, %last_layer : index
     %finish = scalar.andi %outputs_only, %is_last : i1
-    %finished, %finished_normalized, %finished_injection, %finished_down, %finished_up = scf.if %finish -> (buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>) {
+    %finished, %finished_mixed, %finished_injection = scf.if %finish -> (buffer, buffer, buffer) {
       %ordinal = index.div %layer, %c4 : index
       %key_origin = index.scale %ordinal, %main_plane_bytes : index, offset -> offset
       %value_origin = index.add %key_origin, %value_tile_offset : offset
@@ -422,7 +418,7 @@ command.def public @flash_next_body_injection_fused(%outputs_only: i1, %begin_la
       %tail_relative = index.scale %ordinal, %tail_stride : index, offset -> offset
       %tail_origin = index.add %tail_base, %tail_relative : offset
       command.launch @flash_next_finish_output[%workload_count, %layer, %key_origin, %value_origin, %index_origin, %tail_origin](%parameters, %epoch, %mapping, %rows, %state, %input, %attention_mixed, %attention_injection, %residual, %capture, %input_tokens) : [index, index, offset, offset, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
-      scf.yield %residual, %input_normalized, %attention_injection, %attention_down, %attention_up : buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>
+      scf.yield %residual, %attention_mixed, %attention_injection : buffer, buffer, buffer
     } else {
       %projected = buffer.alloca<global> align(256) %hidden_bytes : buffer
       %ordinal = index.div %layer, %c4 : index
@@ -442,15 +438,13 @@ command.def public @flash_next_body_injection_fused(%outputs_only: i1, %begin_la
         command.launch @flash_next_gdn_attention[%workload_count, %span_count, %layer, %state_origin](%parameters, %epoch, %attention_mixed, %rows, %state, %projected, %capture) : [index, index, index, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       }
       %attention = buffer.alloca<global> align(256) %activation_bytes : buffer
-      %ffn_normalized = buffer.alloca<global> align(256) %activation_bytes : buffer
       %ffn_injection = buffer.alloca<global> align(256) %injection_bytes : buffer
       %ffn_gamma = command.parameter %parameters, "blk.{}.hc_ffn_norm.weight"[%layer] : view<4x2560xf32>
       %ffn_down = command.parameter %parameters, "blk.{}.hc_ffn_down.weight"[%layer] : view<3481600xi8>
       %ffn_up = command.parameter %parameters, "blk.{}.hc_ffn_up.weight"[%layer] : view<3481600xi8>
       %ffn_weight = command.parameter %parameters, "blk.{}.hc_ffn_inject.weight"[%layer] : view<4x10240xf32>
-      kernel.launch @hc_combine_normalize_inject[%workload_count](%epoch, %input, %projected, %attention_injection, %ffn_gamma, %attention, %ffn_normalized, %ffn_weight, %ffn_injection) : [index](buffer, buffer, buffer, buffer, view<4x2560xf32>, buffer, buffer, view<4x10240xf32>, buffer)
       %ffn_mixed = buffer.alloca<global> align(256) %hidden_bytes : buffer
-      command.launch @flash_next_hc_mix_normalized[%workload_count, %ffn_down, %ffn_up](%epoch, %ffn_normalized, %ffn_mixed) : [index, view<3481600xi8>, view<3481600xi8>](buffer, buffer, buffer)
+      command.launch @flash_next_hc_combine_mix[%workload_count, %ffn_gamma, %ffn_down, %ffn_up, %ffn_weight](%epoch, %input, %projected, %attention_injection, %attention, %ffn_injection, %ffn_mixed) : [index, view<4x2560xf32>, view<3481600xi8>, view<3481600xi8>, view<4x10240xf32>](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       %ids = buffer.alloca<global> align(256) %selection_bytes : buffer
       %weights = buffer.alloca<global> align(256) %selection_bytes : buffer
       %shared_gate = buffer.alloca<global> align(256) %gate_bytes : buffer
@@ -467,25 +461,25 @@ command.def public @flash_next_body_injection_fused(%outputs_only: i1, %begin_la
       }
       %before_ple = index.cmp eq, %layer, %c0 : index
       %separate = scalar.ori %before_ple, %last : i1
-      %next_normalized, %next_injection, %next_down, %next_up = scf.if %separate -> (buffer, buffer, view<3481600xi8>, view<3481600xi8>) {
+      %next_mixed, %next_injection = scf.if %separate -> (buffer, buffer) {
         kernel.launch @hc_combine[%neural_enabled](%epoch, %attention, %branch, %ffn_injection, %output) : [i1](buffer, buffer, buffer, buffer, buffer)
         // PLE replaces this value before use; the final head gathers its own
-        // rows. Neither boundary consumes an early normalized publication.
-        scf.yield %input_normalized, %attention_injection, %attention_down, %attention_up : buffer, buffer, view<3481600xi8>, view<3481600xi8>
+        // rows. Neither boundary consumes a prepared attention mixer.
+        scf.yield %attention_mixed, %attention_injection : buffer, buffer
       } else {
         %next_layer = index.add %layer, %c1 : index
         %next_gamma = command.parameter %parameters, "blk.{}.hc_attn_norm.weight"[%next_layer] : view<4x2560xf32>
-        %next = buffer.alloca<global> align(256) %activation_bytes : buffer
+        %mixed = buffer.alloca<global> align(256) %hidden_bytes : buffer
         %injection = buffer.alloca<global> align(256) %injection_bytes : buffer
         %down_weight = command.parameter %parameters, "blk.{}.hc_attn_down.weight"[%next_layer] : view<3481600xi8>
         %up_weight = command.parameter %parameters, "blk.{}.hc_attn_up.weight"[%next_layer] : view<3481600xi8>
         %next_weight = command.parameter %parameters, "blk.{}.hc_attn_inject.weight"[%next_layer] : view<4x10240xf32>
-        kernel.launch @hc_combine_normalize_inject[%workload_count](%epoch, %attention, %branch, %ffn_injection, %next_gamma, %output, %next, %next_weight, %injection) : [index](buffer, buffer, buffer, buffer, view<4x2560xf32>, buffer, buffer, view<4x10240xf32>, buffer)
-        scf.yield %next, %injection, %down_weight, %up_weight : buffer, buffer, view<3481600xi8>, view<3481600xi8>
+        command.launch @flash_next_hc_combine_mix[%workload_count, %next_gamma, %down_weight, %up_weight, %next_weight](%epoch, %attention, %branch, %ffn_injection, %output, %injection, %mixed) : [index, view<4x2560xf32>, view<3481600xi8>, view<3481600xi8>, view<4x10240xf32>](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+        scf.yield %mixed, %injection : buffer, buffer
       }
-      scf.yield %output, %next_normalized, %next_injection, %next_down, %next_up : buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>
+      scf.yield %output, %next_mixed, %next_injection : buffer, buffer, buffer
     }
-    scf.yield %finished, %finished_normalized, %finished_injection, %finished_down, %finished_up : buffer, buffer, buffer, view<3481600xi8>, view<3481600xi8>
+    scf.yield %finished, %finished_mixed, %finished_injection : buffer, buffer, buffer
   }
   command.return
 }
@@ -618,7 +612,6 @@ command.def public @flash_next_body_quant_injection(%outputs_only: i1, %begin_la
         command.launch @flash_next_gdn_attention[%workload_count, %span_count, %layer, %state_origin](%parameters, %epoch, %attention_mixed, %rows, %state, %projected, %capture) : [index, index, index, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       }
       %attention = buffer.alloca<global> align(256) %activation_bytes : buffer
-      %ffn_normalized = buffer.alloca<global> align(256) %activation_bytes : buffer
       %ffn_quantized = buffer.alloca<global> align(256) %quantized_bytes : buffer
       %ffn_injection = buffer.alloca<global> align(256) %injection_bytes : buffer
       %ffn_gamma = command.parameter %parameters, "blk.{}.hc_ffn_norm.weight"[%layer] : view<4x2560xf32>
@@ -629,9 +622,9 @@ command.def public @flash_next_body_quant_injection(%outputs_only: i1, %begin_la
       // The final mixer matches the selected-output finisher. Only
       // row liveness differs between the two model entry points.
       scf.if %is_last {
-        kernel.launch @hc_combine_normalize_inject[%workload_count](%epoch, %input, %projected, %attention_injection, %ffn_gamma, %attention, %ffn_normalized, %ffn_weight, %ffn_injection) : [index](buffer, buffer, buffer, buffer, view<4x2560xf32>, buffer, buffer, view<4x10240xf32>, buffer)
-        command.launch @flash_next_hc_mix_normalized[%workload_count, %ffn_down, %ffn_up](%epoch, %ffn_normalized, %ffn_mixed) : [index, view<3481600xi8>, view<3481600xi8>](buffer, buffer, buffer)
+        command.launch @flash_next_hc_combine_mix[%workload_count, %ffn_gamma, %ffn_down, %ffn_up, %ffn_weight](%epoch, %input, %projected, %attention_injection, %attention, %ffn_injection, %ffn_mixed) : [index, view<4x2560xf32>, view<3481600xi8>, view<3481600xi8>, view<4x10240xf32>](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
       } else {
+        %ffn_normalized = buffer.alloca<global> align(256) %activation_bytes : buffer
         kernel.launch @hc_combine_normalize_inject_int8[%workload_count](%epoch, %input, %projected, %attention_injection, %ffn_gamma, %attention, %ffn_normalized, %ffn_weight, %ffn_injection, %ffn_quantized) : [index](buffer, buffer, buffer, buffer, view<4x2560xf32>, buffer, buffer, view<4x10240xf32>, buffer, buffer)
         command.launch @flash_next_hc_mix_quantized[%ffn_down, %ffn_up](%epoch, %ffn_normalized, %ffn_quantized, %ffn_mixed) : [view<3481600xi8>, view<3481600xi8>](buffer, buffer, buffer, buffer)
       }
