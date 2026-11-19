@@ -1,8 +1,22 @@
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
-kernel.decl @gdn_project_alpha_beta() launch(%span: buffer, %input: buffer, %alpha_weight: buffer, %beta_weight: buffer, %alpha: buffer, %beta: buffer)
+func.decl pure @gdn_projection_rows(%workload_count: index) -> (index, index, index)
 
-kernel.decl @route_project(%neural_enabled: i1) launch(%epoch: buffer, %input: buffer, %route_weight: buffer, %shared_weight: buffer, %logits: buffer, %gate: buffer)
+kernel.decl @gdn_alpha_beta_dot(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %alpha_weight_arg: buffer, %beta_weight_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer)
+
+kernel.decl @gdn_alpha_beta_panels(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %alpha_weight_arg: buffer, %beta_weight_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer)
+
+kernel.decl @flash_next_alpha_beta_matrix(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %alpha_weight_arg: buffer, %beta_weight_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer)
+
+func.decl pure @route_projection_rows(%workload_count: index) -> (index, index, index, index)
+
+kernel.decl @route_project_single(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %route_weight_arg: buffer, %shared_weight_arg: buffer, %logits_arg: buffer, %gate_arg: buffer)
+
+kernel.decl @route_project_shared(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %route_weight_arg: buffer, %shared_weight_arg: buffer, %logits_arg: buffer, %gate_arg: buffer)
+
+kernel.decl @route_project_tile(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %route_weight_arg: buffer, %shared_weight_arg: buffer, %logits_arg: buffer, %gate_arg: buffer)
+
+kernel.decl @flash_next_route_matrix(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %route_weight_arg: buffer, %shared_weight_arg: buffer, %logits_arg: buffer, %gate_arg: buffer)
 
 // Every policy uses the same backing storage and owns its configured prefix.
 // Empty, single-row, aligned, and ragged inputs leave inactive rows unchanged.
@@ -13,7 +27,7 @@ kernel.def @routing_fixture() {
   %threads = index.constant 128 : index
   kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%requested_arg: index, %epoch: buffer, %input: buffer) {
-  %requested = index.assume %requested_arg [range(%requested_arg, 0, 1025)] : index
+  %requested = index.assume %requested_arg [range(%requested_arg, 0, 2048)] : index
   %capacity = config.get @flash_next.token_count : index
   %count = index.min %requested, %capacity : index
   %group = kernel.workgroup.id<x> : index
@@ -71,7 +85,7 @@ kernel.def @coefficient_reference() {
   %c1 = index.constant 1 : index
   %last_first = index.sub %first_outputs, %c1 : index
   %threshold = index.constant 2048 : index
-  %matrix = index.cmp uge, %capacity, %threshold : index
+  %matrix = index.cmp uge, %count, %threshold : index
   %column = index.madd %group, %c64, %thread : index
   %live_column = index.cmp ult, %column, %outputs : index
   scf.if %live_column {
@@ -134,9 +148,8 @@ kernel.def @coefficient_reference() {
 }
 
 check.case public @router_coefficients {
-  %neural_enabled = check.literal value(true) : i1
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
-  %requested = check.param.choice values([0, 1, 128, 129]) name("active") : index
+  %requested = check.param.choice values([0, 1, 7, 64, 129, 2048]) name("active") : index
   %capacity = check.literal value(2048) : index
   %first_outputs = check.literal value(512) : index
   %second_outputs = check.literal value(1) : index
@@ -154,7 +167,11 @@ check.case public @router_coefficients {
   %gate = check.generate.fill value(-17.0) : tensor<[%capacity]xf32>
   %expected_gate = check.generate.fill value(-17.0) : tensor<[%capacity]xf32>
   kernel.launch @coefficient_reference(%first_outputs, %second_outputs, %sigmoid, %epoch, %input, %weights, %shared, %expected, %expected_gate) : (index, index, i1, tensor<3xi32>, tensor<[%capacity]x2560xbf16>, tensor<512x2560xf32>, tensor<2560xf32>, tensor<[%capacity]x512xf32>, tensor<[%capacity]xf32>)
-  kernel.launch @route_project[%neural_enabled](%epoch, %input, %weights, %shared, %actual, %gate) : [i1](tensor<3xi32>, tensor<[%capacity]x2560xbf16>, tensor<512x2560xf32>, tensor<2560xf32>, tensor<[%capacity]x512xf32>, tensor<[%capacity]xf32>)
+  %single_rows, %shared_rows, %tile_rows, %matrix_rows = func.call pure @route_projection_rows(%requested) : (index) -> (index, index, index, index)
+  kernel.launch @route_project_single[%single_rows](%epoch, %input, %weights, %shared, %actual, %gate) : [index](tensor<3xi32>, tensor<[%capacity]x2560xbf16>, tensor<512x2560xf32>, tensor<2560xf32>, tensor<[%capacity]x512xf32>, tensor<[%capacity]xf32>)
+  kernel.launch @route_project_shared[%shared_rows](%epoch, %input, %weights, %shared, %actual, %gate) : [index](tensor<3xi32>, tensor<[%capacity]x2560xbf16>, tensor<512x2560xf32>, tensor<2560xf32>, tensor<[%capacity]x512xf32>, tensor<[%capacity]xf32>)
+  kernel.launch @route_project_tile[%tile_rows](%epoch, %input, %weights, %shared, %actual, %gate) : [index](tensor<3xi32>, tensor<[%capacity]x2560xbf16>, tensor<512x2560xf32>, tensor<2560xf32>, tensor<[%capacity]x512xf32>, tensor<[%capacity]xf32>)
+  kernel.launch @flash_next_route_matrix[%matrix_rows](%epoch, %input, %weights, %shared, %actual, %gate) : [index](tensor<3xi32>, tensor<[%capacity]x2560xbf16>, tensor<512x2560xf32>, tensor<2560xf32>, tensor<[%capacity]x512xf32>, tensor<[%capacity]xf32>)
   check.expect.approximate actual(%actual) expected(%expected) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<[%capacity]x512xf32>, tensor<[%capacity]x512xf32>
   check.expect.approximate actual(%gate) expected(%expected_gate) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<[%capacity]xf32>, tensor<[%capacity]xf32>
   check.return
@@ -162,7 +179,7 @@ check.case public @router_coefficients {
 
 check.case public @alpha_beta_coefficients {
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
-  %requested = check.param.choice values([0, 1, 128, 129, 1025]) name("active") : index
+  %requested = check.param.choice values([0, 1, 64, 65, 129, 2048]) name("active") : index
   %capacity = check.literal value(2048) : index
   %first_outputs = check.literal value(48) : index
   %second_outputs = check.literal value(48) : index
@@ -180,7 +197,10 @@ check.case public @alpha_beta_coefficients {
   %gate = check.generate.fill value(-17.0) : tensor<[%capacity]x48xf32>
   %expected_gate = check.generate.fill value(-17.0) : tensor<[%capacity]x48xf32>
   kernel.launch @coefficient_reference(%first_outputs, %second_outputs, %sigmoid, %epoch, %input, %weights, %shared, %expected, %expected_gate) : (index, index, i1, tensor<3xi32>, tensor<[%capacity]x2560xbf16>, tensor<48x2560xf32>, tensor<48x2560xf32>, tensor<[%capacity]x48xf32>, tensor<[%capacity]x48xf32>)
-  kernel.launch @gdn_project_alpha_beta(%epoch, %input, %weights, %shared, %actual, %gate) : (tensor<3xi32>, tensor<[%capacity]x2560xbf16>, tensor<48x2560xf32>, tensor<48x2560xf32>, tensor<[%capacity]x48xf32>, tensor<[%capacity]x48xf32>)
+  %dot_rows, %panel_rows, %matrix_rows = func.call pure @gdn_projection_rows(%requested) : (index) -> (index, index, index)
+  kernel.launch @gdn_alpha_beta_dot[%dot_rows](%epoch, %input, %weights, %shared, %actual, %gate) : [index](tensor<3xi32>, tensor<[%capacity]x2560xbf16>, tensor<48x2560xf32>, tensor<48x2560xf32>, tensor<[%capacity]x48xf32>, tensor<[%capacity]x48xf32>)
+  kernel.launch @gdn_alpha_beta_panels[%panel_rows](%epoch, %input, %weights, %shared, %actual, %gate) : [index](tensor<3xi32>, tensor<[%capacity]x2560xbf16>, tensor<48x2560xf32>, tensor<48x2560xf32>, tensor<[%capacity]x48xf32>, tensor<[%capacity]x48xf32>)
+  kernel.launch @flash_next_alpha_beta_matrix[%matrix_rows](%epoch, %input, %weights, %shared, %actual, %gate) : [index](tensor<3xi32>, tensor<[%capacity]x2560xbf16>, tensor<48x2560xf32>, tensor<48x2560xf32>, tensor<[%capacity]x48xf32>, tensor<[%capacity]x48xf32>)
   check.expect.approximate actual(%actual) expected(%expected) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<[%capacity]x48xf32>, tensor<[%capacity]x48xf32>
   check.expect.approximate actual(%gate) expected(%expected_gate) atol(1.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<[%capacity]x48xf32>, tensor<[%capacity]x48xf32>
   check.return

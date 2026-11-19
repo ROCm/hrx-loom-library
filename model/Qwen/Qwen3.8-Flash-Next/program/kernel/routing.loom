@@ -10,8 +10,6 @@ func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
 func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
 
-template.decl @flash_next.route_tile(%capacity: index, %span: buffer, %input: buffer, %route_weight: buffer, %shared_weight: buffer, %logits: buffer, %gate: buffer)
-
 // Original F32 parameters contract the same packed BF16 activation used by
 // both the routed and shared expert branches.
 func.def inline @route_partial(%token0: index, %row0: index, %rows0: index, %lane0: index, %input: buffer, %weight: buffer) -> (f32) {
@@ -108,115 +106,84 @@ func.def inline @route_shared_row(%span: buffer, %input: buffer, %route_weight: 
   func.return
 }
 
-// One token uses independent wave dots. Small cohorts share a coefficient row
-// across four token waves; larger capacities share panels across both axes.
-// Capacity specialization selects the launch and body together.
-kernel.def target(@flash_next_route_wave32) @route_project(%neural_enabled: i1) {
-  %tokens = config.get @flash_next.token_count : index
+// One wave per output row for a single token. Additional tokens share each
+// coefficient load across four waves in the grouped projection.
+kernel.def target(@flash_next_route_wave32) @route_project_single(%active_rows: index) {
+  %rows = index.constant 129 : index
   %c1 = index.constant 1 : index
-  %c5 = index.constant 5 : index
-  %c9 = index.constant 9 : index
-  %c63 = index.constant 63 : index
-  %c64 = index.constant 64 : index
-  %c127 = index.constant 127 : index
-  %c128 = index.constant 128 : index
-  %c129 = index.constant 129 : index
-  %c256 = index.constant 256 : index
-  %tiled = index.cmp uge, %tokens, %c64 : index
-  %threshold = index.constant 2048 : index
-  %matrix = index.cmp uge, %tokens, %threshold : index
-  %panel_height = scf.select %matrix, %c128, %c64 : index
-  %rounding = scf.select %matrix, %c127, %c63 : index
-  %rounded = index.add %tokens, %rounding : index
-  %tile_rows = index.div %rounded, %panel_height : index
-  %panel_groups = scf.select %matrix, %c5, %c9 : index
-  %c4 = index.constant 4 : index
-  %c3 = index.constant 3 : index
-  %c513 = index.constant 513 : index
-  %multiple = index.cmp ugt, %tokens, %c1 : index
-  %cohort_rounded = index.add %tokens, %c3 : index
-  %cohorts = index.div %cohort_rounded, %c4 : index
-  %narrow_groups = scf.select %multiple, %c513, %c129 : index
-  %narrow_rows = scf.select %multiple, %cohorts, %tokens : index
-  %groups = scf.select %tiled, %panel_groups, %narrow_groups : index
-  %rows = scf.select %tiled, %tile_rows, %narrow_rows : index
-  %threads = scf.select %tiled, %c256, %c128 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %rows, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%rows, %active_rows, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %input_arg: buffer, %route_weight_arg: buffer, %shared_weight_arg: buffer, %logits_arg: buffer, %gate_arg: buffer) {
-  %capacity = config.get @flash_next.token_count : index
-  %c64 = index.constant 64 : index
-  %tiled = index.cmp uge, %capacity, %c64 : index
-  scf.if %tiled {
-    template.apply<@flash_next.route_tile>(%capacity, %span_arg, %input_arg, %route_weight_arg, %shared_weight_arg, %logits_arg, %gate_arg) : (index, buffer, buffer, buffer, buffer, buffer, buffer)
-  } else {
-    %c1_index_2 = index.constant 1 : index
-    %multiple = index.cmp ugt, %capacity, %c1_index_2 : index
-    scf.if %multiple {
-      func.call @route_shared_row(%span_arg, %input_arg, %route_weight_arg, %shared_weight_arg, %logits_arg, %gate_arg) : (buffer, buffer, buffer, buffer, buffer, buffer)
+  %span, %input, %route_weight, %shared_weight, %logits, %gate = buffer.assume.noalias %span_arg, %input_arg, %route_weight_arg, %shared_weight_arg, %logits_arg, %gate_arg : buffer, buffer, buffer, buffer, buffer, buffer
+  %tokens = config.get @flash_next.token_count : index
+  %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
+  %token = kernel.workgroup.id<y> : index
+  %group = kernel.workgroup.id<x> : index
+  %wave = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %c4 = index.constant 4 : index
+  %rows = index.constant 512 : index
+  %last = index.constant 513 : index
+  %row = index.madd %group, %c4, %wave : index
+  %active_token = index.cmp ult, %token, %end : index
+  %valid_row = index.cmp ult, %row, %last : index
+  %active = scalar.andi %active_token, %valid_row : i1
+  scf.if %active {
+    %c0_index = index.constant 0 : index
+    %c1_index = index.constant 1 : index
+    %is_route = index.cmp ult, %row, %rows : index
+    %partial = scf.if %is_route -> (f32) {
+      %bounded_row = index.assume %row [range(%row, 0, 511)] : index
+      %value = func.call @route_partial(%token, %bounded_row, %rows, %lane, %input, %route_weight) : (index, index, index, index, buffer, buffer) -> (f32)
+      scf.yield %value : f32
     } else {
-      %span, %input, %route_weight, %shared_weight, %logits, %gate = buffer.assume.noalias %span_arg, %input_arg, %route_weight_arg, %shared_weight_arg, %logits_arg, %gate_arg : buffer, buffer, buffer, buffer, buffer, buffer
-      %tokens = config.get @flash_next.token_count : index
-      %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-      %token = kernel.workgroup.id<y> : index
-      %group = kernel.workgroup.id<x> : index
-      %wave = kernel.subgroup.id : index
-      %lane = kernel.subgroup.lane.id : index
-      %c4 = index.constant 4 : index
-      %rows = index.constant 512 : index
-      %last = index.constant 513 : index
-      %row = index.madd %group, %c4, %wave : index
-      %active_token = index.cmp ult, %token, %end : index
-      %valid_row = index.cmp ult, %row, %last : index
-      %active = scalar.andi %active_token, %valid_row : i1
-      scf.if %active {
-        %c0_index = index.constant 0 : index
-        %c1_index = index.constant 1 : index
-        %is_route = index.cmp ult, %row, %rows : index
-        %partial = scf.if %is_route -> (f32) {
-          %bounded_row = index.assume %row [range(%row, 0, 511)] : index
-          %value = func.call @route_partial(%token, %bounded_row, %rows, %lane, %input, %route_weight) : (index, index, index, index, buffer, buffer) -> (f32)
-          scf.yield %value : f32
-        } else {
-          %value = func.call @route_partial(%token, %c0_index, %c1_index, %lane, %input, %shared_weight) : (index, index, index, index, buffer, buffer) -> (f32)
-          scf.yield %value : f32
-        }
-        %sum = kernel.subgroup.reduce<addf> %partial : f32
-        %leader = index.cmp eq, %lane, %c0_index : index
-        scf.if %leader {
-          %origin = index.constant 0 : offset
-          scf.if %is_route {
-            %bounded_row = index.assume %row [range(%row, 0, 511)] : index
-            %output = buffer.view %logits[%origin] : buffer -> view<[%tokens]x512xf32>
-            view.store %sum, %output[%token, %bounded_row] : f32, view<[%tokens]x512xf32>
-          } else {
-            %c1 = scalar.constant 1.0 : f32
-            %negative = scalar.negf %sum : f32
-            %exponential = scalar.expf<afn> %negative : f32
-            %denominator = scalar.addf %c1, %exponential : f32
-            %sigmoid = scalar.divf %c1, %denominator : f32
-            %output = buffer.view %gate[%origin] : buffer -> view<[%tokens]xf32>
-            view.store %sigmoid, %output[%token] : f32, view<[%tokens]xf32>
-          }
-        }
+      %value = func.call @route_partial(%token, %c0_index, %c1_index, %lane, %input, %shared_weight) : (index, index, index, index, buffer, buffer) -> (f32)
+      scf.yield %value : f32
+    }
+    %sum = kernel.subgroup.reduce<addf> %partial : f32
+    %leader = index.cmp eq, %lane, %c0_index : index
+    scf.if %leader {
+      %origin = index.constant 0 : offset
+      scf.if %is_route {
+        %bounded_row = index.assume %row [range(%row, 0, 511)] : index
+        %output = buffer.view %logits[%origin] : buffer -> view<[%tokens]x512xf32>
+        view.store %sum, %output[%token, %bounded_row] : f32, view<[%tokens]x512xf32>
+      } else {
+        %c1 = scalar.constant 1.0 : f32
+        %negative = scalar.negf %sum : f32
+        %exponential = scalar.expf<afn> %negative : f32
+        %denominator = scalar.addf %c1, %exponential : f32
+        %sigmoid = scalar.divf %c1, %denominator : f32
+        %output = buffer.view %gate[%origin] : buffer -> view<[%tokens]xf32>
+        view.store %sigmoid, %output[%token] : f32, view<[%tokens]xf32>
       }
     }
   }
   kernel.return
 }
 
+kernel.def target(@flash_next_route_wave32) @route_project_shared(%active_rows: index) {
+  %rows = index.constant 513 : index
+  %tile = index.constant 4 : index
+  %tail = index.constant 3 : index
+  %rounded = index.add %active_rows, %tail : index
+  %batches = index.div %rounded, %tile : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%rows, %batches, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%span_arg: buffer, %input_arg: buffer, %route_weight_arg: buffer, %shared_weight_arg: buffer, %logits_arg: buffer, %gate_arg: buffer) {
+  func.call @route_shared_row(%span_arg, %input_arg, %route_weight_arg, %shared_weight_arg, %logits_arg, %gate_arg) : (buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
 // Selecting logits before normalizing cancels the full softmax denominator.
 // Ties choose the lower expert ID; selected probabilities remain F32.
-kernel.def target(@flash_next_route_wave32) @route_top10(%neural_enabled: i1) {
-  %tokens = config.get @flash_next.token_count : index
+kernel.def target(@flash_next_route_wave32) @route_top10(%active_rows: index) {
   %threads = index.constant 256 : index
   %c1 = index.constant 1 : index
   %units = target.execution.unit.count : index
-  %workers = func.call pure @flash_next_token_workers(%tokens, %c1, %units) : (index, index, index) -> (index)
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %workers = func.call pure @flash_next_token_workers(%active_rows, %c1, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%span_arg: buffer, %logits_arg: buffer, %ids_arg: buffer, %weights_arg: buffer) {
   %span, %logits, %ids, %weights = buffer.assume.noalias %span_arg, %logits_arg, %ids_arg, %weights_arg : buffer, buffer, buffer, buffer
   %tokens = config.get @flash_next.token_count : index
