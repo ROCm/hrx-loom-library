@@ -14,7 +14,9 @@ func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
 func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
 
-func.decl @flash_next_span_active(%epoch: buffer, %span: index) -> (i1)
+func.decl @flash_next_span_count(%epoch: buffer) -> (index)
+
+func.decl pure @flash_next_span_workers(%capacity: index) -> (index)
 
 func.decl @flash_next_span_state(%epoch: buffer, %rows: buffer, %span: index, %layer_origin: offset, %capacity: index) -> (index, index, i1, offset, offset)
 
@@ -445,11 +447,12 @@ kernel.def target(@gdn_fused_wave32) @gdn_fused_projection() {
   kernel.return
 }
 
-// A head/session owner consumes every boundary before publishing its history.
-// This ordering is necessary when the readable and writable arena rows alias.
+// A channel group strides across live spans. Each span consumes every boundary
+// before publishing its history, including when its reader and writer alias.
 kernel.def target(@gdn_fused_wave32) @gdn_fused_boundary() {
   %groups = index.constant 20 : index
-  %spans = config.get @flash_next.span_capacity : index
+  %span_capacity = config.get @flash_next.span_capacity : index
+  %spans = func.call pure @flash_next_span_workers(%span_capacity) : (index) -> (index)
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %spans, %c1) workgroup_size(%threads, %c1, %c1) : index
@@ -457,9 +460,10 @@ kernel.def target(@gdn_fused_wave32) @gdn_fused_boundary() {
   %epoch, %rows, %halo, %weight, %arena, %output, %norm = buffer.assume.noalias %epoch_arg, %rows_arg, %halo_arg, %weight_arg, %arena_arg, %output_arg, %norm_arg : buffer, buffer, buffer, buffer, buffer, buffer, buffer
   %capacity = config.get @flash_next.token_count : index
   %verification = config.get @flash_next.verification_width : index
-  %span = kernel.workgroup.id<y> : index
-  %active = func.call @flash_next_span_active(%epoch, %span) : (buffer, index) -> (i1)
-  scf.if %active {
+  %first_span = kernel.workgroup.id<y> : index
+  %span_stride = kernel.workgroup.count<y> : index
+  %span_count = func.call @flash_next_span_count(%epoch) : (buffer) -> (index)
+  scf.for %span = [%first_span to %span_count step %span_stride] {
     %begin, %end, %fresh, %reader, %writer = func.call @flash_next_span_state(%epoch, %rows, %span, %history_origin, %capacity) : (buffer, buffer, index, offset, index) -> (index, index, i1, offset, offset)
     %origin = index.constant 0 : offset
     %c0 = index.constant 0 : index
