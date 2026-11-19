@@ -13,6 +13,8 @@ func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
 func.decl @flash_next_mtp_span(%epoch: buffer, %span: index) -> (index, index, index, index)
 
+func.decl @flash_next_store_logit(%expanded: i1, %rows: index, %row: index, %id: index, %sum: f32, %output: buffer)
+
 func.decl @flash_next_q8_partial(%width: index, %token: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (f32)
 
 func.decl @flash_next_q8_batch_partial(%width: index, %group_size: index, %batch_size: index, %first: index, %end: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (vector<[%group_size]xf32>)
@@ -106,7 +108,7 @@ kernel.def target(@flash_next_draft_wave32) @flash_next_draft_common_head(%neura
   %c0_index = index.constant 0 : index
   %active_groups = scf.select %neural_enabled, %workers, %c0_index : index
   kernel.launch.config workgroups(%active_groups, %batches, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
-} launch(%epoch: buffer, %plan: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+} launch(%expanded: i1, %epoch: buffer, %plan: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %count_value = func.call @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
   %count = index.assume %count_value [range(%count_value, 0, %capacity)] : index
@@ -138,7 +140,6 @@ kernel.def target(@flash_next_draft_wave32) @flash_next_draft_common_head(%neura
     %width = index.constant 2560 : index
     %stride = index.constant 32 : index
     %leader = index.cmp eq, %lane, %c0_index : index
-    %logits = buffer.view %output[%origin] : buffer -> view<[%capacity]x248320xf32>
     scf.for %group = [%worker to %groups step %workers] {
       %column = index.madd %group, %c4_index, %wave : index
       %valid = index.cmp ult, %column, %rows : index
@@ -161,9 +162,7 @@ kernel.def target(@flash_next_draft_wave32) @flash_next_draft_common_head(%neura
             %live = index.cmp ult, %token, %count : index
             scf.if %live {
               %sum = vector.extract %sums[%ordinal] : vector<[%c4_index]xf32> -> f32
-              %packed = scalar.fptrunc %sum : f32 to bf16
-              %logit = scalar.extf %packed : bf16 to f32
-              view.store %logit, %logits[%token, %id] : f32, view<[%capacity]x248320xf32>
+              func.call @flash_next_store_logit(%expanded, %capacity, %token, %id, %sum, %output) : (i1, index, index, index, f32, buffer)
             }
           }
         }
@@ -181,7 +180,7 @@ kernel.def target(@flash_next_draft_wave32) @flash_next_draft_rare_head(%neural_
   %c0_index = index.constant 0 : index
   %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
   kernel.launch.config workgroups(%active_groups, %capacity, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
-} launch(%epoch: buffer, %plan: buffer, %carry: buffer, %input: buffer, %weight: buffer, %output: buffer) {
+} launch(%expanded: i1, %epoch: buffer, %plan: buffer, %carry: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %capacity = config.get @flash_next.token_count : index
   %count_value = func.call @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
   %count = index.assume %count_value [range(%count_value, 0, %capacity)] : index
@@ -219,10 +218,7 @@ kernel.def target(@flash_next_draft_wave32) @flash_next_draft_rare_head(%neural_
         %c0_index = index.constant 0 : index
         %leader = index.cmp eq, %lane, %c0_index : index
         scf.if %leader {
-          %packed = scalar.fptrunc %sum : f32 to bf16
-          %logit = scalar.extf %packed : bf16 to f32
-          %logits = buffer.view %output[%origin] : buffer -> view<[%capacity]x248320xf32>
-          view.store %logit, %logits[%token, %id] : f32, view<[%capacity]x248320xf32>
+          func.call @flash_next_store_logit(%expanded, %capacity, %token, %id, %sum, %output) : (i1, index, index, index, f32, buffer)
         }
       }
     }
@@ -263,7 +259,7 @@ kernel.def @flash_next_draft_sample(%neural_enabled: i1) {
     %subset_rows = index.add %common, %rare : index
     %columns = scf.select %full, %full_rows, %subset_rows : index
     %origin = index.constant 0 : offset
-    %values = buffer.view %logits[%origin] : buffer -> view<[%capacity]x248320xf32>
+    %values = buffer.view %logits[%origin] : buffer -> view<[%capacity]x248320xbf16>
     %thread = kernel.workitem.id<x> : index
     %threads = kernel.workgroup.size<x> : index
     %empty = scalar.constant 0 : i64
@@ -275,7 +271,8 @@ kernel.def @flash_next_draft_sample(%neural_enabled: i1) {
       %live = index.cmp ult, %position, %columns : index
       %column = index.min %position, %last : index
       %id = func.call @qwen38_draft_vocabulary_id(%column, %full, %carry, %record) : (index, i1, buffer, offset) -> (index)
-      %value = view.load %values[%token, %id] : view<[%capacity]x248320xf32> -> f32
+      %packed_value = view.load %values[%token, %id] : view<[%capacity]x248320xbf16> -> bf16
+      %value = scalar.extf %packed_value : bf16 to f32
       %id_word = index.cast %id : index to i32
       %candidate = func.call @sampling_key(%value, %id_word) : (f32, i32) -> (i64)
       %contribution = scf.select %live, %candidate, %empty : i64
@@ -291,14 +288,16 @@ kernel.def @flash_next_draft_sample(%neural_enabled: i1) {
     // proposed token using its unchanged weights, logits, and acceptance.
     %selected_value = index.cast %selected : i32 to index
     %selected_id = index.assume %selected_value [range(%selected_value, 0, 248076)] : index
-    %peak = view.load %values[%token, %selected_id] : view<[%capacity]x248320xf32> -> f32
+    %packed_peak = view.load %values[%token, %selected_id] : view<[%capacity]x248320xbf16> -> bf16
+    %peak = scalar.extf %packed_peak : bf16 to f32
     %empty_mass = scalar.constant 0.0 : f32
     %local_mass = scf.for %base = [%c0_index to %columns step %threads](%mass = %empty_mass : f32) -> (f32) {
       %position = index.add %base, %thread : index
       %live = index.cmp ult, %position, %columns : index
       %column = index.min %position, %last : index
       %id = func.call @qwen38_draft_vocabulary_id(%column, %full, %carry, %record) : (index, i1, buffer, offset) -> (index)
-      %value = view.load %values[%token, %id] : view<[%capacity]x248320xf32> -> f32
+      %packed_value = view.load %values[%token, %id] : view<[%capacity]x248320xbf16> -> bf16
+      %value = scalar.extf %packed_value : bf16 to f32
       %difference = scalar.subf %value, %peak : f32
       %exponential = scalar.expf<afn> %difference : f32
       %contribution = scf.select %live, %exponential, %empty_mass : f32
