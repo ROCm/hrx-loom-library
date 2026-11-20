@@ -10,6 +10,8 @@ config.decl @storage_test.draft_page_bytes : i64
 // Per-resident working state lives after retained carry, outside snapshots.
 config.decl @storage_test.draft_working_stride : i64
 
+func.decl @qwen38_feedback_bank_bytes(%capacity: index) -> (offset)
+
 func.decl pure @qwen38.speculation_origin(%state: buffer) -> (offset)
 
 func.decl readonly @qwen38.control_has_draft(%state: buffer) -> (i1)
@@ -180,9 +182,9 @@ func.def @valid_draft_storage(%allocations: buffer, %draft: buffer, %geometry: b
   func.return %valid : i1
 }
 
-// Eight prepared request slots remain independent of token and resident counts.
-// Inspect the actual bootstrap allocation and bank origin used by the service.
-func.def @feedback_layout(%allocations: buffer, %geometry: buffer, %enabled: i1) -> (i1) {
+// The publisher reads two feedback banks and one continuation owner tag per
+// admitted request. Growing the resident directory preserves that boundary.
+func.def @feedback_layout(%allocations: buffer, %geometry: buffer, %capacity: index, %enabled: i1) -> (i1) {
   %origin = index.constant 0 : offset
   %records = buffer.view %allocations[%origin] : buffer -> view<11x3xi64>
   %header = buffer.view %geometry[%origin] : buffer -> view<8xi64>
@@ -190,9 +192,14 @@ func.def @feedback_layout(%allocations: buffer, %geometry: buffer, %enabled: i1)
   %clear = view.load %records[8, 2] : view<11x3xi64> -> i64
   %split = view.load %header[3] : view<8xi64> -> i64
   %c0_i64 = scalar.constant 0 : i64
-  %allocated = scalar.constant 912 : i64
+  %bank = func.call @qwen38_feedback_bank_bytes(%capacity) : (index) -> (offset)
+  %tag_stride = index.constant 4 : offset
+  %tags = index.scale %capacity, %tag_stride : index, offset -> offset
+  %banks = index.add %bank, %bank : offset
+  %extent = index.add %banks, %tags : offset
+  %allocated = index.cast %extent : offset to i64
   %expected = scf.select %enabled, %allocated, %c0_i64 : i64
-  %expected_split = scalar.constant 440 : i64
+  %expected_split = index.cast %bank : offset to i64
   %sized = scalar.cmpi eq, %bytes, %expected : i64
   %uninitialized = scalar.cmpi eq, %clear, %c0_i64 : i64
   %partitioned = scalar.cmpi eq, %split, %expected_split : i64
@@ -201,7 +208,7 @@ func.def @feedback_layout(%allocations: buffer, %geometry: buffer, %enabled: i1)
   func.return %valid : i1
 }
 
-func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64, %context: i64, %pool: i64, %provider_words: index) -> (i1, i1) {
+func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64, %context: i64, %pool: i64, %feedback_slots: index, %provider_words: index) -> (i1, i1) {
   %disabled = scalar.constant 0 : i32
   %enabled = scalar.cmpi ne, %draft_depth, %disabled : i32
   %origin = index.constant 0 : offset
@@ -209,7 +216,7 @@ func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64, %context:
   %intermediate_rows = scalar.constant 17 : i64
   %final_rows = scalar.constant 129 : i64
   %tokens = scalar.constant 128 : i64
-  %feedback_capacity = scalar.constant 8 : i64
+  %feedback_capacity = index.cast %feedback_slots : index to i64
   %packed = scalar.constant true : i1
   %dflash = config.get @storage_test.dflash : i1
   %word_stride = index.constant 8 : offset
@@ -319,8 +326,8 @@ func.def @grows_without_moving_payloads(%draft_depth: i32, %pins: i64, %context:
   %working_valid = scalar.andi %initial_working, %grown_working : i1
   %initial_bank = func.call readonly @qwen38.control_has_draft(%state) : (buffer) -> (i1)
   %grown_bank = func.call readonly @qwen38.control_has_draft(%grown) : (buffer) -> (i1)
-  %initial_feedback = func.call @feedback_layout(%allocations, %geometry, %initial_bank) : (buffer, buffer, i1) -> (i1)
-  %grown_feedback = func.call @feedback_layout(%grown_allocations, %grown_geometry, %grown_bank) : (buffer, buffer, i1) -> (i1)
+  %initial_feedback = func.call @feedback_layout(%allocations, %geometry, %feedback_slots, %initial_bank) : (buffer, buffer, index, i1) -> (i1)
+  %grown_feedback = func.call @feedback_layout(%grown_allocations, %grown_geometry, %feedback_slots, %grown_bank) : (buffer, buffer, index, i1) -> (i1)
   %feedback_valid = scalar.andi %initial_feedback, %grown_feedback : i1
   %state_valid = scalar.andi %layouts_equal, %working_valid : i1
   %layout_valid = scalar.andi %state_valid, %feedback_valid : i1
@@ -337,8 +344,9 @@ check.case public @append_stable_resident_growth {
   %pins = check.param.choice values([0, 3]) : i64
   %context = check.literal value(256) : i64
   %pool = check.literal value(4096) : i64
+  %feedback_slots = check.literal value(8) : index
   %provider_words = check.param.choice values([0, 3, 10]) : index
-  %valid, %wide_payload = func.call @grows_without_moving_payloads(%draft_depth, %pins, %context, %pool, %provider_words) : (i32, i64, i64, i64, index) -> (i1, i1)
+  %valid, %wide_payload = func.call @grows_without_moving_payloads(%draft_depth, %pins, %context, %pool, %feedback_slots, %provider_words) : (i32, i64, i64, i64, index, index) -> (i1, i1)
   %expected = check.literal value(true) : i1
   check.expect.equal actual(%valid) expected(%expected) : i1
   check.return
@@ -355,8 +363,9 @@ check.case public @native_context_resident_growth {
   %pins = check.param.choice values([0, 3]) : i64
   %context = check.literal value(262144) : i64
   %pool = check.literal value(524288) : i64
+  %feedback_slots = check.literal value(3) : index
   %provider_words = check.param.choice values([0, 3, 10]) : index
-  %valid, %wide_payload = func.call @grows_without_moving_payloads(%draft_depth, %pins, %context, %pool, %provider_words) : (i32, i64, i64, i64, index) -> (i1, i1)
+  %valid, %wide_payload = func.call @grows_without_moving_payloads(%draft_depth, %pins, %context, %pool, %feedback_slots, %provider_words) : (i32, i64, i64, i64, index, index) -> (i1, i1)
   %expected = check.literal value(true) : i1
   check.expect.equal actual(%valid) expected(%expected) : i1
   check.expect.equal actual(%wide_payload) expected(%expected) : i1
