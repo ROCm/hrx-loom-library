@@ -44,8 +44,8 @@ func.def public @qwen38.speculation_register(%state: buffer, %level_value: index
   func.return
 }
 
-// A program that consumes each span's actual reservation can share its
-// ordinary stages across widths. Stage handles are nonnegative ordinals.
+// The ordinary stages can cap paid neural predictions while retaining the
+// whole target reservation for candidates already available from history.
 func.def public @qwen38.speculation_register_width(%state: buffer, %level: index, %width: i32) {
   %ordinary = scalar.constant -1 : i32
   func.call @qwen38.speculation_register(%state, %level, %width, %ordinary, %ordinary) : (buffer, index, i32, i32, i32)
@@ -54,9 +54,10 @@ func.def public @qwen38.speculation_register_width(%state: buffer, %level: index
 
 // A valid native plan can contain work requiring the ordinary program:
 // multi-token prefill, media, or supplied candidates. Alternative widths apply
-// to generated spans beside optional one-token final decodes. Reservations and
-// owner identities stay immutable; the packet encoder consumes the chosen width.
-func.def public @qwen38.speculation_choose(%state: buffer, %plan: buffer, %first_count: i32, %next_count: i32, %media_count: i32) -> (i32) {
+// to generated spans beside optional one-token final decodes. The host plan and
+// owner identities stay immutable. Named stage pairs constrain both the target
+// and draft widths. Shared stages can constrain just the neural draft width.
+func.def public @qwen38.speculation_choose(%state: buffer, %plan: buffer, %first_count: i32, %next_count: i32, %media_count: i32) -> (i32, i32) {
   %origin = func.call pure @qwen38.speculation_origin(%state) : (buffer) -> (offset)
   %words = buffer.view %state[%origin] : buffer -> view<12xi32>
   %entries = buffer.view %state[%origin] : buffer -> view<3x3xi32>
@@ -73,7 +74,7 @@ func.def public @qwen38.speculation_choose(%state: buffer, %plan: buffer, %first
   %first_fits = scalar.andi %multiple, %bounded : i1
   %rest_fits = scalar.andi %next_bounded, %text : i1
   %eligible = scalar.andi %first_fits, %rest_fits : i1
-  %width, %selected = scf.if %eligible -> (i32, i32) {
+  %target_width, %neural_width, %selected = scf.if %eligible -> (i32, i32, i32) {
     %level = func.call @qwen38.proposal_level(%first_count) : (i32) -> (i32)
     %entry_word = scalar.subi %level, %c1 : i32
     %entry_value = index.cast %entry_word : i32 to index
@@ -127,12 +128,13 @@ func.def public @qwen38.speculation_choose(%state: buffer, %plan: buffer, %first
     %named_pair = scalar.cmpi sge, %proposal, %c0 : i32
     %override = scalar.andi %supported, %named_pair : i1
     %chosen_entry = scf.select %override, %entry_word, %ordinary_entry : i32
-    scf.yield %chosen_width, %chosen_entry : i32, i32
+    %named_width = scf.select %override, %candidate, %c0 : i32
+    scf.yield %named_width, %chosen_width, %chosen_entry : i32, i32, i32
   } else {
-    scf.yield %c0, %ordinary_entry : i32, i32
+    scf.yield %c0, %c0, %ordinary_entry : i32, i32, i32
   }
   view.store %selected, %words[11] : i32, view<12xi32>
-  func.return %width : i32
+  func.return %target_width, %neural_width : i32, i32
 }
 
 // A zero width selects the ordinary stages; stage identities remain opaque.

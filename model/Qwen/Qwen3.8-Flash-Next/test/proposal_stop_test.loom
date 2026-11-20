@@ -10,7 +10,8 @@ config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 
 
 // Slots deliberately run in reverse target-span order. Probabilities below,
 // equal to, and above the gate retain their current proposal; only slots one
-// and two can survive into the next neural cohort. Closed-form expected fields
+// and two can survive into the next neural cohort. In the full cohort the
+// second of those owners has also exhausted its neural budget. Expected fields
 // preserve the untouched suffix instead of reproducing overlapping copies.
 func.def @stop_fixture(%trial_value: index, %finished: i1, %epoch: buffer, %draft: buffer, %origins: buffer, %predictions: buffer, %ids: buffer, %tokens: buffer, %results: buffer, %plan: buffer, %moves: buffer, %count_buffer: buffer) {
   %trial = index.assume %trial_value [range(%trial_value, 0, 4)] : index
@@ -27,6 +28,8 @@ func.def @stop_fixture(%trial_value: index, %finished: i1, %epoch: buffer, %draf
   %is_mixed = index.cmp ne, %mixed, %c0 : index
   %stride = scf.select %is_mixed, %c8, %c1 : index
   %target = buffer.view %epoch[%descriptor] : buffer -> view<32x6xi32>
+  %options_origin = index.constant 908 : offset
+  %options = buffer.view %epoch[%options_origin] : buffer -> view<32x2xi32>
   %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
   %spans = buffer.view %draft[%descriptor] : buffer -> view<4x6xi32>
   %mapping = buffer.view %origins[%origin] : buffer -> view<4x3xi32>
@@ -40,7 +43,9 @@ func.def @stop_fixture(%trial_value: index, %finished: i1, %epoch: buffer, %draf
   %live = buffer.view %count_buffer[%origin] : buffer -> view<1xi32>
   %at_least_one = index.max %trial, %c1 : index
   %possible = index.sub %at_least_one, %c1 : index
-  %survivors = index.min %possible, %c2 : index
+  %full = index.cmp eq, %trial, %c4 : index
+  %limit = scf.select %full, %c1, %c2 : index
+  %survivors = index.min %possible, %limit : index
   %count = scf.select %finished, %survivors, %trial : index
   %count_word = index.cast %count : index to i32
   %trial_word = index.cast %trial : index to i32
@@ -63,7 +68,13 @@ func.def @stop_fixture(%trial_value: index, %finished: i1, %epoch: buffer, %draf
     %low = scalar.ori %first, %last : i1
     %stopped = scalar.andi %active, %low : i1
     %stopped_final = scalar.andi %finished, %stopped : i1
-    %target_length = scf.select %stopped_final, %c2_i32, %c8_i32 : i32
+    %third = index.cmp eq, %slot, %c2 : index
+    %limited = scalar.andi %full, %third : i1
+    %budget = scf.select %limited, %c2_i32, %c8_i32 : i32
+    view.store %budget, %options[%target_slot, 0] : i32, view<32x2xi32>
+    %shortened = scalar.ori %stopped, %limited : i1
+    %shortened_final = scalar.andi %finished, %shortened : i1
+    %target_length = scf.select %shortened_final, %c2_i32, %c8_i32 : i32
     view.store %target_length, %target[%target_slot, 0] : i32, view<32x6xi32>
     %advanced = scalar.andi %active, %finished : i1
     %increment = scf.select %advanced, %c1, %c0 : index
@@ -179,7 +190,7 @@ func.def @stop_reference(%epoch: buffer, %draft: buffer, %origins: buffer, %pred
 
 check.scenario public @stop_cohort {
   check.trial[5](%trial: index, %entropy: check.entropy) {
-    %epoch = check.generate.fill value(-99) : tensor<195xi32>
+    %epoch = check.generate.fill value(-99) : tensor<291xi32>
     %draft = check.generate.fill value(-99) : tensor<27xi32>
     %origins = check.generate.fill value(-99) : tensor<4x3xi32>
     %predictions = check.generate.fill value(-99) : tensor<4x2xi32>
@@ -192,9 +203,9 @@ check.scenario public @stop_cohort {
     %parameters = check.generate.fill value(0) : tensor<4x16xi32>
     %selected = check.generate.fill value(0) : tensor<4x2xi32>
     %no = check.literal value(false) : i1
-    check.generate<@stop_fixture>(%trial, %no, %epoch, %draft, %origins, %predictions, %ids, %tokens, %results, %plan, %moves, %counts) : (index, i1, tensor<195xi32>, tensor<27xi32>, tensor<4x3xi32>, tensor<4x2xi32>, tensor<4xi32>, tensor<32x8xi32>, tensor<38xi32>, tensor<5xi32>, tensor<4xi32>, tensor<1xi32>) -> ()
-    check.compare<@stop_call, @stop_reference>(%epoch, %draft, %origins, %predictions, %ids, %tokens, %results, %plan, %moves, %counts, %parameters, %selected) : (tensor<195xi32>, tensor<27xi32>, tensor<4x3xi32>, tensor<4x2xi32>, tensor<4xi32>, tensor<32x8xi32>, tensor<38xi32>, tensor<5xi32>, tensor<4xi32>, tensor<1xi32>, tensor<4x16xi32>, tensor<4x2xi32>) -> () {
-      check.expect.bitwise actual(%epoch) expected(%epoch) : tensor<195xi32>
+    check.generate<@stop_fixture>(%trial, %no, %epoch, %draft, %origins, %predictions, %ids, %tokens, %results, %plan, %moves, %counts) : (index, i1, tensor<291xi32>, tensor<27xi32>, tensor<4x3xi32>, tensor<4x2xi32>, tensor<4xi32>, tensor<32x8xi32>, tensor<38xi32>, tensor<5xi32>, tensor<4xi32>, tensor<1xi32>) -> ()
+    check.compare<@stop_call, @stop_reference>(%epoch, %draft, %origins, %predictions, %ids, %tokens, %results, %plan, %moves, %counts, %parameters, %selected) : (tensor<291xi32>, tensor<27xi32>, tensor<4x3xi32>, tensor<4x2xi32>, tensor<4xi32>, tensor<32x8xi32>, tensor<38xi32>, tensor<5xi32>, tensor<4xi32>, tensor<1xi32>, tensor<4x16xi32>, tensor<4x2xi32>) -> () {
+      check.expect.bitwise actual(%epoch) expected(%epoch) : tensor<291xi32>
       check.expect.bitwise actual(%draft) expected(%draft) : tensor<27xi32>
       check.expect.bitwise actual(%origins) expected(%origins) : tensor<4x3xi32>
       check.expect.bitwise actual(%ids) expected(%ids) : tensor<4xi32>

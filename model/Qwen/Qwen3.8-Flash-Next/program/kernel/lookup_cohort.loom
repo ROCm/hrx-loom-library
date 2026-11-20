@@ -19,6 +19,8 @@ func.decl @qwen38_input_store_token(%mixed: index, %capacity: index, %inputs: bu
 
 config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]
 
+func.decl @qwen38_packet_options_origin(%capacity: index) -> (offset)
+
 func.decl @qwen38_packet_policy_origin(%capacity: index) -> (offset)
 
 func.decl @qwen38_packet_identity_origin(%capacity: index) -> (offset)
@@ -136,6 +138,9 @@ kernel.def @flash_next_lookup_publish(%round: index) {
   %header = buffer.view %draft[%origin] : buffer -> view<3xi32>
   %spans = buffer.view %draft[%descriptor_origin] : buffer -> view<[%capacity]x6xi32>
   %reservations = buffer.view %epoch[%descriptor_origin] : buffer -> view<[%target_capacity]x6xi32>
+  %packet_capacity = config.get @qwen38.packet_capacity : index
+  %options_origin = func.call @qwen38_packet_options_origin(%packet_capacity) : (index) -> (offset)
+  %options = buffer.view %epoch[%options_origin] : buffer -> view<[%target_capacity]x2xi32>
   %origins_view = buffer.view %origins[%origin] : buffer -> view<[%capacity]x3xi32>
   %inputs = buffer.view %ids[%origin] : buffer -> view<[%capacity]xi32>
   %records = buffer.view %parameters[%origin] : buffer -> view<[%capacity]x16xi32>
@@ -156,6 +161,7 @@ kernel.def @flash_next_lookup_publish(%round: index) {
     view.store %c0_i32, %cohorts[%cohort] : i32, view<[%cohort_count]xi32>
   }
   %first = index.add %round, %c1 : index
+  %first_word = index.cast %first : index to i32
   %remaining_count = scf.for %old = [%c0 to %count step %c1](%next = %c0 : index) -> (index) {
     %end_word = view.load %selections[%old, 0] : view<[%capacity]x2xi32> -> i32
     %end = index.cast %end_word : i32 to index
@@ -177,16 +183,25 @@ kernel.def @flash_next_lookup_publish(%round: index) {
     %has_match = index.cmp ugt, %end, %c0 : index
     %fits = index.cmp ule, %source_limit, %committed : index
     %matched = scalar.andi %has_match, %fits : i1
-    %copied = scalar.ori %matched, %finished : i1
+    %satisfied = scalar.ori %matched, %finished : i1
+    %neural_width = view.load %options[%owner, 0] : view<[%target_capacity]x2xi32> -> i32
+    %at_limit = scalar.cmpi uge, %first_word, %neural_width : i32
+    %retire = scalar.ori %satisfied, %at_limit : i1
     %begin_word = view.load %origins_view[%old, 0] : view<[%capacity]x3xi32> -> i32
     %begin = index.cast %begin_word : i32 to index
-    %new_count = scf.if %copied -> (index) {
-      scf.for %relative = [%c0 to %remaining step %c1] {
-        %position = index.add %end, %relative : index
-        %id = func.call @flash_next_lookup_id(%rows, %cache, %parameters, %old, %position) : (buffer, buffer, buffer, index, index) -> (i32)
-        %offset = index.add %first, %relative : index
-        %destination = index.add %begin, %offset : index
-        func.call @qwen38_input_store_token(%mixed, %target_capacity, %target_tokens, %destination, %id) : (index, index, buffer, index, i32)
+    %new_count = scf.if %retire -> (index) {
+      // History can fill the full reservation even after the last neural step.
+      // On a miss the verifier consumes only the initialized prefix.
+      scf.if %satisfied {
+        scf.for %relative = [%c0 to %remaining step %c1] {
+          %position = index.add %end, %relative : index
+          %id = func.call @flash_next_lookup_id(%rows, %cache, %parameters, %old, %position) : (buffer, buffer, buffer, index, index) -> (i32)
+          %offset = index.add %first, %relative : index
+          %destination = index.add %begin, %offset : index
+          func.call @qwen38_input_store_token(%mixed, %target_capacity, %target_tokens, %destination, %id) : (index, index, buffer, index, i32)
+        }
+      } else {
+        view.store %first_word, %reservations[%owner, 0] : i32, view<[%target_capacity]x6xi32>
       }
       scf.yield %next : index
     } else {

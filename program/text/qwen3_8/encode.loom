@@ -23,7 +23,7 @@ func.decl @qwen38_packet_policy_origin(%capacity: index) -> (offset)
 
 func.decl @qwen38_packet_identity_origin(%capacity: index) -> (offset)
 
-func.decl @qwen38.speculation_choose(%state: buffer, %plan: buffer, %first_count: i32, %next_count: i32, %media_count: i32) -> (i32)
+func.decl @qwen38.speculation_choose(%state: buffer, %plan: buffer, %first_count: i32, %next_count: i32, %media_count: i32) -> (i32, i32)
 
 func.decl @encode_media_plan(%plan: buffer, %inputs: buffer, %media_plan: buffer, %media_begin: index, %media_end: index, %count: index, %first: index, %metadata: buffer, %metadata_origin: offset, %tokens: buffer)
 
@@ -59,7 +59,7 @@ func.def public @text_encode_state_v2(%bindings: buffer, %count: i32, %origins: 
 // PROPOSE=2. The second plan follows the first cohort; known IDs form one
 // contiguous host stream. Six-word descriptors preserve source position and
 // selected output independently; neither field steals bits from the other.
-func.def @encode_plan(%plan: buffer, %inputs: buffer, %count: index, %first: index, %metadata: buffer, %metadata_origin: offset, %tokens: buffer, %token_origin: offset, %record_origin: i32, %ordinary: i1, %chosen_width: i32) -> (i32, i32) {
+func.def @encode_plan(%plan: buffer, %inputs: buffer, %count: index, %first: index, %metadata: buffer, %metadata_origin: offset, %tokens: buffer, %token_origin: offset, %record_origin: i32, %ordinary: i1, %target_width: i32, %neural_width: i32) -> (i32, i32) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -103,12 +103,14 @@ func.def @encode_plan(%plan: buffer, %inputs: buffer, %count: index, %first: ind
     %selected = scalar.cmpi ne, %select_bits, %zero32 : i32
     %propose_bits = scalar.andi %flags, %two32 : i32
     %proposes = scalar.cmpi ne, %propose_bits, %zero32 : i32
-    %chosen = scalar.cmpi ne, %chosen_width, %zero32 : i32
+    %chosen = scalar.cmpi ne, %target_width, %zero32 : i32
     %shortened = scalar.andi %chosen, %proposes : i1
-    %length = scf.select %shortened, %chosen_width, %reserved_length : i32
+    %length = scf.select %shortened, %target_width, %reserved_length : i32
     %speculative = scalar.cmpi ne, %credit, %zero32 : i32
     %speculative32 = scalar.extui %speculative : i1 to i32
-    %mode = scf.select %proposes, %two32, %speculative32 : i32
+    %limited = scalar.cmpi ne, %neural_width, %zero32 : i32
+    %draft_width = scf.select %limited, %neural_width, %reserved_length : i32
+    %mode = scf.select %proposes, %draft_width, %speculative32 : i32
     %selection = scf.select %selected, %outputs, %absent : i32
     view.store %length, %descriptors[%i, 0] : i32, view<[%capacity]x6xi32>
     view.store %position, %descriptors[%i, 1] : i32, view<[%capacity]x6xi32>
@@ -196,9 +198,9 @@ func.def public @text_encode_epoch_v2(%control_state: buffer, %plan: buffer, %in
     buffer.copy %control_state[%source_offset], %metadata[%target_offset], %policy_stride
   }
   %media_count = scalar.addi %first_media_count, %next_media_count : i32
-  %chosen_width = func.call @qwen38.speculation_choose(%control_state, %plan, %first_count, %next_count, %media_count) : (buffer, buffer, i32, i32, i32) -> (i32)
+  %target_width, %neural_width = func.call @qwen38.speculation_choose(%control_state, %plan, %first_count, %next_count, %media_count) : (buffer, buffer, i32, i32, i32) -> (i32, i32)
   %ordinary = scalar.cmpi eq, %media_count, %zero32 : i32
-  %outputs, %first_tokens = func.call @encode_plan(%plan, %inputs, %first, %c0, %metadata, %origin, %tokens, %origin, %zero32, %ordinary, %chosen_width) : (buffer, buffer, index, index, buffer, offset, buffer, offset, i32, i1, i32) -> (i32, i32)
+  %outputs, %first_tokens = func.call @encode_plan(%plan, %inputs, %first, %c0, %metadata, %origin, %tokens, %origin, %zero32, %ordinary, %target_width, %neural_width) : (buffer, buffer, index, index, buffer, offset, buffer, offset, i32, i1, i32, i32) -> (i32, i32)
   %eos_offset = func.call @qwen38_packet_eos_origin(%capacity) : (index) -> (offset)
   %terminal = buffer.view %metadata[%eos_offset] : buffer -> view<1xi32>
   view.store %eos, %terminal[0] : i32, view<1xi32>
@@ -215,7 +217,7 @@ func.def public @text_encode_epoch_v2(%control_state: buffer, %plan: buffer, %in
     %plane_bytes = index.div %token_byte_count, %plane_count : index
     %token_base = index.cast %plane_bytes : index to offset
     %queued_record_origin = scf.select %ordinary, %zero32, %first_reserved_tokens : i32
-    %next_outputs, %next_tokens = func.call @encode_plan(%plan, %inputs, %next, %first, %metadata, %metadata_base, %tokens, %token_base, %queued_record_origin, %ordinary, %chosen_width) : (buffer, buffer, index, index, buffer, offset, buffer, offset, i32, i1, i32) -> (i32, i32)
+    %next_outputs, %next_tokens = func.call @encode_plan(%plan, %inputs, %next, %first, %metadata, %metadata_base, %tokens, %token_base, %queued_record_origin, %ordinary, %target_width, %neural_width) : (buffer, buffer, index, index, buffer, offset, buffer, offset, i32, i1, i32, i32) -> (i32, i32)
     %next_eos_offset = index.add %metadata_base, %eos_offset : offset
     %next_terminal = buffer.view %metadata[%next_eos_offset] : buffer -> view<1xi32>
     view.store %eos, %next_terminal[0] : i32, view<1xi32>
