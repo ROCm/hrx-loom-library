@@ -1,7 +1,7 @@
 // Copyright 2026 AMD ROCm™ Software
 // SPDX-License-Identifier: MIT
 
-// Source interface for the native text-service v1 publication callback. All
+// Source interface for the native text-service publication callback. All
 // buffers are borrowed. The caller joins work and feedback completion before
 // invoking publication and retains every backing allocation through return.
 #pragma once
@@ -60,6 +60,6 @@ struct EpochPublication {
 
 } // namespace text_service
 
-// Member-order flattening defines the fourteen-argument native v1 signature.
+// Member-order flattening defines the fourteen-argument native publication signature.
 // Implementations and C++ callers share these records without heap allocation.
-void text_publish_epoch_v1(text_service::EpochPublication epoch);
+void text_publish_epoch_v2(text_service::EpochPublication epoch);

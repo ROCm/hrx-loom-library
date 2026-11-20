@@ -7,6 +7,8 @@ func.decl readonly @flash_next_span_count(%epoch: buffer) -> (index)
 
 config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
 
+config.decl @flash_next.dot_packet : %value: index where [range(%value, 0, 1)]
+
 command.decl @flash_next_finish_output(%workload_count: index, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset) launch(%parameters: buffer, %epoch: buffer, %mapping: buffer, %rows: buffer, %arena: buffer, %residual: buffer, %mixed: buffer, %injection: buffer, %output: buffer, %capture: buffer, %inputs: buffer)
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
@@ -63,8 +65,23 @@ command.def public @flash_next_body_range(%outputs_only: i1, %begin_layer: index
   %allow_quantized = scalar.constant true : i1
   %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %tokens = config.get @flash_next.token_count : index
-  %workload_count = func.call readonly @flash_next_token_count(%epoch, %tokens) : (buffer, index) -> (index)
-  %span_count = func.call readonly @flash_next_span_count(%epoch) : (buffer) -> (index)
+  %mode = config.get @flash_next.dot_packet : index
+  %zero = index.constant 0 : index
+  %short_packet = index.cmp ne, %mode, %zero : index
+  %live_workload_count = func.call readonly @flash_next_token_count(%epoch, %tokens) : (buffer, index) -> (index)
+  %workload_count = scf.if %short_packet -> (index) {
+    %short_workload_count = index.assume %live_workload_count [range(%live_workload_count, 1, 15)] : index
+    scf.yield %short_workload_count : index
+  } else {
+    scf.yield %live_workload_count : index
+  }
+  %live_span_count = func.call readonly @flash_next_span_count(%epoch) : (buffer) -> (index)
+  %span_count = scf.if %short_packet -> (index) {
+    %short_span_count = index.assume %live_span_count [range(%live_span_count, 1, 15)] : index
+    scf.yield %short_span_count : index
+  } else {
+    scf.yield %live_span_count : index
+  }
   %pool = config.get @flash_next.pool_capacity : index
   %row_bytes = index.constant 20480 : offset
   %hidden_row_bytes = index.constant 5120 : offset

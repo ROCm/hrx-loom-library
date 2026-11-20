@@ -26,7 +26,7 @@ void publish_media_positions(Buffer plan, Buffer media_plan, Index count,
 
 namespace {
 
-// Native v1 request and progress fields. Causal and source positions are
+// Native request and progress fields. Causal and source positions are
 // independent; media publication recovers the latter from the original plan.
 enum RequestField : unsigned {
   Length = 0,
@@ -77,7 +77,7 @@ using ProgressRows =
 
 } // namespace
 
-void text_publish_epoch_v1(text_service::EpochPublication epoch) {
+void text_publish_epoch_v2(text_service::EpochPublication epoch) {
   loom::assume(epoch.inputs.request_count >= 0);
   unsigned extent = static_cast<unsigned>(epoch.inputs.request_count);
   auto requests = loom::buffer::view<Dynamic, RequestWords>(

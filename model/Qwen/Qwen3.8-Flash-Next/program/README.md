@@ -16,9 +16,10 @@ three contain tensor payloads. The predictor scope contains one Q8_0 file.
 Parameter identities allow its identical embedding and vocabulary tensors to
 share the target's storage.
 
-Preparation declares the stage catalog and immutable capacities. Packed
-epochs carry the live token count, spans, row ownership, page IDs, and
-recurrent frontiers. `weights.loom` is an explicit auxiliary compiler input:
+Preparation declares the command programs for each enabled phase and sizes
+their storage from the token and span budgets. Each packed epoch supplies its
+live token and span counts, row ownership, page IDs, and recurrent frontiers.
+`weights.loom` is an explicit auxiliary compiler input:
 it configures one in-place preparation command for the QKV, gate, and output
 matrices in all 36 GDN layers. Each disjoint four-channel group is read into
 workgroup storage before publishing contiguous scale and code planes. The
@@ -41,8 +42,9 @@ PLE adds hashed n-gram lookup and its own token and convolution history.
 Read anchors and writable endpoints are distinct arguments, allowing forks
 to share immutable history while publishing into private state.
 
-`ple_prepare.loom` declares the request and independent-prefix catalogs plus
-one cached-host request root. `ple_control.loom` implements the shared epoch
+`ple_prepare.loom` declares one file-request program and one independent
+layer-zero program per input layout, plus one cached-host request allocation.
+`ple_control.loom` implements the shared epoch
 template with a finite HAL file batch: request dispatch, producer fence,
 independent layer-zero work, and a completion join before the suffix. The file
 resolver supplies the retained checkpoint handle and exact tensor byte window;
@@ -85,21 +87,20 @@ accepted prefix into non-page state. Catch-up uses accepted target hidden
 rows to advance predictor state. Draft vocabulary membership is learned from
 accepted tokens and is retained with the request.
 
-Text preparation registers shorter paired proposal/verifier stages for rounded
-cohorts of four and eight requests. The shared packet owner selects both stage
-identities before enqueue; queued work keeps its captured choice while later
-cohorts can choose another. A three- or four-owner cohort uses at most two
-proposals, and a five- through eight-owner cohort uses one. One or two owners
-retain the configured ceiling. Alternative stages borrow the same parameters
-and retained storage; preparation adds no copies or model-specific host policy.
+The proposal and verifier programs read each owner's reserved width from the
+packet. For ordinary text decoding, three or four owners can request up to two
+proposals each, and five through eight can request one. Other cohort sizes
+retain the configured ceiling. Both queued packets capture their widths before
+submission. The same recorded programs serve the next cohort as owners arrive
+or finish.
 
 Within each recursive chain, a predicted probability below 0.85 stops that
 owner's subsequent neural steps. The current prediction remains a target
 verification candidate. Stable compaction retains the original target span in
 shared proposal origins, so removing stopped owners cannot change request or
 media identity. The threshold and cohort policy do not modify target sampling
-or accepted-prefix verification. Prefill, media, supplied candidates, and
-cohorts beyond the prepared alternatives retain their ordinary stage pairing.
+or accepted-prefix verification. Prefill, media, and supplied candidates
+retain their ordinary reservations.
 
 The input-content kernels distinguish ordinary IDs from media records using
 composition facts. Target embedding reads original Q8 vocabulary rows or F32
@@ -183,11 +184,10 @@ state layout and accepted-prefix replay contract are unchanged.
 ## Original image and video projector
 
 Image-enabled variants set `flash_next.image_inputs` and add the image service
-exports. Preparation declares ordinary and mixed-input target, proposal, warm,
-verification, and continuation stages using one catalog builder and the same
-immutable parameter handles. The shared controller chooses the corresponding
-catalog from each packet's actual input representation. Text-only variants
-retain only the ordinary catalog.
+exports. Preparation binds target, proposal, catch-up, verification, and
+continuation programs to the same immutable parameters for each enabled input
+layout. A packet containing image or video placeholders selects the mixed-input
+handles. Text-only variants prepare the ordinary layout.
 
 The projector reads original BF16 matrices and F32 affine parameters from the
 separate `vision` scope. `vision_projector.loom` owns the complete resize,

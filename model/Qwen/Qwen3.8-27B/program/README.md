@@ -23,9 +23,11 @@ retained context. Both strategies remain parts of the text service.
 
 DFlash2 supports a `draft_depth` ceiling from one through seven, with seven as
 the default. A single live request uses that ceiling; two through four use at
-most three proposals, and five through eight use one. Preparation returns the
-admitted proposal capacity from its existing shape traversal and declares only
-reachable shorter proposal/verifier pairs. The shared text encoder selects a
+most three proposals, and five through eight use one. The packet token budget
+divided by the verification width bounds how many owners fit, and the span
+budget bounds how many distinct owners can be submitted. Preparation uses
+both bounds to declare the reachable shorter proposal/verifier pairs.
+The shared text encoder selects a
 pair and compacts both queued banks while preserving the native reservation and
 request identities. The selected width includes one anchor and specializes
 convolution, bidirectional attention, candidate selection, and private storage
@@ -35,9 +37,9 @@ the target's acceptance rule.
 RDNA proposals containing four or eight neural positions use shared raw
 Q4_K/Q6_K register panels. Each decoded weight serves the complete row bank
 before retirement, reducing inactive matrix lanes at those sizes. Model
-composition selects that schedule from the prepared shape. The shared host
-policy can change that shape during a response as peers arrive or finish;
-already queued programs retain their captured stage identities.
+composition selects the projection schedule for the active proposal width.
+Epochs can select a different width as peers arrive or finish. Already queued
+work retains its selected stage handles.
 
 ## Link and parameter boundaries
 
