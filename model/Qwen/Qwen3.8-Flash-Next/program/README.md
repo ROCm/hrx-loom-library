@@ -76,6 +76,12 @@ accepted prefix into non-page state. Catch-up uses accepted target hidden
 rows to advance predictor state. Draft vocabulary membership is learned from
 accepted tokens and is retained with the request.
 
+The text service records four command programs for speculative generation.
+They gather embedding rows, propose tokens, verify the live packet, and bring
+accepted state up to date. A fixed-grid kernel then prepares a queued packet
+directly from device feedback. Each stage takes its work from the live packet,
+including when a request enters or leaves a batch.
+
 The proposal and verifier programs read each owner's reserved width from the
 packet. For ordinary text decoding, three or four owners can request up to two
 proposals each, and five through eight can request one. Other cohort sizes
