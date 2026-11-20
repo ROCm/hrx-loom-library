@@ -87,3 +87,51 @@ check.scenario public @predictor_projection {
 }
 
 check.benchmark<@predictor_projection> @predictor_projection_benchmark
+
+// The first hidden coefficient is 37 * F16(0.01). Reconstructing it in
+// F16 gives 0.3701171875. Against input 0.5 this rounds to BF16
+// 0.185546875; applying the scale after the dot instead gives 0.1845703125.
+func.def @hidden_rounding_weight(%weight: buffer) {
+  %hidden_half = index.constant 2720 : offset
+  %first_code = index.constant 2722 : offset
+  %scale = buffer.view %weight[%hidden_half] : buffer -> view<1xf16>
+  %code = buffer.view %weight[%first_code] : buffer -> view<1xi8>
+  %scale_value = scalar.constant 0.01 : f16
+  %code_value = scalar.constant 37 : i8
+  view.store %scale_value, %scale[0] : f16, view<1xf16>
+  view.store %code_value, %code[0] : i8, view<1xi8>
+  func.return
+}
+
+func.def @hidden_rounding_reference(%epoch: buffer, %hidden: buffer, %weight: buffer, %embedding: buffer, %expected: buffer) {
+  %origin = index.constant 0 : offset
+  %outputs = buffer.view %expected[%origin] : buffer -> view<4x2560xbf16>
+  %value = scalar.constant 0.185546875 : bf16
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %four = index.constant 4 : index
+  scf.for %stream = [%zero to %four step %one] {
+    view.store %value, %outputs[%stream, 0] : bf16, view<4x2560xbf16>
+  }
+  func.return
+}
+
+check.scenario public @hidden_matrix_coefficient_rounding {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %single = check.literal value(1) : index
+    %capacity, %count = check.generate<@projection_geometry>(%single) : (index) -> (index, index)
+    %epoch = check.generate.fill value(0) : tensor<3xi32>
+    check.generate<@projection_epoch>(%count, %epoch) : (index, tensor<3xi32>) -> ()
+    %weight = check.generate.fill value(0) : tensor<13926400xi8>
+    %embedding = check.generate.fill value(0.0) : tensor<[%capacity]x2560xbf16>
+    %hidden = check.generate.fill value(0.5) : tensor<[%capacity]x10240xbf16>
+    %actual = check.generate.fill value(0.0) : tensor<[%capacity]x4x2560xbf16>
+    check.generate<@hidden_rounding_weight>(%weight) : (tensor<13926400xi8>) -> ()
+    %enabled = check.literal value(true) : i1
+    check.compare<@flash_next_mtp_hidden_matrix, @hidden_rounding_reference>[%enabled](%epoch, %hidden, %weight, %embedding, %actual) : [i1](tensor<3xi32>, tensor<[%capacity]x10240xbf16>, tensor<13926400xi8>, tensor<[%capacity]x2560xbf16>, tensor<[%capacity]x4x2560xbf16>) -> () {
+      check.expect.bitwise actual(%actual) expected(%actual) : tensor<[%capacity]x4x2560xbf16>
+    }
+  }
+  check.return
+}
