@@ -82,12 +82,12 @@ accepted state up to date. A fixed-grid kernel then prepares a queued packet
 directly from device feedback. Each stage takes its work from the live packet,
 including when a request enters or leaves a batch.
 
-The proposal and verifier programs read each owner's reserved width from the
-packet. For ordinary text decoding, three or four owners can request up to two
-proposals each, and five through eight can request one. Other cohort sizes
-retain the configured ceiling. Both queued packets capture their widths before
-submission. The same recorded programs serve the next cohort as owners arrive
-or finish.
+Each packet carries the target reservation and the neural budget for each
+owner. For ordinary text decoding, the model budgets two neural proposals
+each for three or four owners, and one each for five through eight owners.
+The reservation can accommodate a longer match from accepted history.
+Both queued packets carry the scheduling decision across compaction. The
+same recorded programs serve the next cohort as owners arrive or finish.
 
 Within each recursive chain, a predicted probability below 0.85 stops that
 owner's subsequent neural steps. The current prediction remains a target
@@ -126,7 +126,7 @@ No per-context coordinate history, packet copy, or extra dispatch is required.
 Greedy proposal rounds first search accepted token history. A trigram bitset
 locates the newest sixteen occurrences, and backward comparison selects the
 longest suffix, breaking ties toward the newest occurrence. A match of at least
-twelve tokens supplies the complete remaining proposal tail only when those
+eight tokens supplies the complete remaining proposal tail only when those
 IDs are already committed. The target still verifies every proposed token.
 Sampled requests retain neural drafting.
 
