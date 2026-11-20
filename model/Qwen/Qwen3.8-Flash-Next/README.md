@@ -22,13 +22,13 @@ The resident target bank occupies approximately 76.86 GiB before request state, 
 | --- | --- | --- |
 | `chat` | `ud-q4-k-xl` | Four execution rows and 16,384-position contexts. |
 | `mtp` | `ud-q4-k-xl-mtp` | The same capacities with a seven-proposal ceiling and adaptive text cohorts. |
-| `mtp-continuation` | `ud-q4-k-xl-mtp` | Adaptive text cohorts and two-epoch continuation. |
+| `mtp-continuation` | `ud-q4-k-xl-mtp` | Up to fifteen proposals from accepted history, seven neural steps, and a device-fed second epoch. |
 | `long-context` | `ud-q4-k-xl` | Eight rows and 262,144-position contexts. |
 | `long-context-mtp` | `ud-q4-k-xl-mtp` | The same native-context capacities with adaptive text cohorts. |
 | `vision` | `ud-q4-k-xl-vision` | Chat capacities with the original BF16 image projector. |
 | `vision-mtp` | `ud-q4-k-xl-vision-mtp` | Images and video frames with three recursive predictor proposals. |
 
-Text MTP treats draft depth as a ceiling. One or two active requests can use up to seven proposals, three or four use at most two, and five through eight use one. Each request's predicted probability can stop its chain earlier; every proposed token still goes through target verification. These choices update during a response as peers arrive and retire, without a calibration request or device readback. Lower configured ceilings remain respected. Prefill, media, supplied candidates, and larger cohorts keep their original proposal reservations. A draft-enabled model serves all of them through the same recorded target verifier, even when a request has only one output token left.
+The target verifies a pending token and its proposed continuation together. A repeated suffix can supply up to fifteen tokens from history in one pass. The neural predictor runs at most seven steps and can stop earlier on low confidence. The text policy shortens eligible reservations to two proposals for three or four active requests and one for five through eight. These choices update during a response as peers arrive and retire, without a calibration request or device readback. Lower configured ceilings remain respected. Prefill, media, supplied candidates, and larger cohorts keep their original proposal reservations. A draft-enabled model serves all of them through the same recorded target verifier, even when a request has only one output token left.
 
 MTP remains part of the text service. The model card selects the predictor parameter scope and JIT configuration; deployment decides devices, process memory, and request admission. Request-time sampling remains a service option. These capacities are configuration contracts, not throughput or peak-memory estimates.
 

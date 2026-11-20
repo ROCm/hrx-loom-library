@@ -177,6 +177,7 @@ kernel.def export("qwen38_mtp_proposal_advance_confident") @qwen38_mtp_proposal_
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %relative = index.add %round, %c1 : index
+  %last = index.cmp eq, %relative, %maximum_proposals : index
   %count_word = view.load %header[1] : view<3xi32> -> i32
   %count_value = index.cast %count_word : i32 to index
   %count = index.assume %count_value [range(%count_value, 0, %draft_capacity)] : index
@@ -187,7 +188,10 @@ kernel.def export("qwen38_mtp_proposal_advance_confident") @qwen38_mtp_proposal_
     func.call @qwen38_mtp_publish_token(%mixed_inputs, %relative, %target_capacity, %draft_capacity, %slot, %prediction, %mapping, %spans, %inputs, %target_tokens) : (index, index, index, index, index, i32, view<[%draft_capacity]x3xi32>, view<[%draft_capacity]x6xi32>, view<[%draft_capacity]xi32>, buffer)
     %probability_bits = view.load %outputs[%slot, 1] : view<[%draft_capacity]x2xi32> -> i32
     %probability = scalar.bitcast %probability_bits : i32 to f32
-    %stop = scalar.cmpf olt, %probability, %minimum_probability : f32
+    %low = scalar.cmpf olt, %probability, %minimum_probability : f32
+    // A history reservation can exceed the number of neural steps. Only
+    // the initialized prefix may reach the verifier on a lookup miss.
+    %stop = scalar.ori %low, %last : i1
     scf.if %stop {
       %owner_word = view.load %mapping[%slot, 2] : view<[%draft_capacity]x3xi32> -> i32
       %owner_value = index.cast %owner_word : i32 to index
@@ -201,8 +205,6 @@ kernel.def export("qwen38_mtp_proposal_advance_confident") @qwen38_mtp_proposal_
   }
   // The final scheduled advance also runs for an empty draft cohort. It owns
   // compaction after early exits, independent of the configured chain ceiling.
-  %last_round = index.sub %maximum_proposals, %c1 : index
-  %last = index.cmp eq, %round, %last_round : index
   scf.if %last {
     func.call @qwen38_packet_compact_prefix(%mixed_inputs, %target_capacity, %epoch, %target_tokens) : (index, index, buffer, buffer)
   }

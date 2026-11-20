@@ -48,7 +48,7 @@ enum ProgressField : unsigned {
 };
 constexpr unsigned RequestWords = 9;
 constexpr unsigned ProgressWords = 21;
-constexpr unsigned FeedbackWords = 10;
+constexpr unsigned FeedbackWords = 18;
 constexpr unsigned MaximumBankOutputs = FeedbackWords - 2;
 // The live span count follows the three queue timestamps and input-token count.
 constexpr unsigned FeedbackLiveCountBytes = 28;
@@ -68,8 +68,8 @@ using ProgressRows =
                                         unsigned count,
                                         ProgressRows destination,
                                         unsigned owner, unsigned output_begin) {
-  // Verification bounds each bank to eight tokens; two banks share one output
-  // record. These are producer invariants, not new runtime validation.
+  // Both verifications spend the same per-request output credit. The queued
+  // bank starts after the tokens already published by the first bank.
   loom::assume(count <= MaximumBankOutputs);
   loom::assume(output_begin <= MaximumBankOutputs);
   for (unsigned i = 0; i < count; ++i) {

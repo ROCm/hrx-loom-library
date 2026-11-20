@@ -2,12 +2,12 @@
 // Launch arguments are (mixed_inputs, verification_width, token_capacity, packet_capacity,
 // epoch, inputs, predictions, committed, replay, results). mixed_inputs is 0
 // for contiguous I32 IDs and 1 for eight-word media records; the composition
-// supplies this fact. Width is the 1..8 verification ceiling; each speculative
+// supplies this fact. Width is the 1..16 verification ceiling; each speculative
 // descriptor supplies its actual anchor-plus-draft count within that ceiling.
 // Allocation capacity is positive.
 // Packet capacity bounds spans and selected predictions independently of the
 // current token shape. Each output control has a three-word header and six
-// words per span; feedback has a work-observation header and ten words per span.
+// words per span; feedback has a work-observation header and eighteen words per span.
 // Allocations are disjoint. Acceptance preserves the header's queue timestamps.
 // Input storage contains token_capacity records and remains immutable with
 // the epoch and predictions until completion. Unused output rows retain their
@@ -25,7 +25,7 @@ func.decl @qwen38_feedback_records_origin() -> (offset)
 func.decl @qwen38_feedback_counts(%outputs: i32, %proposals: i32) -> (i32)
 
 // Greedy acceptance is the sole owner of speculative publication. A result
-// record is {consumed_inputs, packed_counts, token[8]}. The final selected token
+// record is {consumed_inputs, packed_counts, token[16]}. The final selected token
 // remains pending; consuming the anchor plus matched drafts advances by exactly
 // output_count. EOS and the caller's output credit truncate the same prefix.
 // Committed control and replay preserve the original packed token offsets.
@@ -36,7 +36,7 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
   kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
 } launch(%mixed_inputs_value: index, %width_value: index, %token_capacity_value: index, %packet_capacity: index, %epoch: buffer, %inputs: buffer, %predictions: buffer, %committed: buffer, %replay: buffer, %results: buffer) {
   %mixed_inputs = index.assume %mixed_inputs_value [range(%mixed_inputs_value, 0, 1)] : index
-  %width = index.assume %width_value [range(%width_value, 1, 8)] : index
+  %width = index.assume %width_value [range(%width_value, 1, 16)] : index
   %token_capacity = index.assume %token_capacity_value [range(%token_capacity_value, 1, 2147483647)] : index
   %origin = index.constant 0 : offset
   %descriptor_origin = index.constant 12 : offset
@@ -57,7 +57,7 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
-  %capacity = index.constant 8 : index
+  %capacity = index.constant 16 : index
   %c0_2 = scalar.constant 0 : i32
   %c1_2 = scalar.constant 1 : i32
   %true = scalar.constant true : i1
@@ -67,7 +67,7 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
   %span_word = view.load %header[1] : view<3xi32> -> i32
   %span_value = index.cast %span_word : i32 to index
   %spans = index.assume %span_value [range(%span_value, 0, %packet_capacity)] : index
-  %outputs = buffer.view %results[%result_origin] : buffer -> view<[%spans]x10xi32>
+  %outputs = buffer.view %results[%result_origin] : buffer -> view<[%spans]x18xi32>
   %counts_origin = index.constant 24 : offset
   %counts = buffer.view %results[%counts_origin] : buffer -> view<2xi32>
   view.store %total, %counts[0] : i32, view<2xi32>
@@ -75,13 +75,13 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
   view.store %total, %accepted_header[0] : i32, view<3xi32>
   view.store %span_word, %accepted_header[1] : i32, view<3xi32>
   view.store %c0_2, %accepted_header[2] : i32, view<3xi32>
-  %widths = vector.iota %c1_2 step %c1_2 : vector<8xi32>
-  %empty_histogram = vector.splati 0 : vector<8xi32>
+  %widths = vector.iota %c1_2 step %c1_2 : vector<16xi32>
+  %empty_histogram = vector.splati 0 : vector<16xi32>
   %zero_pairs = scalar.constant 0 : i64
   %one64 = scalar.constant 1 : i64
   %two64 = scalar.constant 2 : i64
   %generated_flag = scalar.constant 2 : i32
-  %replay_count, %histogram, %known_inputs, %maximum_context, %causal_pairs, %generated = scf.for %span = [%c0 to %spans step %c1](%prior_replay = %c0 : index, %bins = %empty_histogram : vector<8xi32>, %known = %c0_2 : i32, %maximum = %c0_2 : i32, %pairs = %zero_pairs : i64, %has_generated = %false : i1) -> (index, vector<8xi32>, i32, i32, i64, i1) {
+  %replay_count, %histogram, %known_inputs, %maximum_context, %causal_pairs, %generated = scf.for %span = [%c0 to %spans step %c1](%prior_replay = %c0 : index, %bins = %empty_histogram : vector<16xi32>, %known = %c0_2 : i32, %maximum = %c0_2 : i32, %pairs = %zero_pairs : i64, %has_generated = %false : i1) -> (index, vector<16xi32>, i32, i32, i64, i1) {
     %count_word = view.load %descriptors[%span, 0] : view<[%packet_capacity]x6xi32> -> i32
     %position = view.load %descriptors[%span, 1] : view<[%packet_capacity]x6xi32> -> i32
     %begin_word = view.load %descriptors[%span, 2] : view<[%packet_capacity]x6xi32> -> i32
@@ -93,10 +93,10 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
     %is_generated = scalar.cmpi eq, %flag, %generated_flag : i32
     %next_generated = scalar.ori %has_generated, %is_generated : i1
     %observed_width = scf.select %speculative, %count_word, %c0_2 : i32
-    %width_vector = vector.splat %observed_width : vector<8xi32>
-    %matches_width = vector.cmpi eq, %widths, %width_vector : vector<8xi32> -> vector<8xi1>
-    %increments = vector.extui %matches_width : vector<8xi1> to vector<8xi32>
-    %next_bins = vector.addi %bins, %increments : vector<8xi32>
+    %width_vector = vector.splat %observed_width : vector<16xi32>
+    %matches_width = vector.cmpi eq, %widths, %width_vector : vector<16xi32> -> vector<16xi1>
+    %increments = vector.extui %matches_width : vector<16xi1> to vector<16xi32>
+    %next_bins = vector.addi %bins, %increments : vector<16xi32>
     %known_count = scf.select %speculative, %c0_2, %count_word : i32
     %next_known = scalar.addi %known, %known_count : i32
     %context = scalar.addi %position, %count_word : i32
@@ -113,7 +113,7 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
     %selection = index.cast %selection_word : i32 to index
     scf.for %token = [%c0 to %capacity step %c1] {
       %slot = index.add %token, %c2 : index
-      view.store %c0_2, %outputs[%span, %slot] : i32, view<[%spans]x10xi32>
+      view.store %c0_2, %outputs[%span, %slot] : i32, view<[%spans]x18xi32>
     }
     %consumed_word, %emitted_word = scf.if %speculative -> (i32, i32) {
       %span_width_value = index.cast %count_word : i32 to index
@@ -129,7 +129,7 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
           %prediction_index = index.assume %prediction_value [ge(%prediction_value, 0), lt(%prediction_value, %packet_capacity)] : index
           %prediction = view.load %selected[%prediction_index] : view<[%packet_capacity]xi32> -> i32
           %slot = index.add %token, %c2 : index
-          view.store %prediction, %outputs[%span, %slot] : i32, view<[%spans]x10xi32>
+          view.store %prediction, %outputs[%span, %slot] : i32, view<[%spans]x18xi32>
           %next_count = index.add %count, %c1 : index
           %has_draft = index.cmp ult, %token, %draft_count : index
           %matches = scf.if %has_draft -> (i1) {
@@ -157,18 +157,18 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
       %emitted = scf.if %has_output -> (i32) {
         %known_selection = index.assume %selection [ge(%selection, 0), lt(%selection, %packet_capacity)] : index
         %prediction = view.load %selected[%known_selection] : view<[%packet_capacity]xi32> -> i32
-        view.store %prediction, %outputs[%span, 2] : i32, view<[%spans]x10xi32>
+        view.store %prediction, %outputs[%span, 2] : i32, view<[%spans]x18xi32>
         scf.yield %c1_2 : i32
       } else {
         scf.yield %c0_2 : i32
       }
       scf.yield %count_word, %emitted : i32, i32
     }
-    view.store %consumed_word, %outputs[%span, 0] : i32, view<[%spans]x10xi32>
+    view.store %consumed_word, %outputs[%span, 0] : i32, view<[%spans]x18xi32>
     %candidates = scalar.subi %count_word, %c1_2 : i32
     %proposed = scf.select %speculative, %candidates, %c0_2 : i32
     %counts_word = func.call @qwen38_feedback_counts(%emitted_word, %proposed) : (i32, i32) -> (i32)
-    view.store %counts_word, %outputs[%span, 1] : i32, view<[%spans]x10xi32>
+    view.store %counts_word, %outputs[%span, 1] : i32, view<[%spans]x18xi32>
     view.store %consumed_word, %accepted[%span, 0] : i32, view<[%packet_capacity]x6xi32>
     view.store %position, %accepted[%span, 1] : i32, view<[%packet_capacity]x6xi32>
     view.store %begin_word, %accepted[%span, 2] : i32, view<[%packet_capacity]x6xi32>
@@ -189,19 +189,19 @@ kernel.def export("qwen38_accept_spans") @qwen38_accept_spans() {
     } else {
       scf.yield %prior_replay : index
     }
-    scf.yield %next_replay, %next_bins, %next_known, %next_maximum, %next_pairs, %next_generated : index, vector<8xi32>, i32, i32, i64, i1
+    scf.yield %next_replay, %next_bins, %next_known, %next_maximum, %next_pairs, %next_generated : index, vector<16xi32>, i32, i32, i64, i1
   }
   %histogram_origin = index.constant 64 : offset
-  %width_counts = buffer.view %results[%histogram_origin] : buffer -> view<8xi32>
-  vector.store %histogram, %width_counts[0] : vector<8xi32>, view<8xi32>
-  %context_origin = index.constant 96 : offset
+  %width_counts = buffer.view %results[%histogram_origin] : buffer -> view<16xi32>
+  vector.store %histogram, %width_counts[0] : vector<16xi32>, view<16xi32>
+  %context_origin = index.constant 128 : offset
   %context_counts = buffer.view %results[%context_origin] : buffer -> view<2xi32>
   view.store %known_inputs, %context_counts[0] : i32, view<2xi32>
   view.store %maximum_context, %context_counts[1] : i32, view<2xi32>
-  %pairs_origin = index.constant 104 : offset
+  %pairs_origin = index.constant 136 : offset
   %pair_count = buffer.view %results[%pairs_origin] : buffer -> view<1xi64>
   view.store %causal_pairs, %pair_count[0] : i64, view<1xi64>
-  %shape_origin = index.constant 112 : offset
+  %shape_origin = index.constant 144 : offset
   %shape = buffer.view %results[%shape_origin] : buffer -> view<1xi32>
   %capacity_word = index.cast %token_capacity : index to i32
   view.store %capacity_word, %shape[0] : i32, view<1xi32>

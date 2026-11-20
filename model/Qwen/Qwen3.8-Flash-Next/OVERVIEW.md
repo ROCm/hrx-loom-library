@@ -145,17 +145,17 @@ image-specific stages.
 
 `ud-q4-k-xl-mtp` adds
 [`mtp-Qwen3.8-Flash-Next-Q8_0.gguf`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6/mtp-Qwen3.8-Flash-Next-Q8_0.gguf)
-in the `draft` parameter scope. It supports one through seven recursive
-proposals. The predictor proposes greedily; the target verifies under the
-request's sampling policy and commits only the accepted prefix. The matching
+in the `draft` parameter scope. The predictor proposes up to seven tokens
+recursively. The target verifies them under the request's sampling policy
+and commits only the accepted prefix. The matching
 embedding and vocabulary tensors can share target allocations. The source layout requires
 2,775,621,632 additional parameter bytes for the remaining predictor tensors.
 
-`chat` uses target-only execution. `mtp` enables a ceiling of seven proposals, and
-`mtp-continuation` also enables two-epoch continuation. These are execution
-choices within the same text service. More speculative work is not itself a
-throughput guarantee; qualification compares equal prompts, sampling, output
-budgets, and retained state.
+The `chat` preset uses the target alone. The `mtp` preset can verify seven
+proposals after its pending token. With `mtp-continuation`, a matching suffix
+can supply up to fifteen proposals from accepted history in one target pass.
+The two device-fed epochs share a sixteen-output publication budget for each
+request.
 
 The predictor's vocabulary includes a 98,304-token prefix, all 33 checkpoint
 control tokens, and up to 991 rare tokens learned from accepted request
