@@ -160,9 +160,11 @@ immutable feedback may be published. Continuations preserve their first-cohort
 owner while compacting live rows. Neither policy transforms nor packet writers
 wait for a device or infer ownership from buffer contents.
 
-The shared epoch calls `qwen38.epoch.target` after proposal and before feedback
-and predictor catch-up. A model links one provider with its stage catalog and
-buffer layout. `epoch_dispatch.loom` supplies the ordinary single-command target
+The shared epoch gets its target, proposal, catch-up, verification, and
+continuation command IDs from the model's `qwen38.epoch.stages`. Flash-Next
+retains one handle per phase and input layout across all packet sizes. The
+controller calls `qwen38.epoch.target` after proposal and before feedback and
+predictor catch-up. `epoch_dispatch.loom` supplies the ordinary single-command target
 and verifier paths. A model-specific provider can split that target computation
 around asynchronous input readiness while retaining the shared packet encoding,
 speculation selection, feedback, and continuation policy. The returned completion

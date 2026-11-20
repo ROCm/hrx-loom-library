@@ -1,14 +1,8 @@
-// Cold text-service preparation for the Flash-Next checkpoint. Named
-// parameter scopes produce shared source handles, shape-specialized stages,
-// and explicit allocation/retained-state records for the shared text owner.
-
-// Image-enabled compositions publish a second input-specialized catalog.
-// Text-only compositions omit the projector and mixed-input stage catalog.
+// Cold Flash-Next preparation binds checkpoint parameters, declares command
+// handles for the execution phases, and sizes retained storage. Image-enabled
+// compositions add a second input layout for mixed token/feature records.
 config.def @flash_next.image_inputs = false : i1
 
-// The shared text owner supplies validated capacities and packed shape pairs.
-// This program declares the checkpoint's exact storage and stage catalog;
-// it neither discovers filenames nor transforms the original packed tensors.
 func.decl @qwen38_feedback_bytes(%capacity: index) -> (offset)
 
 func.decl @qwen38_feedback_bank_bytes(%capacity: index) -> (offset)
@@ -23,7 +17,7 @@ func.decl import("prepare") @source_scope(%scope: buffer) -> (i32)
 
 func.decl import("prepare") @parameter(%stage: i32, %binding: i32, %input: i32, %source: i32, %policy: buffer)
 
-func.decl @qwen38.packet_capacities(%shapes: buffer, %shape_count: i64, %prefill: i64) -> (i64, i64)
+func.decl @qwen38.packet_capacities(%shapes: buffer, %shape_count: i64, %prefill: i64) -> (i64, i64, i64)
 
 func.decl @qwen38.allocation(%records: buffer, %slot: index, %bytes: i64, %initial_zero_bytes: i64)
 
@@ -32,6 +26,8 @@ func.decl @qwen38.row_view(%records: buffer, %row_count: index, %row: index, %sl
 func.decl @qwen38_packet_bytes(%capacity: index) -> (offset)
 
 func.decl @qwen38.control_create(%packet_capacity: i64, %feedback_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1, %provider_bytes: offset) -> (buffer)
+
+func.decl @qwen38.control_context(%state: buffer) -> (i64, offset)
 
 func.decl @qwen38.control_resize(%state: buffer, %rows: i64) -> (buffer, i64, i64, i64, i64, i64, i1, i1, i1)
 
@@ -336,47 +332,50 @@ func.def @qwen38.storage(%tokens: i64, %feedback_capacity: i64, %context: i64, %
   func.return %allocations, %views, %target_origins, %draft_origins, %geometry : buffer, buffer, buffer, buffer, buffer
 }
 
-// The service supplies physical token and span envelopes. Target, warm, and
-// verification phases consume live packed prefixes. A single proposal phase
-// covers every reservation; all phases bind the same checkpoint handles.
-func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %enabled: i1, %depth: i64, %mixed: i64, %packet_capacity: i64, %feedback_capacity: i64) -> (i32, i32, i32, i64, i64) {
-  %origin = index.constant 0 : offset
-  %c0 = index.constant 0 : index
-  %c1 = index.constant 1 : index
+// Each input layout retains the five stage IDs returned by preparation.
+// The 32-byte embedding payload precedes the ordinary and mixed rows.
+// Stage zero is a valid target. Optional draft stages follow the target.
+func.def @phase_handles_origin(%state: buffer, %mixed: i1) -> (offset) {
+  %packet_capacity, %provider = func.call @qwen38.control_context(%state) : (buffer) -> (i64, offset)
+  %ordinary = index.constant 32 : offset
+  %features = index.constant 52 : offset
+  %row = scf.select %mixed, %features, %ordinary : offset
+  %origin = index.add %provider, %row : offset
+  func.return %origin : offset
+}
+
+template.decl @qwen38.epoch.stages(%state: buffer, %mixed: i1, %shape: i32, %span_count: i32) -> (i32, i32, i32, i32, i32)
+
+template.def<@qwen38.epoch.stages> @flash_next_phase_stages(%state: buffer, %mixed: i1, %shape: i32, %span_count: i32) -> (i32, i32, i32, i32, i32) {
+  %origin = func.call @phase_handles_origin(%state, %mixed) : (buffer, i1) -> (offset)
+  %stages = buffer.view %state[%origin] : buffer -> view<5xi32>
+  %target = view.load %stages[0] : view<5xi32> -> i32
+  %proposal = view.load %stages[1] : view<5xi32> -> i32
+  %warm = view.load %stages[2] : view<5xi32> -> i32
+  %verifier = view.load %stages[3] : view<5xi32> -> i32
+  %continuation = view.load %stages[4] : view<5xi32> -> i32
+  template.return %target, %proposal, %warm, %verifier, %continuation : i32, i32, i32, i32, i32
+}
+
+// Every phase consumes the live prefix of its packet. Preparation records
+// each once for this layout and keeps the handle returned by the runner.
+func.def @declare_packed_stages(%state: buffer, %mixed_layout: i1, %tokens: i64, %spans: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %enabled: i1, %depth: i64, %proposal_capacity: i64, %packet_capacity: i64) {
+  %origin = func.call @phase_handles_origin(%state, %mixed_layout) : (buffer, i1) -> (offset)
+  %stages = buffer.view %state[%origin] : buffer -> view<5xi32>
+  %mixed = scalar.extui %mixed_layout : i1 to i64
   %c0_i32 = scalar.constant 0 : i32
   %c0_i64 = scalar.constant 0 : i64
-  %limit = scalar.constant 32768 : i64
-  %diagnostic = global.load @limits_error : buffer
-  %full_root = buffer.constant utf8("flash_next_ple_suffix_all") : buffer
-  %selected_root = buffer.constant utf8("flash_next_ple_suffix") : buffer
-  %root = scf.select %enabled, %full_root, %selected_root : buffer
   %one_root = scalar.constant 1 : i32
   %two_roots = scalar.constant 2 : i32
   %three_roots = scalar.constant 3 : i32
-  %bounded = scalar.assume %shape_count [range(%shape_count, 1, 2147483647)] : i64
-  %count = index.cast %bounded : i64 to index
-  %view = buffer.view %shapes[%origin] : buffer -> view<[%count]x2xi64>
-  %anchor = scalar.constant 1 : i64
-  %verification = scalar.addi %depth, %anchor : i64
-  %maximum, %proposal_capacity, %target_first = scf.for %i = [%c0 to %count step %c1](%previous = %c0_i64 : i64, %prior_proposals = %anchor : i64, %first_stage = %c0_i32 : i32) -> (i64, i64, i32) {
-    %tokens = view.load %view[%i, 0] : view<[%count]x2xi64> -> i64
-    %spans = view.load %view[%i, 1] : view<[%count]x2xi64> -> i64
-    %fits = scalar.cmpi ule, %tokens, %limit : i64
-    %fits_word = scalar.extui %fits : i1 to i32
-    func.call @require(%fits_word, %diagnostic) : (i32, buffer)
-    %stage = func.call @declare_stage(%root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %c0_i32, %one_root, %c0_i64, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
-    %larger = scalar.cmpi ugt, %tokens, %previous : i64
-    %next = scf.select %larger, %tokens, %previous : i64
-    %verifiers = scalar.divui %tokens, %verification : i64
-    %by_spans = scalar.cmpi ult, %spans, %verifiers : i64
-    %fitting = scf.select %by_spans, %spans, %verifiers : i64
-    %more = scalar.cmpi ugt, %fitting, %prior_proposals : i64
-    %proposals = scf.select %more, %fitting, %prior_proposals : i64
-    %first_shape = index.cmp eq, %i, %c0 : index
-    %first = scf.select %first_shape, %stage, %first_stage : i32
-    scf.yield %next, %proposals, %first : i64, i64, i32
-  }
-  %proposal, %warm_first = scf.if %enabled -> (i32, i32) {
+  %full_root = buffer.constant utf8("flash_next_ple_suffix_all") : buffer
+  %selected_root = buffer.constant utf8("flash_next_ple_suffix") : buffer
+  %root = scf.select %enabled, %full_root, %selected_root : buffer
+  %target = func.call @declare_stage(%root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %c0_i32, %one_root, %c0_i64, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
+  view.store %target, %stages[0] : i32, view<5xi32>
+  scf.if %enabled {
+    %anchor = scalar.constant 1 : i64
+    %verification = scalar.addi %depth, %anchor : i64
     %proposal_root = global.load @proposal_root : buffer
     %draft_depth_key = global.load @draft_depth_key : buffer
     %epoch_capacity_key = global.load @epoch_capacity_key : buffer
@@ -387,19 +386,8 @@ func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i6
     func.call @config_i64(%proposal, %epoch_capacity_key, %packet_capacity) : (i32, buffer, i64)
     %warm_root = global.load @warm_root : buffer
     %verify_root = buffer.constant utf8("flash_next_verify_stream") : buffer
-    %warm_first = scf.for %i = [%c0 to %count step %c1](%first = %c0_i32 : i32) -> (i32) {
-      %tokens = view.load %view[%i, 0] : view<[%count]x2xi64> -> i64
-      %spans = view.load %view[%i, 1] : view<[%count]x2xi64> -> i64
-      %warm = func.call @declare_stage(%warm_root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %three_roots, %one_root, %c0_i64, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
-      %initial = index.cmp eq, %i, %c0 : index
-      %origin = scf.select %initial, %warm, %first : i32
-      scf.yield %origin : i32
-    }
-    scf.for %i = [%c0 to %count step %c1] {
-      %tokens = view.load %view[%i, 0] : view<[%count]x2xi64> -> i64
-      %spans = view.load %view[%i, 1] : view<[%count]x2xi64> -> i64
-      %verify = func.call @declare_stage(%verify_root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %c0_i32, %two_roots, %verification, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
-    }
+    %warm = func.call @declare_stage(%warm_root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %three_roots, %one_root, %c0_i64, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
+    %verify = func.call @declare_stage(%verify_root, %tokens, %spans, %context, %pool, %model_source, %draft_source, %c0_i32, %two_roots, %verification, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
     %continue_root = global.load @continue_root : buffer
     %continuation = func.call @stage(%continue_root, %c0_i64) : (buffer, i64) -> (i32)
     %mixed_key = global.load @mixed_key : buffer
@@ -407,15 +395,16 @@ func.def @declare_packed_stages(%shapes: buffer, %shape_count: i64, %context: i6
     %packet_key = global.load @packet_capacity_key : buffer
     func.call @config_i64(%continuation, %packet_key, %packet_capacity) : (i32, buffer, i64)
     %feedback_key = global.load @feedback_capacity_key : buffer
-    func.call @config_i64(%continuation, %feedback_key, %feedback_capacity) : (i32, buffer, i64)
+    func.call @config_i64(%continuation, %feedback_key, %spans) : (i32, buffer, i64)
     %context_key = global.load @context_key : buffer
     func.call @config_i64(%continuation, %context_key, %context) : (i32, buffer, i64)
     func.call @config_i64(%continuation, %epoch_capacity_key, %packet_capacity) : (i32, buffer, i64)
-    scf.yield %proposal, %warm_first : i32, i32
-  } else {
-    scf.yield %c0_i32, %c0_i32 : i32, i32
+    view.store %proposal, %stages[1] : i32, view<5xi32>
+    view.store %warm, %stages[2] : i32, view<5xi32>
+    view.store %verify, %stages[3] : i32, view<5xi32>
+    view.store %continuation, %stages[4] : i32, view<5xi32>
   }
-  func.return %target_first, %proposal, %warm_first, %maximum, %proposal_capacity : i32, i32, i32, i64, i64
+  func.return
 }
 
 // The width policy reserves fewer tokens for larger text cohorts. Draft and
@@ -447,8 +436,7 @@ func.decl @flash_next_ple_prepare(%tokens: i64, %spans: i64, %context: i64, %poo
 func.decl pure @flash_next_ple_cache_layout(%tokens: index) -> (offset, offset, offset, offset, offset)
 
 func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %draft_depth: i32, %shapes: buffer, %shape_count: i64, %weights: buffer, %options: buffer) -> (i64, i32, buffer, buffer, buffer, buffer, buffer, buffer, buffer) {
-  %packet_capacity, %feedback_capacity = func.call @qwen38.packet_capacities(%shapes, %shape_count, %prefill) : (buffer, i64, i64) -> (i64, i64)
-  %origin = index.constant 0 : offset
+  %packet_capacity, %feedback_capacity, %packed_tokens = func.call @qwen38.packet_capacities(%shapes, %shape_count, %prefill) : (buffer, i64, i64) -> (i64, i64, i64)
   %c0_i64 = scalar.constant 0 : i64
   %c0_i32 = scalar.constant 0 : i32
   %c64 = scalar.constant 64 : i64
@@ -460,7 +448,7 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
   %valid_depth = scalar.cmpi ule, %draft_depth, %maximum_depth : i32
   %context_tail = scalar.remui %context, %c64 : i64
   %context_whole = scalar.cmpi eq, %context_tail, %c0_i64 : i64
-  %small_enough = scalar.cmpi ule, %prefill, %limit : i64
+  %small_enough = scalar.cmpi ule, %packet_capacity, %limit : i64
   %packed = scalar.andi %has_shapes, %has_pool : i1
   %shaped = scalar.andi %context_whole, %small_enough : i1
   %ordinary = scalar.andi %packed, %valid_depth : i1
@@ -478,36 +466,26 @@ func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows
     scf.yield %c0_i32 : i32
   }
   %depth = scalar.extui %draft_depth : i32 to i64
-  %target_first, %proposal, %warm_first, %maximum, %proposal_capacity = func.call @declare_packed_stages(%shapes, %shape_count, %context, %pool, %model_source, %draft_source, %enabled, %depth, %c0_i64, %packet_capacity, %feedback_capacity) : (buffer, i64, i64, i64, i32, i32, i1, i64, i64, i64, i64) -> (i32, i32, i32, i64, i64)
+  %one = scalar.constant 1 : i64
+  %verification = scalar.addi %depth, %one : i64
+  %fitting = scalar.divui %packed_tokens, %verification : i64
+  %bounded = scalar.minui %fitting, %feedback_capacity : i64
+  %proposal_capacity = scalar.maxui %bounded, %one : i64
+  %false = scalar.constant false : i1
+  %provider_bytes = index.constant 72 : offset
+  %state = func.call @qwen38.control_create(%packet_capacity, %feedback_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %false, %provider_bytes) : (i64, i64, i64, i64, i64, i64, i1, i1, i1, offset) -> (buffer)
+  func.call @declare_packed_stages(%state, %false, %packed_tokens, %feedback_capacity, %context, %pool, %model_source, %draft_source, %enabled, %depth, %proposal_capacity, %packet_capacity) : (buffer, i1, i64, i64, i64, i64, i32, i32, i1, i64, i64, i64)
   %images = config.get @flash_next.image_inputs : i1
-  %mixed_target, %mixed_proposal, %mixed_warm = scf.if %images -> (i32, i32, i32) {
-    %mixed = scalar.constant 1 : i64
-    %target, %proposal, %warm, %maximum, %proposal_capacity = func.call @declare_packed_stages(%shapes, %shape_count, %context, %pool, %model_source, %draft_source, %enabled, %depth, %mixed, %packet_capacity, %feedback_capacity) : (buffer, i64, i64, i64, i32, i32, i1, i64, i64, i64, i64) -> (i32, i32, i32, i64, i64)
-    scf.yield %target, %proposal, %warm : i32, i32, i32
-  } else {
-    scf.yield %c0_i32, %c0_i32, %c0_i32 : i32, i32, i32
+  scf.if %images {
+    func.call @declare_packed_stages(%state, %images, %packed_tokens, %feedback_capacity, %context, %pool, %model_source, %draft_source, %enabled, %depth, %proposal_capacity, %packet_capacity) : (buffer, i1, i64, i64, i64, i64, i32, i32, i1, i64, i64, i64)
   }
-  %shared = scalar.trunci %shape_count : i64 to i32
-  // The shared controller selects explicit ordinary/mixed catalog origins.
-  // Sampling follows these ten control words at byte 40.
-  %dflash = scalar.constant false : i1
-  %provider_bytes = index.constant 32 : offset
-  %state = func.call @qwen38.control_create(%packet_capacity, %feedback_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash, %provider_bytes) : (i64, i64, i64, i64, i64, i64, i1, i1, i1, offset) -> (buffer)
-  %state_view = buffer.view %state[%origin] : buffer -> view<10xi32>
-  view.store %shared, %state_view[2] : i32, view<10xi32>
-  view.store %proposal, %state_view[3] : i32, view<10xi32>
-  view.store %target_first, %state_view[5] : i32, view<10xi32>
-  view.store %mixed_target, %state_view[6] : i32, view<10xi32>
-  view.store %mixed_proposal, %state_view[7] : i32, view<10xi32>
-  view.store %warm_first, %state_view[8] : i32, view<10xi32>
-  view.store %mixed_warm, %state_view[9] : i32, view<10xi32>
   scf.if %enabled {
     func.call @configure_cohort_widths(%state, %depth, %proposal_capacity) : (buffer, i64, i64)
   }
-  func.call @flash_next_ple_prepare(%maximum, %feedback_capacity, %context, %pool, %model_source, %packet_capacity, %images, %state) : (i64, i64, i64, i64, i32, i64, i1, buffer)
-  %less = scalar.cmpi ult, %maximum, %prefill : i64
-  %effective = scf.select %less, %maximum, %prefill : i64
+  func.call @flash_next_ple_prepare(%packed_tokens, %feedback_capacity, %context, %pool, %model_source, %packet_capacity, %images, %state) : (i64, i64, i64, i64, i32, i64, i1, buffer)
+  %effective = scalar.minui %packed_tokens, %prefill : i64
+  %shared = scalar.constant 1 : i32
   %terminal = global.load @terminal : buffer
-  %allocations, %views, %target_origins, %draft_origins, %geometry = func.call @qwen38.storage(%packet_capacity, %feedback_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash) : (i64, i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
+  %allocations, %views, %target_origins, %draft_origins, %geometry = func.call @qwen38.storage(%packet_capacity, %feedback_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %false) : (i64, i64, i64, i64, i64, i64, i1, i1, i1) -> (buffer, buffer, buffer, buffer, buffer)
   func.return %effective, %shared, %state, %terminal, %allocations, %views, %target_origins, %draft_origins, %geometry : i64, i32, buffer, buffer, buffer, buffer, buffer, buffer, buffer
 }

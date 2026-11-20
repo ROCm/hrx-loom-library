@@ -20,7 +20,7 @@ func.decl import("prepare") @parameter(%stage: i32, %binding: i32, %input: i32, 
 
 config.decl @qwen38.draft_kind : %value: i32 where [range(%value, 0, 1)]
 
-func.decl @qwen38.packet_capacities(%shapes: buffer, %shape_count: i64, %prefill: i64) -> (i64, i64)
+func.decl @qwen38.packet_capacities(%shapes: buffer, %shape_count: i64, %prefill: i64) -> (i64, i64, i64)
 
 func.decl @qwen38.allocation(%records: buffer, %slot: index, %bytes: i64, %initial_zero_bytes: i64)
 
@@ -29,6 +29,8 @@ func.decl @qwen38.row_view(%records: buffer, %row_count: index, %row: index, %sl
 func.decl @qwen38_packet_bytes(%capacity: index) -> (offset)
 
 func.decl @qwen38.control_create(%packet_capacity: i64, %feedback_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1, %provider_bytes: offset) -> (buffer)
+
+func.decl @qwen38.speculation_stages(%state: buffer) -> (i32, i32, i32)
 
 func.decl @qwen38.proposal_level(%count: i32) -> (i32)
 
@@ -523,12 +525,53 @@ func.def @declare_cohort_stages(%state: buffer, %ceiling: i64, %proposal_capacit
   func.return
 }
 
-// The caller supplies validated native payload capacities. Shape pairs are
-// little-endian i64 {tokens, spans}; no C struct layout crosses this boundary.
-// Commands, specialization and their shared checkpoint identity are source
-// policy. Returned state is interpreted only by control.loom.
+// Each input layout has its own targets, proposal widths, catch-up and
+// verification runs, and continuation. Stage order is established here by
+// declare_packed_stages. DFlash can bind alternate proposal/verifier pairs.
+template.decl @qwen38.epoch.stages(%state: buffer, %mixed: i1, %shape: i32, %span_count: i32) -> (i32, i32, i32, i32, i32)
+
+template.def<@qwen38.epoch.stages> @qwen38_dense_phase_stages(%state: buffer, %mixed: i1, %shape: i32, %span_count: i32) -> (i32, i32, i32, i32, i32) {
+  %origin = index.constant 0 : offset
+  %stages = buffer.view %state[%origin] : buffer -> view<10xi32>
+  %ordinary_target = view.load %stages[5] : view<10xi32> -> i32
+  %mixed_target = view.load %stages[6] : view<10xi32> -> i32
+  %targets = scf.select %mixed, %mixed_target, %ordinary_target : i32
+  %target = scalar.addi %targets, %shape : i32
+  %ordinary_proposal = view.load %stages[3] : view<10xi32> -> i32
+  %mixed_proposal = view.load %stages[7] : view<10xi32> -> i32
+  %proposals = scf.select %mixed, %mixed_proposal, %ordinary_proposal : i32
+  %zero = scalar.constant 0 : i32
+  %enabled = scalar.cmpi ne, %proposals, %zero : i32
+  %proposal, %warm, %verifier, %continuation = scf.if %enabled -> (i32, i32, i32, i32) {
+    %shape_count = view.load %stages[2] : view<10xi32> -> i32
+    %ordinary_warm = view.load %stages[8] : view<10xi32> -> i32
+    %mixed_warm = view.load %stages[9] : view<10xi32> -> i32
+    %warm_first = scf.select %mixed, %mixed_warm, %ordinary_warm : i32
+    %one = scalar.constant 1 : i32
+    %variants = scalar.subi %warm_first, %proposals : i32
+    %last = scalar.subi %variants, %one : i32
+    %level = func.call @qwen38.proposal_level(%span_count) : (i32) -> (i32)
+    %selected = scalar.minui %level, %last : i32
+    %regular_proposal = scalar.addi %proposals, %selected : i32
+    %warm = scalar.addi %warm_first, %shape : i32
+    %verify_first = scalar.addi %warm_first, %shape_count : i32
+    %regular_verifier = scalar.addi %verify_first, %shape : i32
+    %continuation = scalar.addi %verify_first, %shape_count : i32
+    %width, %chosen_proposal, %chosen_verifier = func.call @qwen38.speculation_stages(%state) : (buffer) -> (i32, i32, i32)
+    %alternative = scalar.cmpi ne, %width, %zero : i32
+    %proposal = scf.select %alternative, %chosen_proposal, %regular_proposal : i32
+    %verifier = scf.select %alternative, %chosen_verifier, %regular_verifier : i32
+    scf.yield %proposal, %warm, %verifier, %continuation : i32, i32, i32, i32
+  } else {
+    scf.yield %zero, %zero, %zero, %zero : i32, i32, i32, i32
+  }
+  template.return %target, %proposal, %warm, %verifier, %continuation : i32, i32, i32, i32, i32
+}
+
+// The native v1 payload supplies little-endian {tokens, spans} pairs.
+// Preparation binds each command to its specialization and checkpoint.
 func.def public @text_prepare_v1(%prefill: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %draft_depth: i32, %shapes: buffer, %shape_count: i64, %weights: buffer, %options: buffer) -> (i64, i32, buffer, buffer, buffer, buffer, buffer, buffer, buffer) {
-  %packet_capacity, %feedback_capacity = func.call @qwen38.packet_capacities(%shapes, %shape_count, %prefill) : (buffer, i64, i64) -> (i64, i64)
+  %packet_capacity, %feedback_capacity, %packed_tokens = func.call @qwen38.packet_capacities(%shapes, %shape_count, %prefill) : (buffer, i64, i64) -> (i64, i64, i64)
   %origin = index.constant 0 : offset
   %zero32 = scalar.constant 0 : i32
   %one32 = scalar.constant 1 : i32
