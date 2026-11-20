@@ -172,12 +172,11 @@ verification applies to both sources. The ID history shares draft KV page
 ownership, so retained forks and restored requests preserve it without a
 separate host-side history cache. Sampled requests use neural proposals.
 
-Proposal programs specialize for power-of-two cohort sizes. Each invocation
-selects from the live span count, so a one-request decode does not execute the
-largest prepared grid. All variants share parameters and the fixed packet
-layout; resident growth preserves their stage handles. Two-epoch continuation
-queues its second proposal and verification without waiting for CPU acceptance
-feedback.
+The same proposal and verification programs serve a single request and a
+batch. Each request's span gives its position and reserved token count. As
+requests finish drafting, the GPU packs the remaining requests together for
+the next step. Two-epoch continuation queues its second proposal and
+verification before the CPU receives acceptance feedback from the first.
 
 ## Capacity and memory
 
@@ -185,12 +184,12 @@ The canonical chat configuration starts with four resident rows,
 16,384-position contexts, 32,768 pooled tokens, 16,384-token packed epochs,
 four checkpoints, and a 256-token default generation limit. `long-context` starts with eight rows,
 262,144-position contexts, 524,288 pooled tokens, and eight checkpoints.
-`long-context-mtp` uses those capacities with a seven-proposal ceiling and the same live-cohort policy.
+`long-context-mtp` uses those capacities with a seven-proposal ceiling.
 The context limit includes both input and output tokens.
 Context capacity must be divisible by 64, an epoch holds at most 32,768 tokens,
 and the composition requires pooled cache storage. Resident rows can grow
-without redeclaring stages or changing the prepared packet capacity; cache
-space and execution shapes bound admitted work independently.
+while the same prepared programs continue serving. Available cache space and
+the token budget per packet bound how much work the service can admit.
 
 The resident target parameters occupy approximately 76.86 GiB; adding MTP
 brings them to approximately 79.44 GiB. The 26.82 GiB packed PLE n-gram table
