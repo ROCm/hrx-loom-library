@@ -57,6 +57,14 @@ remain withheld during streaming and are resolved at completion. Returned
 buffers have VM ownership; request-local scalar state remains opaque to the
 service caller.
 
+Clients compacting a conversation can count its full Qwen prompt even when
+it exceeds the deployment's execution window. The reported positions include
+ChatML framing, tools, and image or video features. A text-only measurement
+streams through the tokenizer with fixed ID scratch. When media markers are
+present, the source also checks their actual token IDs and produces the same
+projection spans as generation. Generation continues to enforce the window
+before admitting the request.
+
 Completion receives the native stop cause. A token-limit stop omits an unfinished
 XML tool call while preserving preceding complete calls, content, and reasoning;
 it remains a `length` completion. Malformed framing still fails, including at a

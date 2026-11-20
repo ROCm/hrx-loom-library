@@ -37,14 +37,12 @@ global.rodata.def @input_mode_error = bytes("756e737570706f7274656420736f7572636
 
 global.rodata.def @input_capacity_error = bytes("736f7572636520696e70757420746f6b656e206361706163697479206973206f7574206f662072616e6765")
 
-global.rodata.def @input_overflow_error = bytes("696e70757420657863656564732074686520617661696c61626c6520636f6e746578742073697a653b20636f6d7061637420686973746f7279206f722073686f7274656e207468652070726f6d7074")
-
 global.rodata.def @input_media_error = bytes("5177656e206d65646961206d61726b657220646f6573206e6f7420656e636f646520746f206974732070726f6a6563746564206665617475726520636f756e74")
 
 // Tokenizes only the ordinary segments between source-owned media markers.
 // Special image/video-pad ranges are independent tokenizer atoms, so their token
 // offsets compose from the preceding segments without rescanning prefixes.
-func.def @prepare_media_spans(%rendered: buffer, %markers: buffer, %marker_count64: i64, %leading_size: offset, %capacity: i64, %tokens: buffer, %token_count: i64) -> (buffer) {
+func.def @prepare_media_spans(%rendered: buffer, %markers: buffer, %marker_count64: i64, %leading_size: offset, %segment_capacity: i64, %tokens: buffer, %token_count: i64) -> (buffer) {
   %origin = index.constant 0 : offset
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -61,7 +59,6 @@ func.def @prepare_media_spans(%rendered: buffer, %markers: buffer, %marker_count
   %span_records = buffer.view %spans[%origin] : buffer -> view<[%marker_count]x3xi32>
   %bounded_token_count = scalar.assume %token_count [range(%token_count, 0, 4294967295)] : i64
   %token_extent = index.cast %bounded_token_count : i64 to index
-  %probe_capacity = scalar.addi %capacity, %one64 : i64
   %media_error = global.load @input_media_error : buffer
   %final_end, %final_cursor = scf.for %i = [%c0 to %marker_count step %c1](%previous_end = %origin : offset, %token_cursor = %zero64 : i64) -> (offset, i64) {
     %image_index = view.load %marker_records[%i, 0] : view<[%marker_count]x6xi32> -> i32
@@ -79,7 +76,7 @@ func.def @prepare_media_spans(%rendered: buffer, %markers: buffer, %marker_count
     %segment_length = index.sub %marker_begin, %previous_end : offset
     %segment = buffer.alloca<private> align(1) %segment_length : buffer
     buffer.copy %rendered[%previous_end], %segment[%origin], %segment_length
-    %segment_tokens, %segment_count = func.call @encode(%segment, %zero32, %probe_capacity) : (buffer, i32, i64) -> (buffer, i64)
+    %segment_tokens, %segment_count = func.call @encode(%segment, %zero32, %segment_capacity) : (buffer, i32, i64) -> (buffer, i64)
     %input_offset = scalar.addi %token_cursor, %segment_count : i64
     %marker = buffer.alloca<private> align(1) %marker_length : buffer
     buffer.copy %rendered[%marker_begin], %marker[%origin], %marker_length
@@ -135,7 +132,10 @@ func.def public @text_prepare_input_v1(%text: buffer, %markers: buffer, %marker_
   %mode_error = global.load @input_mode_error : buffer
   func.call @require(%valid_modes32, %mode_error) : (i32, buffer)
   %capacity_limit = scalar.constant 2305843009213693950 : i64
-  %valid_capacity = scalar.cmpi ule, %capacity, %capacity_limit : i64
+  %measure = scalar.constant -1 : i64
+  %measuring = scalar.cmpi eq, %capacity, %measure : i64
+  %within_limit = scalar.cmpi ule, %capacity, %capacity_limit : i64
+  %valid_capacity = scalar.ori %within_limit, %measuring : i1
   %valid_capacity32 = scalar.extui %valid_capacity : i1 to i32
   %capacity_error = global.load @input_capacity_error : buffer
   func.call @require(%valid_capacity32, %capacity_error) : (i32, buffer)
@@ -179,23 +179,37 @@ func.def public @text_prepare_input_v1(%text: buffer, %markers: buffer, %marker_
     }
     scf.yield %result : buffer
   }
-  // The shared encoder returns a bounded prefix. One extra ID distinguishes
-  // a complete fit from a truncated prompt without a second tokenizer pass.
+  // A bounded caller needs one extra ID to distinguish an exact fit from
+  // an overflow. Measurement uses identical framing and tokenizer flags.
   %one64 = scalar.constant 1 : i64
-  %probe_capacity = scalar.addi %capacity, %one64 : i64
-  %tokens, %count = func.call @encode(%rendered, %zero32, %probe_capacity) : (buffer, i32, i64) -> (buffer, i64)
+  %bounded_probe = scalar.addi %capacity, %one64 : i64
+  %probe = scf.select %measuring, %measure, %bounded_probe : i64
+  %tokens, %count = func.call @encode(%rendered, %zero32, %probe) : (buffer, i32, i64) -> (buffer, i64)
   %fits = scalar.cmpi ule, %count, %capacity : i64
-  %fits32 = scalar.extui %fits : i1 to i32
-  %overflow_error = global.load @input_overflow_error : buffer
-  func.call @require(%fits32, %overflow_error) : (i32, buffer)
+  %output = scf.select %fits, %tokens, %empty : buffer
   %has_markers = scalar.cmpi ne, %marker_count, %zero64 : i64
-  %spans = scf.if %has_markers -> (buffer) {
-    %value = func.call @prepare_media_spans(%rendered, %markers, %marker_count, %leading_size, %capacity, %tokens, %count) : (buffer, buffer, i64, offset, i64, buffer, i64) -> (buffer)
+  %validate_markers = scalar.andi %has_markers, %fits : i1
+  %spans = scf.if %validate_markers -> (buffer) {
+    // Span records and token views use 32-bit positions.
+    %position_limit = scalar.constant 4294967295 : i64
+    %positions_fit = scalar.cmpi ule, %count, %position_limit : i64
+    %positions_fit32 = scalar.extui %positions_fit : i1 to i32
+    func.call @require(%positions_fit32, %capacity_error) : (i32, buffer)
+    // A complete measurement retains no IDs. Media validation needs the
+    // actual IDs at each marker, so materialize exactly the measured extent.
+    %validation_tokens = scf.if %measuring -> (buffer) {
+      %ids, %encoded_count = func.call @encode(%rendered, %zero32, %count) : (buffer, i32, i64) -> (buffer, i64)
+      scf.yield %ids : buffer
+    } else {
+      scf.yield %tokens : buffer
+    }
+    %segment_capacity = scf.select %measuring, %measure, %count : i64
+    %value = func.call @prepare_media_spans(%rendered, %markers, %marker_count, %leading_size, %segment_capacity, %validation_tokens, %count) : (buffer, buffer, i64, offset, i64, buffer, i64) -> (buffer)
     scf.yield %value : buffer
   } else {
     scf.yield %empty : buffer
   }
-  func.return %tokens, %count, %spans : buffer, i64, buffer
+  func.return %output, %count, %spans : buffer, i64, buffer
 }
 
 global.rodata.def @tool_open = bytes("3c746f6f6c5f63616c6c3e0a3c66756e6374696f6e3d")
