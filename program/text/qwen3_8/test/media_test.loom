@@ -11,15 +11,14 @@ func.decl @text_encode_epoch_v1(%control_state: buffer, %plan: buffer, %inputs: 
 
 func.decl @text_publish_epoch_v1(%control_state: buffer, %plan: buffer, %media_plan: buffer, %count: i32, %first_media_count: i32, %next_media_count: i32, %verified: i32, %continues: i32, %continuation_flags: buffer, %ordinary: buffer, %first_results: buffer, %next_results: buffer, %progress: buffer, %proposal_counts: buffer)
 
-// Exercise every split through an ordinary/image/ordinary stream with padded
-// first/continuation packet banks. The coordinate oracle tracks the maximum
-// coordinate directly, independently of the production prefix formula.
+// A v1 caller supplies larger capacities for both epochs. All 66 records
+// still fit in the exact live space, regardless of where the split falls.
 func.def @mixed_split_observation(%split: i32, %grid_width: i32) -> (i32) {
   %origin = index.constant 0 : offset
   %plan_bytes = index.constant 1152 : offset
   %input_bytes = index.constant 264 : offset
-  %metadata_bytes = index.constant 14376 : offset
-  %token_bytes = index.constant 2368 : offset
+  %metadata_bytes = index.constant 14368 : offset
+  %token_bytes = index.constant 2112 : offset
   %media_bytes = index.constant 1800 : offset
   %result_bytes = index.constant 10992 : offset
   %next_result_bytes = index.constant 5752 : offset
@@ -85,6 +84,7 @@ func.def @mixed_split_observation(%split: i32, %grid_width: i32) -> (i32) {
   %c1 = index.constant 1 : index
   %c64 = index.constant 64 : index
   %c66 = index.constant 66 : index
+  // The native feature plan may leave padding after the last record.
   %features_origin = scalar.constant 2368 : i32
   %feature_bytes = scalar.constant 20480 : i32
   scf.for %i = [%c0 to %c64 step %c1] {
@@ -105,14 +105,39 @@ func.def @mixed_split_observation(%split: i32, %grid_width: i32) -> (i32) {
     view.store %row, %media[%i, 6] : i32, view<64x7xi32>
   }
   %outputs, %transfers, %transfer_begin, %transfer_length = func.call @text_encode_epoch_v1(%state, %plan, %inputs, %media_plan, %c1_i32, %c1_i32, %total, %first_media, %next_media, %first_capacity, %next_capacity, %none, %metadata, %tokens) : (buffer, buffer, buffer, buffer, i32, i32, i32, i32, i32, i32, i32, i32, buffer, buffer) -> (i32, buffer, i64, i64)
-  %records = buffer.view %tokens[%origin] : buffer -> view<74x8xi32>
+  // Apply the upload ranges to independent device bindings. Inspecting only
+  // the encoder's host records would miss an incorrect queued transfer.
+  %device_metadata = buffer.alloca<private> align(8) %metadata_bytes : buffer
+  %device_inputs = buffer.alloca<private> align(4) %token_bytes : buffer
+  buffer.fill %none, %device_metadata[%origin], %metadata_bytes : i32
+  buffer.fill %none, %device_inputs[%origin], %token_bytes : i32
+  %table_origin = index.cast %transfer_begin : i64 to offset
+  %table_bytes = index.cast %transfer_length : i64 to index
+  %entry_bytes = index.constant 40 : index
+  %entries = index.div %table_bytes, %entry_bytes : index
+  %table = buffer.view %transfers[%table_origin] : buffer -> view<[%entries]x5xi64>
+  %metadata_binding = scalar.constant 0 : i64
+  scf.for %entry = [%c0 to %entries step %c1] {
+    %from_binding = view.load %table[%entry, 0] : view<[%entries]x5xi64> -> i64
+    %from_word = view.load %table[%entry, 1] : view<[%entries]x5xi64> -> i64
+    %to_binding = view.load %table[%entry, 2] : view<[%entries]x5xi64> -> i64
+    %to_word = view.load %table[%entry, 3] : view<[%entries]x5xi64> -> i64
+    %size_word = view.load %table[%entry, 4] : view<[%entries]x5xi64> -> i64
+    %from_metadata = scalar.cmpi eq, %from_binding, %metadata_binding : i64
+    %to_metadata = scalar.cmpi eq, %to_binding, %metadata_binding : i64
+    %from = scf.select %from_metadata, %metadata, %tokens : buffer
+    %to = scf.select %to_metadata, %device_metadata, %device_inputs : buffer
+    %from_bytes = scalar.assume %from_word [range(%from_word, 0, 9223372036854775807)] : i64
+    %to_bytes = scalar.assume %to_word [range(%to_word, 0, 9223372036854775807)] : i64
+    %size_bytes = scalar.assume %size_word [range(%size_word, 0, 9223372036854775807)] : i64
+    %from_offset = index.cast %from_bytes : i64 to offset
+    %to_offset = index.cast %to_bytes : i64 to offset
+    %size = index.cast %size_bytes : i64 to offset
+    buffer.copy %from[%from_offset], %to[%to_offset], %size
+  }
+  %records = buffer.view %device_inputs[%origin] : buffer -> view<66x8xi32>
   %failures, %expected_source = scf.for %i = [%c0 to %c66 step %c1](%failures = %c0_i32 : i32, %prior_frontier = %c0_i32 : i32) -> (i32, i32) {
     %input = index.cast %i : index to i32
-    %primary = scalar.cmpi ult, %input, %split : i32
-    %queued_index = scalar.addi %input, %c3_i32 : i32
-    %record_word = scf.select %primary, %input, %queued_index : i32
-    %record_value = index.cast %record_word : i32 to index
-    %record = index.assume %record_value [range(%record_value, 0, 73)] : index
     %after_start = scalar.cmpi ugt, %input, %c0_i32 : i32
     %before_end = scalar.cmpi ule, %input, %c64_i32 : i32
     %image = scalar.andi %after_start, %before_end : i1
@@ -132,12 +157,12 @@ func.def @mixed_split_observation(%split: i32, %grid_width: i32) -> (i32) {
       %frontier = scalar.addi %prior_frontier, %c1_i32 : i32
       scf.yield %c0_i32, %prior_frontier, %prior_frontier, %prior_frontier, %frontier : i32, i32, i32, i32, i32
     }
-    %actual_id = view.load %records[%record, 0] : view<74x8xi32> -> i32
-    %actual_offset = view.load %records[%record, 1] : view<74x8xi32> -> i32
-    %actual_temporal = view.load %records[%record, 2] : view<74x8xi32> -> i32
-    %actual_height = view.load %records[%record, 3] : view<74x8xi32> -> i32
-    %actual_width = view.load %records[%record, 4] : view<74x8xi32> -> i32
-    %actual_frontier = view.load %records[%record, 5] : view<74x8xi32> -> i32
+    %actual_id = view.load %records[%i, 0] : view<66x8xi32> -> i32
+    %actual_offset = view.load %records[%i, 1] : view<66x8xi32> -> i32
+    %actual_temporal = view.load %records[%i, 2] : view<66x8xi32> -> i32
+    %actual_height = view.load %records[%i, 3] : view<66x8xi32> -> i32
+    %actual_width = view.load %records[%i, 4] : view<66x8xi32> -> i32
+    %actual_frontier = view.load %records[%i, 5] : view<66x8xi32> -> i32
     %id_ok = scalar.cmpi eq, %actual_id, %id : i32
     %offset_ok = scalar.cmpi eq, %actual_offset, %feature_offset : i32
     %temporal_ok = scalar.cmpi eq, %actual_temporal, %temporal : i32
@@ -182,18 +207,16 @@ func.def @mixed_split_observation(%split: i32, %grid_width: i32) -> (i32) {
   // expected records before calling it.
   %expected = buffer.alloca<private> align(4) %token_bytes : buffer
   buffer.fill %c0_i32, %expected[%origin], %token_bytes : i32
-  %first_capacity_index = index.cast %first_capacity : i32 to index
-  %next_capacity_index = index.cast %next_capacity : i32 to index
+  %split_index = index.cast %split : i32 to index
   %remaining_index = index.cast %remaining : i32 to index
   %record_bytes = index.constant 32 : offset
-  %queued_origin = index.scale %first_capacity_index, %record_bytes : index, offset -> offset
+  %queued_origin = index.scale %split_index, %record_bytes : index, offset -> offset
   %queued_bytes = index.scale %remaining_index, %record_bytes : index, offset -> offset
-  %active_bytes = index.scale %next_capacity_index, %record_bytes : index, offset -> offset
-  buffer.copy %tokens[%queued_origin], %expected[%origin], %queued_bytes
+  buffer.copy %device_inputs[%queued_origin], %expected[%origin], %queued_bytes
   %context = index.constant 512 : index
   %packet_capacity = index.constant 128 : index
-  func.call @qwen38_continue_spans(%c1, %context, %packet_capacity, %packet_capacity, %metadata, %tokens, %first_results) : (index, index, index, index, buffer, buffer, buffer)
-  %difference = buffer.compare %tokens[%origin], %expected[%origin], %active_bytes
+  func.call @qwen38_continue_spans(%c1, %context, %packet_capacity, %packet_capacity, %device_metadata, %device_inputs, %first_results) : (index, index, index, index, buffer, buffer, buffer)
+  %difference = buffer.compare %device_inputs[%origin], %expected[%origin], %queued_bytes
   %records_ok = scalar.cmpi eq, %difference, %c0_i32 : i32
   %record_failure = scf.select %records_ok, %c0_i32, %c1_i32 : i32
   %all_failures = scalar.addi %published_failures, %record_failure : i32
