@@ -1,7 +1,6 @@
-// PLE overlaps its asynchronous embedding file read with layer zero. Each
-// input layout uses one request program and one prefix program for every live
-// packet. Their handles share the retained provider state with the parameter
-// source, cached-host request ordinal, and cache initialization flag.
+// All inputs use an embedding request program. Direct targets overlap the
+// file read with a separate layer-zero prefix. The speculative target includes
+// that layer in its verification recording.
 
 func.decl @declare_stage(%root: buffer, %tokens: i64, %spans: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %sidecar_roots: i32, %target_roots: i32, %verification: i64, %packet_capacity: i64, %mixed: i64) -> (i32)
 
@@ -13,24 +12,29 @@ func.decl @qwen38.control_context(%state: buffer) -> (i64, offset)
 
 func.decl pure @flash_next_ple_request_layout(%tokens: index) -> (offset, offset)
 
-func.def @declare_ple_stages(%tokens: i64, %spans: i64, %context: i64, %pool: i64, %model_source: i32, %packet_capacity: i64, %mixed: i64) -> (i32, i32) {
+func.def @declare_ple_stages(%tokens: i64, %spans: i64, %context: i64, %pool: i64, %model_source: i32, %packet_capacity: i64, %mixed: i64, %enabled: i1) -> (i32, i32) {
   %c0_i32 = scalar.constant 0 : i32
   %c1_i32 = scalar.constant 1 : i32
   %c0_i64 = scalar.constant 0 : i64
   %requests_root = buffer.constant utf8("flash_next_ple_requests") : buffer
-  %prefix_root = buffer.constant utf8("flash_next_ple_prefix") : buffer
   %requests = func.call @declare_stage(%requests_root, %tokens, %spans, %context, %pool, %model_source, %c0_i32, %c0_i32, %c0_i32, %c0_i64, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
-  %prefix = func.call @declare_stage(%prefix_root, %tokens, %spans, %context, %pool, %model_source, %c0_i32, %c0_i32, %c1_i32, %c0_i64, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
+  %prefix = scf.if %enabled -> (i32) {
+    scf.yield %c0_i32 : i32
+  } else {
+    %prefix_root = buffer.constant utf8("flash_next_ple_prefix") : buffer
+    %stage = func.call @declare_stage(%prefix_root, %tokens, %spans, %context, %pool, %model_source, %c0_i32, %c0_i32, %c1_i32, %c0_i64, %packet_capacity, %mixed) : (buffer, i64, i64, i64, i64, i32, i32, i32, i32, i64, i64, i64) -> (i32)
+    scf.yield %stage : i32
+  }
   func.return %requests, %prefix : i32, i32
 }
 
-func.def @flash_next_ple_prepare(%tokens: i64, %spans: i64, %context: i64, %pool: i64, %model_source: i32, %packet_capacity: i64, %images: i1, %state: buffer) {
+func.def @flash_next_ple_prepare(%tokens: i64, %spans: i64, %context: i64, %pool: i64, %model_source: i32, %packet_capacity: i64, %images: i1, %enabled: i1, %state: buffer) {
   %c0_i32 = scalar.constant 0 : i32
   %c0_i64 = scalar.constant 0 : i64
-  %ordinary_requests, %ordinary_prefix = func.call @declare_ple_stages(%tokens, %spans, %context, %pool, %model_source, %packet_capacity, %c0_i64) : (i64, i64, i64, i64, i32, i64, i64) -> (i32, i32)
+  %ordinary_requests, %ordinary_prefix = func.call @declare_ple_stages(%tokens, %spans, %context, %pool, %model_source, %packet_capacity, %c0_i64, %enabled) : (i64, i64, i64, i64, i32, i64, i64, i1) -> (i32, i32)
   %mixed_requests, %mixed_prefix = scf.if %images -> (i32, i32) {
     %mixed = scalar.constant 1 : i64
-    %requests, %prefix = func.call @declare_ple_stages(%tokens, %spans, %context, %pool, %model_source, %packet_capacity, %mixed) : (i64, i64, i64, i64, i32, i64, i64) -> (i32, i32)
+    %requests, %prefix = func.call @declare_ple_stages(%tokens, %spans, %context, %pool, %model_source, %packet_capacity, %mixed, %enabled) : (i64, i64, i64, i64, i32, i64, i64, i1) -> (i32, i32)
     scf.yield %requests, %prefix : i32, i32
   } else {
     scf.yield %c0_i32, %c0_i32 : i32, i32

@@ -9,12 +9,16 @@
 
 #include <loomcxx/index.h>
 #include <loomcxx/predicate.h>
+#include <loomcxx/template.h>
 #include <loomcxx/view.h>
 
 using text_service::Buffer;
 using Index = loom::type::index;
 using Offset = loom::type::offset;
 constexpr auto Dynamic = loom::type::dynamic;
+
+LOOM_TEMPLATE_DECL("qwen38.epoch.feedback_bank")
+bool uses_feedback_bank(Buffer state, int requested);
 
 // The feedback motif owns its bank layout and packed output/proposal counts.
 Offset qwen38_feedback_records_origin();
@@ -89,6 +93,8 @@ void text_publish_epoch_v2(text_service::EpochPublication epoch) {
   loom::buffer::fill(0, epoch.outputs.progress, Offset{0},
                      loom::buffer::length(epoch.outputs.progress));
 
+  const bool banked =
+      uses_feedback_bank(epoch.inputs.control_state, epoch.completed.verified);
   unsigned ordinary_index = 0;
   for (unsigned row = 0; row < extent; ++row) {
     int consumed;
@@ -96,7 +102,7 @@ void text_publish_epoch_v2(text_service::EpochPublication epoch) {
     unsigned outputs;
     int verifications;
     int proposed;
-    if (epoch.completed.verified) {
+    if (banked) {
       auto records = feedback_rows(epoch.completed.first_feedback, extent);
       consumed = records[row, 0u];
       int counts = records[row, 1u];

@@ -42,31 +42,20 @@ PLE adds hashed n-gram lookup and its own token and convolution history.
 Read anchors and writable endpoints are distinct arguments, allowing forks
 to share immutable history while publishing into private state.
 
-`ple_prepare.loom` declares one file-request program and one independent
-layer-zero program per input layout, plus one cached-host request allocation.
-`ple_control.loom` implements the shared epoch
-template with a finite HAL file batch: request dispatch, producer fence,
-independent layer-zero work, and a completion join before the suffix. The file
-resolver supplies the retained checkpoint handle and exact tensor byte window;
-ordinary queue capture retains the file and buffers through completion. The
-source stores only stable stage/parameter/storage ordinals and one cache
-initialization flag; row growth preserves them. No host request-list readback,
-per-row host submission, or model-specific runtime API is involved.
+Every input layout has a file-request program. It reads the old token history
+and writes the live byte ranges for the PLE embedding table. The file resolver
+supplies the retained checkpoint handle and exact tensor window. Queue capture
+keeps the file and buffers alive until the rows reach the packed row cache.
+The source retains the stage and storage handles across resident growth.
 
-The finite PLE stages separate request generation, layer zero, and the remaining
-target layers. The requester reads the old token history and writes a live byte
-range list without advancing that history. Layer zero has no PLE dependency and
-can execute while file reads fill the packed row cache. The suffix starts after
-read completion, publishes filled cache entries, and uses the same decoding,
-projection, and convolution as the resident path. Layer bounds and input mode
-specialize the existing unfused, normalized, and fused bodies; they do not
-introduce runtime layer dispatch.
-
-Speculative verification retains both prefix and suffix weight domains, captures
-all transition inputs, and replays only accepted history. Its layer-zero replay
-uses the prefix domain. Resident verification supplies one domain for both and
-retains the complete-body root. No request or cache-planning stage publishes
-speculative state on behalf of the verifier.
+Without a drafter, layer zero runs while the embedding file reads are in
+flight. The target suffix joins those reads before consuming PLE rows. With a
+drafter, a single verifier owns layer zero and the remaining target layers.
+It accepts packets containing known prompt tokens, speculative candidates, or
+both. Known input advances history directly. A speculative span captures its
+transition inputs and replays the accepted prefix. Each path writes progress
+and selected tokens into the same feedback bank, including the last ordinary
+token of a response. The model records the target once for all these packets.
 
 Each sparse-attention layer pairs K and V within four-token, single-head
 records. A record contains a 2 KiB K tile followed by a 2 KiB V tile. K keeps
