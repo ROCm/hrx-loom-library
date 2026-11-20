@@ -22,19 +22,20 @@ kernel.decl @flash_next_lookup_publish(%round: index) launch(%round_value: index
 
 kernel.decl @flash_next_lookup_hidden(%count_buffer: buffer) launch(%moves: buffer, %hidden: buffer, %compacted: buffer)
 
-// A 24-token pattern ends at 65, crossing a page and a subgroup boundary.
+// A pattern ends at 65, crossing a page and a subgroup boundary. Seven
+// matching tokens miss, eight qualify, and longer matches exercise selection.
 // A second copy ends at 129. Seventeen newer three-token matches hide the
 // original from a selector bounded to sixteen candidates. The query ends
 // with the same pattern across committed history and the pending chain.
-func.def @token(%slot: index, %position: index, %round: index, %match: i1, %newer: i1, %dense: i1, %crowded: i1) -> (i32) {
+func.def @token(%slot: index, %position: index, %round: index, %pattern_size: index, %match: i1, %newer: i1, %dense: i1, %crowded: i1) -> (i32) {
   %c3 = index.constant 3 : index
   %c5 = index.constant 5 : index
-  %pattern_size = index.constant 24 : index
-  %first_begin = index.constant 41 : index
   %first_end = index.constant 65 : index
-  %second_begin = index.constant 105 : index
+  %first_begin = index.sub %first_end, %pattern_size : index
   %second_end = index.constant 129 : index
-  %query_base = index.constant 169 : index
+  %second_begin = index.sub %second_end, %pattern_size : index
+  %query_end = index.constant 193 : index
+  %query_base = index.sub %query_end, %pattern_size : index
   %query_begin = index.add %query_base, %round : index
   %first_after = index.cmp uge, %position, %first_begin : index
   %first_before = index.cmp ult, %position, %first_end : index
@@ -133,7 +134,7 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
   %match_end = index.constant 65 : index
   %newer_end = index.constant 129 : index
   %dense_end = index.constant 191 : index
-  %match_length = index.constant 24 : index
+  %long_match = index.constant 24 : index
   %dense_length = index.constant 64 : index
   %c0_word = scalar.constant 0 : i32
   %c1_word = scalar.constant 1 : i32
@@ -150,7 +151,10 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
   %mixed = config.get @runner.qwen38.mixed_inputs : index
   %is_mixed = index.cmp ne, %mixed, %c0 : index
   %input_stride = scf.select %is_mixed, %c8, %c1 : index
-  %none = index.cmp eq, %mode, %c0 : index
+  %too_short = index.cmp eq, %mode, %c0 : index
+  %all_match = index.cmp eq, %mode, %c1 : index
+  %positive_length = scf.select %all_match, %c8, %long_match : index
+  %match_length = scf.select %too_short, %c7, %positive_length : index
   %mixed_cohort = index.cmp eq, %mode, %c2 : index
   %all_sampled = index.cmp eq, %mode, %c3 : index
   %dense = index.cmp eq, %mode, %c4 : index
@@ -166,9 +170,9 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
     %sampled_slot = index.cmp eq, %flavor, %c3 : index
     %newer_slot = index.cmp eq, %flavor, %c2 : index
     %mixed_miss = scalar.andi %mixed_cohort, %no_match_slot : i1
-    %missing = scalar.ori %none, %mixed_miss : i1
+    %missing = scalar.ori %too_short, %mixed_miss : i1
     %true = scalar.constant true : i1
-    %match = scalar.xori %missing, %true : i1
+    %match = scalar.xori %mixed_miss, %true : i1
     %mixed_sampled = scalar.andi %mixed_cohort, %sampled_slot : i1
     %sampled = scalar.ori %all_sampled, %mixed_sampled : i1
     %newer = scalar.andi %mixed_cohort, %newer_slot : i1
@@ -196,7 +200,6 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
     %width = index.add %tail, %remaining : index
     %width_word = index.cast %width : index to i32
     // A full history match remains usable even after the neural budget ends.
-    %all_match = index.cmp eq, %mode, %c1 : index
     %budget = scf.select %all_match, %c2, %c8 : index
     %budget_word = index.cast %budget : index to i32
     view.store %budget_word, %options[%target_span, 0] : i32, view<1024x2xi32>
@@ -244,19 +247,19 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
       scf.for %within = [%c0 to %page_tokens step %c1] {
         %logical = index.madd %page, %page_tokens, %within : index
         %physical = index.madd %physical_page, %page_tokens, %within : index
-        %id = func.call @token(%slot, %logical, %round, %match, %newer, %dense, %crowded) : (index, index, index, i1, i1, i1, i1) -> (i32)
+        %id = func.call @token(%slot, %logical, %round, %match_length, %match, %newer, %dense, %crowded) : (index, index, index, index, i1, i1, i1, i1) -> (i32)
         view.store %id, %history[%physical] : i32, view<6400xi32>
       }
     }
     scf.for %relative = [%c0 to %tail step %c1] {
       %logical = index.add %committed, %relative : index
-      %id = func.call @token(%slot, %logical, %round, %match, %newer, %dense, %crowded) : (index, index, index, i1, i1, i1, i1) -> (i32)
+      %id = func.call @token(%slot, %logical, %round, %match_length, %match, %newer, %dense, %crowded) : (index, index, index, index, i1, i1, i1, i1) -> (i32)
       %input = index.add %input_begin, %relative : index
       %word = index.mul %input, %input_stride : index
       view.store %id, %inputs[%word] : i32, view<4096xi32>
       view.store %id, %expected_inputs[%word] : i32, view<4096xi32>
     }
-    %anchor = func.call @token(%slot, %position, %round, %match, %newer, %dense, %crowded) : (index, index, index, i1, i1, i1, i1) -> (i32)
+    %anchor = func.call @token(%slot, %position, %round, %match_length, %match, %newer, %dense, %crowded) : (index, index, index, index, i1, i1, i1, i1) -> (i32)
     view.store %anchor, %draft_ids[%slot] : i32, view<33xi32>
     view.store %anchor, %expected_draft_ids[%slot] : i32, view<33xi32>
     %unavailable = scalar.ori %missing, %sampled : i1
@@ -279,7 +282,7 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
     %new_count = scf.if %copied -> (index) {
       scf.for %relative = [%c0 to %remaining step %c1] {
         %logical = index.add %selected_end, %relative : index
-        %id = func.call @token(%slot, %logical, %round, %match, %newer, %dense, %crowded) : (index, index, index, i1, i1, i1, i1) -> (i32)
+        %id = func.call @token(%slot, %logical, %round, %match_length, %match, %newer, %dense, %crowded) : (index, index, index, index, i1, i1, i1, i1) -> (i32)
         %after_pending = index.add %input_begin, %tail : index
         %input = index.add %after_pending, %relative : index
         %word = index.mul %input, %input_stride : index
