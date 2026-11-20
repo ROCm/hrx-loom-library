@@ -130,6 +130,12 @@ func.def inline @gdn_fused_convolve_head(%capacity: index, %span_capacity: index
       %segment_index = index.add %tile_index, %span : index
       %segment_origin = index.scale %segment_index, %segment_bytes : index, offset -> offset
       %boundary = buffer.view %halo[%segment_origin] : buffer -> view<6x10240xbf16>
+      // The halo owns the first three rows and the convolution owns the
+      // interior. Each publishes its raw projection for accepted-prefix replay.
+      %known = func.call @flash_next_span_publishes(%verification, %epoch, %span) : (index, buffer, index) -> (i1)
+      %no = scalar.constant false : i1
+      %capture_rows = scalar.cmpi eq, %known, %no : i1
+      %destination = buffer.view %capture[%capture_origin] : buffer -> view<[%capacity]x10240xbf16>
       %prefix_wave = index.cmp ult, %wave, %c3 : index
       %prefix_live = index.cmp ult, %wave, %segment_length : index
       %prefix = scalar.andi %prefix_wave, %prefix_live : i1
@@ -138,6 +144,11 @@ func.def inline @gdn_fused_convolve_head(%capacity: index, %span_capacity: index
         %row = index.assume %row_value [range(%row_value, 0, 127)] : index
         %values = vector.load %stage_view[%row, %local_channel] : view<128x132xbf16> -> vector<4xbf16>
         vector.store %values, %boundary[%wave, %channel] : vector<4xbf16>, view<6x10240xbf16>
+        scf.if %capture_rows {
+          %position = index.add %segment_begin, %wave : index
+          %token = index.assume %position [ge(%position, 0), lt(%position, %capacity)] : index
+          vector.store %values, %destination[%token, %channel] : vector<4xbf16>, view<[%capacity]x10240xbf16>
+        }
       }
       %after_prefix = index.cmp uge, %wave, %c3 : index
       %before_suffix_end = index.cmp ult, %wave, %c6 : index
@@ -152,26 +163,11 @@ func.def inline @gdn_fused_convolve_head(%capacity: index, %span_capacity: index
         %values = vector.load %stage_view[%row, %local_channel] : view<128x132xbf16> -> vector<4xbf16>
         vector.store %values, %boundary[%wave, %channel] : vector<4xbf16>, view<6x10240xbf16>
       }
-      %captures = index.cmp ugt, %verification, %c0 : index
-      scf.if %captures {
-        %known = func.call @flash_next_span_publishes(%verification, %epoch, %span) : (index, buffer, index) -> (i1)
-        %no = scalar.constant false : i1
-        %speculative = scalar.cmpi eq, %known, %no : i1
-        %selected = scalar.andi %speculative, %prefix_live : i1
-        scf.if %selected {
-          %row_value = index.add %local_begin, %wave : index
-          %row = index.assume %row_value [range(%row_value, 0, 127)] : index
-          %token_value = index.add %segment_begin, %wave : index
-          %token = index.assume %token_value [ge(%token_value, 0), lt(%token_value, %capacity)] : index
-          %destination = buffer.view %capture[%capture_origin] : buffer -> view<[%capacity]x10240xbf16>
-          %values = vector.load %stage_view[%row, %local_channel] : view<128x132xbf16> -> vector<4xbf16>
-          vector.store %values, %destination[%token, %channel] : vector<4xbf16>, view<[%capacity]x10240xbf16>
-        }
-      }
       %interior_begin = index.add %local_begin, %c3 : index
       %wave_begin = index.add %interior_begin, %wave : index
       scf.for %row3 = [%wave_begin to %local_end step %c8] {
-        %token = index.add %first, %row3 : index
+        %position = index.add %first, %row3 : index
+        %token = index.assume %position [ge(%position, 0), lt(%position, %capacity)] : index
         %row2 = index.sub %row3, %c1 : index
         %row1 = index.sub %row3, %c2 : index
         %row0 = index.sub %row3, %c3 : index
@@ -179,6 +175,9 @@ func.def inline @gdn_fused_convolve_head(%capacity: index, %span_capacity: index
         %stored1 = vector.load %stage_view[%row1, %local_channel] : view<128x132xbf16> -> vector<4xbf16>
         %stored2 = vector.load %stage_view[%row2, %local_channel] : view<128x132xbf16> -> vector<4xbf16>
         %stored3 = vector.load %stage_view[%row3, %local_channel] : view<128x132xbf16> -> vector<4xbf16>
+        scf.if %capture_rows {
+          vector.store %stored3, %destination[%token, %channel] : vector<4xbf16>, view<[%capacity]x10240xbf16>
+        }
         %history0 = vector.extf %stored0 : vector<4xbf16> to vector<4xf32>
         %history1 = vector.extf %stored1 : vector<4xbf16> to vector<4xf32>
         %history2 = vector.extf %stored2 : vector<4xbf16> to vector<4xf32>
