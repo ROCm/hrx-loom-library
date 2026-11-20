@@ -123,8 +123,9 @@ kernel.def @flash_next_lookup_parameters(%round_owners: index) {
   kernel.return
 }
 
-// Copy a complete remaining tail or retain the row for neural drafting. Only
-// transient descriptors move; resident row and target reservation stay fixed.
+// Copy a complete remaining tail or retain the row for neural drafting.
+// Compaction moves the draft slot. The resident row and the start of its
+// target reservation stay fixed as the published prefix shrinks.
 kernel.def @flash_next_lookup_publish(%round: index) {
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
@@ -174,7 +175,9 @@ kernel.def @flash_next_lookup_publish(%round: index) {
     %owner_word = view.load %origins_view[%old, 2] : view<[%capacity]x3xi32> -> i32
     %owner_value = index.cast %owner_word : i32 to index
     %owner = index.assume %owner_value [ge(%owner_value, 0), lt(%owner_value, %target_capacity)] : index
-    %width_word = view.load %reservations[%owner, 0] : view<[%target_capacity]x6xi32> -> i32
+    %reserved_width = view.load %reservations[%owner, 0] : view<[%target_capacity]x6xi32> -> i32
+    %output_credit = view.load %options[%owner, 1] : view<[%target_capacity]x2xi32> -> i32
+    %width_word = scalar.minui %reserved_width, %output_credit : i32
     %width = index.cast %width_word : i32 to index
     // The accepted prefix and the next owner's reservation are adjacent in
     // the target packet. Both copying and neural drafting end at this span.
@@ -192,7 +195,7 @@ kernel.def @flash_next_lookup_publish(%round: index) {
     %begin_word = view.load %origins_view[%old, 0] : view<[%capacity]x3xi32> -> i32
     %begin = index.cast %begin_word : i32 to index
     %new_count = scf.if %retire -> (index) {
-      // History can fill the full reservation even after the last neural step.
+      // History can fill the credited span even after the last neural step.
       // On a miss the verifier consumes only the initialized prefix.
       scf.if %satisfied {
         scf.for %relative = [%c0 to %remaining step %c1] {
@@ -202,9 +205,9 @@ kernel.def @flash_next_lookup_publish(%round: index) {
           %destination = index.add %begin, %offset : index
           func.call @qwen38_input_store_token(%mixed, %target_capacity, %target_tokens, %destination, %id) : (index, index, buffer, index, i32)
         }
-      } else {
-        view.store %first_word, %reservations[%owner, 0] : i32, view<[%target_capacity]x6xi32>
       }
+      %published_width = scf.select %satisfied, %width_word, %first_word : i32
+      view.store %published_width, %reservations[%owner, 0] : i32, view<[%target_capacity]x6xi32>
       scf.yield %next : index
     } else {
       %slot = index.assume %next [range(%next, 0, 32767), lt(%next, %capacity)] : index
