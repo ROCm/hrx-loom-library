@@ -1,0 +1,241 @@
+// Transformer blocks. Each block normalizes the residual stream, attends,
+// normalizes the attention projection again, and adds it back; the SwiGLU
+// feed-forward repeats the pattern. Noise-refiner and main blocks scale both
+// first norms by 1 + scale and gate both residuals by tanh(gate) from the
+// step's modulation row; context-refiner blocks are unmodulated. Modulation
+// immediates are byte offsets of the step's scale_msa; gate_msa, scale_mlp,
+// and gate_mlp follow at 7680-byte strides.
+//
+//   refiner  image rows of the unified hidden state, every key live
+//   context  caption rows, once per request, keys follow the caption mask
+//   layer    [image, caption] rows, keys follow the whole key mask; the caption
+//            projections read the mask and zero unattended caption tiles
+//
+// The hidden state advances in place. Rotations and the SwiGLU product advance
+// their source-owned buffers in place. Lifetimes begin immediately before each
+// producer and end at the last use.
+
+config.decl @zimage.image_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+config.decl @zimage.text_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+command.decl @zimage.refiner_attention_norm(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.refiner_ffn_norm(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.refiner_attention_residual(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %update: buffer, %residual: buffer)
+
+command.decl @zimage.refiner_ffn_residual(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %update: buffer, %residual: buffer)
+
+command.decl @zimage.refiner_query_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer)
+
+command.decl @zimage.refiner_key_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer)
+
+command.decl @zimage.refiner_query(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.refiner_key(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.refiner_value(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.refiner_attention_output(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.refiner_gate(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.refiner_up(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.refiner_down(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.refiner_swiglu() launch(%gate: buffer, %up: buffer, %output: buffer)
+
+command.decl @zimage.refiner_attention() launch(%query: buffer, %key: buffer, %value: buffer, %output: buffer)
+
+command.decl @zimage.context_attention_norm(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.context_ffn_norm(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.context_attention_residual(%layer: index) launch(%parameters: buffer, %update: buffer, %residual: buffer)
+
+command.decl @zimage.context_ffn_residual(%layer: index) launch(%parameters: buffer, %update: buffer, %residual: buffer)
+
+command.decl @zimage.context_query_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer)
+
+command.decl @zimage.context_key_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer)
+
+command.decl @zimage.context_query(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.context_key(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.context_value(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.context_attention_output(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.context_gate(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.context_up(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.context_down(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.context_swiglu() launch(%gate: buffer, %up: buffer, %output: buffer)
+
+command.decl @zimage.context_attention() launch(%query: buffer, %key: buffer, %value: buffer, %mask: buffer, %output: buffer)
+
+command.decl @zimage.layer_attention_norm(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.layer_ffn_norm(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.layer_attention_residual(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %update: buffer, %residual: buffer)
+
+command.decl @zimage.layer_ffn_residual(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %update: buffer, %residual: buffer)
+
+command.decl @zimage.layer_query_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer)
+
+command.decl @zimage.layer_key_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer)
+
+command.decl @zimage.layer_query(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer)
+
+command.decl @zimage.layer_key(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer)
+
+command.decl @zimage.layer_value(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer)
+
+command.decl @zimage.layer_attention_output(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer)
+
+command.decl @zimage.layer_gate(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer)
+
+command.decl @zimage.layer_up(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer)
+
+command.decl @zimage.layer_down(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer)
+
+command.decl @zimage.layer_swiglu() launch(%gate: buffer, %up: buffer, %output: buffer)
+
+command.decl @zimage.layer_attention() launch(%query: buffer, %key: buffer, %value: buffer, %mask: buffer, %output: buffer)
+
+// Noise refiner over the leading image rows of the hidden state.
+command.def public @zimage.refiner_block(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %hidden: buffer, %cosine: buffer, %sine: buffer) {
+  %rows = config.get @zimage.image_tokens : index
+  %hidden_stride = index.constant 7680 : offset
+  %feed_forward_stride = index.constant 20480 : offset
+  %hidden_bytes = index.scale %rows, %hidden_stride : index, offset -> offset
+  %feed_forward_bytes = index.scale %rows, %feed_forward_stride : index, offset -> offset
+  %normalized = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.refiner_attention_norm[%layer, %offset](%parameters, %modulation, %hidden, %normalized) : [index, offset](buffer, buffer, buffer, buffer)
+  %query = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %key = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %value = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.concurrent {
+    command.serial {
+      command.launch @zimage.refiner_query[%layer](%parameters, %normalized, %query) : [index](buffer, buffer, buffer)
+      command.launch @zimage.refiner_query_rotary[%layer](%parameters, %query, %cosine, %sine, %query) : [index](buffer, buffer, buffer, buffer, buffer)
+    }
+    command.serial {
+      command.launch @zimage.refiner_key[%layer](%parameters, %normalized, %key) : [index](buffer, buffer, buffer)
+      command.launch @zimage.refiner_key_rotary[%layer](%parameters, %key, %cosine, %sine, %key) : [index](buffer, buffer, buffer, buffer, buffer)
+    }
+    command.launch @zimage.refiner_value[%layer](%parameters, %normalized, %value) : [index](buffer, buffer, buffer)
+  }
+  %context = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.refiner_attention(%query, %key, %value, %context) : (buffer, buffer, buffer, buffer)
+  %attention_output = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.refiner_attention_output[%layer](%parameters, %context, %attention_output) : [index](buffer, buffer, buffer)
+  command.launch @zimage.refiner_attention_residual[%layer, %offset](%parameters, %modulation, %attention_output, %hidden) : [index, offset](buffer, buffer, buffer, buffer)
+  %feed_forward_input = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.refiner_ffn_norm[%layer, %offset](%parameters, %modulation, %hidden, %feed_forward_input) : [index, offset](buffer, buffer, buffer, buffer)
+  %feed_forward_gate = buffer.alloca<global> align(256) %feed_forward_bytes : buffer
+  %feed_forward_up = buffer.alloca<global> align(256) %feed_forward_bytes : buffer
+  command.concurrent {
+    command.launch @zimage.refiner_gate[%layer](%parameters, %feed_forward_input, %feed_forward_gate) : [index](buffer, buffer, buffer)
+    command.launch @zimage.refiner_up[%layer](%parameters, %feed_forward_input, %feed_forward_up) : [index](buffer, buffer, buffer)
+  }
+  command.launch @zimage.refiner_swiglu(%feed_forward_gate, %feed_forward_up, %feed_forward_gate) : (buffer, buffer, buffer)
+  %feed_forward_output = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.refiner_down[%layer](%parameters, %feed_forward_gate, %feed_forward_output) : [index](buffer, buffer, buffer)
+  command.launch @zimage.refiner_ffn_residual[%layer, %offset](%parameters, %modulation, %feed_forward_output, %hidden) : [index, offset](buffer, buffer, buffer, buffer)
+  command.return
+}
+
+// Context refiner over the embedded caption rows.
+command.def public @zimage.context_block(%layer: index) launch(%parameters: buffer, %caption: buffer, %cosine: buffer, %sine: buffer, %mask: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %hidden_stride = index.constant 7680 : offset
+  %feed_forward_stride = index.constant 20480 : offset
+  %hidden_bytes = index.scale %rows, %hidden_stride : index, offset -> offset
+  %feed_forward_bytes = index.scale %rows, %feed_forward_stride : index, offset -> offset
+  %normalized = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.context_attention_norm[%layer](%parameters, %caption, %normalized) : [index](buffer, buffer, buffer)
+  %query = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %key = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %value = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.concurrent {
+    command.serial {
+      command.launch @zimage.context_query[%layer](%parameters, %normalized, %query) : [index](buffer, buffer, buffer)
+      command.launch @zimage.context_query_rotary[%layer](%parameters, %query, %cosine, %sine, %query) : [index](buffer, buffer, buffer, buffer, buffer)
+    }
+    command.serial {
+      command.launch @zimage.context_key[%layer](%parameters, %normalized, %key) : [index](buffer, buffer, buffer)
+      command.launch @zimage.context_key_rotary[%layer](%parameters, %key, %cosine, %sine, %key) : [index](buffer, buffer, buffer, buffer, buffer)
+    }
+    command.launch @zimage.context_value[%layer](%parameters, %normalized, %value) : [index](buffer, buffer, buffer)
+  }
+  %context = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.context_attention(%query, %key, %value, %mask, %context) : (buffer, buffer, buffer, buffer, buffer)
+  %attention_output = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.context_attention_output[%layer](%parameters, %context, %attention_output) : [index](buffer, buffer, buffer)
+  command.launch @zimage.context_attention_residual[%layer](%parameters, %attention_output, %caption) : [index](buffer, buffer, buffer)
+  %feed_forward_input = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.context_ffn_norm[%layer](%parameters, %caption, %feed_forward_input) : [index](buffer, buffer, buffer)
+  %feed_forward_gate = buffer.alloca<global> align(256) %feed_forward_bytes : buffer
+  %feed_forward_up = buffer.alloca<global> align(256) %feed_forward_bytes : buffer
+  command.concurrent {
+    command.launch @zimage.context_gate[%layer](%parameters, %feed_forward_input, %feed_forward_gate) : [index](buffer, buffer, buffer)
+    command.launch @zimage.context_up[%layer](%parameters, %feed_forward_input, %feed_forward_up) : [index](buffer, buffer, buffer)
+  }
+  command.launch @zimage.context_swiglu(%feed_forward_gate, %feed_forward_up, %feed_forward_gate) : (buffer, buffer, buffer)
+  %feed_forward_output = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.context_down[%layer](%parameters, %feed_forward_gate, %feed_forward_output) : [index](buffer, buffer, buffer)
+  command.launch @zimage.context_ffn_residual[%layer](%parameters, %feed_forward_output, %caption) : [index](buffer, buffer, buffer)
+  command.return
+}
+
+// Main layer over the unified [image, caption] hidden state.
+command.def public @zimage.layer_block(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %hidden: buffer, %cosine: buffer, %sine: buffer, %mask: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %rows = index.add %images, %texts : index
+  %hidden_stride = index.constant 7680 : offset
+  %feed_forward_stride = index.constant 20480 : offset
+  %hidden_bytes = index.scale %rows, %hidden_stride : index, offset -> offset
+  %feed_forward_bytes = index.scale %rows, %feed_forward_stride : index, offset -> offset
+  %normalized = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.layer_attention_norm[%layer, %offset](%parameters, %modulation, %hidden, %normalized) : [index, offset](buffer, buffer, buffer, buffer)
+  %query = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %key = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %value = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.concurrent {
+    command.serial {
+      command.launch @zimage.layer_query[%layer](%parameters, %normalized, %mask, %query) : [index](buffer, buffer, buffer, buffer)
+      command.launch @zimage.layer_query_rotary[%layer](%parameters, %query, %cosine, %sine, %query) : [index](buffer, buffer, buffer, buffer, buffer)
+    }
+    command.serial {
+      command.launch @zimage.layer_key[%layer](%parameters, %normalized, %mask, %key) : [index](buffer, buffer, buffer, buffer)
+      command.launch @zimage.layer_key_rotary[%layer](%parameters, %key, %cosine, %sine, %key) : [index](buffer, buffer, buffer, buffer, buffer)
+    }
+    command.launch @zimage.layer_value[%layer](%parameters, %normalized, %mask, %value) : [index](buffer, buffer, buffer, buffer)
+  }
+  %context = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.layer_attention(%query, %key, %value, %mask, %context) : (buffer, buffer, buffer, buffer, buffer)
+  %attention_output = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.layer_attention_output[%layer](%parameters, %context, %mask, %attention_output) : [index](buffer, buffer, buffer, buffer)
+  command.launch @zimage.layer_attention_residual[%layer, %offset](%parameters, %modulation, %attention_output, %hidden) : [index, offset](buffer, buffer, buffer, buffer)
+  %feed_forward_input = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.layer_ffn_norm[%layer, %offset](%parameters, %modulation, %hidden, %feed_forward_input) : [index, offset](buffer, buffer, buffer, buffer)
+  %feed_forward_gate = buffer.alloca<global> align(256) %feed_forward_bytes : buffer
+  %feed_forward_up = buffer.alloca<global> align(256) %feed_forward_bytes : buffer
+  command.concurrent {
+    command.launch @zimage.layer_gate[%layer](%parameters, %feed_forward_input, %mask, %feed_forward_gate) : [index](buffer, buffer, buffer, buffer)
+    command.launch @zimage.layer_up[%layer](%parameters, %feed_forward_input, %mask, %feed_forward_up) : [index](buffer, buffer, buffer, buffer)
+  }
+  command.launch @zimage.layer_swiglu(%feed_forward_gate, %feed_forward_up, %feed_forward_gate) : (buffer, buffer, buffer)
+  %feed_forward_output = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @zimage.layer_down[%layer](%parameters, %feed_forward_gate, %mask, %feed_forward_output) : [index](buffer, buffer, buffer, buffer)
+  command.launch @zimage.layer_ffn_residual[%layer, %offset](%parameters, %modulation, %feed_forward_output, %hidden) : [index, offset](buffer, buffer, buffer, buffer)
+  command.return
+}

@@ -1,0 +1,117 @@
+// Fresh-frame VAE input path: unpatchify the DiT's packed F32 latent, undo the
+// latent normalization, and run the decoder input convolution in one pass.
+// The DiT emits one 64-wide row per 2x2 latent patch, token = py*(W/2) + px;
+// packed channel k = (2*dy + dx)*16 + c holds channel c at (2*py + dy,
+// 2*px + dx), channel innermost as the reference patchify orders it. The
+// reference decodes latent/scaling_factor + shift_factor with no
+// post-quantization convolution.
+//
+// conv_in reads only sixteen channels, below the 32-channel reduction step of
+// the matrix convolutions, so one direct F32 kernel gathers each tap from the
+// packed rows, normalizes it, and accumulates against the BF16 weights; the
+// layer is a negligible share of decoder work.
+
+config.decl @zimage.latent_height : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+config.decl @zimage.latent_width : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+amdgpu.target<gfx11-generic> @zimage_vae_input_wave32 {subgroup_size = 32}
+
+// One lane owns one latent pixel of one of the 512 output channels and writes
+// F32 NCHW. Padding taps contribute zero after normalization, as the
+// reference pads the normalized latent.
+kernel.def target(@zimage_vae_input_wave32) @zimage_vae_input() {
+  %height = config.get @zimage.latent_height : index
+  %width = config.get @zimage.latent_width : index
+  %pixels = index.mul %height, %width : index
+  %padding = index.constant 127 : index
+  %threads = index.constant 128 : index
+  %rounded = index.add %pixels, %padding : index
+  %groups = index.div %rounded, %threads : index
+  %outputs = index.constant 512 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %outputs, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %height = config.get @zimage.latent_height : index
+  %width = config.get @zimage.latent_width : index
+  %outputs = index.constant 512 : index
+  %inputs = index.constant 16 : index
+  %packed = index.constant 64 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %origin = index.constant 0 : offset
+  %threads = index.constant 128 : index
+  %group = kernel.workgroup.id<x> : index
+  %channel = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %pixel = index.madd %group, %threads, %lane : index
+  %pixels = index.mul %height, %width : index
+  %columns = index.div %width, %c2 : index
+  %rows = index.div %height, %c2 : index
+  %tokens = index.mul %rows, %columns : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%tokens]x64xf32>
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<512x16x3x3xbf16>
+  %bias_view = buffer.view %bias[%origin] : buffer -> view<512xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%outputs]x[%pixels]xf32>
+  %scaling = scalar.constant 0.3611 : f32
+  %shift = scalar.constant 0.1159 : f32
+  %live = index.cmp ult, %pixel, %pixels : index
+  scf.if %live {
+    %y = index.div %pixel, %width : index
+    %x = index.rem %pixel, %width : index
+    %bias_narrow = view.load %bias_view[%channel] : view<512xbf16> -> bf16
+    %bias_value = scalar.extf %bias_narrow : bf16 to f32
+    %zero = scalar.constant 0.0 : f32
+    %accumulated = scf.for %ky = [%c0 to %c3 step %c1](%row_sum = %zero : f32) -> (f32) unroll {
+      %source_y_offset = index.add %y, %ky : index
+      %source_y = index.sub %source_y_offset, %c1 : index
+      %valid_y = index.cmp ult, %source_y, %height : index
+      %row_total = scf.for %kx = [%c0 to %c3 step %c1](%tap_sum = %row_sum : f32) -> (f32) unroll {
+        %source_x_offset = index.add %x, %kx : index
+        %source_x = index.sub %source_x_offset, %c1 : index
+        %valid_x = index.cmp ult, %source_x, %width : index
+        %valid = scalar.andi %valid_y, %valid_x : i1
+        %next = scf.if %valid -> (f32) {
+          %patch_y = index.div %source_y, %c2 : index
+          %patch_x = index.div %source_x, %c2 : index
+          %offset_y = index.rem %source_y, %c2 : index
+          %offset_x = index.rem %source_x, %c2 : index
+          %token_value = index.madd %patch_y, %columns, %patch_x : index
+          %token = index.assume %token_value [ge(%token_value, 0), lt(%token_value, %tokens)] : index
+          %sub_patch = index.madd %offset_y, %c2, %offset_x : index
+          %first_channel = index.mul %sub_patch, %inputs : index
+          %tap_total = scf.for %input_channel = [%c0 to %inputs step %c1](%channel_sum = %tap_sum : f32) -> (f32) unroll {
+            %packed_value = index.add %first_channel, %input_channel : index
+            %packed_channel = index.assume %packed_value [ge(%packed_value, 0), lt(%packed_value, %packed)] : index
+            %latent = view.load %input_view[%token, %packed_channel] : view<[%tokens]x64xf32> -> f32
+            %scaled = scalar.divf %latent, %scaling : f32
+            %value = scalar.addf %scaled, %shift : f32
+            %weight_narrow = view.load %weight_view[%channel, %input_channel, %ky, %kx] : view<512x16x3x3xbf16> -> bf16
+            %weight_value = scalar.extf %weight_narrow : bf16 to f32
+            %sum = scalar.fmaf %value, %weight_value, %channel_sum : f32
+            scf.yield %sum : f32
+          }
+          scf.yield %tap_total : f32
+        } else {
+          scf.yield %tap_sum : f32
+        }
+        scf.yield %next : f32
+      }
+      scf.yield %row_total : f32
+    }
+    %result = scalar.addf %accumulated, %bias_value : f32
+    view.store %result, %output_view[%channel, %pixel] : f32, view<[%outputs]x[%pixels]xf32>
+  }
+  kernel.return
+}
+
+// Source-owned prefix of the decoder: packed DiT latent F32[(H/2)*(W/2),64]
+// in, 512-channel F32 NCHW state out.
+command.def public @vae_input() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "decoder.conv_in.weight" : view<512x16x3x3xbf16>
+  %bias = command.parameter %parameters, "decoder.conv_in.bias" : view<512xbf16>
+  kernel.launch @zimage_vae_input(%input, %weight, %bias, %output) : (buffer, view<512x16x3x3xbf16>, view<512xbf16>, buffer)
+  command.return
+}

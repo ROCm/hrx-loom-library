@@ -1,0 +1,201 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// The image service is text to image, so the input image rides in the prompt:
+// the standard base64 encoding of the input's raw RGB bytes, row-major, three
+// bytes per pixel, at a quarter of the requested output height and width.
+// Four characters encode exactly one pixel, so the prompt length fixes the
+// input size and the device decodes each pixel independently. The prepared
+// packet is those characters unchanged; the seed is unused.
+
+func.decl @esrgan.bind_image_parameters(%stage: i32, %source: i32)
+
+func.decl @esrgan.image_tag(%height: i64, %width: i64) -> (i64)
+
+func.decl @esrgan.image_geometry_valid(%height: i64, %width: i64) -> (i1)
+
+func.decl @esrgan.declare_image_stage(%height: i64, %width: i64) -> (i32)
+
+func.decl import("runner") @execute_3(%stage: i32, %request: hal.buffer, %rgba: hal.buffer, %workspace: hal.buffer) -> (i64)
+
+func.decl import("runner") @feedback(%slot: i32, %source: hal.buffer, %offset: i64, %length: i64) -> (i64)
+
+func.decl import("input") @require(%condition: i32, %diagnostic: buffer)
+
+// expected an output 16 to 4096 pixels high in multiples of 16 and 256 to 4096 pixels wide in multiples of 256
+global.rodata.def @esrgan.request_geometry_error = bytes("657870656374656420616e206f757470757420313620746f203430393620706978656c73206869676820696e206d756c7469706c6573206f6620313620616e642032353620746f203430393620706978656c73207769646520696e206d756c7469706c6573206f6620323536")
+
+// prompt must be the base64 of the raw RGB input, 4 * (height / 4) * (width / 4) characters
+global.rodata.def @esrgan.prompt_error = bytes("70726f6d7074206d7573742062652074686520626173653634206f6620746865207261772052474220696e7075742c2034202a2028686569676874202f203429202a20287769647468202f2034292063686172616374657273")
+
+// Real-ESRGAN upscales one image per batch
+global.rodata.def @esrgan.batch_error = bytes("5265616c2d45535247414e2075707363616c6573206f6e6520696d61676520706572206261746368")
+
+// prompt must use only the base64 alphabet (A-Z a-z 0-9 + / or - _), without padding
+global.rodata.def @esrgan.alphabet_error = bytes("70726f6d7074206d75737420757365206f6e6c79207468652062617365363420616c7068616265742028412d5a20612d7a20302d39202b202f206f72202d205f292c20776974686f75742070616464696e67")
+
+// The prompt holds one 4-character group per input pixel, and the input has
+// (height / 4) * (width / 4) pixels: height * width / 4 characters in all.
+func.def @esrgan.prompt_length(%height: i64, %width: i64) -> (i64) {
+  %c4 = scalar.constant 4 : i64
+  %pixels = scalar.muli %height, %width : i64
+  %length = scalar.divui %pixels, %c4 : i64
+  func.return %length : i64
+}
+
+// Every character must be one the device decoder maps to a sextet (see
+// request.loom), which otherwise reads any other byte as zero. Padding never
+// occurs because each pixel fills four whole characters.
+func.def @esrgan.prompt_alphabet_valid(%prompt: buffer, %length: i64) -> (i1) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %count = index.cast %length : i64 to index
+  %characters = buffer.view %prompt[%origin] : buffer -> view<[%count]xi8>
+  %zero = scalar.constant 0 : i32
+  %one = scalar.constant 1 : i32
+  %upper_first = scalar.constant 65 : i32
+  %upper_last = scalar.constant 90 : i32
+  %lower_first = scalar.constant 97 : i32
+  %lower_last = scalar.constant 122 : i32
+  %digit_first = scalar.constant 48 : i32
+  %digit_last = scalar.constant 57 : i32
+  %plus = scalar.constant 43 : i32
+  %minus = scalar.constant 45 : i32
+  %slash = scalar.constant 47 : i32
+  %underscore = scalar.constant 95 : i32
+  %invalid = scf.for %index = [%c0 to %count step %c1](%total = %zero : i32) -> (i32) {
+    %byte = view.load %characters[%index] : view<[%count]xi8> -> i8
+    %character = scalar.extui %byte : i8 to i32
+    %upper_low = scalar.cmpi uge, %character, %upper_first : i32
+    %upper_high = scalar.cmpi ule, %character, %upper_last : i32
+    %upper = scalar.andi %upper_low, %upper_high : i1
+    %lower_low = scalar.cmpi uge, %character, %lower_first : i32
+    %lower_high = scalar.cmpi ule, %character, %lower_last : i32
+    %lower = scalar.andi %lower_low, %lower_high : i1
+    %digit_low = scalar.cmpi uge, %character, %digit_first : i32
+    %digit_high = scalar.cmpi ule, %character, %digit_last : i32
+    %digit = scalar.andi %digit_low, %digit_high : i1
+    %is_plus = scalar.cmpi eq, %character, %plus : i32
+    %is_minus = scalar.cmpi eq, %character, %minus : i32
+    %is_slash = scalar.cmpi eq, %character, %slash : i32
+    %is_underscore = scalar.cmpi eq, %character, %underscore : i32
+    %letter = scalar.ori %upper, %lower : i1
+    %alphanumeric = scalar.ori %letter, %digit : i1
+    %standard = scalar.ori %is_plus, %is_slash : i1
+    %url_safe = scalar.ori %is_minus, %is_underscore : i1
+    %symbol = scalar.ori %standard, %url_safe : i1
+    %valid = scalar.ori %alphanumeric, %symbol : i1
+    %bad = scf.select %valid, %zero, %one : i32
+    %next = scalar.ori %total, %bad : i32
+    scf.yield %next : i32
+  }
+  %clean = scalar.cmpi eq, %invalid, %zero : i32
+  func.return %clean : i1
+}
+
+func.def public @image_prepare_request_v1(%state: buffer, %height: i64, %width: i64, %prompt: buffer, %seed: i64, %loras: buffer) -> (buffer, i64, i64) {
+  %origin = index.constant 0 : offset
+  %zero64 = scalar.constant 0 : i64
+  %valid_geometry = func.call @esrgan.image_geometry_valid(%height, %width) : (i64, i64) -> (i1)
+  %geometry_condition = scalar.extui %valid_geometry : i1 to i32
+  %geometry_diagnostic = global.load @esrgan.request_geometry_error : buffer
+  func.call @require(%geometry_condition, %geometry_diagnostic) : (i32, buffer)
+  %expected = func.call @esrgan.prompt_length(%height, %width) : (i64, i64) -> (i64)
+  %prompt_bytes = buffer.length %prompt
+  %prompt_length = index.cast %prompt_bytes : offset to i64
+  %matches = scalar.cmpi eq, %prompt_length, %expected : i64
+  %prompt_condition = scalar.extui %matches : i1 to i32
+  %prompt_diagnostic = global.load @esrgan.prompt_error : buffer
+  func.call @require(%prompt_condition, %prompt_diagnostic) : (i32, buffer)
+  %alphabet = func.call @esrgan.prompt_alphabet_valid(%prompt, %prompt_length) : (buffer, i64) -> (i1)
+  %alphabet_condition = scalar.extui %alphabet : i1 to i32
+  %alphabet_diagnostic = global.load @esrgan.alphabet_error : buffer
+  func.call @require(%alphabet_condition, %alphabet_diagnostic) : (i32, buffer)
+  %geometry_bytes = index.constant 32 : offset
+  %prepared_bytes = index.add %geometry_bytes, %prompt_bytes : offset
+  %prepared = buffer.alloca<private> align(8) %prepared_bytes : buffer
+  %geometry = buffer.view %prepared[%origin] : buffer -> view<4xi64>
+  view.store %height, %geometry[0] : i64, view<4xi64>
+  view.store %width, %geometry[1] : i64, view<4xi64>
+  view.store %zero64, %geometry[2] : i64, view<4xi64>
+  view.store %zero64, %geometry[3] : i64, view<4xi64>
+  buffer.copy %prompt[%origin], %prepared[%geometry_bytes], %prompt_bytes
+  %tag = func.call @esrgan.image_tag(%height, %width) : (i64, i64) -> (i64)
+  %units = scalar.constant 1 : i64
+  func.return %prepared, %units, %tag : buffer, i64, i64
+}
+
+// A batch is one image: the payload is a 16-byte header followed by its
+// characters. The default geometry reuses the cold stage; any other geometry
+// declares and binds a stage of its own.
+func.def public @image_prepare_batch_v1(%state: buffer, %tags: buffer, %ranges: buffer, %prepared: buffer) -> (i32, buffer) {
+  %origin = index.constant 0 : offset
+  %state_view = buffer.view %state[%origin] : buffer -> view<8xi64>
+  %range_bytes = buffer.length %ranges
+  %range_length = index.cast %range_bytes : offset to i64
+  %c16 = scalar.constant 16 : i64
+  %items = scalar.divui %range_length, %c16 : i64
+  %c1_i64 = scalar.constant 1 : i64
+  %single = scalar.cmpi eq, %items, %c1_i64 : i64
+  %single_condition = scalar.extui %single : i1 to i32
+  %batch_diagnostic = global.load @esrgan.batch_error : buffer
+  func.call @require(%single_condition, %batch_diagnostic) : (i32, buffer)
+  %range = buffer.view %ranges[%origin] : buffer -> view<1x2xi64>
+  %source64 = view.load %range[0, 0] : view<1x2xi64> -> i64
+  %source_nonnegative = scalar.assume %source64 [range(%source64, 0, 9223372036854775807)] : i64
+  %source = index.cast %source_nonnegative : i64 to offset
+  %geometry = buffer.view %prepared[%source] : buffer -> view<4xi64>
+  %height = view.load %geometry[0] : view<4xi64> -> i64
+  %width = view.load %geometry[1] : view<4xi64> -> i64
+  %default_height = view.load %state_view[0] : view<8xi64> -> i64
+  %default_width = view.load %state_view[1] : view<8xi64> -> i64
+  %cold64 = view.load %state_view[4] : view<8xi64> -> i64
+  %cold_stage = scalar.trunci %cold64 : i64 to i32
+  %same_height = scalar.cmpi eq, %height, %default_height : i64
+  %same_width = scalar.cmpi eq, %width, %default_width : i64
+  %default_geometry = scalar.andi %same_height, %same_width : i1
+  %stage = scf.if %default_geometry -> (i32) {
+    scf.yield %cold_stage : i32
+  } else {
+    %requested = func.call @esrgan.declare_image_stage(%height, %width) : (i64, i64) -> (i32)
+    %checkpoint64 = view.load %state_view[5] : view<8xi64> -> i64
+    %checkpoint = scalar.trunci %checkpoint64 : i64 to i32
+    func.call @esrgan.bind_image_parameters(%requested, %checkpoint) : (i32, i32)
+    scf.yield %requested : i32
+  }
+  %length64 = func.call @esrgan.prompt_length(%height, %width) : (i64, i64) -> (i64)
+  %length_nonnegative = scalar.assume %length64 [range(%length64, 0, 9223372036854775807)] : i64
+  %packet_bytes = index.cast %length_nonnegative : i64 to offset
+  %header_bytes = index.constant 16 : offset
+  %geometry_bytes = index.constant 32 : offset
+  %payload_bytes = index.add %header_bytes, %packet_bytes : offset
+  %payload = buffer.alloca<private> align(8) %payload_bytes : buffer
+  %header = buffer.view %payload[%origin] : buffer -> view<2xi64>
+  %zero64 = scalar.constant 0 : i64
+  view.store %items, %header[0] : i64, view<2xi64>
+  view.store %zero64, %header[1] : i64, view<2xi64>
+  %source_packet = index.add %source, %geometry_bytes : offset
+  buffer.copy %prepared[%source_packet], %payload[%header_bytes], %packet_bytes
+  func.return %stage, %payload : i32, buffer
+}
+
+// Barrier-aligned parts share the original command's workspace and weights.
+// The owner retires a part before calling again; only the last copies output.
+func.def public @image_generate_v1(%first_part: i32, %part_count: i32, %cursor: i32, %output_bytes: i64, %request: hal.buffer, %rgba: hal.buffer, %workspace: hal.buffer) -> (i32) {
+  %part = scalar.addi %first_part, %cursor : i32
+  %work = func.call @execute_3(%part, %request, %rgba, %workspace) : (i32, hal.buffer, hal.buffer, hal.buffer) -> (i64)
+  %c1 = scalar.constant 1 : i32
+  %next = scalar.addi %cursor, %c1 : i32
+  %more = scalar.cmpi slt, %next, %part_count : i32
+  %result = scf.if %more -> (i32) {
+    scf.yield %next : i32
+  } else {
+    %c0 = scalar.constant 0 : i32
+    %offset = scalar.constant 0 : i64
+    %completion = func.call @feedback(%c0, %rgba, %offset, %output_bytes) : (i32, hal.buffer, i64, i64) -> (i64)
+    %terminal = scalar.constant -1 : i32
+    scf.yield %terminal : i32
+  }
+  func.return %result : i32
+}

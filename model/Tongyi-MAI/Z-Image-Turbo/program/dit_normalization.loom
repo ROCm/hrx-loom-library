@@ -1,0 +1,524 @@
+// Transformer normalizations. Every RMSNorm (block norms, query/key norms, and
+// the caption embedder's input norm) reduces in F32 with epsilon 1e-5, rounds
+// the normalized value to BF16, multiplies its BF16 weight, and rounds again.
+//
+// A modulated block scales the first norm by the BF16 (1 + scale) row and
+// gates the second norm's update by the BF16 tanh of the gate row before the
+// residual addition; the context refiner applies both norms without
+// modulation. Query and key rows take their per-head norm, then the rotary
+// rotation of adjacent channel pairs in F32 against F32 [token, channel]
+// tables, rounded once.
+//
+// The final layer is affine-free LayerNorm in F32 with epsilon 1e-6 (mean, then
+// the mean square of the centered row), rounded to BF16 once, then the BF16
+// (1 + scale) multiply. It reads only the image rows of the unified sequence.
+//
+// Modulation operands are byte offsets of one time row in the conditioning
+// table; within a block row, scale_msa, gate_msa, scale_mlp, and gate_mlp
+// start at 0, 7680, 15360, and 23040 bytes.
+
+config.decl @zimage.image_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+config.decl @zimage.text_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+amdgpu.target<gfx11-generic> @zimage_normalization_wave32 {subgroup_size = 32}
+
+template.decl @modulation.affine_bf16(%value: bf16, %scale: bf16, %scale_table: f32, %shift: bf16, %shift_table: f32) -> (bf16)
+
+template.decl @normalization.rms_inverse_bf16(%rows: index, %width: index, %threads: index, %row: index, %epsilon: f32, %input: buffer) -> (f32)
+
+template.decl @normalization.scaled_bf16(%value: bf16, %weight: bf16, %inverse: f32) -> (bf16)
+
+template.decl @normalization.scaled_rows_bf16(%rows: index, %width: index, %threads: index, %epsilon: f32, %input: buffer, %weight: buffer, %output: buffer)
+
+template.decl @residual.gated_bf16(%value: bf16, %update: bf16, %gate: bf16) -> (bf16)
+
+template.decl @zimage.modulate_rows(%rows: index, %input: buffer, %weight: buffer, %scale: buffer, %output: buffer)
+
+template.decl @zimage.norm_residual_rows(%rows: index, %gated: i1, %update: buffer, %weight: buffer, %gate: buffer, %residual: buffer)
+
+template.decl @zimage.normalize_rotary_rows(%tokens: index, %input: buffer, %weight: buffer, %cosine: buffer, %sine: buffer, %output: buffer)
+
+template.decl @zimage.final_modulate_rows(%rows: index, %input: buffer, %scale: buffer, %output: buffer)
+
+// One 256-thread workgroup owns one 3840-wide row: RMSNorm, then the scale.
+template.def<@zimage.modulate_rows> device @zimage_modulate_rows(%rows: index, %input: buffer, %weight: buffer, %scale: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %width = index.constant 3840 : index
+  %threads = index.constant 256 : index
+  %row = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %c0_0 = scalar.constant 0.0 : f32
+  %zero = scalar.fptrunc %c0_0 : f32 to bf16
+  %epsilon = scalar.constant 1.0000000000000001e-05 : f32
+  %inverse = template.apply<@normalization.rms_inverse_bf16>(%rows, %width, %threads, %row, %epsilon, %input) : (index, index, index, index, f32, buffer) -> (f32)
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x3840xbf16>
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<3840xbf16>
+  %scale_view = buffer.view %scale[%origin] : buffer -> view<3840xbf16>
+  scf.for %column = [%lane to %width step %threads] {
+    %value = view.load %input_view[%row, %column] : view<[%rows]x3840xbf16> -> bf16
+    %weight_value = view.load %weight_view[%column] : view<3840xbf16> -> bf16
+    %scale_value = view.load %scale_view[%column] : view<3840xbf16> -> bf16
+    %normalized = template.apply<@normalization.scaled_bf16>(%value, %weight_value, %inverse) : (bf16, bf16, f32) -> (bf16)
+    %result = template.apply<@modulation.affine_bf16>(%normalized, %scale_value, %c0_0, %zero, %c0_0) : (bf16, bf16, f32, bf16, f32) -> (bf16)
+    view.store %result, %output_view[%row, %column] : bf16, view<[%rows]x3840xbf16>
+  }
+  template.return
+}
+
+// One 256-thread workgroup owns one row of the update and the same row of the
+// residual stream: RMSNorm of the update, the tanh gate when gated, and the
+// BF16 residual addition in place. Ungated rows add the normalized update.
+template.def<@zimage.norm_residual_rows> device @zimage_norm_residual_rows(%rows: index, %gated: i1, %update: buffer, %weight: buffer, %gate: buffer, %residual: buffer) {
+  %origin = index.constant 0 : offset
+  %width = index.constant 3840 : index
+  %threads = index.constant 256 : index
+  %row = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %c1_0 = scalar.constant 1.0 : f32
+  %one = scalar.fptrunc %c1_0 : f32 to bf16
+  %epsilon = scalar.constant 1.0000000000000001e-05 : f32
+  %inverse = template.apply<@normalization.rms_inverse_bf16>(%rows, %width, %threads, %row, %epsilon, %update) : (index, index, index, index, f32, buffer) -> (f32)
+  %update_view = buffer.view %update[%origin] : buffer -> view<[%rows]x3840xbf16>
+  %residual_view = buffer.view %residual[%origin] : buffer -> view<[%rows]x3840xbf16>
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<3840xbf16>
+  %gate_view = buffer.view %gate[%origin] : buffer -> view<3840xbf16>
+  scf.for %column = [%lane to %width step %threads] {
+    %update_value = view.load %update_view[%row, %column] : view<[%rows]x3840xbf16> -> bf16
+    %weight_value = view.load %weight_view[%column] : view<3840xbf16> -> bf16
+    %normalized = template.apply<@normalization.scaled_bf16>(%update_value, %weight_value, %inverse) : (bf16, bf16, f32) -> (bf16)
+    %gate_value = scf.if %gated -> (bf16) {
+      %stored = view.load %gate_view[%column] : view<3840xbf16> -> bf16
+      %raw = scalar.extf %stored : bf16 to f32
+      // tanh(x) = 1 - 2 / (exp(2x) + 1); saturates cleanly at either end.
+      %c2_0 = scalar.constant 2.0 : f32
+      %doubled = scalar.mulf %raw, %c2_0 : f32
+      %exponential = scalar.expf<afn> %doubled : f32
+      %denominator = scalar.addf %exponential, %c1_0 : f32
+      %fraction = scalar.divf %c2_0, %denominator : f32
+      %activated = scalar.subf %c1_0, %fraction : f32
+      %rounded = scalar.fptrunc %activated : f32 to bf16
+      scf.yield %rounded : bf16
+    } else {
+      scf.yield %one : bf16
+    }
+    %value = view.load %residual_view[%row, %column] : view<[%rows]x3840xbf16> -> bf16
+    %result = template.apply<@residual.gated_bf16>(%value, %normalized, %gate_value) : (bf16, bf16, bf16) -> (bf16)
+    view.store %result, %residual_view[%row, %column] : bf16, view<[%rows]x3840xbf16>
+  }
+  template.return
+}
+
+// One 64-thread workgroup owns one 128-wide head row; each lane owns one
+// adjacent channel pair and captures both values before either store, so
+// output may alias input.
+template.def<@zimage.normalize_rotary_rows> device @zimage_normalize_rotary_rows(%tokens: index, %input: buffer, %weight: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %heads = index.constant 30 : index
+  %unit = index.constant 1 : index
+  %pair = index.constant 2 : index
+  %rows = index.mul %tokens, %heads : index
+  %row = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %token = index.div %row, %heads : index
+  %even = index.mul %lane, %pair : index
+  %odd = index.add %even, %unit : index
+  %width_f32 = scalar.constant 128.0 : f32
+  %epsilon = scalar.constant 1.0000000000000001e-05 : f32
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x128xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x128xbf16>
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<128xbf16>
+  %cosine_view = buffer.view %cosine[%origin] : buffer -> view<[%tokens]x128xf32>
+  %sine_view = buffer.view %sine[%origin] : buffer -> view<[%tokens]x128xf32>
+  %even_stored = view.load %input_view[%row, %even] : view<[%rows]x128xbf16> -> bf16
+  %odd_stored = view.load %input_view[%row, %odd] : view<[%rows]x128xbf16> -> bf16
+  %even_input = scalar.extf %even_stored : bf16 to f32
+  %odd_input = scalar.extf %odd_stored : bf16 to f32
+  %even_square = scalar.mulf %even_input, %even_input : f32
+  %odd_square = scalar.mulf %odd_input, %odd_input : f32
+  %partial = scalar.addf %even_square, %odd_square : f32
+  %sum = kernel.workgroup.reduce<addf> %partial : f32
+  %mean = scalar.divf %sum, %width_f32 : f32
+  %biased = scalar.addf %mean, %epsilon : f32
+  %inverse = scalar.rsqrtf<afn> %biased : f32
+  %even_weight = view.load %weight_view[%even] : view<128xbf16> -> bf16
+  %odd_weight = view.load %weight_view[%odd] : view<128xbf16> -> bf16
+  %even_bf16 = template.apply<@normalization.scaled_bf16>(%even_stored, %even_weight, %inverse) : (bf16, bf16, f32) -> (bf16)
+  %odd_bf16 = template.apply<@normalization.scaled_bf16>(%odd_stored, %odd_weight, %inverse) : (bf16, bf16, f32) -> (bf16)
+  %even_value = scalar.extf %even_bf16 : bf16 to f32
+  %odd_value = scalar.extf %odd_bf16 : bf16 to f32
+  %even_cosine = view.load %cosine_view[%token, %even] : view<[%tokens]x128xf32> -> f32
+  %odd_cosine = view.load %cosine_view[%token, %odd] : view<[%tokens]x128xf32> -> f32
+  %even_sine = view.load %sine_view[%token, %even] : view<[%tokens]x128xf32> -> f32
+  %odd_sine = view.load %sine_view[%token, %odd] : view<[%tokens]x128xf32> -> f32
+  %even_cosine_term = scalar.mulf %even_value, %even_cosine : f32
+  %odd_cosine_term = scalar.mulf %odd_value, %odd_cosine : f32
+  %even_sine_term = scalar.mulf %odd_value, %even_sine : f32
+  %odd_sine_term = scalar.mulf %even_value, %odd_sine : f32
+  %even_rotated = scalar.subf %even_cosine_term, %even_sine_term : f32
+  %odd_rotated = scalar.addf %odd_cosine_term, %odd_sine_term : f32
+  %even_output = scalar.fptrunc %even_rotated : f32 to bf16
+  %odd_output = scalar.fptrunc %odd_rotated : f32 to bf16
+  view.store %even_output, %output_view[%row, %even] : bf16, view<[%rows]x128xbf16>
+  view.store %odd_output, %output_view[%row, %odd] : bf16, view<[%rows]x128xbf16>
+  template.return
+}
+
+// One 256-thread workgroup owns one 3840-wide row. Every lane finishes both
+// reductions before any store.
+template.def<@zimage.final_modulate_rows> device @zimage_final_modulate_rows(%rows: index, %input: buffer, %scale: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %width = index.constant 3840 : index
+  %threads = index.constant 256 : index
+  %row = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %c0_0 = scalar.constant 0.0 : f32
+  %zero = scalar.fptrunc %c0_0 : f32 to bf16
+  %width_f32 = scalar.constant 3840.0 : f32
+  %epsilon = scalar.constant 9.9999999999999995e-07 : f32
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x3840xbf16>
+  %scale_view = buffer.view %scale[%origin] : buffer -> view<3840xbf16>
+  %partial_sum = scf.for %column = [%lane to %width step %threads](%acc = %c0_0 : f32) -> (f32) {
+    %stored = view.load %input_view[%row, %column] : view<[%rows]x3840xbf16> -> bf16
+    %value = scalar.extf %stored : bf16 to f32
+    %sum = scalar.addf %acc, %value : f32
+    scf.yield %sum : f32
+  }
+  %sum = kernel.workgroup.reduce<addf> %partial_sum : f32
+  %mean = scalar.divf %sum, %width_f32 : f32
+  %partial_square = scf.for %column = [%lane to %width step %threads](%acc = %c0_0 : f32) -> (f32) {
+    %stored = view.load %input_view[%row, %column] : view<[%rows]x3840xbf16> -> bf16
+    %value = scalar.extf %stored : bf16 to f32
+    %centered = scalar.subf %value, %mean : f32
+    %square = scalar.mulf %centered, %centered : f32
+    %total = scalar.addf %acc, %square : f32
+    scf.yield %total : f32
+  }
+  %square_sum = kernel.workgroup.reduce<addf> %partial_square : f32
+  %variance = scalar.divf %square_sum, %width_f32 : f32
+  %biased = scalar.addf %variance, %epsilon : f32
+  %inverse = scalar.rsqrtf<afn> %biased : f32
+  scf.for %column = [%lane to %width step %threads] {
+    %stored = view.load %input_view[%row, %column] : view<[%rows]x3840xbf16> -> bf16
+    %value = scalar.extf %stored : bf16 to f32
+    %centered = scalar.subf %value, %mean : f32
+    %normalized_f32 = scalar.mulf %centered, %inverse : f32
+    %normalized = scalar.fptrunc %normalized_f32 : f32 to bf16
+    %scale_value = view.load %scale_view[%column] : view<3840xbf16> -> bf16
+    %result = template.apply<@modulation.affine_bf16>(%normalized, %scale_value, %c0_0, %zero, %c0_0) : (bf16, bf16, f32, bf16, f32) -> (bf16)
+    view.store %result, %output_view[%row, %column] : bf16, view<[%rows]x3840xbf16>
+  }
+  template.return
+}
+
+kernel.def target(@zimage_normalization_wave32) @zimage_refiner_modulate() {
+  %rows = config.get @zimage.image_tokens : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %scale: buffer, %output: buffer) {
+  %rows = config.get @zimage.image_tokens : index
+  template.apply<@zimage.modulate_rows>(%rows, %input, %weight, %scale, %output) : (index, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@zimage_normalization_wave32) @zimage_layer_modulate() {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %rows = index.add %images, %texts : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %scale: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %rows = index.add %images, %texts : index
+  template.apply<@zimage.modulate_rows>(%rows, %input, %weight, %scale, %output) : (index, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@zimage_normalization_wave32) @zimage_context_normalize() {
+  %rows = config.get @zimage.text_tokens : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %width = index.constant 3840 : index
+  %threads = index.constant 256 : index
+  %epsilon = scalar.constant 1.0000000000000001e-05 : f32
+  template.apply<@normalization.scaled_rows_bf16>(%rows, %width, %threads, %epsilon, %input, %weight, %output) : (index, index, index, f32, buffer, buffer, buffer)
+  kernel.return
+}
+
+// Encoder features [text, 2560] ahead of the caption embedding.
+kernel.def target(@zimage_normalization_wave32) @zimage_caption_normalize() {
+  %rows = config.get @zimage.text_tokens : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %width = index.constant 2560 : index
+  %threads = index.constant 256 : index
+  %epsilon = scalar.constant 1.0000000000000001e-05 : f32
+  template.apply<@normalization.scaled_rows_bf16>(%rows, %width, %threads, %epsilon, %input, %weight, %output) : (index, index, index, f32, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@zimage_normalization_wave32) @zimage_refiner_residual() {
+  %rows = config.get @zimage.image_tokens : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%update: buffer, %weight: buffer, %gate: buffer, %residual: buffer) {
+  %rows = config.get @zimage.image_tokens : index
+  %gated = scalar.constant true : i1
+  template.apply<@zimage.norm_residual_rows>(%rows, %gated, %update, %weight, %gate, %residual) : (index, i1, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@zimage_normalization_wave32) @zimage_layer_residual() {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %rows = index.add %images, %texts : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%update: buffer, %weight: buffer, %gate: buffer, %residual: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %rows = index.add %images, %texts : index
+  %gated = scalar.constant true : i1
+  template.apply<@zimage.norm_residual_rows>(%rows, %gated, %update, %weight, %gate, %residual) : (index, i1, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+// The context refiner has no gate; the weight stands in for the unread gate row.
+kernel.def target(@zimage_normalization_wave32) @zimage_context_residual() {
+  %rows = config.get @zimage.text_tokens : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%update: buffer, %weight: buffer, %residual: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %gated = scalar.constant false : i1
+  template.apply<@zimage.norm_residual_rows>(%rows, %gated, %update, %weight, %weight, %residual) : (index, i1, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@zimage_normalization_wave32) @zimage_refiner_rotary() {
+  %tokens = config.get @zimage.image_tokens : index
+  %heads = index.constant 30 : index
+  %rows = index.mul %tokens, %heads : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %tokens = config.get @zimage.image_tokens : index
+  template.apply<@zimage.normalize_rotary_rows>(%tokens, %input, %weight, %cosine, %sine, %output) : (index, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@zimage_normalization_wave32) @zimage_context_rotary() {
+  %tokens = config.get @zimage.text_tokens : index
+  %heads = index.constant 30 : index
+  %rows = index.mul %tokens, %heads : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %tokens = config.get @zimage.text_tokens : index
+  template.apply<@zimage.normalize_rotary_rows>(%tokens, %input, %weight, %cosine, %sine, %output) : (index, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@zimage_normalization_wave32) @zimage_layer_rotary() {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %tokens = index.add %images, %texts : index
+  %heads = index.constant 30 : index
+  %rows = index.mul %tokens, %heads : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %tokens = index.add %images, %texts : index
+  template.apply<@zimage.normalize_rotary_rows>(%tokens, %input, %weight, %cosine, %sine, %output) : (index, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@zimage_normalization_wave32) @zimage_final_modulate() {
+  %rows = config.get @zimage.image_tokens : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %scale: buffer, %output: buffer) {
+  %rows = config.get @zimage.image_tokens : index
+  template.apply<@zimage.final_modulate_rows>(%rows, %input, %scale, %output) : (index, buffer, buffer, buffer)
+  kernel.return
+}
+
+// Block norms. Input is the residual stream; output is a separate normalized
+// buffer. The offset selects the block's time row in the modulation table.
+command.def public @zimage.refiner_attention_norm(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "noise_refiner.{}.attention_norm1.weight"[%layer] : view<3840xbf16>
+  %scale = buffer.view %modulation[%offset] : buffer -> view<3840xbf16>
+  kernel.launch @zimage_refiner_modulate(%input, %weight, %scale, %output) : (buffer, view<3840xbf16>, view<3840xbf16>, buffer)
+  command.return
+}
+
+command.def public @zimage.refiner_ffn_norm(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %input: buffer, %output: buffer) {
+  %scale_bytes = index.constant 15360 : offset
+  %scale_offset = index.add %offset, %scale_bytes : offset
+  %weight = command.parameter %parameters, "noise_refiner.{}.ffn_norm1.weight"[%layer] : view<3840xbf16>
+  %scale = buffer.view %modulation[%scale_offset] : buffer -> view<3840xbf16>
+  kernel.launch @zimage_refiner_modulate(%input, %weight, %scale, %output) : (buffer, view<3840xbf16>, view<3840xbf16>, buffer)
+  command.return
+}
+
+command.def public @zimage.layer_attention_norm(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "layers.{}.attention_norm1.weight"[%layer] : view<3840xbf16>
+  %scale = buffer.view %modulation[%offset] : buffer -> view<3840xbf16>
+  kernel.launch @zimage_layer_modulate(%input, %weight, %scale, %output) : (buffer, view<3840xbf16>, view<3840xbf16>, buffer)
+  command.return
+}
+
+command.def public @zimage.layer_ffn_norm(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %input: buffer, %output: buffer) {
+  %scale_bytes = index.constant 15360 : offset
+  %scale_offset = index.add %offset, %scale_bytes : offset
+  %weight = command.parameter %parameters, "layers.{}.ffn_norm1.weight"[%layer] : view<3840xbf16>
+  %scale = buffer.view %modulation[%scale_offset] : buffer -> view<3840xbf16>
+  kernel.launch @zimage_layer_modulate(%input, %weight, %scale, %output) : (buffer, view<3840xbf16>, view<3840xbf16>, buffer)
+  command.return
+}
+
+command.def public @zimage.context_attention_norm(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "context_refiner.{}.attention_norm1.weight"[%layer] : view<3840xbf16>
+  kernel.launch @zimage_context_normalize(%input, %weight, %output) : (buffer, view<3840xbf16>, buffer)
+  command.return
+}
+
+command.def public @zimage.context_ffn_norm(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "context_refiner.{}.ffn_norm1.weight"[%layer] : view<3840xbf16>
+  kernel.launch @zimage_context_normalize(%input, %weight, %output) : (buffer, view<3840xbf16>, buffer)
+  command.return
+}
+
+command.def public @zimage.caption_norm() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "cap_embedder.0.weight" : view<2560xbf16>
+  kernel.launch @zimage_caption_normalize(%input, %weight, %output) : (buffer, view<2560xbf16>, buffer)
+  command.return
+}
+
+// Residual updates. The update is a projection output with the residual
+// stream's row layout; the residual stream is updated in place.
+command.def public @zimage.refiner_attention_residual(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %update: buffer, %residual: buffer) {
+  %gate_bytes = index.constant 7680 : offset
+  %gate_offset = index.add %offset, %gate_bytes : offset
+  %weight = command.parameter %parameters, "noise_refiner.{}.attention_norm2.weight"[%layer] : view<3840xbf16>
+  %gate = buffer.view %modulation[%gate_offset] : buffer -> view<3840xbf16>
+  kernel.launch @zimage_refiner_residual(%update, %weight, %gate, %residual) : (buffer, view<3840xbf16>, view<3840xbf16>, buffer)
+  command.return
+}
+
+command.def public @zimage.refiner_ffn_residual(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %update: buffer, %residual: buffer) {
+  %gate_bytes = index.constant 23040 : offset
+  %gate_offset = index.add %offset, %gate_bytes : offset
+  %weight = command.parameter %parameters, "noise_refiner.{}.ffn_norm2.weight"[%layer] : view<3840xbf16>
+  %gate = buffer.view %modulation[%gate_offset] : buffer -> view<3840xbf16>
+  kernel.launch @zimage_refiner_residual(%update, %weight, %gate, %residual) : (buffer, view<3840xbf16>, view<3840xbf16>, buffer)
+  command.return
+}
+
+command.def public @zimage.layer_attention_residual(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %update: buffer, %residual: buffer) {
+  %gate_bytes = index.constant 7680 : offset
+  %gate_offset = index.add %offset, %gate_bytes : offset
+  %weight = command.parameter %parameters, "layers.{}.attention_norm2.weight"[%layer] : view<3840xbf16>
+  %gate = buffer.view %modulation[%gate_offset] : buffer -> view<3840xbf16>
+  kernel.launch @zimage_layer_residual(%update, %weight, %gate, %residual) : (buffer, view<3840xbf16>, view<3840xbf16>, buffer)
+  command.return
+}
+
+command.def public @zimage.layer_ffn_residual(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %update: buffer, %residual: buffer) {
+  %gate_bytes = index.constant 23040 : offset
+  %gate_offset = index.add %offset, %gate_bytes : offset
+  %weight = command.parameter %parameters, "layers.{}.ffn_norm2.weight"[%layer] : view<3840xbf16>
+  %gate = buffer.view %modulation[%gate_offset] : buffer -> view<3840xbf16>
+  kernel.launch @zimage_layer_residual(%update, %weight, %gate, %residual) : (buffer, view<3840xbf16>, view<3840xbf16>, buffer)
+  command.return
+}
+
+command.def public @zimage.context_attention_residual(%layer: index) launch(%parameters: buffer, %update: buffer, %residual: buffer) {
+  %weight = command.parameter %parameters, "context_refiner.{}.attention_norm2.weight"[%layer] : view<3840xbf16>
+  kernel.launch @zimage_context_residual(%update, %weight, %residual) : (buffer, view<3840xbf16>, buffer)
+  command.return
+}
+
+command.def public @zimage.context_ffn_residual(%layer: index) launch(%parameters: buffer, %update: buffer, %residual: buffer) {
+  %weight = command.parameter %parameters, "context_refiner.{}.ffn_norm2.weight"[%layer] : view<3840xbf16>
+  kernel.launch @zimage_context_residual(%update, %weight, %residual) : (buffer, view<3840xbf16>, buffer)
+  command.return
+}
+
+// Query and key norms with rotation. Rotary tables hold image rows, then
+// caption rows, 512 bytes each; the context refiner starts at the caption rows.
+command.def public @zimage.refiner_query_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "noise_refiner.{}.attention.q_norm.weight"[%layer] : view<128xbf16>
+  kernel.launch @zimage_refiner_rotary(%input, %weight, %cosine, %sine, %output) : (buffer, view<128xbf16>, buffer, buffer, buffer)
+  command.return
+}
+
+command.def public @zimage.refiner_key_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "noise_refiner.{}.attention.k_norm.weight"[%layer] : view<128xbf16>
+  kernel.launch @zimage_refiner_rotary(%input, %weight, %cosine, %sine, %output) : (buffer, view<128xbf16>, buffer, buffer, buffer)
+  command.return
+}
+
+command.def public @zimage.context_query_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %row_bytes = index.constant 512 : offset
+  %text_origin = index.scale %images, %row_bytes : index, offset -> offset
+  %text_cosine = buffer.view %cosine[%text_origin] : buffer -> view<[%texts]x128xf32>
+  %text_sine = buffer.view %sine[%text_origin] : buffer -> view<[%texts]x128xf32>
+  %weight = command.parameter %parameters, "context_refiner.{}.attention.q_norm.weight"[%layer] : view<128xbf16>
+  kernel.launch @zimage_context_rotary(%input, %weight, %text_cosine, %text_sine, %output) : (buffer, view<128xbf16>, view<[%texts]x128xf32>, view<[%texts]x128xf32>, buffer)
+  command.return
+}
+
+command.def public @zimage.context_key_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %row_bytes = index.constant 512 : offset
+  %text_origin = index.scale %images, %row_bytes : index, offset -> offset
+  %text_cosine = buffer.view %cosine[%text_origin] : buffer -> view<[%texts]x128xf32>
+  %text_sine = buffer.view %sine[%text_origin] : buffer -> view<[%texts]x128xf32>
+  %weight = command.parameter %parameters, "context_refiner.{}.attention.k_norm.weight"[%layer] : view<128xbf16>
+  kernel.launch @zimage_context_rotary(%input, %weight, %text_cosine, %text_sine, %output) : (buffer, view<128xbf16>, view<[%texts]x128xf32>, view<[%texts]x128xf32>, buffer)
+  command.return
+}
+
+command.def public @zimage.layer_query_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "layers.{}.attention.q_norm.weight"[%layer] : view<128xbf16>
+  kernel.launch @zimage_layer_rotary(%input, %weight, %cosine, %sine, %output) : (buffer, view<128xbf16>, buffer, buffer, buffer)
+  command.return
+}
+
+command.def public @zimage.layer_key_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "layers.{}.attention.k_norm.weight"[%layer] : view<128xbf16>
+  kernel.launch @zimage_layer_rotary(%input, %weight, %cosine, %sine, %output) : (buffer, view<128xbf16>, buffer, buffer, buffer)
+  command.return
+}
+
+// The final table stores the unactivated scale row. Input is the unified
+// hidden state; only its leading image rows are normalized.
+command.def public @zimage.final_norm(%offset: offset) launch(%modulation: buffer, %input: buffer, %output: buffer) {
+  %scale = buffer.view %modulation[%offset] : buffer -> view<3840xbf16>
+  kernel.launch @zimage_final_modulate(%input, %scale, %output) : (buffer, view<3840xbf16>, buffer)
+  command.return
+}

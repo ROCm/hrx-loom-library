@@ -1,0 +1,95 @@
+// Complete image roots bind the encoder, diffusion transformer, and VAE to an
+// opaque request and packed RGBA8 output. Device kernels derive noise, token
+// framing, attention masks, rotary coefficients, and diffusion constants from
+// that request. Their intermediate storage belongs to the reflected invocation
+// workspace; parameter storage remains shared across invocations.
+
+config.decl @zimage.image_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+config.decl @zimage.text_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+config.decl @zimage.batch_items : %value: index where [range(%value, 1, 2)]
+
+kernel.decl @request_noise() launch(%request: buffer, %output: buffer)
+
+kernel.decl @request_prompt() launch(%request: buffer, %tokens: buffer, %encoder_mask: buffer, %key_mask: buffer)
+
+kernel.decl @request_encoder_rotary() launch(%cosine: buffer, %sine: buffer)
+
+kernel.decl @request_rotary() launch(%request: buffer, %cosine: buffer, %sine: buffer)
+
+kernel.decl @request_constants() launch(%times: buffer, %deltas: buffer)
+
+command.decl @sample_image() launch(%encoder_parameters: buffer, %parameters: buffer, %vae_parameters: buffer, %sample: buffer, %token_ids: buffer, %encoder_cosine: buffer, %encoder_sine: buffer, %encoder_mask: buffer, %key_mask: buffer, %times: buffer, %cosine: buffer, %sine: buffer, %deltas: buffer, %output: buffer)
+
+// Request-derived tensors live in the reflected command workspace. Only the
+// opaque request packet crosses from the host. Preparation has no mutable RNG,
+// checkpoint access or host completion boundary.
+command.def @zimage.generate_one() launch(%encoder_parameters: buffer, %parameters: buffer, %vae_parameters: buffer, %request: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %tokens = index.add %images, %texts : index
+  %c1 = index.constant 1 : offset
+  %c4 = index.constant 4 : offset
+  // F32[image_tokens,64] noise, BF16[text_tokens,128] encoder tables, and
+  // F32[image_tokens+text_tokens,128] transformer tables.
+  %latent_stride = index.constant 256 : offset
+  %encoder_stride = index.constant 256 : offset
+  %rotary_stride = index.constant 512 : offset
+  %noise_bytes = index.scale %images, %latent_stride : index, offset -> offset
+  %id_bytes = index.scale %texts, %c4 : index, offset -> offset
+  %encoder_mask_bytes = index.scale %texts, %c1 : index, offset -> offset
+  %key_mask_bytes = index.scale %tokens, %c1 : index, offset -> offset
+  %encoder_bytes = index.scale %texts, %encoder_stride : index, offset -> offset
+  %rotary_bytes = index.scale %tokens, %rotary_stride : index, offset -> offset
+  // Eight F32 transformer timesteps and eight F32 Euler step sizes.
+  %time_bytes = index.constant 32 : offset
+  %delta_bytes = index.constant 32 : offset
+  %noise = buffer.alloca<global> align(256) %noise_bytes : buffer
+  %token_ids = buffer.alloca<global> align(256) %id_bytes : buffer
+  %encoder_mask = buffer.alloca<global> align(256) %encoder_mask_bytes : buffer
+  %key_mask = buffer.alloca<global> align(256) %key_mask_bytes : buffer
+  %encoder_cosine = buffer.alloca<global> align(256) %encoder_bytes : buffer
+  %encoder_sine = buffer.alloca<global> align(256) %encoder_bytes : buffer
+  %cosine = buffer.alloca<global> align(256) %rotary_bytes : buffer
+  %sine = buffer.alloca<global> align(256) %rotary_bytes : buffer
+  %times = buffer.alloca<global> align(256) %time_bytes : buffer
+  %deltas = buffer.alloca<global> align(256) %delta_bytes : buffer
+  command.concurrent {
+    kernel.launch @request_noise(%request, %noise) : (buffer, buffer)
+    kernel.launch @request_prompt(%request, %token_ids, %encoder_mask, %key_mask) : (buffer, buffer, buffer, buffer)
+    kernel.launch @request_encoder_rotary(%encoder_cosine, %encoder_sine) : (buffer, buffer)
+    kernel.launch @request_rotary(%request, %cosine, %sine) : (buffer, buffer, buffer)
+    kernel.launch @request_constants(%times, %deltas) : (buffer, buffer)
+  }
+  command.launch @sample_image(%encoder_parameters, %parameters, %vae_parameters, %noise, %token_ids, %encoder_cosine, %encoder_sine, %encoder_mask, %key_mask, %times, %cosine, %sine, %deltas, %output) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+// The batch payload is a 16-byte header followed by one packet per member:
+// seed, framed count, and text_tokens IDs. Sequential members reuse
+// invocation workspace, and outputs retain request order.
+command.def public @generate_image() launch(%encoder_parameters: buffer, %parameters: buffer, %vae_parameters: buffer, %request: buffer, %output: buffer) {
+  %items = config.get @zimage.batch_items : index
+  %texts = config.get @zimage.text_tokens : index
+  %images = config.get @zimage.image_tokens : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %header_bytes = index.constant 16 : offset
+  %c4 = index.constant 4 : offset
+  %token_bytes = index.scale %texts, %c4 : index, offset -> offset
+  %packet_bytes = index.add %header_bytes, %token_bytes : offset
+  %rgba_bytes_per_patch = index.constant 1024 : offset
+  %rgba_bytes = index.scale %images, %rgba_bytes_per_patch : index, offset -> offset
+  %packet_extent = index.cast %packet_bytes : offset to index
+  %rgba_extent = index.cast %rgba_bytes : offset to index
+  scf.for %item = [%c0 to %items step %c1] unroll {
+    %packet_offset = index.scale %item, %packet_bytes : index, offset -> offset
+    %packet_begin = index.add %header_bytes, %packet_offset : offset
+    %rgba_begin = index.scale %item, %rgba_bytes : index, offset -> offset
+    %packet = buffer.view %request[%packet_begin] : buffer -> view<[%packet_extent]xi8>
+    %rgba = buffer.view %output[%rgba_begin] : buffer -> view<[%rgba_extent]xi8>
+    command.launch @zimage.generate_one(%encoder_parameters, %parameters, %vae_parameters, %packet, %rgba) : (buffer, buffer, buffer, view<[%packet_extent]xi8>, view<[%rgba_extent]xi8>)
+  }
+  command.return
+}

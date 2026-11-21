@@ -1,0 +1,150 @@
+// Decode one packed DiT latent into row-major opaque RGBA8 at eight times
+// each latent dimension. The input path, the first mid residual, and spatial
+// attention run on the full latent grid; the remaining mid residual, the four
+// up stages, and the output head form a body that runs either once on the
+// full grid or per overlapping decoder tile. Stitching publishes only each
+// tile's owned rectangle.
+//
+// Decoder tiles are at most 128 latent pixels per side, so the 8x output
+// stage stays within the 1024-pixel convolution and normalization domain.
+// Preparation sets the tile equal to the latent grid when the latent fits.
+// Tiled GroupNorm statistics are per tile, so a tiled decode approximates the
+// reference; an untiled decode does not.
+
+config.decl @zimage.latent_height : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+config.decl @zimage.latent_width : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+config.decl @zimage.vae_tile_height : %value: index where [range(%value, 2, 128), multiple_of(%value, 2)]
+
+config.decl @zimage.vae_tile_width : %value: index where [range(%value, 2, 128), multiple_of(%value, 2)]
+
+template.decl @zimage.vae_tile_axis_plan(%extent: index, %tile: index) -> (index, index)
+
+template.decl @zimage.vae_tile_axis_interval(%extent: index, %tile: index, %stride: index, %ordinal: index) -> (index, index, index)
+
+command.decl @vae_input() launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @vae_spatial_attention() launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.vae_mid_residual(%block: index, %height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)]
+
+command.decl @zimage.vae_up_residual(%stage: index, %block: index, %height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)]
+
+command.decl @zimage.vae_up2_residual(%block: index, %height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)]
+
+command.decl @zimage.vae_up3_residual(%block: index, %height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)]
+
+command.decl @zimage.vae_up2_narrow(%height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)]
+
+command.decl @zimage.vae_up3_narrow(%height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)]
+
+command.decl @zimage.vae_resize(%stage: index, %height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)]
+
+command.decl @zimage.vae_up2_resize(%height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)]
+
+command.decl @zimage.vae_output(%height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)]
+
+command.decl @zimage.vae_extract_tile(%origin_y: index, %origin_x: index) launch(%input: buffer, %output: buffer) where [range(%origin_y, 0, 1022), range(%origin_x, 0, 1022)]
+
+command.decl @zimage.vae_stitch_tile(%origin_y: index, %origin_x: index, %crop_y_begin: index, %crop_y_end: index, %crop_x_begin: index, %crop_x_end: index) launch(%input: buffer, %output: buffer) where [range(%origin_y, 0, 1022), range(%origin_x, 0, 1022), range(%crop_y_begin, 0, 1024), range(%crop_y_end, 0, 1024), range(%crop_x_begin, 0, 1024), range(%crop_x_end, 0, 1024)]
+
+// Input is 512-channel attended features on the tile grid and stays
+// immutable. Stage state advances in place; each narrowing block and resize
+// writes the next, larger allocation.
+command.def public @vae_decoder_body() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %height = config.get @zimage.vae_tile_height : index
+  %width = config.get @zimage.vae_tile_width : index
+  %pixels = index.mul %height, %width : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %height2 = index.mul %height, %c2 : index
+  %width2 = index.mul %width, %c2 : index
+  %height4 = index.mul %height, %c4 : index
+  %width4 = index.mul %width, %c4 : index
+  %height8 = index.mul %height, %c8 : index
+  %width8 = index.mul %width, %c8 : index
+  %state0_pixel_bytes = index.constant 2048 : offset
+  %state0_bytes = index.scale %pixels, %state0_pixel_bytes : index, offset -> offset
+  %state0 = buffer.alloca<global> align(256) %state0_bytes : buffer
+  command.launch @zimage.vae_mid_residual[%c1, %height, %width](%parameters, %input, %state0) : [index, index, index](buffer, buffer, buffer)
+  scf.for %block = [%c0 to %c3 step %c1] unroll {
+    command.launch @zimage.vae_up_residual[%c0, %block, %height, %width](%parameters, %state0, %state0) : [index, index, index, index](buffer, buffer, buffer)
+  }
+  %state1_pixel_bytes = index.constant 8192 : offset
+  %state1_bytes = index.scale %pixels, %state1_pixel_bytes : index, offset -> offset
+  %state1 = buffer.alloca<global> align(256) %state1_bytes : buffer
+  command.launch @zimage.vae_resize[%c0, %height, %width](%parameters, %state0, %state1) : [index, index, index](buffer, buffer, buffer)
+  scf.for %block = [%c0 to %c3 step %c1] unroll {
+    command.launch @zimage.vae_up_residual[%c1, %block, %height2, %width2](%parameters, %state1, %state1) : [index, index, index, index](buffer, buffer, buffer)
+  }
+  %state2_pixel_bytes = index.constant 32768 : offset
+  %state2_bytes = index.scale %pixels, %state2_pixel_bytes : index, offset -> offset
+  %state2 = buffer.alloca<global> align(256) %state2_bytes : buffer
+  command.launch @zimage.vae_resize[%c1, %height2, %width2](%parameters, %state1, %state2) : [index, index, index](buffer, buffer, buffer)
+  %state3_pixel_bytes = index.constant 16384 : offset
+  %state3_bytes = index.scale %pixels, %state3_pixel_bytes : index, offset -> offset
+  %state3 = buffer.alloca<global> align(256) %state3_bytes : buffer
+  command.launch @zimage.vae_up2_narrow[%height4, %width4](%parameters, %state2, %state3) : [index, index](buffer, buffer, buffer)
+  scf.for %block = [%c1 to %c3 step %c1] unroll {
+    command.launch @zimage.vae_up2_residual[%block, %height4, %width4](%parameters, %state3, %state3) : [index, index, index](buffer, buffer, buffer)
+  }
+  %state4_pixel_bytes = index.constant 65536 : offset
+  %state4_bytes = index.scale %pixels, %state4_pixel_bytes : index, offset -> offset
+  %state4 = buffer.alloca<global> align(256) %state4_bytes : buffer
+  command.launch @zimage.vae_up2_resize[%height4, %width4](%parameters, %state3, %state4) : [index, index](buffer, buffer, buffer)
+  %state5_pixel_bytes = index.constant 32768 : offset
+  %state5_bytes = index.scale %pixels, %state5_pixel_bytes : index, offset -> offset
+  %state5 = buffer.alloca<global> align(256) %state5_bytes : buffer
+  command.launch @zimage.vae_up3_narrow[%height8, %width8](%parameters, %state4, %state5) : [index, index](buffer, buffer, buffer)
+  scf.for %block = [%c1 to %c3 step %c1] unroll {
+    command.launch @zimage.vae_up3_residual[%block, %height8, %width8](%parameters, %state5, %state5) : [index, index, index](buffer, buffer, buffer)
+  }
+  command.launch @zimage.vae_output[%height8, %width8](%parameters, %state5, %output) : [index, index](buffer, buffer, buffer)
+  command.return
+}
+
+command.def public @vae_decode() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %height = config.get @zimage.latent_height : index
+  %width = config.get @zimage.latent_width : index
+  %tile_height = config.get @zimage.vae_tile_height : index
+  %tile_width = config.get @zimage.vae_tile_width : index
+  %pixels = index.mul %height, %width : index
+  %pixel_bytes = index.constant 2048 : offset
+  %bytes = index.scale %pixels, %pixel_bytes : index, offset -> offset
+  %features = buffer.alloca<global> align(256) %bytes : buffer
+  %c0 = index.constant 0 : index
+  command.launch @vae_input(%parameters, %input, %features) : (buffer, buffer, buffer)
+  command.launch @zimage.vae_mid_residual[%c0, %height, %width](%parameters, %features, %features) : [index, index, index](buffer, buffer, buffer)
+  command.launch @vae_spatial_attention(%parameters, %features, %features) : (buffer, buffer, buffer)
+  %height_tiled = index.cmp ne, %height, %tile_height : index
+  %width_tiled = index.cmp ne, %width, %tile_width : index
+  %tiled = scalar.ori %height_tiled, %width_tiled : i1
+  scf.if %tiled {
+    %height_stride, %height_count = template.apply<@zimage.vae_tile_axis_plan>(%height, %tile_height) : (index, index) -> (index, index)
+    %width_stride, %width_count = template.apply<@zimage.vae_tile_axis_plan>(%width, %tile_width) : (index, index) -> (index, index)
+    %tile_pixels = index.mul %tile_height, %tile_width : index
+    %tile_bytes = index.scale %tile_pixels, %pixel_bytes : index, offset -> offset
+    %tile_features = buffer.alloca<global> align(256) %tile_bytes : buffer
+    %output_pixel_bytes = index.constant 256 : offset
+    %output_bytes = index.scale %tile_pixels, %output_pixel_bytes : index, offset -> offset
+    %tile_output = buffer.alloca<global> align(256) %output_bytes : buffer
+    %c1 = index.constant 1 : index
+    scf.for %row = [%c0 to %height_count step %c1] unroll {
+      %origin_y, %crop_y_begin, %crop_y_end = template.apply<@zimage.vae_tile_axis_interval>(%height, %tile_height, %height_stride, %row) : (index, index, index, index) -> (index, index, index)
+      scf.for %column = [%c0 to %width_count step %c1] unroll {
+        %origin_x, %crop_x_begin, %crop_x_end = template.apply<@zimage.vae_tile_axis_interval>(%width, %tile_width, %width_stride, %column) : (index, index, index, index) -> (index, index, index)
+        command.launch @zimage.vae_extract_tile[%origin_y, %origin_x](%features, %tile_features) : [index, index](buffer, buffer)
+        command.launch @vae_decoder_body(%parameters, %tile_features, %tile_output) : (buffer, buffer, buffer)
+        command.launch @zimage.vae_stitch_tile[%origin_y, %origin_x, %crop_y_begin, %crop_y_end, %crop_x_begin, %crop_x_end](%tile_output, %output) : [index, index, index, index, index, index](buffer, buffer)
+      }
+    }
+  } else {
+    command.launch @vae_decoder_body(%parameters, %features, %output) : (buffer, buffer, buffer)
+  }
+  command.return
+}

@@ -1,0 +1,650 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Real-ESRGAN x4plus (RRDBNet, 64 features, 32 growth) convolutions over F32
+// activations blocked by sixteen channels, [channels/16][height][width][16],
+// so one pixel's sixteen channels of a block are 64 contiguous bytes. Weights
+// are BF16 [outputs][inputs*9], blocked the same way along the reduction:
+// column (c/16)*144 + tap*16 + c%16 with tap = ky*3 + kx. Biases are F32.
+// Every layer is 3x3 with padding 1. The matrix body rounds activations to
+// BF16 operands and accumulates in F32.
+//
+// Dense-block concatenation is a channel offset: an activation buffer holds
+// in_total channels and a layer reads its first `inputs` of them and writes
+// `outputs` channels starting at out_offset of a buffer with out_total
+// channels. Blocks are channel-major, so a channel prefix is a buffer prefix.
+// Read and written channel ranges of one launch never overlap, so a dense
+// block grows in place. Nearest upsampling is an input-index transform:
+// height and width describe the physical input and the output is upsample
+// times larger.
+//
+// Store epilogue, after bias and optional leaky ReLU (slope 0.2), by
+// residual_mode (residual and skip are indexed by the stored channel without
+// out_offset; output may alias either):
+//   0: v
+//   1: v * 0.2 + residual                    (residual dense block)
+//   2: (v * 0.2 + residual) * 0.2 + skip     (last block of an RRDB)
+//   3: v + residual                          (trunk skip)
+
+amdgpu.target<gfx11-generic> @esrgan_matrix_rdna3
+
+amdgpu.target<gfx11-generic> @esrgan_wave32 {subgroup_size = 32}
+
+template.decl @esrgan.convolution_store(%sum: vector<8xf32>, %first_pixel: index, %channel: index, %pixels: index, %outputs: index, %out_offset: index, %lrelu: i1, %residual_mode: index, %bias: buffer, %residual: buffer, %skip: buffer, %output: buffer)
+
+template.decl @esrgan.convolution_patch32_bf16(%height: index, %width: index, %in_total: index, %inputs: index, %out_total: index, %out_offset: index, %outputs: index, %upsample: index, %lrelu: i1, %residual_mode: index, %input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %skip: buffer, %output: buffer)
+
+template.decl @esrgan.convolution_patch64_bf16(%height: index, %width: index, %in_total: index, %inputs: index, %out_total: index, %out_offset: index, %outputs: index, %upsample: index, %lrelu: i1, %residual_mode: index, %input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %skip: buffer, %output: buffer)
+
+// One 16x16 F32 result fragment: row=2*component+lane/16 (pixel),
+// column=lane%16 (channel), so each component stores two pixels' sixteen
+// channels as two contiguous 64-byte runs. Bias, activation and the residual
+// epilogue happen at the store.
+template.def<@esrgan.convolution_store> device @esrgan_convolution_store(%sum: vector<8xf32>, %first_pixel: index, %channel: index, %pixels: index, %outputs: index, %out_offset: index, %lrelu: i1, %residual_mode: index, %bias: buffer, %residual: buffer, %skip: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %slope = scalar.constant 0.2 : f32
+  %unit = scalar.constant 1.0 : f32
+  %c4 = index.constant 4 : index
+  %blocks = index.div %outputs, %c16 : index
+  %bias_view = buffer.view %bias[%origin] : buffer -> view<[%outputs]xf32>
+  // A block is 16 * pixels values whatever the buffer's channel count, so the
+  // stored channels are a view starting out_offset * pixels values in.
+  %output_row = index.mul %out_offset, %pixels : index
+  %output_byte = index.mul %output_row, %c4 : index
+  %output_origin = index.cast %output_byte : index to offset
+  %output_view = buffer.view %output[%output_origin] : buffer -> view<[%blocks]x[%pixels]x16xf32>
+  %has_residual = index.cmp ne, %residual_mode, %c0 : index
+  %plain_residual = index.cmp eq, %residual_mode, %c3 : index
+  %has_skip = index.cmp eq, %residual_mode, %c2 : index
+  %block_value = index.div %channel, %c16 : index
+  %block = index.assume %block_value [ge(%block_value, 0), lt(%block_value, %blocks)] : index
+  %slot = index.rem %channel, %c16 : index
+  %bias_value = view.load %bias_view[%channel] : view<[%outputs]xf32> -> f32
+  scf.for %component = [%c0 to %c8 step %c1] unroll {
+    // Tiles cover the output exactly, so every fragment pixel is in range.
+    %pixel_value = index.madd %component, %c2, %first_pixel : index
+    %pixel = index.assume %pixel_value [ge(%pixel_value, 0), lt(%pixel_value, %pixels)] : index
+    %value = vector.extract %sum[%component] : vector<8xf32> -> f32
+    %biased = scalar.addf %value, %bias_value : f32
+    %activated = scf.if %lrelu -> (f32) {
+      %negative = scalar.mulf %biased, %slope : f32
+      %rectified = scalar.maxnumf %biased, %negative : f32
+      scf.yield %rectified : f32
+    } else {
+      scf.yield %biased : f32
+    }
+    %result = scf.if %has_residual -> (f32) {
+      %residual_view = buffer.view %residual[%origin] : buffer -> view<[%blocks]x[%pixels]x16xf32>
+      %carried = view.load %residual_view[%block, %pixel, %slot] : view<[%blocks]x[%pixels]x16xf32> -> f32
+      %scale = scf.if %plain_residual -> (f32) {
+        scf.yield %unit : f32
+      } else {
+        scf.yield %slope : f32
+      }
+      %scaled = scalar.mulf %activated, %scale : f32
+      %dense = scalar.addf %scaled, %carried : f32
+      %outer = scf.if %has_skip -> (f32) {
+        %skip_view = buffer.view %skip[%origin] : buffer -> view<[%blocks]x[%pixels]x16xf32>
+        %skipped = view.load %skip_view[%block, %pixel, %slot] : view<[%blocks]x[%pixels]x16xf32> -> f32
+        %damped = scalar.mulf %dense, %slope : f32
+        %combined = scalar.addf %damped, %skipped : f32
+        scf.yield %combined : f32
+      } else {
+        scf.yield %dense : f32
+      }
+      scf.yield %outer : f32
+    } else {
+      scf.yield %activated : f32
+    }
+    view.store %result, %output_view[%block, %pixel, %slot] : f32, view<[%blocks]x[%pixels]x16xf32>
+  }
+  template.return
+}
+
+// Output width divisible by 64, inputs divisible by 16, outputs divisible by
+// 32. Each 128-pixel tile is two 64-pixel output row segments, which share a
+// row when the width is a multiple of 128 and sit on consecutive rows
+// otherwise; each half's receptive field is a 3x66 halo patch. A step stages
+// one sixteen-channel input block of both patches (one 64-byte load and one
+// 32-byte operand row per patch pixel), then runs all nine taps: tap (ky, kx)
+// reads half h's pixel p from patch[h][ky][p + kx]. Weights arrive blocked tap-major, so each tap's weight
+// operand row is 32 contiguous bytes of global memory. Four wave32s each own
+// 32 pixels of the tile across all 32 channels (four accumulators, 36 MMAs
+// per step against two barriers). Patch rows are padded to 24 elements so
+// 16-lane 32-byte reads hit distinct banks.
+template.def<@esrgan.convolution_patch32_bf16> target(@esrgan_matrix_rdna3) requires [#target.subgroup.size<32>] @esrgan_convolution_patch32_bf16(%height: index, %width: index, %in_total: index, %inputs: index, %out_total: index, %out_offset: index, %outputs: index, %upsample: index, %lrelu: i1, %residual_mode: index, %input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %skip: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c9 = index.constant 9 : index
+  %c15 = index.constant 15 : index
+  %matrix_tile = index.constant 16 : index
+  %depth = index.constant 32 : index
+  %tile = index.constant 128 : index
+  %threads = index.constant 128 : index
+  %half_tile = index.constant 64 : index
+  %patch_columns = index.constant 66 : index
+  %half_patch = index.constant 198 : index
+  %patch_pixels = index.constant 396 : index
+  %patch_bytes = index.constant 19008 : offset
+  %c0_0_8 = vector.splatf 0.0 : vector<8xf32>
+  %c0_0_16 = vector.splatf 0.0 : vector<16xf32>
+  %initial = vector.fragment<init> %c0_0_8 shape [%matrix_tile, %matrix_tile] : vector<8xf32>
+  %spatial_group = kernel.workgroup.id<x> : index
+  %channel_groups = index.div %outputs, %depth : index
+  %channel_group_value = kernel.workgroup.id<y> : index
+  %channel_group = index.assume %channel_group_value [ge(%channel_group_value, 0), lt(%channel_group_value, %channel_groups)] : index
+  %workitem = kernel.workitem.id<x> : index
+  %wave = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %lane_column = index.rem %lane, %matrix_tile : index
+  %lane_row = index.div %lane, %matrix_tile : index
+  %wave_pixel = index.mul %wave, %depth : index
+  // Waves 0-1 own the tile's first 64-pixel half and waves 2-3 the second.
+  %wave_half = index.div %wave, %c2 : index
+  %wave_parity = index.rem %wave, %c2 : index
+  %wave_column = index.mul %wave_parity, %depth : index
+  %wave_patch = index.madd %wave_half, %half_patch, %wave_column : index
+  %fragment_row0 = index.add %wave_patch, %lane_column : index
+  %fragment_row1 = index.add %fragment_row0, %matrix_tile : index
+  %pixel_origin = index.mul %spatial_group, %tile : index
+  %channel_origin = index.mul %channel_group, %depth : index
+  %channel_origin1 = index.add %channel_origin, %matrix_tile : index
+  %output_height = index.mul %height, %upsample : index
+  %output_width = index.mul %width, %upsample : index
+  %pixels = index.mul %output_height, %output_width : index
+  %reduction_count = index.mul %inputs, %c9 : index
+  %step_count = index.div %inputs, %matrix_tile : index
+  %in_blocks = index.div %in_total, %matrix_tile : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%in_blocks]x[%height]x[%width]x16xf32>
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<[%outputs]x[%reduction_count]xbf16>
+  %patch_stage = buffer.alloca<workgroup> align(16) %patch_bytes : buffer
+  %patch_view = buffer.view %patch_stage[%origin] : buffer -> view<396x24xbf16>
+  %slice_limit = index.sub %reduction_count, %c15 : index
+  %weight_row_value0 = index.add %channel_origin, %lane_column : index
+  %weight_row0 = index.assume %weight_row_value0 [ge(%weight_row_value0, 0), lt(%weight_row_value0, %outputs)] : index
+  %weight_row_value1 = index.add %channel_origin1, %lane_column : index
+  %weight_row1 = index.assume %weight_row_value1 [ge(%weight_row_value1, 0), lt(%weight_row_value1, %outputs)] : index
+
+  %sum00, %sum01, %sum10, %sum11 = scf.for %step = [%c0 to %step_count step %c1](%total00 = %initial : vector<8xf32>, %total01 = %initial : vector<8xf32>, %total10 = %initial : vector<8xf32>, %total11 = %initial : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) pipeline(%c1) {
+    %channel_base_value = index.mul %step, %matrix_tile : index
+    %channel_base = index.assume %channel_base_value [ge(%channel_base_value, 0), lt(%channel_base_value, %inputs)] : index
+    %block = index.assume %step [ge(%step, 0), lt(%step, %in_blocks)] : index
+
+    // Half h's patch pixel (r, j) is output-domain position (y_h + r - 1,
+    // x_h + j - 1), where (y_h, x_h) is the half's first pixel; out-of-image
+    // positions stage zeros. Stores need no remapping: a half is 64 consecutive
+    // pixels of one row, so pixel_origin + p is already its row-major index.
+    scf.for %round = [%c0 to %c4 step %c1] unroll schedule(linear) {
+      %slot = index.madd %round, %threads, %workitem : index
+      %slot_live = index.cmp ult, %slot, %patch_pixels : index
+      scf.if %slot_live {
+        %half = index.div %slot, %half_patch : index
+        %half_slot = index.rem %slot, %half_patch : index
+        %patch_row = index.div %half_slot, %patch_columns : index
+        %patch_column = index.rem %half_slot, %patch_columns : index
+        %half_origin = index.madd %half, %half_tile, %pixel_origin : index
+        %half_y = index.div %half_origin, %output_width : index
+        %half_x = index.rem %half_origin, %output_width : index
+        %source_y_offset = index.add %half_y, %patch_row : index
+        %source_x_offset = index.add %half_x, %patch_column : index
+        %source_y = index.sub %source_y_offset, %c1 : index
+        %source_x = index.sub %source_x_offset, %c1 : index
+        %valid_y = index.cmp ult, %source_y, %output_height : index
+        %valid_x = index.cmp ult, %source_x, %output_width : index
+        %valid = scalar.andi %valid_y, %valid_x : i1
+        %values = scf.if %valid -> (vector<16xf32>) {
+          %physical_y = index.div %source_y, %upsample : index
+          %physical_x = index.div %source_x, %upsample : index
+          %gathered = vector.load %input_view[%block, %physical_y, %physical_x, %c0] : view<[%in_blocks]x[%height]x[%width]x16xf32> -> vector<16xf32>
+          scf.yield %gathered : vector<16xf32>
+        } else {
+          scf.yield %c0_0_16 : vector<16xf32>
+        }
+        %packet = vector.fptrunc %values : vector<16xf32> to vector<16xbf16>
+        vector.store %packet, %patch_view[%slot, %c0] : vector<16xbf16>, view<396x24xbf16>
+      }
+      scf.yield
+    }
+
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+    // C = X W per tap (pixels by channels, so the result fragment's columns
+    // are channels and its stores are contiguous); lanes separated by 16 read
+    // identical operand rows as required by RDNA3 WMMA. The step's weights are
+    // 144 contiguous columns (tap-major), read straight from the
+    // cache-resident weight buffer.
+    %step_column = index.mul %channel_base, %c9 : index
+    %next00, %next01, %next10, %next11 = scf.for %tap = [%c0 to %c9 step %c1](%partial00 = %total00 : vector<8xf32>, %partial01 = %total01 : vector<8xf32>, %partial10 = %total10 : vector<8xf32>, %partial11 = %total11 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll schedule(linear) {
+      %ky = index.div %tap, %c3 : index
+      %kx = index.rem %tap, %c3 : index
+      %tap_offset = index.madd %tap, %matrix_tile, %step_column : index
+      %tap_column = index.assume %tap_offset [ge(%tap_offset, 0), lt(%tap_offset, %slice_limit)] : index
+      %patch_base = index.madd %ky, %patch_columns, %kx : index
+      %patch_row0 = index.add %patch_base, %fragment_row0 : index
+      %patch_row1 = index.add %patch_base, %fragment_row1 : index
+      %weight_values0 = vector.load %weight_view[%weight_row0, %tap_column] : view<[%outputs]x[%reduction_count]xbf16> -> vector<16xbf16>
+      %weight_values1 = vector.load %weight_view[%weight_row1, %tap_column] : view<[%outputs]x[%reduction_count]xbf16> -> vector<16xbf16>
+      %weight0 = vector.fragment<rhs> %weight_values0 shape [%matrix_tile, %matrix_tile] : vector<16xbf16>
+      %weight1 = vector.fragment<rhs> %weight_values1 shape [%matrix_tile, %matrix_tile] : vector<16xbf16>
+      %input_values0 = vector.load %patch_view[%patch_row0, %c0] : view<396x24xbf16> -> vector<16xbf16>
+      %input_values1 = vector.load %patch_view[%patch_row1, %c0] : view<396x24xbf16> -> vector<16xbf16>
+      %input0 = vector.fragment<lhs> %input_values0 shape [%matrix_tile, %matrix_tile] : vector<16xbf16>
+      %input1 = vector.fragment<lhs> %input_values1 shape [%matrix_tile, %matrix_tile] : vector<16xbf16>
+      %accumulated00 = vector.mma %input0, %weight0, %partial00 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+      %accumulated01 = vector.mma %input1, %weight0, %partial01 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+      %accumulated10 = vector.mma %input0, %weight1, %partial10 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+      %accumulated11 = vector.mma %input1, %weight1, %partial11 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+      scf.yield %accumulated00, %accumulated01, %accumulated10, %accumulated11 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %next00, %next01, %next10, %next11 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+  }
+
+  %fragment_pixel0 = index.add %wave_pixel, %lane_row : index
+  %fragment_pixel1 = index.add %fragment_pixel0, %matrix_tile : index
+  %pixel0 = index.add %pixel_origin, %fragment_pixel0 : index
+  %pixel1 = index.add %pixel_origin, %fragment_pixel1 : index
+  template.apply<@esrgan.convolution_store>(%sum00, %pixel0, %weight_row0, %pixels, %outputs, %out_offset, %lrelu, %residual_mode, %bias, %residual, %skip, %output) : (vector<8xf32>, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer)
+  template.apply<@esrgan.convolution_store>(%sum01, %pixel1, %weight_row0, %pixels, %outputs, %out_offset, %lrelu, %residual_mode, %bias, %residual, %skip, %output) : (vector<8xf32>, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer)
+  template.apply<@esrgan.convolution_store>(%sum10, %pixel0, %weight_row1, %pixels, %outputs, %out_offset, %lrelu, %residual_mode, %bias, %residual, %skip, %output) : (vector<8xf32>, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer)
+  template.apply<@esrgan.convolution_store>(%sum11, %pixel1, %weight_row1, %pixels, %outputs, %out_offset, %lrelu, %residual_mode, %bias, %residual, %skip, %output) : (vector<8xf32>, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer)
+  template.return
+}
+
+// The 32-channel tile above for outputs divisible by 64, widened to 64
+// channels: each staged patch feeds four weight operand rows, so a wave keeps
+// eight accumulators and runs 72 MMAs per step against the same two barriers.
+template.def<@esrgan.convolution_patch64_bf16> target(@esrgan_matrix_rdna3) requires [#target.subgroup.size<32>] @esrgan_convolution_patch64_bf16(%height: index, %width: index, %in_total: index, %inputs: index, %out_total: index, %out_offset: index, %outputs: index, %upsample: index, %lrelu: i1, %residual_mode: index, %input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %skip: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c9 = index.constant 9 : index
+  %c15 = index.constant 15 : index
+  %c32 = index.constant 32 : index
+  %matrix_tile = index.constant 16 : index
+  %depth = index.constant 64 : index
+  %tile = index.constant 128 : index
+  %threads = index.constant 128 : index
+  %half_tile = index.constant 64 : index
+  %patch_columns = index.constant 66 : index
+  %half_patch = index.constant 198 : index
+  %patch_pixels = index.constant 396 : index
+  %patch_bytes = index.constant 19008 : offset
+  %c0_0_8 = vector.splatf 0.0 : vector<8xf32>
+  %c0_0_16 = vector.splatf 0.0 : vector<16xf32>
+  %initial = vector.fragment<init> %c0_0_8 shape [%matrix_tile, %matrix_tile] : vector<8xf32>
+  %spatial_group = kernel.workgroup.id<x> : index
+  %channel_groups = index.div %outputs, %depth : index
+  %channel_group_value = kernel.workgroup.id<y> : index
+  %channel_group = index.assume %channel_group_value [ge(%channel_group_value, 0), lt(%channel_group_value, %channel_groups)] : index
+  %workitem = kernel.workitem.id<x> : index
+  %wave = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %lane_column = index.rem %lane, %matrix_tile : index
+  %lane_row = index.div %lane, %matrix_tile : index
+  %wave_pixel = index.mul %wave, %c32 : index
+  %wave_half = index.div %wave, %c2 : index
+  %wave_parity = index.rem %wave, %c2 : index
+  %wave_column = index.mul %wave_parity, %c32 : index
+  %wave_patch = index.madd %wave_half, %half_patch, %wave_column : index
+  %fragment_row0 = index.add %wave_patch, %lane_column : index
+  %fragment_row1 = index.add %fragment_row0, %matrix_tile : index
+  %pixel_origin = index.mul %spatial_group, %tile : index
+  %channel_origin = index.mul %channel_group, %depth : index
+  %channel_origin1 = index.add %channel_origin, %matrix_tile : index
+  %channel_origin2 = index.add %channel_origin1, %matrix_tile : index
+  %channel_origin3 = index.add %channel_origin2, %matrix_tile : index
+  %output_height = index.mul %height, %upsample : index
+  %output_width = index.mul %width, %upsample : index
+  %pixels = index.mul %output_height, %output_width : index
+  %reduction_count = index.mul %inputs, %c9 : index
+  %step_count = index.div %inputs, %matrix_tile : index
+  %in_blocks = index.div %in_total, %matrix_tile : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%in_blocks]x[%height]x[%width]x16xf32>
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<[%outputs]x[%reduction_count]xbf16>
+  %patch_stage = buffer.alloca<workgroup> align(16) %patch_bytes : buffer
+  %patch_view = buffer.view %patch_stage[%origin] : buffer -> view<396x24xbf16>
+  %slice_limit = index.sub %reduction_count, %c15 : index
+  %weight_row_value0 = index.add %channel_origin, %lane_column : index
+  %weight_row0 = index.assume %weight_row_value0 [ge(%weight_row_value0, 0), lt(%weight_row_value0, %outputs)] : index
+  %weight_row_value1 = index.add %channel_origin1, %lane_column : index
+  %weight_row1 = index.assume %weight_row_value1 [ge(%weight_row_value1, 0), lt(%weight_row_value1, %outputs)] : index
+  %weight_row_value2 = index.add %channel_origin2, %lane_column : index
+  %weight_row2 = index.assume %weight_row_value2 [ge(%weight_row_value2, 0), lt(%weight_row_value2, %outputs)] : index
+  %weight_row_value3 = index.add %channel_origin3, %lane_column : index
+  %weight_row3 = index.assume %weight_row_value3 [ge(%weight_row_value3, 0), lt(%weight_row_value3, %outputs)] : index
+
+  %sum00, %sum01, %sum10, %sum11, %sum20, %sum21, %sum30, %sum31 = scf.for %step = [%c0 to %step_count step %c1](%total00 = %initial : vector<8xf32>, %total01 = %initial : vector<8xf32>, %total10 = %initial : vector<8xf32>, %total11 = %initial : vector<8xf32>, %total20 = %initial : vector<8xf32>, %total21 = %initial : vector<8xf32>, %total30 = %initial : vector<8xf32>, %total31 = %initial : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) pipeline(%c1) {
+    %channel_base_value = index.mul %step, %matrix_tile : index
+    %channel_base = index.assume %channel_base_value [ge(%channel_base_value, 0), lt(%channel_base_value, %inputs)] : index
+    %block = index.assume %step [ge(%step, 0), lt(%step, %in_blocks)] : index
+
+    scf.for %round = [%c0 to %c4 step %c1] unroll schedule(linear) {
+      %slot = index.madd %round, %threads, %workitem : index
+      %slot_live = index.cmp ult, %slot, %patch_pixels : index
+      scf.if %slot_live {
+        %half = index.div %slot, %half_patch : index
+        %half_slot = index.rem %slot, %half_patch : index
+        %patch_row = index.div %half_slot, %patch_columns : index
+        %patch_column = index.rem %half_slot, %patch_columns : index
+        %half_origin = index.madd %half, %half_tile, %pixel_origin : index
+        %half_y = index.div %half_origin, %output_width : index
+        %half_x = index.rem %half_origin, %output_width : index
+        %source_y_offset = index.add %half_y, %patch_row : index
+        %source_x_offset = index.add %half_x, %patch_column : index
+        %source_y = index.sub %source_y_offset, %c1 : index
+        %source_x = index.sub %source_x_offset, %c1 : index
+        %valid_y = index.cmp ult, %source_y, %output_height : index
+        %valid_x = index.cmp ult, %source_x, %output_width : index
+        %valid = scalar.andi %valid_y, %valid_x : i1
+        %values = scf.if %valid -> (vector<16xf32>) {
+          %physical_y = index.div %source_y, %upsample : index
+          %physical_x = index.div %source_x, %upsample : index
+          %gathered = vector.load %input_view[%block, %physical_y, %physical_x, %c0] : view<[%in_blocks]x[%height]x[%width]x16xf32> -> vector<16xf32>
+          scf.yield %gathered : vector<16xf32>
+        } else {
+          scf.yield %c0_0_16 : vector<16xf32>
+        }
+        %packet = vector.fptrunc %values : vector<16xf32> to vector<16xbf16>
+        vector.store %packet, %patch_view[%slot, %c0] : vector<16xbf16>, view<396x24xbf16>
+      }
+      scf.yield
+    }
+
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+    %step_column = index.mul %channel_base, %c9 : index
+    %next00, %next01, %next10, %next11, %next20, %next21, %next30, %next31 = scf.for %tap = [%c0 to %c9 step %c1](%partial00 = %total00 : vector<8xf32>, %partial01 = %total01 : vector<8xf32>, %partial10 = %total10 : vector<8xf32>, %partial11 = %total11 : vector<8xf32>, %partial20 = %total20 : vector<8xf32>, %partial21 = %total21 : vector<8xf32>, %partial30 = %total30 : vector<8xf32>, %partial31 = %total31 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll schedule(linear) {
+      %ky = index.div %tap, %c3 : index
+      %kx = index.rem %tap, %c3 : index
+      %tap_offset = index.madd %tap, %matrix_tile, %step_column : index
+      %tap_column = index.assume %tap_offset [ge(%tap_offset, 0), lt(%tap_offset, %slice_limit)] : index
+      %patch_base = index.madd %ky, %patch_columns, %kx : index
+      %patch_row0 = index.add %patch_base, %fragment_row0 : index
+      %patch_row1 = index.add %patch_base, %fragment_row1 : index
+      %input_values0 = vector.load %patch_view[%patch_row0, %c0] : view<396x24xbf16> -> vector<16xbf16>
+      %input_values1 = vector.load %patch_view[%patch_row1, %c0] : view<396x24xbf16> -> vector<16xbf16>
+      %input0 = vector.fragment<lhs> %input_values0 shape [%matrix_tile, %matrix_tile] : vector<16xbf16>
+      %input1 = vector.fragment<lhs> %input_values1 shape [%matrix_tile, %matrix_tile] : vector<16xbf16>
+      %weight_values0 = vector.load %weight_view[%weight_row0, %tap_column] : view<[%outputs]x[%reduction_count]xbf16> -> vector<16xbf16>
+      %weight_values1 = vector.load %weight_view[%weight_row1, %tap_column] : view<[%outputs]x[%reduction_count]xbf16> -> vector<16xbf16>
+      %weight_values2 = vector.load %weight_view[%weight_row2, %tap_column] : view<[%outputs]x[%reduction_count]xbf16> -> vector<16xbf16>
+      %weight_values3 = vector.load %weight_view[%weight_row3, %tap_column] : view<[%outputs]x[%reduction_count]xbf16> -> vector<16xbf16>
+      %weight0 = vector.fragment<rhs> %weight_values0 shape [%matrix_tile, %matrix_tile] : vector<16xbf16>
+      %weight1 = vector.fragment<rhs> %weight_values1 shape [%matrix_tile, %matrix_tile] : vector<16xbf16>
+      %weight2 = vector.fragment<rhs> %weight_values2 shape [%matrix_tile, %matrix_tile] : vector<16xbf16>
+      %weight3 = vector.fragment<rhs> %weight_values3 shape [%matrix_tile, %matrix_tile] : vector<16xbf16>
+      %accumulated00 = vector.mma %input0, %weight0, %partial00 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+      %accumulated01 = vector.mma %input1, %weight0, %partial01 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+      %accumulated10 = vector.mma %input0, %weight1, %partial10 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+      %accumulated11 = vector.mma %input1, %weight1, %partial11 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+      %accumulated20 = vector.mma %input0, %weight2, %partial20 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+      %accumulated21 = vector.mma %input1, %weight2, %partial21 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+      %accumulated30 = vector.mma %input0, %weight3, %partial30 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+      %accumulated31 = vector.mma %input1, %weight3, %partial31 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
+      scf.yield %accumulated00, %accumulated01, %accumulated10, %accumulated11, %accumulated20, %accumulated21, %accumulated30, %accumulated31 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %next00, %next01, %next10, %next11, %next20, %next21, %next30, %next31 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+  }
+
+  %fragment_pixel0 = index.add %wave_pixel, %lane_row : index
+  %fragment_pixel1 = index.add %fragment_pixel0, %matrix_tile : index
+  %pixel0 = index.add %pixel_origin, %fragment_pixel0 : index
+  %pixel1 = index.add %pixel_origin, %fragment_pixel1 : index
+  template.apply<@esrgan.convolution_store>(%sum00, %pixel0, %weight_row0, %pixels, %outputs, %out_offset, %lrelu, %residual_mode, %bias, %residual, %skip, %output) : (vector<8xf32>, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer)
+  template.apply<@esrgan.convolution_store>(%sum01, %pixel1, %weight_row0, %pixels, %outputs, %out_offset, %lrelu, %residual_mode, %bias, %residual, %skip, %output) : (vector<8xf32>, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer)
+  template.apply<@esrgan.convolution_store>(%sum10, %pixel0, %weight_row1, %pixels, %outputs, %out_offset, %lrelu, %residual_mode, %bias, %residual, %skip, %output) : (vector<8xf32>, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer)
+  template.apply<@esrgan.convolution_store>(%sum11, %pixel1, %weight_row1, %pixels, %outputs, %out_offset, %lrelu, %residual_mode, %bias, %residual, %skip, %output) : (vector<8xf32>, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer)
+  template.apply<@esrgan.convolution_store>(%sum20, %pixel0, %weight_row2, %pixels, %outputs, %out_offset, %lrelu, %residual_mode, %bias, %residual, %skip, %output) : (vector<8xf32>, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer)
+  template.apply<@esrgan.convolution_store>(%sum21, %pixel1, %weight_row2, %pixels, %outputs, %out_offset, %lrelu, %residual_mode, %bias, %residual, %skip, %output) : (vector<8xf32>, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer)
+  template.apply<@esrgan.convolution_store>(%sum30, %pixel0, %weight_row3, %pixels, %outputs, %out_offset, %lrelu, %residual_mode, %bias, %residual, %skip, %output) : (vector<8xf32>, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer)
+  template.apply<@esrgan.convolution_store>(%sum31, %pixel1, %weight_row3, %pixels, %outputs, %out_offset, %lrelu, %residual_mode, %bias, %residual, %skip, %output) : (vector<8xf32>, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer)
+  template.return
+}
+
+// 128-pixel output tiles, 64 channels deep when outputs divide by 64 and 32
+// otherwise. The bias holds `outputs` values.
+kernel.def target(@esrgan_wave32) @esrgan_convolution(%height: index, %width: index, %in_total: index, %inputs: index, %out_total: index, %out_offset: index, %outputs: index, %upsample: index, %lrelu_flag: index, %residual_mode: index) {
+  %output_height = index.mul %height, %upsample : index
+  %output_width = index.mul %width, %upsample : index
+  %pixels = index.mul %output_height, %output_width : index
+  %tile = index.constant 128 : index
+  %c64 = index.constant 64 : index
+  // outputs is a multiple of 32, so this is 64 or 32.
+  %remainder = index.rem %outputs, %c64 : index
+  %depth = index.sub %c64, %remainder : index
+  %threads = index.constant 128 : index
+  %groups = index.div %pixels, %tile : index
+  %channel_groups = index.div %outputs, %depth : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %channel_groups, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%height: index, %width: index, %in_total: index, %inputs: index, %out_total: index, %out_offset: index, %outputs: index, %upsample: index, %lrelu_flag: index, %residual_mode: index, %input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %skip: buffer, %output: buffer) where [range(%height, 1, 4096), range(%width, 64, 4096), multiple_of(%width, 64), range(%in_total, 16, 512), range(%inputs, 16, 512), multiple_of(%inputs, 16), range(%out_total, 32, 512), range(%out_offset, 0, 480), range(%outputs, 32, 512), multiple_of(%outputs, 32), range(%upsample, 1, 2), range(%lrelu_flag, 0, 1), range(%residual_mode, 0, 3)] {
+  %c0 = index.constant 0 : index
+  %c64 = index.constant 64 : index
+  %lrelu = index.cmp ne, %lrelu_flag, %c0 : index
+  %remainder = index.rem %outputs, %c64 : index
+  %wide = index.cmp eq, %remainder, %c0 : index
+  scf.if %wide {
+    template.apply<@esrgan.convolution_patch64_bf16>(%height, %width, %in_total, %inputs, %out_total, %out_offset, %outputs, %upsample, %lrelu, %residual_mode, %input, %weight, %bias, %residual, %skip, %output) : (index, index, index, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer, buffer, buffer)
+  } else {
+    template.apply<@esrgan.convolution_patch32_bf16>(%height, %width, %in_total, %inputs, %out_total, %out_offset, %outputs, %upsample, %lrelu, %residual_mode, %input, %weight, %bias, %residual, %skip, %output) : (index, index, index, index, index, index, index, index, i1, index, buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  kernel.return
+}
+
+// One RGB channel's value quantized to a byte: clamp to [0, 1], scale by 255,
+// round half to even.
+template.decl @esrgan.rgba_byte(%value: f32, %bias: f32) -> (i8)
+
+template.def<@esrgan.rgba_byte> device @esrgan_rgba_byte(%value: f32, %bias: f32) -> (i8) {
+  %minimum = scalar.constant 0.0 : f32
+  %maximum = scalar.constant 1.0 : f32
+  %scale = scalar.constant 255.0 : f32
+  %biased = scalar.addf %value, %bias : f32
+  %above = scalar.maxnumf %biased, %minimum : f32
+  %clamped = scalar.minnumf %above, %maximum : f32
+  %intensity = scalar.mulf %clamped, %scale : f32
+  %rounded = scalar.roundevenf %intensity : f32
+  %wide = scalar.fptoui %rounded : f32 to i32
+  %byte = scalar.trunci %wide : i32 to i8
+  template.return %byte : i8
+}
+
+// Final 3x3 convolution from 64 features to RGB, clamped to [0, 1] and
+// quantized at the store into packed RGBA8 with opaque alpha; weights, bias and
+// arithmetic stay F32. A workgroup owns a 128x4 pixel tile (width divisible
+// by 128, height by 4) and each lane one column of it: four vertically
+// adjacent pixels' three channels, kept as vector<4xf32> per channel. Eight
+// input channels of the 6x130 halo patch are staged per step, each lane's six
+// rows contiguous, so one vector load feeds all three vertical taps of a
+// column. Weights are uniform loads.
+kernel.def target(@esrgan_wave32) @esrgan_rgba_convolution(%height: index, %width: index) {
+  %pixels = index.mul %height, %width : index
+  %tile = index.constant 512 : index
+  %groups = index.div %pixels, %tile : index
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%height: index, %width: index, %input: buffer, %weight: buffer, %bias: buffer, %output: buffer) where [range(%height, 4, 8192), multiple_of(%height, 4), range(%width, 128, 8192), multiple_of(%width, 128)] {
+  %origin = index.constant 0 : offset
+  %inputs = index.constant 64 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c128 = index.constant 128 : index
+  %c130 = index.constant 130 : index
+  %patch_bytes = index.constant 33280 : offset
+  %c0_0 = scalar.constant 0.0 : f32
+  %c9 = index.constant 9 : index
+  %blocks = index.constant 4 : index
+  %zeros = vector.splatf 0.0 : vector<4xf32>
+  %zeros8 = vector.splatf 0.0 : vector<8xf32>
+  %pixels = index.mul %height, %width : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %tiles_x = index.div %width, %c128 : index
+  %tile_row = index.div %group, %tiles_x : index
+  %tile_column = index.rem %group, %tiles_x : index
+  %tile_y = index.mul %tile_row, %c4 : index
+  %tile_x = index.mul %tile_column, %c128 : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%blocks]x[%height]x[%width]x16xf32>
+  %weight_view = buffer.view %weight[%origin] : buffer -> view<3x64x3x3xf32>
+  %bias_view = buffer.view %bias[%origin] : buffer -> view<3xf32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%height]x[%width]x4xi8>
+  %patch_stage = buffer.alloca<workgroup> align(16) %patch_bytes : buffer
+  %patch_view = buffer.view %patch_stage[%origin] : buffer -> view<8x130x8xf32>
+
+  // Patch column j, row r of a channel is image position
+  // (tile_y + r - 1, tile_x + j - 1); lane l stages column l and, for l < 2,
+  // column l + 128. Rows 6 and 7 are padding.
+  %top = index.sub %tile_y, %c1 : index
+  %bottom = index.add %tile_y, %c4 : index
+  %valid_top = index.cmp ult, %top, %height : index
+  %valid_bottom = index.cmp ult, %bottom, %height : index
+  // The grid covers height / 4 tile rows, so the tile's four rows are in range.
+  %row0 = index.assume %tile_y [ge(%tile_y, 0), lt(%tile_y, %height)] : index
+  %row1_value = index.add %tile_y, %c1 : index
+  %row1 = index.assume %row1_value [ge(%row1_value, 0), lt(%row1_value, %height)] : index
+  %row2_value = index.add %tile_y, %c2 : index
+  %row2 = index.assume %row2_value [ge(%row2_value, 0), lt(%row2_value, %height)] : index
+  %row3_value = index.add %tile_y, %c3 : index
+  %row3 = index.assume %row3_value [ge(%row3_value, 0), lt(%row3_value, %height)] : index
+
+  %red, %green, %blue = scf.for %step = [%c0 to %c8 step %c1](%red_total = %zeros : vector<4xf32>, %green_total = %zeros : vector<4xf32>, %blue_total = %zeros : vector<4xf32>) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+    %channel_base = index.mul %step, %c8 : index
+    // A step's eight channels are half of one input block: one 32-byte load
+    // per patch pixel, transposed in registers to the patch's rows-innermost
+    // layout.
+    %block_value = index.div %step, %c2 : index
+    %block = index.assume %block_value [ge(%block_value, 0), lt(%block_value, %blocks)] : index
+    %parity = index.rem %step, %c2 : index
+    %half_value = index.mul %parity, %c8 : index
+    %half = index.assume %half_value [ge(%half_value, 0), lt(%half_value, %c9)] : index
+    scf.for %part = [%c0 to %c2 step %c1] unroll schedule(linear) {
+      %column = index.madd %part, %c128, %lane : index
+      %live = index.cmp ult, %column, %c130 : index
+      scf.if %live {
+        %x_offset = index.add %tile_x, %column : index
+        %x = index.sub %x_offset, %c1 : index
+        %valid_column = index.cmp ult, %x, %width : index
+        %load_top = scalar.andi %valid_column, %valid_top : i1
+        %load_bottom = scalar.andi %valid_column, %valid_bottom : i1
+        %value0 = scf.if %load_top -> (vector<8xf32>) {
+          %loaded = vector.load %input_view[%block, %top, %x, %half] : view<[%blocks]x[%height]x[%width]x16xf32> -> vector<8xf32>
+          scf.yield %loaded : vector<8xf32>
+        } else {
+          scf.yield %zeros8 : vector<8xf32>
+        }
+        %value1, %value2, %value3, %value4 = scf.if %valid_column -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
+          %loaded1 = vector.load %input_view[%block, %row0, %x, %half] : view<[%blocks]x[%height]x[%width]x16xf32> -> vector<8xf32>
+          %loaded2 = vector.load %input_view[%block, %row1, %x, %half] : view<[%blocks]x[%height]x[%width]x16xf32> -> vector<8xf32>
+          %loaded3 = vector.load %input_view[%block, %row2, %x, %half] : view<[%blocks]x[%height]x[%width]x16xf32> -> vector<8xf32>
+          %loaded4 = vector.load %input_view[%block, %row3, %x, %half] : view<[%blocks]x[%height]x[%width]x16xf32> -> vector<8xf32>
+          scf.yield %loaded1, %loaded2, %loaded3, %loaded4 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+        } else {
+          scf.yield %zeros8, %zeros8, %zeros8, %zeros8 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+        }
+        %value5 = scf.if %load_bottom -> (vector<8xf32>) {
+          %loaded = vector.load %input_view[%block, %bottom, %x, %half] : view<[%blocks]x[%height]x[%width]x16xf32> -> vector<8xf32>
+          scf.yield %loaded : vector<8xf32>
+        } else {
+          scf.yield %zeros8 : vector<8xf32>
+        }
+        scf.for %offset = [%c0 to %c8 step %c1] unroll schedule(linear) {
+          %element0 = vector.extract %value0[%offset] : vector<8xf32> -> f32
+          %element1 = vector.extract %value1[%offset] : vector<8xf32> -> f32
+          %element2 = vector.extract %value2[%offset] : vector<8xf32> -> f32
+          %element3 = vector.extract %value3[%offset] : vector<8xf32> -> f32
+          %element4 = vector.extract %value4[%offset] : vector<8xf32> -> f32
+          %element5 = vector.extract %value5[%offset] : vector<8xf32> -> f32
+          %rows = vector.from_elements %element0, %element1, %element2, %element3, %element4, %element5, %c0_0, %c0_0 : vector<8xf32>
+          vector.store %rows, %patch_view[%offset, %column, 0] : vector<8xf32>, view<8x130x8xf32>
+          scf.yield
+        }
+      }
+      scf.yield
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+    %next_red, %next_green, %next_blue = scf.for %offset = [%c0 to %c8 step %c1](%red_partial = %red_total : vector<4xf32>, %green_partial = %green_total : vector<4xf32>, %blue_partial = %blue_total : vector<4xf32>) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>) unroll schedule(linear) {
+      %channel_value = index.add %channel_base, %offset : index
+      %channel = index.assume %channel_value [ge(%channel_value, 0), lt(%channel_value, %inputs)] : index
+      %tap_red, %tap_green, %tap_blue = scf.for %kx = [%c0 to %c3 step %c1](%red_sum = %red_partial : vector<4xf32>, %green_sum = %green_partial : vector<4xf32>, %blue_sum = %blue_partial : vector<4xf32>) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>) unroll schedule(linear) {
+        %column = index.add %lane, %kx : index
+        %rows = vector.load %patch_view[%offset, %column, 0] : view<8x130x8xf32> -> vector<8xf32>
+        %above = vector.slice %rows[0] : vector<8xf32> -> vector<4xf32>
+        %middle = vector.slice %rows[1] : vector<8xf32> -> vector<4xf32>
+        %below = vector.slice %rows[2] : vector<8xf32> -> vector<4xf32>
+        %red_weight0 = view.load %weight_view[%c0, %channel, %c0, %kx] : view<3x64x3x3xf32> -> f32
+        %red_weight1 = view.load %weight_view[%c0, %channel, %c1, %kx] : view<3x64x3x3xf32> -> f32
+        %red_weight2 = view.load %weight_view[%c0, %channel, %c2, %kx] : view<3x64x3x3xf32> -> f32
+        %green_weight0 = view.load %weight_view[%c1, %channel, %c0, %kx] : view<3x64x3x3xf32> -> f32
+        %green_weight1 = view.load %weight_view[%c1, %channel, %c1, %kx] : view<3x64x3x3xf32> -> f32
+        %green_weight2 = view.load %weight_view[%c1, %channel, %c2, %kx] : view<3x64x3x3xf32> -> f32
+        %blue_weight0 = view.load %weight_view[%c2, %channel, %c0, %kx] : view<3x64x3x3xf32> -> f32
+        %blue_weight1 = view.load %weight_view[%c2, %channel, %c1, %kx] : view<3x64x3x3xf32> -> f32
+        %blue_weight2 = view.load %weight_view[%c2, %channel, %c2, %kx] : view<3x64x3x3xf32> -> f32
+        %red_splat0 = vector.splat %red_weight0 : vector<4xf32>
+        %red_splat1 = vector.splat %red_weight1 : vector<4xf32>
+        %red_splat2 = vector.splat %red_weight2 : vector<4xf32>
+        %green_splat0 = vector.splat %green_weight0 : vector<4xf32>
+        %green_splat1 = vector.splat %green_weight1 : vector<4xf32>
+        %green_splat2 = vector.splat %green_weight2 : vector<4xf32>
+        %blue_splat0 = vector.splat %blue_weight0 : vector<4xf32>
+        %blue_splat1 = vector.splat %blue_weight1 : vector<4xf32>
+        %blue_splat2 = vector.splat %blue_weight2 : vector<4xf32>
+        %red0 = vector.fmaf %above, %red_splat0, %red_sum : vector<4xf32>
+        %red1 = vector.fmaf %middle, %red_splat1, %red0 : vector<4xf32>
+        %red_next = vector.fmaf %below, %red_splat2, %red1 : vector<4xf32>
+        %green0 = vector.fmaf %above, %green_splat0, %green_sum : vector<4xf32>
+        %green1 = vector.fmaf %middle, %green_splat1, %green0 : vector<4xf32>
+        %green_next = vector.fmaf %below, %green_splat2, %green1 : vector<4xf32>
+        %blue0 = vector.fmaf %above, %blue_splat0, %blue_sum : vector<4xf32>
+        %blue1 = vector.fmaf %middle, %blue_splat1, %blue0 : vector<4xf32>
+        %blue_next = vector.fmaf %below, %blue_splat2, %blue1 : vector<4xf32>
+        scf.yield %red_next, %green_next, %blue_next : vector<4xf32>, vector<4xf32>, vector<4xf32>
+      }
+      scf.yield %tap_red, %tap_green, %tap_blue : vector<4xf32>, vector<4xf32>, vector<4xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %next_red, %next_green, %next_blue : vector<4xf32>, vector<4xf32>, vector<4xf32>
+  }
+
+  // Quantize at the convolution store: no float image or packing pass.
+  %red_bias = view.load %bias_view[%c0] : view<3xf32> -> f32
+  %green_bias = view.load %bias_view[%c1] : view<3xf32> -> f32
+  %blue_bias = view.load %bias_view[%c2] : view<3xf32> -> f32
+  %opaque = scalar.constant -1 : i8
+  %x = index.add %tile_x, %lane : index
+  scf.for %row = [%c0 to %c4 step %c1] unroll schedule(linear) {
+    %y_value = index.add %tile_y, %row : index
+    %y = index.assume %y_value [ge(%y_value, 0), lt(%y_value, %height)] : index
+    %red_value = vector.extract %red[%row] : vector<4xf32> -> f32
+    %green_value = vector.extract %green[%row] : vector<4xf32> -> f32
+    %blue_value = vector.extract %blue[%row] : vector<4xf32> -> f32
+    %red_byte = template.apply<@esrgan.rgba_byte>(%red_value, %red_bias) : (f32, f32) -> (i8)
+    %green_byte = template.apply<@esrgan.rgba_byte>(%green_value, %green_bias) : (f32, f32) -> (i8)
+    %blue_byte = template.apply<@esrgan.rgba_byte>(%blue_value, %blue_bias) : (f32, f32) -> (i8)
+    %pixel = vector.from_elements %red_byte, %green_byte, %blue_byte, %opaque : vector<4xi8>
+    vector.store %pixel, %output_view[%y, %x, 0] : vector<4xi8>, view<[%height]x[%width]x4xi8>
+    scf.yield
+  }
+  kernel.return
+}

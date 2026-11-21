@@ -1,0 +1,217 @@
+// Decoder GroupNorm(32, eps 1e-6) over F32 NCHW state with BF16 affine
+// parameters. A group is one contiguous span of channels/32 planes, up to
+// four million elements at 1024x1024, so statistics are two-level: each
+// 4096-element chunk stores its mean and centered sum of squares, and one
+// workgroup per group merges them with the parallel-variance identity
+// M2 = sum(M2_i + n_i * (mean_i - mean)^2). No pass accumulates raw squares.
+// The apply pass optionally fuses SiLU and may run in place.
+
+amdgpu.target<gfx11-generic> @zimage_vae_norm_wave32 {subgroup_size = 32}
+
+// Chunk statistics: workgroup (chunk, group) writes (mean, M2) at
+// partials[group][chunk]. A short final chunk records its own count implicitly.
+kernel.def target(@zimage_vae_norm_wave32) @zimage_vae_group_partials(%channels: index, %pixels: index) {
+  %groups = index.constant 32 : index
+  %chunk = index.constant 4096 : index
+  %padding = index.constant 4095 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  %planes = index.div %channels, %groups : index
+  %span = index.mul %planes, %pixels : index
+  %rounded = index.add %span, %padding : index
+  %chunks = index.div %rounded, %chunk : index
+  kernel.launch.config workgroups(%chunks, %groups, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%channels: index, %pixels: index, %input: buffer, %partials: buffer) where [range(%channels, 32, 512), multiple_of(%channels, 32), range(%pixels, 1, 1048576)] {
+  %origin = index.constant 0 : offset
+  %groups = index.constant 32 : index
+  %chunk_size = index.constant 4096 : index
+  %padding = index.constant 4095 : index
+  %threads = index.constant 256 : index
+  %c0_0 = scalar.constant 0.0 : f32
+  %planes = index.div %channels, %groups : index
+  %span = index.mul %planes, %pixels : index
+  %elements = index.mul %channels, %pixels : index
+  %rounded = index.add %span, %padding : index
+  %chunks = index.div %rounded, %chunk_size : index
+  %chunk_value = kernel.workgroup.id<x> : index
+  %chunk = index.assume %chunk_value [ge(%chunk_value, 0), lt(%chunk_value, %chunks)] : index
+  %group_value = kernel.workgroup.id<y> : index
+  %group = index.assume %group_value [ge(%group_value, 0), lt(%group_value, %groups)] : index
+  %lane = kernel.workitem.id<x> : index
+  %chunk_origin = index.mul %chunk, %chunk_size : index
+  %remaining = index.sub %span, %chunk_origin : index
+  %count = index.min %remaining, %chunk_size : index
+  %base = index.madd %group, %span, %chunk_origin : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xf32>
+  %partial_view = buffer.view %partials[%origin] : buffer -> view<32x[%chunks]x2xf32>
+  %partial_sum = scf.for %offset = [%lane to %count step %threads](%acc = %c0_0 : f32) -> (f32) {
+    %element_value = index.add %base, %offset : index
+    %element = index.assume %element_value [ge(%element_value, 0), lt(%element_value, %elements)] : index
+    %value = view.load %input_view[%element] : view<[%elements]xf32> -> f32
+    %sum = scalar.addf %acc, %value : f32
+    scf.yield %sum : f32
+  }
+  %sum = kernel.workgroup.reduce<addf> %partial_sum : f32
+  %count_i32 = index.cast %count : index to i32
+  %count_f32 = scalar.uitofp %count_i32 : i32 to f32
+  %mean = scalar.divf %sum, %count_f32 : f32
+  %partial_square = scf.for %offset = [%lane to %count step %threads](%acc = %c0_0 : f32) -> (f32) {
+    %element_value = index.add %base, %offset : index
+    %element = index.assume %element_value [ge(%element_value, 0), lt(%element_value, %elements)] : index
+    %value = view.load %input_view[%element] : view<[%elements]xf32> -> f32
+    %centered = scalar.subf %value, %mean : f32
+    %square = scalar.mulf %centered, %centered : f32
+    %total = scalar.addf %acc, %square : f32
+    scf.yield %total : f32
+  }
+  %square_sum = kernel.workgroup.reduce<addf> %partial_square : f32
+  %c0 = index.constant 0 : index
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    view.store %mean, %partial_view[%group, %chunk, 0] : f32, view<32x[%chunks]x2xf32>
+    view.store %square_sum, %partial_view[%group, %chunk, 1] : f32, view<32x[%chunks]x2xf32>
+  }
+  kernel.return
+}
+
+// One workgroup per group merges its chunk statistics into (mean, rstd).
+kernel.def target(@zimage_vae_norm_wave32) @zimage_vae_group_merge(%channels: index, %pixels: index) {
+  %groups = index.constant 32 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%channels: index, %pixels: index, %partials: buffer, %statistics: buffer) where [range(%channels, 32, 512), multiple_of(%channels, 32), range(%pixels, 1, 1048576)] {
+  %origin = index.constant 0 : offset
+  %groups = index.constant 32 : index
+  %chunk_size = index.constant 4096 : index
+  %padding = index.constant 4095 : index
+  %threads = index.constant 256 : index
+  %c0 = index.constant 0 : index
+  %c0_0 = scalar.constant 0.0 : f32
+  %planes = index.div %channels, %groups : index
+  %span = index.mul %planes, %pixels : index
+  %rounded = index.add %span, %padding : index
+  %chunks = index.div %rounded, %chunk_size : index
+  %group_value = kernel.workgroup.id<x> : index
+  %group = index.assume %group_value [ge(%group_value, 0), lt(%group_value, %groups)] : index
+  %lane = kernel.workitem.id<x> : index
+  %partial_view = buffer.view %partials[%origin] : buffer -> view<32x[%chunks]x2xf32>
+  %statistics_view = buffer.view %statistics[%origin] : buffer -> view<32x2xf32>
+  %span_i32 = index.cast %span : index to i32
+  %span_f32 = scalar.uitofp %span_i32 : i32 to f32
+  %partial_weighted = scf.for %chunk = [%lane to %chunks step %threads](%acc = %c0_0 : f32) -> (f32) {
+    %chunk_origin = index.mul %chunk, %chunk_size : index
+    %remaining = index.sub %span, %chunk_origin : index
+    %count = index.min %remaining, %chunk_size : index
+    %count_i32 = index.cast %count : index to i32
+    %count_f32 = scalar.uitofp %count_i32 : i32 to f32
+    %chunk_mean = view.load %partial_view[%group, %chunk, 0] : view<32x[%chunks]x2xf32> -> f32
+    %total = scalar.fmaf %count_f32, %chunk_mean, %acc : f32
+    scf.yield %total : f32
+  }
+  %weighted = kernel.workgroup.reduce<addf> %partial_weighted : f32
+  %mean = scalar.divf %weighted, %span_f32 : f32
+  %partial_m2 = scf.for %chunk = [%lane to %chunks step %threads](%acc = %c0_0 : f32) -> (f32) {
+    %chunk_origin = index.mul %chunk, %chunk_size : index
+    %remaining = index.sub %span, %chunk_origin : index
+    %count = index.min %remaining, %chunk_size : index
+    %count_i32 = index.cast %count : index to i32
+    %count_f32 = scalar.uitofp %count_i32 : i32 to f32
+    %chunk_mean = view.load %partial_view[%group, %chunk, 0] : view<32x[%chunks]x2xf32> -> f32
+    %chunk_m2 = view.load %partial_view[%group, %chunk, 1] : view<32x[%chunks]x2xf32> -> f32
+    %delta = scalar.subf %chunk_mean, %mean : f32
+    %delta_square = scalar.mulf %delta, %delta : f32
+    %between = scalar.fmaf %count_f32, %delta_square, %chunk_m2 : f32
+    %total = scalar.addf %acc, %between : f32
+    scf.yield %total : f32
+  }
+  %m2 = kernel.workgroup.reduce<addf> %partial_m2 : f32
+  %variance = scalar.divf %m2, %span_f32 : f32
+  %epsilon = scalar.constant 9.9999999999999995e-07 : f32
+  %biased = scalar.addf %variance, %epsilon : f32
+  %inverse = scalar.rsqrtf<afn> %biased : f32
+  %first = index.cmp eq, %lane, %c0 : index
+  scf.if %first {
+    view.store %mean, %statistics_view[%group, 0] : f32, view<32x2xf32>
+    view.store %inverse, %statistics_view[%group, 1] : f32, view<32x2xf32>
+  }
+  kernel.return
+}
+
+// (x - mean) * rstd * gamma + beta, then SiLU when silu_flag is 1. Each lane
+// reads and writes only its own element, so output may alias input.
+kernel.def target(@zimage_vae_norm_wave32) @zimage_vae_group_apply(%channels: index, %pixels: index, %silu_flag: index) {
+  %padding = index.constant 255 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  %rounded = index.add %pixels, %padding : index
+  %blocks = index.div %rounded, %threads : index
+  kernel.launch.config workgroups(%blocks, %channels, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%channels: index, %pixels: index, %silu_flag: index, %input: buffer, %statistics: buffer, %gamma: buffer, %beta: buffer, %output: buffer) where [range(%channels, 32, 512), multiple_of(%channels, 32), range(%pixels, 1, 1048576), range(%silu_flag, 0, 1)] {
+  %origin = index.constant 0 : offset
+  %groups = index.constant 32 : index
+  %threads = index.constant 256 : index
+  %c0 = index.constant 0 : index
+  %planes = index.div %channels, %groups : index
+  %block = kernel.workgroup.id<x> : index
+  %channel_value = kernel.workgroup.id<y> : index
+  %channel = index.assume %channel_value [ge(%channel_value, 0), lt(%channel_value, %channels)] : index
+  %lane = kernel.workitem.id<x> : index
+  %pixel = index.madd %block, %threads, %lane : index
+  %group_value = index.div %channel, %planes : index
+  %group = index.assume %group_value [ge(%group_value, 0), lt(%group_value, %groups)] : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%channels]x[%pixels]xf32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%channels]x[%pixels]xf32>
+  %statistics_view = buffer.view %statistics[%origin] : buffer -> view<32x2xf32>
+  %gamma_view = buffer.view %gamma[%origin] : buffer -> view<[%channels]xbf16>
+  %beta_view = buffer.view %beta[%origin] : buffer -> view<[%channels]xbf16>
+  %silu = index.cmp ne, %silu_flag, %c0 : index
+  %live = index.cmp ult, %pixel, %pixels : index
+  scf.if %live {
+    %mean = view.load %statistics_view[%group, 0] : view<32x2xf32> -> f32
+    %inverse = view.load %statistics_view[%group, 1] : view<32x2xf32> -> f32
+    %gamma_narrow = view.load %gamma_view[%channel] : view<[%channels]xbf16> -> bf16
+    %beta_narrow = view.load %beta_view[%channel] : view<[%channels]xbf16> -> bf16
+    %gamma_value = scalar.extf %gamma_narrow : bf16 to f32
+    %beta_value = scalar.extf %beta_narrow : bf16 to f32
+    %scale = scalar.mulf %inverse, %gamma_value : f32
+    %value = view.load %input_view[%channel, %pixel] : view<[%channels]x[%pixels]xf32> -> f32
+    %centered = scalar.subf %value, %mean : f32
+    %normalized = scalar.fmaf %centered, %scale, %beta_value : f32
+    %result = scf.if %silu -> (f32) {
+      %negated = scalar.negf %normalized : f32
+      %exponential = scalar.expf<afn> %negated : f32
+      %c1_0 = scalar.constant 1.0 : f32
+      %denominator = scalar.addf %c1_0, %exponential : f32
+      %activated = scalar.divf %normalized, %denominator : f32
+      scf.yield %activated : f32
+    } else {
+      scf.yield %normalized : f32
+    }
+    view.store %result, %output_view[%channel, %pixel] : f32, view<[%channels]x[%pixels]xf32>
+  }
+  kernel.return
+}
+
+// Full GroupNorm over a [channels, height*width] F32 plane. Callers pass the
+// BF16 affine parameters as views. Partials hold one (mean, M2) pair per
+// 4096-element chunk per group; statistics hold (mean, rstd) per group.
+command.def public @zimage.vae_group_norm(%channels: index, %height: index, %width: index, %silu_flag: index) launch(%input: buffer, %gamma: buffer, %beta: buffer, %output: buffer) {
+  %groups = index.constant 32 : index
+  %chunk = index.constant 4096 : index
+  %padding = index.constant 4095 : index
+  %pixels = index.mul %height, %width : index
+  %planes = index.div %channels, %groups : index
+  %span = index.mul %planes, %pixels : index
+  %rounded = index.add %span, %padding : index
+  %chunks = index.div %rounded, %chunk : index
+  %chunk_bytes = index.constant 256 : offset
+  %partial_bytes = index.scale %chunks, %chunk_bytes : index, offset -> offset
+  %statistics_bytes = index.constant 256 : offset
+  %partials = buffer.alloca<global> align(256) %partial_bytes : buffer
+  %statistics = buffer.alloca<global> align(256) %statistics_bytes : buffer
+  kernel.launch @zimage_vae_group_partials[%channels, %pixels](%channels, %pixels, %input, %partials) : [index, index](index, index, buffer, buffer)
+  kernel.launch @zimage_vae_group_merge[%channels, %pixels](%channels, %pixels, %partials, %statistics) : [index, index](index, index, buffer, buffer)
+  kernel.launch @zimage_vae_group_apply[%channels, %pixels, %silu_flag](%channels, %pixels, %silu_flag, %input, %statistics, %gamma, %beta, %output) : [index, index, index](index, index, index, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}

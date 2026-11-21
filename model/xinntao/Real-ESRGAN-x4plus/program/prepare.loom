@@ -1,0 +1,75 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Cold image preparation retains the checkpoint source and one default stage.
+// Real-ESRGAN has no text encoder: the request prompt carries the input image
+// itself (see control.loom) and is never tokenized. The image service still
+// names a tokenizer asset, so the card ships one whose vocabulary is the
+// base64 alphabet. There are no adapters and no deployment options.
+
+func.decl @esrgan.bind_image_parameters(%stage: i32, %source: i32)
+
+func.decl @esrgan.declare_image_stage(%height: i64, %width: i64) -> (i32)
+
+func.decl import("input") @require(%condition: i32, %diagnostic: buffer)
+
+func.decl import("prepare") @source_scope(%scope: buffer) -> (i32)
+
+func.decl import("json") @members(%json: buffer) -> (buffer, i32, i64)
+
+// Real-ESRGAN has no adapters; leave the adapter asset empty
+global.rodata.def @esrgan.adapter_error = bytes("5265616c2d45535247414e20686173206e6f2061646170746572733b206c6561766520746865206164617074657220617373657420656d707479")
+
+// Real-ESRGAN accepts no options
+global.rodata.def @esrgan.options_error = bytes("5265616c2d45535247414e2061636365707473206e6f206f7074696f6e73")
+
+// esrgan
+global.rodata.def @esrgan.scope = bytes("65737267616e")
+
+// text
+global.rodata.def @esrgan.tokenizer = bytes("74657874")
+
+// realesrgan-x4plus
+global.rodata.def @esrgan.identifier = bytes("7265616c65737267616e2d7834706c7573")
+
+func.def public @image_prepare_v1(%height: i64, %width: i64, %text: i64, %directory: buffer, %adapter: buffer, %options: buffer) -> (i64, i64, buffer, buffer, buffer) {
+  %origin = index.constant 0 : offset
+  %adapter_length = buffer.length %adapter
+  %base = index.cmp eq, %adapter_length, %origin : offset
+  %adapter_condition = scalar.extui %base : i1 to i32
+  %adapter_error = global.load @esrgan.adapter_error : buffer
+  func.call @require(%adapter_condition, %adapter_error) : (i32, buffer)
+  // Options are a JSON object, and this model has none to set.
+  %fields, %type, %count = func.call @members(%options) : (buffer) -> (buffer, i32, i64)
+  %object_type = scalar.constant 2 : i32
+  %zero64 = scalar.constant 0 : i64
+  %object = scalar.cmpi eq, %type, %object_type : i32
+  %empty = scalar.cmpi eq, %count, %zero64 : i64
+  %no_options = scalar.andi %object, %empty : i1
+  %options_condition = scalar.extui %no_options : i1 to i32
+  %options_error = global.load @esrgan.options_error : buffer
+  func.call @require(%options_condition, %options_error) : (i32, buffer)
+  %scope = global.load @esrgan.scope : buffer
+  %source = func.call @source_scope(%scope) : (buffer) -> (i32)
+  %stage = func.call @esrgan.declare_image_stage(%height, %width) : (i64, i64) -> (i32)
+  func.call @esrgan.bind_image_parameters(%stage, %source) : (i32, i32)
+  // Native request transport bounds inputs and allocates only the payload.
+  %capacity = scalar.constant 9223372036854775807 : i64
+  %tokenizer = global.load @esrgan.tokenizer : buffer
+  %identifier = global.load @esrgan.identifier : buffer
+  %state_bytes = index.constant 64 : offset
+  %state = buffer.alloca<private> align(8) %state_bytes : buffer
+  %state_view = buffer.view %state[%origin] : buffer -> view<8xi64>
+  %stage64 = scalar.extui %stage : i32 to i64
+  %source64 = scalar.extui %source : i32 to i64
+  view.store %height, %state_view[0] : i64, view<8xi64>
+  view.store %width, %state_view[1] : i64, view<8xi64>
+  view.store %zero64, %state_view[2] : i64, view<8xi64>
+  view.store %zero64, %state_view[3] : i64, view<8xi64>
+  view.store %stage64, %state_view[4] : i64, view<8xi64>
+  view.store %source64, %state_view[5] : i64, view<8xi64>
+  view.store %zero64, %state_view[6] : i64, view<8xi64>
+  view.store %zero64, %state_view[7] : i64, view<8xi64>
+  %batch_units = scalar.constant 1 : i64
+  func.return %batch_units, %capacity, %tokenizer, %identifier, %state : i64, i64, buffer, buffer, buffer
+}

@@ -1,0 +1,124 @@
+// Euler trajectory through the transformer. Known times are conditioned once
+// into the modulation table, and the caption rows are normalized, embedded,
+// padded, and refined once, since the context refiner is unmodulated. Each step
+// rounds the F32 latent to BF16, embeds it into the image rows of the unified
+// hidden state, copies the refined caption rows behind them, runs the two
+// noise-refiner blocks over the image rows and the thirty main blocks over the
+// whole sequence, normalizes the image rows, projects the prediction, and
+// advances the latent. The first update consumes immutable input noise and
+// later updates advance output in place.
+//
+// Modulation table layout (see dit_time.loom), 30720-byte block rows per time:
+// layer b at b*491520, noise refiner r at 14745600 + r*491520, final layer at
+// 15728640 with 7680-byte rows.
+
+config.decl @zimage.image_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+config.decl @zimage.text_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+config.decl @zimage.time_count : %value: index where [range(%value, 1, 17)]
+
+template.decl @zimage.denoise_step(%step: index, %parameters: buffer, %caption: buffer, %sample: buffer, %modulation: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %deltas: buffer, %latent: buffer, %hidden: buffer, %prediction: buffer, %output: buffer)
+
+command.decl @zimage.time_conditioning() launch(%parameters: buffer, %times: buffer, %output: buffer)
+
+command.decl @zimage.caption_norm() launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.caption_embedding() launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.caption_pad() launch(%parameters: buffer, %mask: buffer, %caption: buffer)
+
+command.decl @zimage.caption_copy() launch(%caption: buffer, %hidden: buffer)
+
+command.decl @zimage.context_block(%layer: index) launch(%parameters: buffer, %caption: buffer, %cosine: buffer, %sine: buffer, %mask: buffer)
+
+command.decl @zimage.latent_cast() launch(%input: buffer, %output: buffer)
+
+command.decl @zimage.image_embedding() launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.refiner_block(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %hidden: buffer, %cosine: buffer, %sine: buffer)
+
+command.decl @zimage.layer_block(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %hidden: buffer, %cosine: buffer, %sine: buffer, %mask: buffer)
+
+command.decl @zimage.final_norm(%offset: offset) launch(%modulation: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.dit_output() launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.dit_update(%step: index) launch(%sample: buffer, %prediction: buffer, %deltas: buffer, %output: buffer)
+
+template.def<@zimage.denoise_step> @zimage_denoise_step(%step: index, %parameters: buffer, %caption: buffer, %sample: buffer, %modulation: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %deltas: buffer, %latent: buffer, %hidden: buffer, %prediction: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %block_bytes = index.constant 491520 : offset
+  %block_row_bytes = index.constant 30720 : offset
+  %refiner_base = index.constant 14745600 : offset
+  %final_base = index.constant 15728640 : offset
+  %final_row_bytes = index.constant 7680 : offset
+  %hidden_stride = index.constant 7680 : offset
+  %step_row = index.scale %step, %block_row_bytes : index, offset -> offset
+  %refiner_row = index.add %refiner_base, %step_row : offset
+  %final_row = index.scale %step, %final_row_bytes : index, offset -> offset
+  %final_offset = index.add %final_base, %final_row : offset
+  command.launch @zimage.latent_cast(%sample, %latent) : (buffer, buffer)
+  command.launch @zimage.image_embedding(%parameters, %latent, %hidden) : (buffer, buffer, buffer)
+  command.launch @zimage.caption_copy(%caption, %hidden) : (buffer, buffer)
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %refiners = index.constant 2 : index
+  %layers = index.constant 30 : index
+  scf.for %refiner = [%c0 to %refiners step %c1] unroll {
+    %refiner_block = index.scale %refiner, %block_bytes : index, offset -> offset
+    %refiner_offset = index.add %refiner_row, %refiner_block : offset
+    command.launch @zimage.refiner_block[%refiner, %refiner_offset](%parameters, %modulation, %hidden, %cosine, %sine) : [index, offset](buffer, buffer, buffer, buffer, buffer)
+  }
+  scf.for %layer = [%c0 to %layers step %c1] unroll {
+    %layer_block = index.scale %layer, %block_bytes : index, offset -> offset
+    %layer_offset = index.add %step_row, %layer_block : offset
+    command.launch @zimage.layer_block[%layer, %layer_offset](%parameters, %modulation, %hidden, %cosine, %sine, %mask) : [index, offset](buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  %normalized_bytes = index.scale %images, %hidden_stride : index, offset -> offset
+  %normalized = buffer.alloca<global> align(256) %normalized_bytes : buffer
+  command.launch @zimage.final_norm[%final_offset](%modulation, %hidden, %normalized) : [offset](buffer, buffer, buffer)
+  command.launch @zimage.dit_output(%parameters, %normalized, %prediction) : (buffer, buffer, buffer)
+  command.launch @zimage.dit_update[%step](%sample, %prediction, %deltas, %output) : [index](buffer, buffer, buffer, buffer)
+  template.return
+}
+
+// Sample is F32[image_tokens,64] input noise and output the denoised latent;
+// they may not alias. Text is the encoder hidden state BF16[text_tokens,2560];
+// times, deltas, cosine, sine, and the byte key mask come from the request
+// stage.
+command.def public @denoise() launch(%parameters: buffer, %sample: buffer, %text: buffer, %times: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %deltas: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %count = config.get @zimage.time_count : index
+  %tokens = index.add %images, %texts : index
+  %modulation_bytes = index.constant 15851520 : offset
+  %feature_stride = index.constant 5120 : offset
+  %hidden_stride = index.constant 7680 : offset
+  %patch_stride = index.constant 128 : offset
+  %feature_bytes = index.scale %texts, %feature_stride : index, offset -> offset
+  %caption_bytes = index.scale %texts, %hidden_stride : index, offset -> offset
+  %hidden_bytes = index.scale %tokens, %hidden_stride : index, offset -> offset
+  %patch_bytes = index.scale %images, %patch_stride : index, offset -> offset
+  %modulation = buffer.alloca<global> align(256) %modulation_bytes : buffer
+  command.launch @zimage.time_conditioning(%parameters, %times, %modulation) : (buffer, buffer, buffer)
+  %features = buffer.alloca<global> align(256) %feature_bytes : buffer
+  command.launch @zimage.caption_norm(%parameters, %text, %features) : (buffer, buffer, buffer)
+  %caption = buffer.alloca<global> align(256) %caption_bytes : buffer
+  command.launch @zimage.caption_embedding(%parameters, %features, %caption) : (buffer, buffer, buffer)
+  command.launch @zimage.caption_pad(%parameters, %mask, %caption) : (buffer, buffer, buffer)
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %refiners = index.constant 2 : index
+  scf.for %refiner = [%c0 to %refiners step %c1] unroll {
+    command.launch @zimage.context_block[%refiner](%parameters, %caption, %cosine, %sine, %mask) : [index](buffer, buffer, buffer, buffer, buffer)
+  }
+  %latent = buffer.alloca<global> align(256) %patch_bytes : buffer
+  %hidden = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %prediction = buffer.alloca<global> align(256) %patch_bytes : buffer
+  template.apply<@zimage.denoise_step>(%c0, %parameters, %caption, %sample, %modulation, %cosine, %sine, %mask, %deltas, %latent, %hidden, %prediction, %output) : (index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  scf.for %step = [%c1 to %count step %c1] unroll {
+    template.apply<@zimage.denoise_step>(%step, %parameters, %caption, %output, %modulation, %cosine, %sine, %mask, %deltas, %latent, %hidden, %prediction, %output) : (index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  command.return
+}

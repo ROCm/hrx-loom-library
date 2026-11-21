@@ -1,0 +1,250 @@
+// Transformer normalizations. Layer modulation is affine-free LayerNorm in F32
+// (mean, then the mean square of the centered row), rounded to BF16 once, then
+// the BF16 (1 + scale) * x + shift modulation. Text rows of the joint sequence
+// take the text-stream coefficients and image rows the image-stream ones; the
+// single-stream blocks and the output norm pass one coefficient pair for both.
+// Query/key normalization is per-head RMSNorm with a BF16 weight, rounded once,
+// then rotary rotation over adjacent channel pairs with F32 [token,channel]
+// tables, rounded once. Text rows take the added-stream weight.
+
+config.decl @klein.text_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+config.decl @klein.image_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+amdgpu.target<gfx11-generic> @dit_normalization_wave32 {subgroup_size = 32}
+
+template.decl @modulation.affine_bf16(%value: bf16, %scale: bf16, %scale_table: f32, %shift: bf16, %shift_table: f32) -> (bf16)
+
+template.decl @klein.layer_modulate_rows(%rows: index, %text_rows: index, %input: buffer, %text_shift: buffer, %text_scale: buffer, %image_shift: buffer, %image_scale: buffer, %output: buffer)
+
+template.decl @klein.normalize_rotary_rows(%tokens: index, %text_rows: index, %input: buffer, %text_weight: buffer, %image_weight: buffer, %cosine: buffer, %sine: buffer, %output: buffer)
+
+// One 256-thread workgroup owns one 3072-wide row. Every lane finishes both
+// reductions before any store, so output may alias input.
+template.def<@klein.layer_modulate_rows> device @klein_layer_modulate_rows(%rows: index, %text_rows: index, %input: buffer, %text_shift: buffer, %text_scale: buffer, %image_shift: buffer, %image_scale: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %width = index.constant 3072 : index
+  %threads = index.constant 256 : index
+  %row = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %c0_0 = scalar.constant 0.0 : f32
+  %width_f32 = scalar.constant 3072.0 : f32
+  %epsilon = scalar.constant 9.9999999999999995e-07 : f32
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x3072xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x3072xbf16>
+  %partial_sum = scf.for %column = [%lane to %width step %threads](%acc = %c0_0 : f32) -> (f32) {
+    %stored = view.load %input_view[%row, %column] : view<[%rows]x3072xbf16> -> bf16
+    %value = scalar.extf %stored : bf16 to f32
+    %sum = scalar.addf %acc, %value : f32
+    scf.yield %sum : f32
+  }
+  %sum = kernel.workgroup.reduce<addf> %partial_sum : f32
+  %mean = scalar.divf %sum, %width_f32 : f32
+  %partial_square = scf.for %column = [%lane to %width step %threads](%acc = %c0_0 : f32) -> (f32) {
+    %stored = view.load %input_view[%row, %column] : view<[%rows]x3072xbf16> -> bf16
+    %value = scalar.extf %stored : bf16 to f32
+    %centered = scalar.subf %value, %mean : f32
+    %square = scalar.mulf %centered, %centered : f32
+    %total = scalar.addf %acc, %square : f32
+    scf.yield %total : f32
+  }
+  %square_sum = kernel.workgroup.reduce<addf> %partial_square : f32
+  %variance = scalar.divf %square_sum, %width_f32 : f32
+  %biased = scalar.addf %variance, %epsilon : f32
+  %inverse = scalar.rsqrtf<afn> %biased : f32
+  %is_text = index.cmp ult, %row, %text_rows : index
+  %text_shift_view = buffer.view %text_shift[%origin] : buffer -> view<3072xbf16>
+  %text_scale_view = buffer.view %text_scale[%origin] : buffer -> view<3072xbf16>
+  %image_shift_view = buffer.view %image_shift[%origin] : buffer -> view<3072xbf16>
+  %image_scale_view = buffer.view %image_scale[%origin] : buffer -> view<3072xbf16>
+  scf.for %column = [%lane to %width step %threads] {
+    %stored = view.load %input_view[%row, %column] : view<[%rows]x3072xbf16> -> bf16
+    %value = scalar.extf %stored : bf16 to f32
+    %centered = scalar.subf %value, %mean : f32
+    %normalized_f32 = scalar.mulf %centered, %inverse : f32
+    %normalized = scalar.fptrunc %normalized_f32 : f32 to bf16
+    %shift, %scale = scf.if %is_text -> (bf16, bf16) {
+      %text_shift_value = view.load %text_shift_view[%column] : view<3072xbf16> -> bf16
+      %text_scale_value = view.load %text_scale_view[%column] : view<3072xbf16> -> bf16
+      scf.yield %text_shift_value, %text_scale_value : bf16, bf16
+    } else {
+      %image_shift_value = view.load %image_shift_view[%column] : view<3072xbf16> -> bf16
+      %image_scale_value = view.load %image_scale_view[%column] : view<3072xbf16> -> bf16
+      scf.yield %image_shift_value, %image_scale_value : bf16, bf16
+    }
+    %result = template.apply<@modulation.affine_bf16>(%normalized, %scale, %c0_0, %shift, %c0_0) : (bf16, bf16, f32, bf16, f32) -> (bf16)
+    view.store %result, %output_view[%row, %column] : bf16, view<[%rows]x3072xbf16>
+  }
+  template.return
+}
+
+// One 64-thread workgroup owns one 128-wide head row; each lane owns one
+// adjacent channel pair and captures both values before either store.
+template.def<@klein.normalize_rotary_rows> device @klein_normalize_rotary_rows(%tokens: index, %text_rows: index, %input: buffer, %text_weight: buffer, %image_weight: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %heads = index.constant 24 : index
+  %unit = index.constant 1 : index
+  %pair = index.constant 2 : index
+  %rows = index.mul %tokens, %heads : index
+  %row = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %token = index.div %row, %heads : index
+  %even = index.mul %lane, %pair : index
+  %odd = index.add %even, %unit : index
+  %width_f32 = scalar.constant 128.0 : f32
+  %epsilon = scalar.constant 9.9999999999999995e-07 : f32
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x128xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x128xbf16>
+  %text_weight_view = buffer.view %text_weight[%origin] : buffer -> view<128xbf16>
+  %image_weight_view = buffer.view %image_weight[%origin] : buffer -> view<128xbf16>
+  %cosine_view = buffer.view %cosine[%origin] : buffer -> view<[%tokens]x128xf32>
+  %sine_view = buffer.view %sine[%origin] : buffer -> view<[%tokens]x128xf32>
+  %even_stored = view.load %input_view[%row, %even] : view<[%rows]x128xbf16> -> bf16
+  %odd_stored = view.load %input_view[%row, %odd] : view<[%rows]x128xbf16> -> bf16
+  %even_input = scalar.extf %even_stored : bf16 to f32
+  %odd_input = scalar.extf %odd_stored : bf16 to f32
+  %even_square = scalar.mulf %even_input, %even_input : f32
+  %odd_square = scalar.mulf %odd_input, %odd_input : f32
+  %partial = scalar.addf %even_square, %odd_square : f32
+  %sum = kernel.workgroup.reduce<addf> %partial : f32
+  %mean = scalar.divf %sum, %width_f32 : f32
+  %biased = scalar.addf %mean, %epsilon : f32
+  %inverse = scalar.rsqrtf<afn> %biased : f32
+  %is_text = index.cmp ult, %token, %text_rows : index
+  %even_weight, %odd_weight = scf.if %is_text -> (bf16, bf16) {
+    %text_even = view.load %text_weight_view[%even] : view<128xbf16> -> bf16
+    %text_odd = view.load %text_weight_view[%odd] : view<128xbf16> -> bf16
+    scf.yield %text_even, %text_odd : bf16, bf16
+  } else {
+    %image_even = view.load %image_weight_view[%even] : view<128xbf16> -> bf16
+    %image_odd = view.load %image_weight_view[%odd] : view<128xbf16> -> bf16
+    scf.yield %image_even, %image_odd : bf16, bf16
+  }
+  %even_scale = scalar.extf %even_weight : bf16 to f32
+  %odd_scale = scalar.extf %odd_weight : bf16 to f32
+  %even_normalized = scalar.mulf %even_input, %inverse : f32
+  %odd_normalized = scalar.mulf %odd_input, %inverse : f32
+  %even_weighted = scalar.mulf %even_normalized, %even_scale : f32
+  %odd_weighted = scalar.mulf %odd_normalized, %odd_scale : f32
+  %even_bf16 = scalar.fptrunc %even_weighted : f32 to bf16
+  %odd_bf16 = scalar.fptrunc %odd_weighted : f32 to bf16
+  %even_value = scalar.extf %even_bf16 : bf16 to f32
+  %odd_value = scalar.extf %odd_bf16 : bf16 to f32
+  %even_cosine = view.load %cosine_view[%token, %even] : view<[%tokens]x128xf32> -> f32
+  %odd_cosine = view.load %cosine_view[%token, %odd] : view<[%tokens]x128xf32> -> f32
+  %even_sine = view.load %sine_view[%token, %even] : view<[%tokens]x128xf32> -> f32
+  %odd_sine = view.load %sine_view[%token, %odd] : view<[%tokens]x128xf32> -> f32
+  %even_cosine_term = scalar.mulf %even_value, %even_cosine : f32
+  %odd_cosine_term = scalar.mulf %odd_value, %odd_cosine : f32
+  %even_sine_term = scalar.mulf %odd_value, %even_sine : f32
+  %odd_sine_term = scalar.mulf %even_value, %odd_sine : f32
+  %even_rotated = scalar.subf %even_cosine_term, %even_sine_term : f32
+  %odd_rotated = scalar.addf %odd_cosine_term, %odd_sine_term : f32
+  %even_output = scalar.fptrunc %even_rotated : f32 to bf16
+  %odd_output = scalar.fptrunc %odd_rotated : f32 to bf16
+  view.store %even_output, %output_view[%row, %even] : bf16, view<[%rows]x128xbf16>
+  view.store %odd_output, %output_view[%row, %odd] : bf16, view<[%rows]x128xbf16>
+  template.return
+}
+
+// Joint text+image rows; text rows take the text-stream coefficients.
+kernel.def target(@dit_normalization_wave32) @joint_modulate() {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %rows = index.add %text, %image : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %text_shift: buffer, %text_scale: buffer, %image_shift: buffer, %image_scale: buffer, %output: buffer) {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %rows = index.add %text, %image : index
+  template.apply<@klein.layer_modulate_rows>(%rows, %text, %input, %text_shift, %text_scale, %image_shift, %image_scale, %output) : (index, index, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+// Image rows only, for the output norm ahead of the velocity projection.
+kernel.def target(@dit_normalization_wave32) @klein_image_modulate() {
+  %rows = config.get @klein.image_tokens : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %shift: buffer, %scale: buffer, %output: buffer) {
+  %rows = config.get @klein.image_tokens : index
+  %text = index.constant 0 : index
+  template.apply<@klein.layer_modulate_rows>(%rows, %text, %input, %shift, %scale, %shift, %scale, %output) : (index, index, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@dit_normalization_wave32) @klein_joint_rotary() {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %tokens = index.add %text, %image : index
+  %heads = index.constant 24 : index
+  %rows = index.mul %tokens, %heads : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %text_weight: buffer, %image_weight: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %tokens = index.add %text, %image : index
+  template.apply<@klein.normalize_rotary_rows>(%tokens, %text, %input, %text_weight, %image_weight, %cosine, %sine, %output) : (index, index, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.return
+}
+
+// Modulation immediates are byte offsets into the conditioning tables. Each
+// stream's shift row is followed by its scale row; output may alias input.
+command.def public @klein.joint_modulate(%text_offset: offset, %image_offset: offset) launch(%modulation: buffer, %input: buffer, %output: buffer) {
+  %row_bytes = index.constant 6144 : offset
+  %text_scale_offset = index.add %text_offset, %row_bytes : offset
+  %image_scale_offset = index.add %image_offset, %row_bytes : offset
+  %text_shift = buffer.view %modulation[%text_offset] : buffer -> view<3072xbf16>
+  %text_scale = buffer.view %modulation[%text_scale_offset] : buffer -> view<3072xbf16>
+  %image_shift = buffer.view %modulation[%image_offset] : buffer -> view<3072xbf16>
+  %image_scale = buffer.view %modulation[%image_scale_offset] : buffer -> view<3072xbf16>
+  kernel.launch @joint_modulate(%input, %text_shift, %text_scale, %image_shift, %image_scale, %output) : (buffer, view<3072xbf16>, view<3072xbf16>, view<3072xbf16>, view<3072xbf16>, buffer)
+  command.return
+}
+
+// The output table stores scale before shift. Input is the joint hidden state;
+// only its image rows are normalized, into an image-row output.
+command.def public @klein.output_modulate(%offset: offset) launch(%modulation: buffer, %input: buffer, %output: buffer) {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %row_bytes = index.constant 6144 : offset
+  %image_origin = index.scale %text, %row_bytes : index, offset -> offset
+  %shift_offset = index.add %offset, %row_bytes : offset
+  %image_rows = buffer.view %input[%image_origin] : buffer -> view<[%image]x3072xbf16>
+  %scale = buffer.view %modulation[%offset] : buffer -> view<3072xbf16>
+  %shift = buffer.view %modulation[%shift_offset] : buffer -> view<3072xbf16>
+  kernel.launch @klein_image_modulate(%image_rows, %shift, %scale, %output) : (view<[%image]x3072xbf16>, view<3072xbf16>, view<3072xbf16>, buffer)
+  command.return
+}
+
+command.def public @klein.double_query_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %text_weight = command.parameter %parameters, "transformer_blocks.{}.attn.norm_added_q.weight"[%layer] : view<128xbf16>
+  %image_weight = command.parameter %parameters, "transformer_blocks.{}.attn.norm_q.weight"[%layer] : view<128xbf16>
+  kernel.launch @klein_joint_rotary(%input, %text_weight, %image_weight, %cosine, %sine, %output) : (buffer, view<128xbf16>, view<128xbf16>, buffer, buffer, buffer)
+  command.return
+}
+
+command.def public @klein.double_key_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %text_weight = command.parameter %parameters, "transformer_blocks.{}.attn.norm_added_k.weight"[%layer] : view<128xbf16>
+  %image_weight = command.parameter %parameters, "transformer_blocks.{}.attn.norm_k.weight"[%layer] : view<128xbf16>
+  kernel.launch @klein_joint_rotary(%input, %text_weight, %image_weight, %cosine, %sine, %output) : (buffer, view<128xbf16>, view<128xbf16>, buffer, buffer, buffer)
+  command.return
+}
+
+// Single-stream blocks normalize text and image rows with one weight.
+command.def public @klein.single_query_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "single_transformer_blocks.{}.attn.norm_q.weight"[%layer] : view<128xbf16>
+  kernel.launch @klein_joint_rotary(%input, %weight, %weight, %cosine, %sine, %output) : (buffer, view<128xbf16>, view<128xbf16>, buffer, buffer, buffer)
+  command.return
+}
+
+command.def public @klein.single_key_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "single_transformer_blocks.{}.attn.norm_k.weight"[%layer] : view<128xbf16>
+  kernel.launch @klein_joint_rotary(%input, %weight, %weight, %cosine, %sine, %output) : (buffer, view<128xbf16>, view<128xbf16>, buffer, buffer, buffer)
+  command.return
+}

@@ -1,0 +1,115 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// Wide-tile BF16 projection preserves grouped traversal, output layouts, and
+// long reductions. Each configuration launches the production motif once over
+// the whole matrix. The shared scalar reference reads actual dyadic inputs,
+// sums without native fragments, and rounds at publication. Complete
+// allocation comparisons include padding, guards, and immutable inputs.
+
+amdgpu.target<gfx11-generic> @tensor_projection_wide_rdna3
+
+amdgpu.target<gfx11-generic> @tensor_projection_tiled_rdna3
+
+amdgpu.target<gfx11-generic> @wide_projection_wave32 {subgroup_size = 32}
+
+template.decl @projection.linear_wide_bf16(%rows: index, %inputs: index, %outputs: index, %row_tile_group_size: index, %output_layout: encoding<layout>, %input: buffer, %weight: buffer, %output: buffer)
+
+func.decl @linear_fixture_initialize(%rows: index, %inputs: index, %outputs: index, %row_stride: index, %column_stride: index, %precision: i1, %input: buffer, %weight: buffer)
+
+func.decl @linear_fixture_reference(%input: buffer, %weight: buffer, %output: buffer)
+
+template.decl @wide_shape(%configuration: index) -> (index, index, index, index, index, index, index)
+
+template.def<@wide_shape> @wide_shape_values(%configuration: index) -> (index, index, index, index, index, index, index) {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c16 = index.constant 16 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c192 = index.constant 192 : index
+  %c256 = index.constant 256 : index
+  %c384 = index.constant 384 : index
+  %c512 = index.constant 512 : index
+  %c768 = index.constant 768 : index
+  %c1280 = index.constant 1280 : index
+  %c6144 = index.constant 6144 : index
+  %rows, %inputs, %outputs, %group = scf.lookup %configuration {
+    0 = (%c256, %c64, %c128, %c1),
+    1 = (%c256, %c256, %c128, %c1),
+    2 = (%c512, %c192, %c256, %c1),
+    3 = (%c768, %c128, %c384, %c2),
+    4 = (%c512, %c256, %c256, %c4),
+    5 = (%c1280, %c64, %c128, %c2),
+    6 = (%c256, %c6144, %c128, %c1)
+  } default(%c512, %c768, %c256, %c3) : index, index, index, index
+  %column_major = index.cmp eq, %configuration, %c2 : index
+  %padded = index.cmp eq, %configuration, %c4 : index
+  %wide = index.add %outputs, %c16 : index
+  %pitch = scf.select %padded, %wide, %outputs : index
+  %row_stride = scf.select %column_major, %c1, %pitch : index
+  %column_stride = scf.select %column_major, %rows, %c1 : index
+  %output_count = index.mul %rows, %pitch : index
+  template.return %rows, %inputs, %outputs, %group, %row_stride, %column_stride, %output_count : index, index, index, index, index, index, index
+}
+
+func.def @wide_storage(%configuration: index) -> (index, index, index) {
+  %rows, %inputs, %outputs, %group, %row_stride, %column_stride, %output_count = template.apply<@wide_shape>(%configuration) : (index) -> (index, index, index, index, index, index, index)
+  %guards = index.constant 32 : index
+  %input_storage = index.madd %rows, %inputs, %guards : index
+  %weight_storage = index.madd %outputs, %inputs, %guards : index
+  %output_storage = index.add %output_count, %guards : index
+  func.return %input_storage, %weight_storage, %output_storage : index, index, index
+}
+
+func.def @initialize_wide_projection(%configuration: index, %input: buffer, %weight: buffer) {
+  %rows, %inputs, %outputs, %group, %row_stride, %column_stride, %output_count = template.apply<@wide_shape>(%configuration) : (index) -> (index, index, index, index, index, index, index)
+  %false = scalar.constant false : i1
+  func.call @linear_fixture_initialize(%rows, %inputs, %outputs, %row_stride, %column_stride, %false, %input, %weight) : (index, index, index, index, index, i1, buffer, buffer)
+  func.return
+}
+
+kernel.def target(@wide_projection_wave32) @apply_wide_projection(%rows: index, %outputs: index) {
+  %row_tile = index.constant 256 : index
+  %output_tile = index.constant 128 : index
+  %threads = index.constant 256 : index
+  %unit = index.constant 1 : index
+  %row_tiles = index.div %rows, %row_tile : index
+  %output_tiles = index.div %outputs, %output_tile : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %unit) workgroup_size(%threads, %unit, %unit) : index
+} launch(%rows: index, %inputs: index, %outputs: index, %group: index, %row_stride: index, %column_stride: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %layout = encoding.layout.strided [%row_stride, %column_stride] : encoding<layout>
+  template.apply<@projection.linear_wide_bf16>(%rows, %inputs, %outputs, %group, %layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  kernel.return
+}
+
+command.def @wide_projection_program(%configuration: index) launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows, %inputs, %outputs, %group, %row_stride, %column_stride, %output_count = template.apply<@wide_shape>(%configuration) : (index) -> (index, index, index, index, index, index, index)
+  %origin = index.constant 32 : offset
+  %activation = buffer.view %input[%origin] : buffer -> view<[%rows]x[%inputs]xbf16>
+  %weights = buffer.view %weight[%origin] : buffer -> view<[%outputs]x[%inputs]xbf16>
+  %results = buffer.view %output[%origin] : buffer -> view<[%output_count]xbf16>
+  kernel.launch @apply_wide_projection[%rows, %outputs](%rows, %inputs, %outputs, %group, %row_stride, %column_stride, %activation, %weights, %results) : [index, index](index, index, index, index, index, index, view<[%rows]x[%inputs]xbf16>, view<[%outputs]x[%inputs]xbf16>, view<[%output_count]xbf16>)
+  command.return
+}
+
+check.scenario public @wide_projection configure[8](%configuration: index, %configuration_entropy: check.entropy) {
+  check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
+  check.trial[1](%trial: index, %entropy: check.entropy) {
+    %input_count, %weight_count, %output_count = check.generate<@wide_storage>(%configuration) : (index) -> (index, index, index)
+    %input = check.generate.fill value(-12345) : tensor<[%input_count]xi16>
+    %weight = check.generate.fill value(-12345) : tensor<[%weight_count]xi16>
+    %output = check.generate.fill value(17142) : tensor<[%output_count]xi16>
+    check.generate<@initialize_wide_projection>(%configuration, %input, %weight) : (index, tensor<[%input_count]xi16>, tensor<[%weight_count]xi16>) -> ()
+    check.compare<@wide_projection_program, @linear_fixture_reference>[%configuration](%input, %weight, %output) : [index](tensor<[%input_count]xi16>, tensor<[%weight_count]xi16>, tensor<[%output_count]xi16>) -> () {
+      check.expect.bitwise actual(%input) expected(%input) : tensor<[%input_count]xi16>
+      check.expect.bitwise actual(%weight) expected(%weight) : tensor<[%weight_count]xi16>
+      check.expect.bitwise actual(%output) expected(%output) : tensor<[%output_count]xi16>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@wide_projection> @wide_projection_benchmark

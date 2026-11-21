@@ -1,0 +1,132 @@
+# Copyright 2026 AMD ROCm™ Software
+# SPDX-License-Identifier: MIT
+
+load("@hrx//build_tools/bazel:python.bzl", "iree_py_test")
+load("@hrx//build_tools/bazel:requirements.bzl", "apply_test_requirements")
+load("@hrx//loom/target/amdgpu:execution_profiles.bzl", "AMD_GPU_HARDWARE_PROFILE")
+load("@hrx//loom/target/vm:execution_profiles.bzl", "VM_REFERENCE_PROFILE")
+load("//build_tools/bazel:defs.bzl", "loom_test")
+
+package(default_visibility = ["//visibility:private"])
+
+iree_py_test(
+    name = "image_check_test",
+    srcs = [
+        "image_check.py",
+        "image_check_test.py",
+    ],
+    imports = ["."],
+    main = "image_check_test.py",
+    deps = [
+        "@hrx//loom/src/loom/serve/testing/loom_serve_testing:http",
+        "@hrx//loom/src/loom/serve/testing/loom_serve_testing:model_staging",
+    ],
+)
+
+_IMAGE_REQUIREMENTS = apply_test_requirements(
+    {},
+    build_requirements = AMD_GPU_HARDWARE_PROFILE.build_requirements,
+    resource_group = AMD_GPU_HARDWARE_PROFILE.resource_group,
+    run_requirements = AMD_GPU_HARDWARE_PROFILE.run_requirements,
+)
+
+[
+    filegroup(
+        name = representation + suffix + "_card",
+        srcs = ["//model/black-forest-labs/FLUX.2-klein-4B:" + representation + suffix],
+        output_group = "model_card",
+    )
+    for representation in [
+        "source",
+        "archive",
+    ]
+    for suffix in [
+        "",
+        "_bounded_workspace",
+        "_lifecycle",
+    ]
+]
+
+# Full checkpoints are provisioned through LOOM_MODEL_ASSETS, outside Bazel.
+[
+    iree_py_test(
+        name = "image_" + representation + suffix + "_test",
+        size = "large",
+        srcs = ["image_check.py"],
+        args = [
+            "--server=$(location @loom_sdk//:loom-serve)",
+            "--model=$(location :" + representation + suffix + "_card)",
+            "--reference=$(location reference.json)",
+        ] + AMD_GPU_HARDWARE_PROFILE.runner_args + (["--lifecycle"] if suffix == "_lifecycle" else []),
+        data = [
+            ":" + representation + suffix + "_card",
+            "reference.json",
+            "@loom_sdk//:loom-serve",
+        ],
+        main = "image_check.py",
+        resource_group = _IMAGE_REQUIREMENTS["resource_group"],
+        tags = ["manual"] + _IMAGE_REQUIREMENTS["tags"],
+        target_compatible_with = _IMAGE_REQUIREMENTS["target_compatible_with"],
+        deps = [
+            "@hrx//loom/src/loom/serve/testing/loom_serve_testing:http",
+            "@hrx//loom/src/loom/serve/testing/loom_serve_testing:model_staging",
+        ],
+    )
+    for representation in [
+        "source",
+        "archive",
+    ]
+    for suffix in [
+        "",
+        "_bounded_workspace",
+        "_lifecycle",
+    ]
+]
+
+loom_test(
+    name = "geometry",
+    srcs = ["geometry_test.loom"],
+    execution_profiles = [VM_REFERENCE_PROFILE],
+    deps = ["//model/black-forest-labs/FLUX.2-klein-4B/program:geometry"],
+)
+
+_PROFILES = [AMD_GPU_HARDWARE_PROFILE]
+
+loom_test(
+    name = "vae_output",
+    srcs = ["vae_output_test.loom"],
+    execution_profiles = _PROFILES,
+    deps = ["//model/black-forest-labs/FLUX.2-klein-4B/program:vae_convolution"],
+)
+
+loom_test(
+    name = "vae_tile_axis",
+    srcs = ["vae_tile_axis_test.loom"],
+    execution_profiles = [VM_REFERENCE_PROFILE],
+    deps = ["//model/black-forest-labs/FLUX.2-klein-4B/program:vae_tiles"],
+)
+
+[
+    loom_test(
+        name = "vae_tiles_" + name,
+        size = "medium",
+        srcs = ["vae_tiles_test.loom"],
+        config = {
+            "klein.latent_height": str(height),
+            "klein.latent_width": str(width),
+            "klein.vae_tile_height": str(tile_height),
+            "klein.vae_tile_width": str(tile_width),
+        },
+        execution_profiles = _PROFILES,
+        deps = ["//model/black-forest-labs/FLUX.2-klein-4B/program:vae_tiles"],
+    )
+    for name, height, width, tile_height, tile_width in [
+        ("untiled", 2, 2, 2, 2),
+        ("minimum_overlap", 34, 34, 32, 32),
+        ("landscape", 48, 80, 40, 54),
+        ("portrait", 94, 66, 64, 40),
+        ("image1024", 128, 128, 80, 80),
+        ("one_axis", 16, 96, 16, 64),
+        ("long_axis", 1024, 2, 64, 2),
+    ]
+]

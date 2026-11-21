@@ -1,0 +1,100 @@
+// Four-step Euler trajectory through the transformer. Known times are
+// conditioned once into the four modulation tables; each step embeds the
+// prompt rows and the current latent, runs five double-stream and twenty
+// single-stream blocks in place over the joint hidden state, normalizes the
+// image rows, projects the velocity, and advances the latent. The first update
+// consumes immutable input noise and later updates advance output in place.
+//
+// Conditioning layout per padded time row R (see dit_time.loom): text table at
+// 0 and image table at R*36864, 36864-byte rows; single-stream table at
+// 2R*36864, 18432-byte rows; output table after it, 12288-byte rows.
+
+config.decl @klein.text_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+config.decl @klein.image_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+config.decl @klein.time_count : %value: index where [range(%value, 1, 256)]
+
+template.decl @klein.denoise_step(%rows: index, %step: index, %parameters: buffer, %text: buffer, %sample: buffer, %conditioning: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %deltas: buffer, %hidden: buffer, %velocity: buffer, %output: buffer)
+
+command.decl @klein.time_conditioning() launch(%parameters: buffer, %times: buffer, %output: buffer)
+
+command.decl @klein.dit_embedding() launch(%parameters: buffer, %text_input: buffer, %image_input: buffer, %output: buffer)
+
+command.decl @klein.double_block(%layer: index, %text_offset: offset, %image_offset: offset) launch(%parameters: buffer, %modulation: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %output: buffer)
+
+command.decl @klein.single_block(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %output: buffer)
+
+command.decl @klein.output_modulate(%offset: offset) launch(%modulation: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.dit_output() launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.dit_update(%step: index) launch(%sample: buffer, %velocity: buffer, %deltas: buffer, %output: buffer)
+
+// Rows is the padded time-row count of the conditioning tables.
+template.def<@klein.denoise_step> @klein_denoise_step(%rows: index, %step: index, %parameters: buffer, %text: buffer, %sample: buffer, %conditioning: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %deltas: buffer, %hidden: buffer, %velocity: buffer, %output: buffer) {
+  %image = config.get @klein.image_tokens : index
+  %dual_row_bytes = index.constant 36864 : offset
+  %single_row_bytes = index.constant 18432 : offset
+  %output_row_bytes = index.constant 12288 : offset
+  %hidden_stride = index.constant 6144 : offset
+  %dual_bytes = index.scale %rows, %dual_row_bytes : index, offset -> offset
+  %single_base = index.add %dual_bytes, %dual_bytes : offset
+  %single_bytes = index.scale %rows, %single_row_bytes : index, offset -> offset
+  %output_base = index.add %single_base, %single_bytes : offset
+  %text_offset = index.scale %step, %dual_row_bytes : index, offset -> offset
+  %image_offset = index.add %dual_bytes, %text_offset : offset
+  %single_row = index.scale %step, %single_row_bytes : index, offset -> offset
+  %single_offset = index.add %single_base, %single_row : offset
+  %output_row = index.scale %step, %output_row_bytes : index, offset -> offset
+  %output_offset = index.add %output_base, %output_row : offset
+  command.launch @klein.dit_embedding(%parameters, %text, %sample, %hidden) : (buffer, buffer, buffer, buffer)
+  %c0_0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %double_layers = index.constant 5 : index
+  %single_layers = index.constant 20 : index
+  scf.for %layer = [%c0_0 to %double_layers step %c1] unroll {
+    command.launch @klein.double_block[%layer, %text_offset, %image_offset](%parameters, %conditioning, %hidden, %cosine, %sine, %mask, %hidden) : [index, offset, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  scf.for %layer = [%c0_0 to %single_layers step %c1] unroll {
+    command.launch @klein.single_block[%layer, %single_offset](%parameters, %conditioning, %hidden, %cosine, %sine, %mask, %hidden) : [index, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  %normalized_bytes = index.scale %image, %hidden_stride : index, offset -> offset
+  %normalized = buffer.alloca<global> align(256) %normalized_bytes : buffer
+  command.launch @klein.output_modulate[%output_offset](%conditioning, %hidden, %normalized) : [offset](buffer, buffer, buffer)
+  command.launch @klein.dit_output(%parameters, %normalized, %velocity) : (buffer, buffer, buffer)
+  command.launch @klein.dit_update[%step](%sample, %velocity, %deltas, %output) : [index](buffer, buffer, buffer, buffer)
+  template.return
+}
+
+// Sample is BF16[image_tokens,128] input noise and output the denoised latent;
+// they may not alias. Text is the encoder taps BF16[text_tokens,7680]; times,
+// deltas, cosine, sine, and the byte mask come from the request stage.
+command.def public @denoise() launch(%parameters: buffer, %sample: buffer, %text: buffer, %times: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %deltas: buffer, %output: buffer) {
+  %text_rows = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %count = config.get @klein.time_count : index
+  %c1 = index.constant 1 : index
+  %c0_0 = index.constant 0 : index
+  %tile = index.constant 16 : index
+  %padding = index.constant 15 : index
+  %padded_count = index.add %count, %padding : index
+  %tiles = index.div %padded_count, %tile : index
+  %rows = index.mul %tiles, %tile : index
+  %tokens = index.add %text_rows, %image : index
+  %condition_stride = index.constant 104448 : offset
+  %hidden_stride = index.constant 6144 : offset
+  %velocity_stride = index.constant 256 : offset
+  %condition_bytes = index.scale %rows, %condition_stride : index, offset -> offset
+  %hidden_bytes = index.scale %tokens, %hidden_stride : index, offset -> offset
+  %velocity_bytes = index.scale %image, %velocity_stride : index, offset -> offset
+  %conditioning = buffer.alloca<global> align(256) %condition_bytes : buffer
+  %hidden = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %velocity = buffer.alloca<global> align(256) %velocity_bytes : buffer
+  command.launch @klein.time_conditioning(%parameters, %times, %conditioning) : (buffer, buffer, buffer)
+  template.apply<@klein.denoise_step>(%rows, %c0_0, %parameters, %text, %sample, %conditioning, %cosine, %sine, %mask, %deltas, %hidden, %velocity, %output) : (index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  scf.for %step = [%c1 to %count step %c1] unroll {
+    template.apply<@klein.denoise_step>(%rows, %step, %parameters, %text, %output, %conditioning, %cosine, %sine, %mask, %deltas, %hidden, %velocity, %output) : (index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  command.return
+}
