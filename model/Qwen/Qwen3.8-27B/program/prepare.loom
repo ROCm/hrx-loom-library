@@ -361,15 +361,34 @@ func.def @qwen38.storage(%packet_capacity_arg: i64, %feedback_capacity: i64, %co
 }
 
 // Dense projection and single-owner decoding share the allocation and weights.
-// Each input layout retains two sets of four handles, the continuation handle,
-// and the largest single-owner block served by its narrow projection.
+// Each input layout retains its decode and general stages, the continuation,
+// the decode bound, and a matrix target for one physical 32-row panel.
 func.def @dense_phases_origin(%state: buffer, %mixed: i1) -> (offset) {
   %packet_capacity, %provider = func.call @qwen38.control_context(%state) : (buffer) -> (i64, offset)
   %zero = index.constant 0 : offset
-  %stride = index.constant 40 : offset
+  %stride = index.constant 44 : offset
   %offset = scf.select %mixed, %stride, %zero : offset
   %origin = index.add %provider, %offset : offset
   func.return %origin : offset
+}
+
+// Native Q5 projection shares one weight traversal across this many rows.
+// All live widths through one panel use the same target and allocations.
+func.def pure @dense_projection_panel_rows() -> (i64) {
+  %rows = scalar.constant 32 : i64
+  func.return %rows : i64
+}
+
+func.def @declare_dense_target(%tokens: i64, %spans: i64, %context: i64, %pool: i64, %model_source: i32, %dflash: i1, %mixed: i64, %packet_capacity: i64) -> (i32) {
+  %one32 = scalar.constant 1 : i32
+  %one64 = scalar.constant 1 : i64
+  %epoch_root = global.load @epoch_root : buffer
+  %target = func.call @declare_stage(%epoch_root, %tokens, %spans, %context, %pool, %one32, %mixed, %model_source, %packet_capacity) : (buffer, i64, i64, i64, i64, i32, i64, i32, i64) -> (i32)
+  scf.if %dflash {
+    %capture_key = global.load @capture_key : buffer
+    func.call @config_i64(%target, %capture_key, %one64) : (i32, buffer, i64)
+  }
+  func.return %target : i32
 }
 
 func.def @declare_phases(%tokens: i64, %spans: i64, %proposal_capacity: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %enabled: i1, %dflash: i1, %width: i64, %mixed: i64, %packet_capacity: i64) -> (i32, i32, i32, i32) {
@@ -378,12 +397,7 @@ func.def @declare_phases(%tokens: i64, %spans: i64, %proposal_capacity: i64, %co
   %three32 = scalar.constant 3 : i32
   %seven32 = scalar.constant 7 : i32
   %one64 = scalar.constant 1 : i64
-  %epoch_root = global.load @epoch_root : buffer
-  %target = func.call @declare_stage(%epoch_root, %tokens, %spans, %context, %pool, %one32, %mixed, %model_source, %packet_capacity) : (buffer, i64, i64, i64, i64, i32, i64, i32, i64) -> (i32)
-  scf.if %dflash {
-    %capture_key = global.load @capture_key : buffer
-    func.call @config_i64(%target, %capture_key, %one64) : (i32, buffer, i64)
-  }
+  %target = func.call @declare_dense_target(%tokens, %spans, %context, %pool, %model_source, %dflash, %mixed, %packet_capacity) : (i64, i64, i64, i64, i32, i1, i64, i64) -> (i32)
   %proposal, %warm, %verify = scf.if %enabled -> (i32, i32, i32) {
     %mtp_proposal_root = global.load @proposal_root : buffer
     %dflash_proposal_root = global.load @dflash_proposal_root : buffer
@@ -424,7 +438,7 @@ func.def @declare_phases(%tokens: i64, %spans: i64, %proposal_capacity: i64, %co
 
 func.def @declare_packed_layout(%state: buffer, %mixed: i1, %tokens: i64, %spans: i64, %proposal_capacity: i64, %context: i64, %pool: i64, %model_source: i32, %draft_source: i32, %enabled: i1, %dflash: i1, %width: i64, %packet_capacity: i64) {
   %origin = func.call @dense_phases_origin(%state, %mixed) : (buffer, i1) -> (offset)
-  %stages = buffer.view %state[%origin] : buffer -> view<10xi32>
+  %stages = buffer.view %state[%origin] : buffer -> view<11xi32>
   %one = scalar.constant 1 : i64
   %zero = scalar.constant 0 : i32
   %layout = scalar.extui %mixed : i1 to i64
@@ -448,17 +462,27 @@ func.def @declare_packed_layout(%state: buffer, %mixed: i1, %tokens: i64, %spans
   } else {
     scf.yield %zero : i32
   }
-  view.store %general, %stages[0] : i32, view<10xi32>
-  view.store %proposal, %stages[1] : i32, view<10xi32>
-  view.store %warm, %stages[2] : i32, view<10xi32>
-  view.store %verify, %stages[3] : i32, view<10xi32>
-  view.store %single, %stages[4] : i32, view<10xi32>
-  view.store %single_proposal, %stages[5] : i32, view<10xi32>
-  view.store %single_warm, %stages[6] : i32, view<10xi32>
-  view.store %single_verify, %stages[7] : i32, view<10xi32>
-  view.store %continuation, %stages[8] : i32, view<10xi32>
+  %panel_rows = func.call pure @dense_projection_panel_rows() : () -> (i64)
+  %needs_panel = scalar.cmpi ugt, %tokens, %panel_rows : i64
+  %panel = scf.if %needs_panel -> (i32) {
+    %owners = scalar.minui %spans, %panel_rows : i64
+    %stage = func.call @declare_dense_target(%panel_rows, %owners, %context, %pool, %model_source, %dflash, %layout, %packet_capacity) : (i64, i64, i64, i64, i32, i1, i64, i64) -> (i32)
+    scf.yield %stage : i32
+  } else {
+    scf.yield %general : i32
+  }
+  view.store %panel, %stages[10] : i32, view<11xi32>
+  view.store %general, %stages[0] : i32, view<11xi32>
+  view.store %proposal, %stages[1] : i32, view<11xi32>
+  view.store %warm, %stages[2] : i32, view<11xi32>
+  view.store %verify, %stages[3] : i32, view<11xi32>
+  view.store %single, %stages[4] : i32, view<11xi32>
+  view.store %single_proposal, %stages[5] : i32, view<11xi32>
+  view.store %single_warm, %stages[6] : i32, view<11xi32>
+  view.store %single_verify, %stages[7] : i32, view<11xi32>
+  view.store %continuation, %stages[8] : i32, view<11xi32>
   %bound = scalar.trunci %short_width : i64 to i32
-  view.store %bound, %stages[9] : i32, view<10xi32>
+  view.store %bound, %stages[9] : i32, view<11xi32>
   func.return
 }
 
@@ -523,8 +547,8 @@ template.decl @qwen38.epoch.stages(%state: buffer, %mixed: i1, %token_count: i32
 
 template.def<@qwen38.epoch.stages> @qwen38_dense_phase_stages(%state: buffer, %mixed: i1, %token_count: i32, %span_count: i32) -> (i32, i32, i32, i32, i32) {
   %origin = func.call @dense_phases_origin(%state, %mixed) : (buffer, i1) -> (offset)
-  %stages = buffer.view %state[%origin] : buffer -> view<10xi32>
-  %bound = view.load %stages[9] : view<10xi32> -> i32
+  %stages = buffer.view %state[%origin] : buffer -> view<11xi32>
+  %bound = view.load %stages[9] : view<11xi32> -> i32
   %one = scalar.constant 1 : i32
   %one_owner = scalar.cmpi eq, %span_count, %one : i32
   %short = scalar.cmpi ule, %token_count, %bound : i32
@@ -534,11 +558,18 @@ template.def<@qwen38.epoch.stages> @qwen38_dense_phase_stages(%state: buffer, %m
   %offset = scf.select %narrow, %short_bank, %wide_bank : offset
   %bank = index.add %origin, %offset : offset
   %phase = buffer.view %state[%bank] : buffer -> view<4xi32>
-  %target = view.load %phase[0] : view<4xi32> -> i32
+  %rows64 = func.call pure @dense_projection_panel_rows() : () -> (i64)
+  %panel_rows = scalar.trunci %rows64 : i64 to i32
+  %fits_panel = scalar.cmpi ule, %token_count, %panel_rows : i32
+  %panel = view.load %stages[10] : view<11xi32> -> i32
+  %general = view.load %stages[0] : view<11xi32> -> i32
+  %matrix = scf.select %fits_panel, %panel, %general : i32
+  %single = view.load %stages[4] : view<11xi32> -> i32
+  %target = scf.select %narrow, %single, %matrix : i32
   %draft = view.load %phase[1] : view<4xi32> -> i32
   %warm = view.load %phase[2] : view<4xi32> -> i32
   %verify = view.load %phase[3] : view<4xi32> -> i32
-  %continuation = view.load %stages[8] : view<10xi32> -> i32
+  %continuation = view.load %stages[8] : view<11xi32> -> i32
   %width, %chosen_proposal, %chosen_verifier = func.call @qwen38.speculation_stages(%state) : (buffer) -> (i32, i32, i32)
   %zero = scalar.constant 0 : i32
   %alternative = scalar.cmpi ne, %width, %zero : i32
@@ -586,7 +617,7 @@ func.def public @text_prepare_v2(%prefill: i64, %context: i64, %pool: i64, %rows
   %enabled = scalar.cmpi ne, %draft_depth, %zero32 : i32
   %packed = scalar.cmpi ne, %span_budget, %zero64 : i64
   %feedback_capacity = scalar.maxui %span_budget, %one64 : i64
-  %provider_bytes = index.constant 80 : offset
+  %provider_bytes = index.constant 88 : offset
   %state = func.call @qwen38.control_create(%packet_capacity, %feedback_capacity, %context, %pool, %rows, %pins, %packed, %enabled, %dflash, %provider_bytes) : (i64, i64, i64, i64, i64, i64, i1, i1, i1, offset) -> (buffer)
   %steps = buffer.view %state[%origin] : buffer -> view<2xi32>
   view.store %prefill_stage, %steps[0] : i32, view<2xi32>

@@ -15,6 +15,13 @@ Gated DeltaNet carries convolution and recurrent state. Dense projections can
 share a token matrix while every span retains its own causal position and
 state ownership. Private writer endpoints preserve forked history.
 
+When the submitted rows fit in one 32-row projection panel, the target can
+read each weight tile once for those rows. Wider prompts use the matrix
+schedule. The single-owner decode path keeps its dot-product kernel. These
+choices use the same packet layout for every live token and owner count.
+Only selected output rows need a vocabulary projection. A solitary row uses
+the one-row contraction and empty windows submit zero workgroups.
+
 MTP proposes through the checkpoint's NextN block. Target verification chooses
 the accepted prefix before recurrent replay; accepted target hidden rows feed
 predictor catch-up. DFlash2 uses a separate parameter scope, five target-layer

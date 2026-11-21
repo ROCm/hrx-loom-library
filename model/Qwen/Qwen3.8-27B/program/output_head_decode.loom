@@ -128,6 +128,18 @@ command.def public target(@qwen38_execution) @qwen38_output_projection_logits(%t
 command.def target(@qwen38_execution) @qwen38_select_projection(%rows: index, %normalized_origin: offset, %output_origin: offset, %request_policy: i1) launch(%parameters: buffer, %normalized: buffer, %epoch: buffer, %token_ids: buffer) {
   %budget = func.call pure @qwen38_output_workgroup_budget() : () -> (index)
   %cohort = index.constant 32 : index
+  %one = index.constant 1 : index
+  %several_rows = index.cmp ugt, %rows, %one : index
+  %sampled_windows = scalar.andi %request_policy, %several_rows : i1
+  %live = scf.if %sampled_windows -> (index) {
+    %header_origin = index.constant 0 : offset
+    %header = buffer.view %epoch[%header_origin] : buffer -> view<3xi32>
+    %count_word = view.load %header[2] : view<3xi32> -> i32
+    %selected = index.cast %count_word : i32 to index
+    scf.yield %selected : index
+  } else {
+    scf.yield %rows : index
+  }
   %window = index.min %rows, %cohort : index
   %input_stride = index.constant 5760 : offset
   %score_stride = index.constant 993280 : offset
@@ -150,7 +162,18 @@ command.def target(@qwen38_execution) @qwen38_select_projection(%rows: index, %n
     %id_offset = index.scale %first, %id_stride : index, offset -> offset
     %id_origin = index.add %output_origin, %id_offset : offset
     %ids = buffer.view %token_ids[%id_origin] : buffer -> view<[%count]xi32>
-    command.launch @qwen38_project_packed_head[%count, %input_offset, %origin, %budget](%parameters, %packed, %scores) : [index, offset, offset, index](buffer, buffer, buffer)
+    // A solitary selected row uses the scalar-row contraction. A wider
+    // cohort shares each fetched weight across rows in the existing panel.
+    %second = index.add %first, %one : index
+    %wide = index.cmp ugt, %live, %second : index
+    %wide_budget = scf.select %wide, %budget, %c0 : index
+    %window_budget = scf.select %sampled_windows, %wide_budget, %budget : index
+    command.launch @qwen38_project_packed_head[%count, %input_offset, %origin, %window_budget](%parameters, %packed, %scores) : [index, offset, offset, index](buffer, buffer, buffer)
+    scf.if %sampled_windows {
+      %single = index.cmp eq, %live, %second : index
+      %single_budget = scf.select %single, %budget, %c0 : index
+      command.launch @qwen38_project_packed_head[%one, %input_offset, %origin, %single_budget](%parameters, %packed, %scores) : [index, offset, offset, index](buffer, buffer, buffer)
+    }
     scf.if %request_policy {
       kernel.launch @qwen38_sampling_partial_rows[%count, %budget](%count, %first, %epoch, %scores, %partial_scores, %partial_ids) : [index, index](index, index, buffer, buffer, buffer, buffer)
       kernel.launch @qwen38_sample_rows[%count](%count, %first, %epoch, %scores, %partial_scores, %partial_ids, %ids) : [index](index, index, buffer, buffer, buffer, buffer, view<[%count]xi32>)
