@@ -162,17 +162,32 @@ command.def target(@qwen38_execution) @qwen38_select_projection(%rows: index, %n
     %id_offset = index.scale %first, %id_stride : index, offset -> offset
     %id_origin = index.add %output_origin, %id_offset : offset
     %ids = buffer.view %token_ids[%id_origin] : buffer -> view<[%count]xi32>
-    // A solitary selected row uses the scalar-row contraction. A wider
-    // cohort shares each fetched weight across rows in the existing panel.
-    %second = index.add %first, %one : index
-    %wide = index.cmp ugt, %live, %second : index
-    %wide_budget = scf.select %wide, %budget, %c0 : index
-    %window_budget = scf.select %sampled_windows, %wide_budget, %budget : index
-    command.launch @qwen38_project_packed_head[%count, %input_offset, %origin, %window_budget](%parameters, %packed, %scores) : [index, offset, offset, index](buffer, buffer, buffer)
     scf.if %sampled_windows {
-      %single = index.cmp eq, %live, %second : index
-      %single_budget = scf.select %single, %budget, %c0 : index
-      command.launch @qwen38_project_packed_head[%one, %input_offset, %origin, %single_budget](%parameters, %packed, %scores) : [index, offset, offset, index](buffer, buffer, buffer)
+      // Choose between the single-row, four-row, eight-row, and full
+      // contractions. Empty windows issue zero workgroups.
+      %four = index.constant 4 : index
+      %eight = index.constant 8 : index
+      %skipped_rows = index.min %live, %first : index
+      %available = index.sub %live, %skipped_rows : index
+      %window_rows = index.min %available, %count : index
+      %four_rows = index.min %count, %four : index
+      %eight_rows = index.min %count, %eight : index
+      %over_eight = index.cmp ugt, %window_rows, %eight : index
+      %over_four = index.cmp ugt, %window_rows, %four : index
+      %over_one = index.cmp ugt, %window_rows, %one : index
+      %one_row = index.cmp eq, %window_rows, %one : index
+      %multi_budget = scf.select %over_one, %budget, %c0 : index
+      %panel_budget = scf.select %over_four, %budget, %c0 : index
+      %full_budget = scf.select %over_eight, %budget, %c0 : index
+      %eight_budget = scf.select %over_eight, %c0, %panel_budget : index
+      %four_budget = scf.select %over_four, %c0, %multi_budget : index
+      %one_budget = scf.select %one_row, %budget, %c0 : index
+      command.launch @qwen38_project_packed_head[%count, %input_offset, %origin, %full_budget](%parameters, %packed, %scores) : [index, offset, offset, index](buffer, buffer, buffer)
+      command.launch @qwen38_project_packed_head[%eight_rows, %input_offset, %origin, %eight_budget](%parameters, %packed, %scores) : [index, offset, offset, index](buffer, buffer, buffer)
+      command.launch @qwen38_project_packed_head[%four_rows, %input_offset, %origin, %four_budget](%parameters, %packed, %scores) : [index, offset, offset, index](buffer, buffer, buffer)
+      command.launch @qwen38_project_packed_head[%one, %input_offset, %origin, %one_budget](%parameters, %packed, %scores) : [index, offset, offset, index](buffer, buffer, buffer)
+    } else {
+      command.launch @qwen38_project_packed_head[%count, %input_offset, %origin, %budget](%parameters, %packed, %scores) : [index, offset, offset, index](buffer, buffer, buffer)
     }
     scf.if %request_policy {
       kernel.launch @qwen38_sampling_partial_rows[%count, %budget](%count, %first, %epoch, %scores, %partial_scores, %partial_ids) : [index, index](index, index, buffer, buffer, buffer, buffer)
