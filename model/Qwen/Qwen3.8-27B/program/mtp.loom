@@ -5,6 +5,8 @@
 
 target.decl @qwen38_execution
 
+func.decl readonly @qwen38_prefill_launch_spans(%control: buffer, %span_capacity: index) -> (index)
+
 config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
 
 config.decl @runner.qwen38.verification_width : index
@@ -17,7 +19,7 @@ config.decl @runner.qwen38.span_capacity : %value: index where [range(%value, 1,
 
 config.decl @qwen38.packet_capacity : %value: index where [range(%value, 2, 2147483646), multiple_of(%value, 2)]
 
-command.decl @qwen38_attention_layer_prefill(%live_rows: index, %token_count: index, %schedule_token_count: index, %layer: index, %attention_ordinal: index, %verification_depth: index, %span_capacity: index, %mixed_inputs: index) launch(%parameters: buffer, %residual: buffer, %attention_cache: buffer, %control: buffer, %attention_output: buffer, %rows: buffer, %input_tokens: buffer) where [range(%token_count, 1, 512), range(%schedule_token_count, 1, 512), range(%layer, 0, 64), range(%attention_ordinal, 0, 15), range(%verification_depth, 0, 8), range(%span_capacity, 0, 2147483647), range(%mixed_inputs, 0, 1)]
+command.decl @qwen38_attention_layer_prefill(%live_rows: index, %live_spans: index, %token_count: index, %schedule_token_count: index, %layer: index, %attention_ordinal: index, %verification_depth: index, %span_capacity: index, %mixed_inputs: index) launch(%parameters: buffer, %residual: buffer, %attention_cache: buffer, %control: buffer, %attention_output: buffer, %rows: buffer, %input_tokens: buffer) where [range(%token_count, 1, 512), range(%schedule_token_count, 1, 512), range(%layer, 0, 64), range(%attention_ordinal, 0, 15), range(%verification_depth, 0, 8), range(%span_capacity, 0, 2147483647), range(%mixed_inputs, 0, 1)]
 
 command.decl @qwen38_output_projection_greedy(%token_count: index, %normalized_origin: offset, %output_origin: offset) launch(%parameters: buffer, %normalized: buffer, %token_id: buffer) where [range(%token_count, 1, 512)]
 
@@ -64,6 +66,7 @@ command.def public target(@qwen38_execution) @qwen38_mtp_warm() launch(%embeddin
   %tokens = config.get @runner.qwen38.prefill_token_count : index
   %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %spans = config.get @runner.qwen38.span_capacity : index
+  %live_spans = func.call readonly @qwen38_prefill_launch_spans(%epoch, %spans) : (buffer, index) -> (index)
   %capacity = index.constant 512 : index
   %hidden_size = index.constant 5120 : index
   %concat_size = index.constant 10240 : index
@@ -105,8 +108,8 @@ command.def public target(@qwen38_execution) @qwen38_mtp_warm() launch(%embeddin
     kernel.launch @qwen38_rmsnorm_f32_prefill[%tokens](%capacity, %epsilon, %target_residual, %target_norm, %normalized) : [index](index, f32, buffer, view<5120xf32>, buffer)
     kernel.launch @qwen38_input_embedding_f32[%tokens](%mixed_inputs, %epoch, %input_tokens, %embedding_weight, %embedding) : [index](index, buffer, buffer, view<874086400xi8>, buffer)
   }
-  kernel.launch @qwen38_mtp_shift_spans[%spans](%epoch, %normalized, %carry, %shifted) : [index](buffer, buffer, buffer, buffer)
-  kernel.launch @qwen38_mtp_save_carry[%spans](%epoch, %normalized, %carry) : [index](buffer, buffer, buffer)
+  kernel.launch @qwen38_mtp_shift_spans[%live_spans](%epoch, %normalized, %carry, %shifted) : [index](buffer, buffer, buffer, buffer)
+  kernel.launch @qwen38_mtp_save_carry[%live_spans](%epoch, %normalized, %carry) : [index](buffer, buffer, buffer)
   command.concurrent {
     kernel.launch @qwen38_mtp_rmsnorm_concat_embedding_f32_prefill[%tokens](%capacity, %epsilon, %embedding, %embedding_norm, %concat) : [index](index, f32, buffer, view<5120xf32>, buffer)
     kernel.launch @qwen38_mtp_rmsnorm_concat_hidden_f32_prefill[%tokens](%capacity, %epsilon, %shifted, %hidden_norm, %concat) : [index](index, f32, buffer, view<5120xf32>, buffer)
@@ -129,7 +132,7 @@ command.def public target(@qwen38_execution) @qwen38_mtp_warm() launch(%embeddin
     command.launch @qwen38_dispatch_linear_q8_0_f16_x128[%live_rows, %hidden_size, %key_value_size, %hidden_size, %key_value_size](%epoch, %attention_normalized, %value_weight, %value_projection) : [index, index, index, index, index](buffer, buffer, view<5570560xi8>, buffer)
   }
   %cache_origin = index.constant 0 : offset
-  kernel.launch @qwen38_attention_kv_prepare_spans[%live_rows, %spans](%mixed_inputs, %epoch, %rows, %cache_origin, %epsilon, %key_projection, %value_projection, %key_norm_weight, %cache, %input_tokens) : [index, index](index, buffer, buffer, offset, f32, buffer, buffer, view<256xf32>, buffer, buffer)
+  kernel.launch @qwen38_attention_kv_prepare_spans[%live_rows, %live_spans](%mixed_inputs, %epoch, %rows, %cache_origin, %epsilon, %key_projection, %value_projection, %key_norm_weight, %cache, %input_tokens) : [index, index](index, buffer, buffer, offset, f32, buffer, buffer, view<256xf32>, buffer, buffer)
   command.return
 }
 
@@ -140,6 +143,7 @@ command.def target(@qwen38_execution) @qwen38_mtp_draft() launch(%embedding_para
   %live_rows = index.cast %live_word : i32 to index
   %tokens = config.get @runner.qwen38.prefill_token_count : index
   %spans = config.get @runner.qwen38.span_capacity : index
+  %live_spans = func.call readonly @qwen38_prefill_launch_spans(%epoch, %spans) : (buffer, index) -> (index)
   %capacity = index.constant 512 : index
   %hidden_size = index.constant 5120 : index
   %concat_size = index.constant 10240 : index
@@ -169,7 +173,7 @@ command.def target(@qwen38_execution) @qwen38_mtp_draft() launch(%embedding_para
     kernel.launch @qwen38_mtp_rmsnorm_concat_hidden_f32_prefill[%tokens](%capacity, %epsilon, %hidden, %hidden_norm, %concat) : [index](index, f32, buffer, view<5120xf32>, buffer)
   }
   command.launch @qwen38_dispatch_linear_q8_0_f16_x128[%live_rows, %concat_size, %hidden_size, %concat_size, %hidden_size](%epoch, %concat, %embedding_hidden_weight, %residual) : [index, index, index, index, index](buffer, buffer, view<55705600xi8>, buffer)
-  command.launch @qwen38_attention_layer_prefill[%live_rows, %tokens, %tokens, %layer, %c0, %c0, %spans, %c0](%layer_parameters, %residual, %cache, %epoch, %attention, %rows, %input_tokens) : [index, index, index, index, index, index, index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.launch @qwen38_attention_layer_prefill[%live_rows, %live_spans, %tokens, %tokens, %layer, %c0, %c0, %spans, %c0](%layer_parameters, %residual, %cache, %epoch, %attention, %rows, %input_tokens) : [index, index, index, index, index, index, index, index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.launch @qwen38_rmsnorm_f32_prefill[%tokens](%capacity, %epsilon, %residual, %head_norm, %hidden) : [index](index, f32, buffer, view<5120xf32>, buffer)
   %origin = index.constant 0 : offset
   command.launch @qwen38_output_projection_greedy[%outputs, %origin, %origin](%output_parameters, %hidden, %output_tokens) : [index, offset, offset](buffer, buffer, buffer)
