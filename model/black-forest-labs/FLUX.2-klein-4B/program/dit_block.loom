@@ -1,0 +1,154 @@
+// Transformer blocks over the joint [text, image] sequence. Double-stream
+// blocks keep separate text and image weights and modulation; single-stream
+// blocks share one fused projection and one modulation row. Modulation
+// immediates are byte offsets of the step's shift1 (double) or shift (single)
+// row in the conditioning tables; scale, gate, and the second shift/scale/gate
+// follow at fixed 6144-byte strides.
+//
+// The first gated residual completes all reads of the original input, so
+// output may coincide with input; later stages use separate storage and the
+// final residual advances output in place. Lifetimes begin immediately before
+// each producer and end at the last use.
+
+config.decl @klein.text_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+config.decl @klein.image_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+command.decl @klein.joint_modulate(%text_offset: offset, %image_offset: offset) launch(%modulation: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.double_query(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.double_key(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.double_value(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.double_query_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer)
+
+command.decl @klein.double_key_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer)
+
+command.decl @klein.double_attention_output(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.double_feed_forward_input(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.double_feed_forward_output(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.double_swiglu() launch(%input: buffer, %output: buffer)
+
+command.decl @klein.single_query(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.single_key(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.single_value(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.single_query_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer)
+
+command.decl @klein.single_key_rotary(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %output: buffer)
+
+command.decl @klein.single_feed_forward_input(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.single_attention_output(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @klein.single_context() launch(%input: buffer, %output: buffer)
+
+command.decl @klein.single_swiglu() launch(%input: buffer, %output: buffer)
+
+command.decl @klein.dit_attention() launch(%query: buffer, %key: buffer, %value: buffer, %mask: buffer, %output: buffer)
+
+command.decl @klein.joint_gated_residual(%text_offset: offset, %image_offset: offset) launch(%modulation: buffer, %input: buffer, %update: buffer, %output: buffer)
+
+command.def public @klein.double_block(%layer: index, %text_offset: offset, %image_offset: offset) launch(%parameters: buffer, %modulation: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %output: buffer) {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %rows = index.add %text, %image : index
+  %hidden_stride = index.constant 6144 : offset
+  %feed_forward_stride = index.constant 36864 : offset
+  %activation_stride = index.constant 18432 : offset
+  %hidden_bytes = index.scale %rows, %hidden_stride : index, offset -> offset
+  %feed_forward_bytes = index.scale %rows, %feed_forward_stride : index, offset -> offset
+  %activation_bytes = index.scale %rows, %activation_stride : index, offset -> offset
+  %gate_bytes = index.constant 12288 : offset
+  %second_bytes = index.constant 18432 : offset
+  %second_gate_bytes = index.constant 30720 : offset
+  %text_gate = index.add %text_offset, %gate_bytes : offset
+  %image_gate = index.add %image_offset, %gate_bytes : offset
+  %text_second = index.add %text_offset, %second_bytes : offset
+  %image_second = index.add %image_offset, %second_bytes : offset
+  %text_second_gate = index.add %text_offset, %second_gate_bytes : offset
+  %image_second_gate = index.add %image_offset, %second_gate_bytes : offset
+  %normalized = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @klein.joint_modulate[%text_offset, %image_offset](%modulation, %input, %normalized) : [offset, offset](buffer, buffer, buffer)
+  %query = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %key = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %value = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.concurrent {
+    command.serial {
+      command.launch @klein.double_query[%layer](%parameters, %normalized, %query) : [index](buffer, buffer, buffer)
+      command.launch @klein.double_query_rotary[%layer](%parameters, %query, %cosine, %sine, %query) : [index](buffer, buffer, buffer, buffer, buffer)
+    }
+    command.serial {
+      command.launch @klein.double_key[%layer](%parameters, %normalized, %key) : [index](buffer, buffer, buffer)
+      command.launch @klein.double_key_rotary[%layer](%parameters, %key, %cosine, %sine, %key) : [index](buffer, buffer, buffer, buffer, buffer)
+    }
+    command.launch @klein.double_value[%layer](%parameters, %normalized, %value) : [index](buffer, buffer, buffer)
+  }
+  %context = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @klein.dit_attention(%query, %key, %value, %mask, %context) : (buffer, buffer, buffer, buffer, buffer)
+  %attention_output = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @klein.double_attention_output[%layer](%parameters, %context, %attention_output) : [index](buffer, buffer, buffer)
+  command.launch @klein.joint_gated_residual[%text_gate, %image_gate](%modulation, %input, %attention_output, %output) : [offset, offset](buffer, buffer, buffer, buffer)
+  %feed_forward_input = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @klein.joint_modulate[%text_second, %image_second](%modulation, %output, %feed_forward_input) : [offset, offset](buffer, buffer, buffer)
+  %feed_forward_hidden = buffer.alloca<global> align(256) %feed_forward_bytes : buffer
+  command.launch @klein.double_feed_forward_input[%layer](%parameters, %feed_forward_input, %feed_forward_hidden) : [index](buffer, buffer, buffer)
+  %activated = buffer.alloca<global> align(256) %activation_bytes : buffer
+  command.launch @klein.double_swiglu(%feed_forward_hidden, %activated) : (buffer, buffer)
+  %feed_forward_output = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @klein.double_feed_forward_output[%layer](%parameters, %activated, %feed_forward_output) : [index](buffer, buffer, buffer)
+  command.launch @klein.joint_gated_residual[%text_second_gate, %image_second_gate](%modulation, %output, %feed_forward_output, %output) : [offset, offset](buffer, buffer, buffer, buffer)
+  command.return
+}
+
+// The MLP input projection reads the same normalized rows as Q/K/V and runs
+// beside them. The attention context and the SwiGLU product fill disjoint
+// columns of one [attention 3072 | SwiGLU 9216] row so a single output
+// projection covers both.
+command.def public @klein.single_block(%layer: index, %offset: offset) launch(%parameters: buffer, %modulation: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %output: buffer) {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %rows = index.add %text, %image : index
+  %hidden_stride = index.constant 6144 : offset
+  %feed_forward_stride = index.constant 36864 : offset
+  %concat_stride = index.constant 24576 : offset
+  %hidden_bytes = index.scale %rows, %hidden_stride : index, offset -> offset
+  %feed_forward_bytes = index.scale %rows, %feed_forward_stride : index, offset -> offset
+  %concat_bytes = index.scale %rows, %concat_stride : index, offset -> offset
+  %gate_bytes = index.constant 12288 : offset
+  %gate = index.add %offset, %gate_bytes : offset
+  %normalized = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @klein.joint_modulate[%offset, %offset](%modulation, %input, %normalized) : [offset, offset](buffer, buffer, buffer)
+  %query = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %key = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %value = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %feed_forward_hidden = buffer.alloca<global> align(256) %feed_forward_bytes : buffer
+  command.concurrent {
+    command.serial {
+      command.launch @klein.single_query[%layer](%parameters, %normalized, %query) : [index](buffer, buffer, buffer)
+      command.launch @klein.single_query_rotary[%layer](%parameters, %query, %cosine, %sine, %query) : [index](buffer, buffer, buffer, buffer, buffer)
+    }
+    command.serial {
+      command.launch @klein.single_key[%layer](%parameters, %normalized, %key) : [index](buffer, buffer, buffer)
+      command.launch @klein.single_key_rotary[%layer](%parameters, %key, %cosine, %sine, %key) : [index](buffer, buffer, buffer, buffer, buffer)
+    }
+    command.launch @klein.single_value[%layer](%parameters, %normalized, %value) : [index](buffer, buffer, buffer)
+    command.launch @klein.single_feed_forward_input[%layer](%parameters, %normalized, %feed_forward_hidden) : [index](buffer, buffer, buffer)
+  }
+  %context = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @klein.dit_attention(%query, %key, %value, %mask, %context) : (buffer, buffer, buffer, buffer, buffer)
+  %concat = buffer.alloca<global> align(256) %concat_bytes : buffer
+  command.launch @klein.single_context(%context, %concat) : (buffer, buffer)
+  command.launch @klein.single_swiglu(%feed_forward_hidden, %concat) : (buffer, buffer)
+  %attention_output = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @klein.single_attention_output[%layer](%parameters, %concat, %attention_output) : [index](buffer, buffer, buffer)
+  command.launch @klein.joint_gated_residual[%gate, %gate](%modulation, %input, %attention_output, %output) : [offset, offset](buffer, buffer, buffer, buffer)
+  command.return
+}

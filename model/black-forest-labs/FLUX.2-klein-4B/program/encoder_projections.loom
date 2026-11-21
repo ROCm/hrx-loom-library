@@ -1,0 +1,179 @@
+// Original BF16 text-encoder attention and feed-forward projections. Public
+// commands select the layer's named checkpoint tensors and bind each concrete
+// contraction shape to the shared 64x64 tiled BF16 projection. Every encoder
+// shape meets the tiled contract: inputs are multiples of 256 and outputs are
+// multiples of 64.
+
+config.decl @klein.text_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+amdgpu.target<gfx11-generic> @encoder_projection_wave32 {subgroup_size = 32}
+
+template.decl @projection.linear_tiled_bf16(%rows: index, %inputs: index, %outputs: index, %row_tile_group_size: index, %output_layout: encoding<layout>, %input: buffer, %weight: buffer, %output: buffer)
+
+template.decl @klein.encoder_row_group_size(%rows: index) -> (index)
+
+// The default 512-token prompt fits in eight row tiles, so the whole height
+// stays resident and each weight panel is read once. Long prompts fall back to
+// bounded row groups to shorten the revisited input panel.
+template.def<@klein.encoder_row_group_size> device @encoder_row_group_size(%rows: index) -> (index) {
+  %minimum_grouped_rows = index.constant 2048 : index
+  %use_grouped = index.cmp uge, %rows, %minimum_grouped_rows : index
+  %group_size = scf.if %use_grouped -> (index) {
+    %group = index.constant 8 : index
+    scf.yield %group : index
+  } else {
+    %rounding = index.constant 63 : index
+    %tile = index.constant 64 : index
+    %padded_rows = index.add %rows, %rounding : index
+    %row_tiles = index.div %padded_rows, %tile : index
+    scf.yield %row_tiles : index
+  }
+  template.return %group_size : index
+}
+
+// attention query
+kernel.def target(@encoder_projection_wave32) @encoder_linear_2560_4096() {
+  %rows = config.get @klein.text_tokens : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %rows, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 64 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @klein.text_tokens : index
+  %inputs = index.constant 2560 : index
+  %outputs = index.constant 4096 : index
+  %group_size = template.apply<@klein.encoder_row_group_size>(%rows) : (index) -> (index)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.linear_tiled_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  kernel.return
+}
+
+// grouped-query key and value
+kernel.def target(@encoder_projection_wave32) @encoder_linear_2560_1024() {
+  %rows = config.get @klein.text_tokens : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %rows, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 16 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @klein.text_tokens : index
+  %inputs = index.constant 2560 : index
+  %outputs = index.constant 1024 : index
+  %group_size = template.apply<@klein.encoder_row_group_size>(%rows) : (index) -> (index)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.linear_tiled_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  kernel.return
+}
+
+// attention output
+kernel.def target(@encoder_projection_wave32) @encoder_linear_4096_2560() {
+  %rows = config.get @klein.text_tokens : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %rows, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 40 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @klein.text_tokens : index
+  %inputs = index.constant 4096 : index
+  %outputs = index.constant 2560 : index
+  %group_size = template.apply<@klein.encoder_row_group_size>(%rows) : (index) -> (index)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.linear_tiled_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  kernel.return
+}
+
+// feed-forward gate and up
+kernel.def target(@encoder_projection_wave32) @encoder_linear_2560_9728() {
+  %rows = config.get @klein.text_tokens : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %rows, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 152 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @klein.text_tokens : index
+  %inputs = index.constant 2560 : index
+  %outputs = index.constant 9728 : index
+  %group_size = template.apply<@klein.encoder_row_group_size>(%rows) : (index) -> (index)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.linear_tiled_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  kernel.return
+}
+
+// feed-forward down
+kernel.def target(@encoder_projection_wave32) @encoder_linear_9728_2560() {
+  %rows = config.get @klein.text_tokens : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %rows, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 40 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @klein.text_tokens : index
+  %inputs = index.constant 9728 : index
+  %outputs = index.constant 2560 : index
+  %group_size = template.apply<@klein.encoder_row_group_size>(%rows) : (index) -> (index)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.linear_tiled_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  kernel.return
+}
+
+command.def public @klein.encoder_query(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "model.layers.{}.self_attn.q_proj.weight"[%layer] : view<4096x2560xbf16>
+  kernel.launch @encoder_linear_2560_4096(%input, %weight, %output) : (buffer, view<4096x2560xbf16>, buffer)
+  command.return
+}
+
+command.def public @klein.encoder_key(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "model.layers.{}.self_attn.k_proj.weight"[%layer] : view<1024x2560xbf16>
+  kernel.launch @encoder_linear_2560_1024(%input, %weight, %output) : (buffer, view<1024x2560xbf16>, buffer)
+  command.return
+}
+
+command.def public @klein.encoder_value(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "model.layers.{}.self_attn.v_proj.weight"[%layer] : view<1024x2560xbf16>
+  kernel.launch @encoder_linear_2560_1024(%input, %weight, %output) : (buffer, view<1024x2560xbf16>, buffer)
+  command.return
+}
+
+command.def public @klein.encoder_attention_output(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "model.layers.{}.self_attn.o_proj.weight"[%layer] : view<2560x4096xbf16>
+  kernel.launch @encoder_linear_4096_2560(%input, %weight, %output) : (buffer, view<2560x4096xbf16>, buffer)
+  command.return
+}
+
+command.def public @klein.encoder_feed_forward_gate(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "model.layers.{}.mlp.gate_proj.weight"[%layer] : view<9728x2560xbf16>
+  kernel.launch @encoder_linear_2560_9728(%input, %weight, %output) : (buffer, view<9728x2560xbf16>, buffer)
+  command.return
+}
+
+command.def public @klein.encoder_feed_forward_up(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "model.layers.{}.mlp.up_proj.weight"[%layer] : view<9728x2560xbf16>
+  kernel.launch @encoder_linear_2560_9728(%input, %weight, %output) : (buffer, view<9728x2560xbf16>, buffer)
+  command.return
+}
+
+command.def public @klein.encoder_feed_forward_down(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "model.layers.{}.mlp.down_proj.weight"[%layer] : view<2560x9728xbf16>
+  kernel.launch @encoder_linear_9728_2560(%input, %weight, %output) : (buffer, view<2560x9728xbf16>, buffer)
+  command.return
+}

@@ -1,0 +1,152 @@
+// Timestep conditioning for every denoising step, formed once per request.
+// Request times are F32 on the 0..1000 axis the transformer embeds; the
+// sinusoid reads them in F32, takes cosines then sines, and rounds once to
+// BF16. The embedder MLP (Linear, SiLU, Linear) yields one 256-wide adaLN row
+// per time. Transformer and noise-refiner blocks project that row directly;
+// the final layer projects its SiLU. Rows are padded to sixteen; padded rows
+// embed time zero and are storage, not additional steps.
+//
+// Modulation table layout, BF16:
+//
+//   block b at b*491520: [16 time rows][15360]   layers.b for b < 30,
+//                                                noise_refiner.(b-30) for 30, 31
+//   final at 15728640:   [16 time rows][3840]
+//
+// A block row holds scale_msa, gate_msa, scale_mlp, and gate_mlp, 3840 each,
+// unactivated; the blocks apply 1 + scale and tanh.
+
+config.decl @zimage.time_count : %value: index where [range(%value, 1, 17)]
+
+amdgpu.target<gfx11-generic> @zimage_time_wave32 {subgroup_size = 32}
+
+template.decl @activation.silu_bf16(%value: bf16) -> (bf16)
+
+template.decl @zimage.time_silu_elements(%elements: index, %input: buffer, %output: buffer)
+
+command.decl @zimage.time_linear_1() launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.time_linear_2() launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.time_layer_modulation(%layer: index, %output_offset: offset) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.time_refiner_modulation(%layer: index, %output_offset: offset) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+command.decl @zimage.time_output_modulation(%output_offset: offset) launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+// One 256-thread workgroup per padded time row; lane c owns feature c.
+kernel.def target(@zimage_time_wave32) @zimage_time_sinusoidal() {
+  %rows = index.constant 16 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %output: buffer) {
+  %count = config.get @zimage.time_count : index
+  %rows = index.constant 16 : index
+  %origin = index.constant 0 : offset
+  %row = kernel.workgroup.id<x> : index
+  %channel = kernel.workitem.id<x> : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%count]xf32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x256xbf16>
+  %valid = index.cmp ult, %row, %count : index
+  %time = scf.if %valid -> (f32) {
+    %stored = view.load %input_view[%row] : view<[%count]xf32> -> f32
+    scf.yield %stored : f32
+  } else {
+    %padding_time = scalar.constant 0.0 : f32
+    scf.yield %padding_time : f32
+  }
+  %half_width = index.constant 128 : index
+  %negative_log_period = scalar.constant -9.2103403719761836 : f32
+  %frequency_index = index.rem %channel, %half_width : index
+  %frequency_i32 = index.cast %frequency_index : index to i32
+  %frequency_f32 = scalar.uitofp %frequency_i32 : i32 to f32
+  %half_f32 = scalar.constant 128.0 : f32
+  %scaled_index = scalar.mulf %negative_log_period, %frequency_f32 : f32
+  %exponent = scalar.divf %scaled_index, %half_f32 : f32
+  %frequency = scalar.expf<afn> %exponent : f32
+  %angle = scalar.mulf %time, %frequency : f32
+  %cosine_half = index.cmp ult, %channel, %half_width : index
+  %value = scf.if %cosine_half -> (f32) {
+    %cosine = scalar.cosf<afn> %angle : f32
+    scf.yield %cosine : f32
+  } else {
+    %sine = scalar.sinf<afn> %angle : f32
+    scf.yield %sine : f32
+  }
+  %feature = scalar.fptrunc %value : f32 to bf16
+  view.store %feature, %output_view[%row, %channel] : bf16, view<[%rows]x256xbf16>
+  kernel.return
+}
+
+// Flat BF16 SiLU; each element reads only its own position.
+template.def<@zimage.time_silu_elements> device @zimage_time_silu_elements(%elements: index, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %element = index.madd %group, %threads, %lane : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
+  %value = view.load %input_view[%element] : view<[%elements]xbf16> -> bf16
+  %result = template.apply<@activation.silu_bf16>(%value) : (bf16) -> (bf16)
+  view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  template.return
+}
+
+// Embedder hidden rows, 16 x 1024.
+kernel.def target(@zimage_time_wave32) @zimage_time_silu_hidden() {
+  %groups = index.constant 64 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %output: buffer) {
+  %elements = index.constant 16384 : index
+  template.apply<@zimage.time_silu_elements>(%elements, %input, %output) : (index, buffer, buffer)
+  kernel.return
+}
+
+// adaLN rows, 16 x 256, for the final-layer modulation only.
+kernel.def target(@zimage_time_wave32) @zimage_time_silu_adaln() {
+  %groups = index.constant 16 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %output: buffer) {
+  %elements = index.constant 4096 : index
+  template.apply<@zimage.time_silu_elements>(%elements, %input, %output) : (index, buffer, buffer)
+  kernel.return
+}
+
+// Output is the 15851520-byte modulation table above. Times are F32[time_count].
+command.def public @zimage.time_conditioning() launch(%parameters: buffer, %times: buffer, %output: buffer) {
+  %feature_bytes = index.constant 8192 : offset
+  %hidden_bytes = index.constant 32768 : offset
+  %block_bytes = index.constant 491520 : offset
+  %refiner_base = index.constant 14745600 : offset
+  %final_offset = index.constant 15728640 : offset
+  %features = buffer.alloca<global> align(256) %feature_bytes : buffer
+  %hidden = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %hidden_activated = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  %adaln = buffer.alloca<global> align(256) %feature_bytes : buffer
+  %adaln_activated = buffer.alloca<global> align(256) %feature_bytes : buffer
+  kernel.launch @zimage_time_sinusoidal(%times, %features) : (buffer, buffer)
+  command.launch @zimage.time_linear_1(%parameters, %features, %hidden) : (buffer, buffer, buffer)
+  kernel.launch @zimage_time_silu_hidden(%hidden, %hidden_activated) : (buffer, buffer)
+  command.launch @zimage.time_linear_2(%parameters, %hidden_activated, %adaln) : (buffer, buffer, buffer)
+  kernel.launch @zimage_time_silu_adaln(%adaln, %adaln_activated) : (buffer, buffer)
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %layers = index.constant 30 : index
+  %refiners = index.constant 2 : index
+  scf.for %layer = [%c0 to %layers step %c1] unroll {
+    %layer_offset = index.scale %layer, %block_bytes : index, offset -> offset
+    command.launch @zimage.time_layer_modulation[%layer, %layer_offset](%parameters, %adaln, %output) : [index, offset](buffer, buffer, buffer)
+  }
+  scf.for %refiner = [%c0 to %refiners step %c1] unroll {
+    %refiner_row = index.scale %refiner, %block_bytes : index, offset -> offset
+    %refiner_offset = index.add %refiner_base, %refiner_row : offset
+    command.launch @zimage.time_refiner_modulation[%refiner, %refiner_offset](%parameters, %adaln, %output) : [index, offset](buffer, buffer, buffer)
+  }
+  command.launch @zimage.time_output_modulation[%final_offset](%parameters, %adaln_activated, %output) : [offset](buffer, buffer, buffer)
+  command.return
+}

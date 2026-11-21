@@ -12,6 +12,9 @@ licenses, execution limits, and a complete fetch-to-request workflow.
 | [Qwen3.8 Flash-Next](Qwen/Qwen3.8-Flash-Next/OVERVIEW.md) | Mixture-of-experts text generation with optional multi-token prediction. |
 | [Qwen3 Embedding 0.6B](Qwen/Qwen3-Embedding-0.6B/OVERVIEW.md) | Text embeddings on the Strix Halo NPU. |
 | [Krea 2 Turbo](krea/Krea-2-Turbo/OVERVIEW.md) | Image generation with BF16 or INT8 parameters and request-selected adapters. |
+| [FLUX.2 [klein] 4B](black-forest-labs/FLUX.2-klein-4B/OVERVIEW.md) | Four-step image generation with BF16 parameters. |
+| [Z-Image-Turbo](Tongyi-MAI/Z-Image-Turbo/OVERVIEW.md) | Eight-step image generation with BF16 parameters and a single-stream transformer. |
+| [Real-ESRGAN x4plus](xinntao/Real-ESRGAN-x4plus/OVERVIEW.md) | Four-times image upscaling with the original F32 checkpoint. |
 
 Support applies to the variants and targets described by each implementation.
 The model card names the exact compatible files; other files or quantizations

@@ -1,0 +1,1138 @@
+// Original BF16 transformer projections. Time, embedding, and output leaves add
+// their BF16 bias to the F32 accumulator before the single BF16 rounding; the
+// attention and feed-forward leaves have no bias. Image and text leaves cover
+// the noise refiner (image rows), the context refiner (caption rows), and the
+// unified layers, whose [image, caption] rows share one weight. Time leaves run
+// over sixteen padded timestep rows; padded rows are storage, not extra steps.
+// Each leaf fixes its contraction shape before applying the shared arithmetic.
+
+config.decl @zimage.image_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+config.decl @zimage.text_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+amdgpu.target<gfx11-generic> @tensor_projection_rdna3
+
+amdgpu.target<gfx11-generic> @dit_projection_wave32 {subgroup_size = 32}
+
+template.decl @projection.linear_bf16(%rows: index, %inputs: index, %outputs: index, %row_origin: index, %output_origin: index, %input: buffer, %weight: buffer) -> (vector<8xf32>)
+
+template.decl @projection.bias_storage_bf16(%outputs: index, %output_origin: index, %weight_is_bf16: i1, %result: vector<8xf32>, %bias: buffer) -> (vector<8xf32>)
+
+template.decl @projection.store_bf16(%rows: index, %outputs: index, %row_origin: index, %output_origin: index, %output_layout: encoding<layout>, %result: vector<8xf32>, %output: buffer)
+
+amdgpu.target<gfx11-generic> @tensor_projection_tiled_rdna3
+
+template.decl @projection.linear_tiled_bf16(%rows: index, %inputs: index, %outputs: index, %row_tile_group_size: index, %output_layout: encoding<layout>, %input: buffer, %weight: buffer, %output: buffer)
+
+template.decl @zimage.projection_row_group_size(%rows: index, %minimum_grouped_rows: index) -> (index)
+
+// Whole-height traversal keeps input reuse at small row counts; bounded row
+// groups shorten the revisited input panel once the sequence is long.
+template.def<@zimage.projection_row_group_size> device @dit_projection_row_group_size(%rows: index, %minimum_grouped_rows: index) -> (index) {
+  %use_grouped = index.cmp uge, %rows, %minimum_grouped_rows : index
+  %group_size = scf.if %use_grouped -> (index) {
+    %group = index.constant 8 : index
+    scf.yield %group : index
+  } else {
+    %rounding = index.constant 63 : index
+    %tile = index.constant 64 : index
+    %padded_rows = index.add %rows, %rounding : index
+    %row_tiles = index.div %padded_rows, %tile : index
+    scf.yield %row_tiles : index
+  }
+  template.return %group_size : index
+}
+
+template.decl @zimage.caption_tile_zero(%rows: index, %outputs: index, %output_layout: encoding<layout>, %output: buffer)
+
+// Zero one whole-height 64x64 caption tile with the tiled helper's wave
+// ownership: eight waves own a 4x2 grid of 16x32 outputs. Rows are a multiple
+// of 32, so every wave owns a complete fragment or no output.
+template.def<@zimage.caption_tile_zero> target(@tensor_projection_tiled_rdna3) requires [#target.subgroup.size<32>] @caption_tile_zero(%rows: index, %outputs: index, %output_layout: encoding<layout>, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %c2 = index.constant 2 : index
+  %tile = index.constant 16 : index
+  %wave_outputs = index.constant 32 : index
+  %workgroup_tile = index.constant 64 : index
+  %row_tile = kernel.workgroup.id<x> : index
+  %output_tile = kernel.workgroup.id<y> : index
+  %subgroup = kernel.subgroup.id : index
+  %wave_row_group = index.div %subgroup, %c2 : index
+  %wave_output_group = index.rem %subgroup, %c2 : index
+  %wave_row = index.mul %wave_row_group, %tile : index
+  %wave_output = index.mul %wave_output_group, %wave_outputs : index
+  %row_origin = index.mul %row_tile, %workgroup_tile : index
+  %output_origin = index.mul %output_tile, %workgroup_tile : index
+  %result_row = index.add %row_origin, %wave_row : index
+  %result_column0 = index.add %output_origin, %wave_output : index
+  %result_column1 = index.add %result_column0, %tile : index
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%outputs]xbf16, %output_layout>
+  %c0_0 = vector.splatf 0.0 : vector<8xf32>
+  %zeros = vector.fragment<init> %c0_0 shape [%tile, %tile] : vector<8xf32>
+  %result_valid = index.cmp ult, %result_row, %rows : index
+  scf.if %result_valid {
+    vector.fragment.store<result> %zeros, %output_view[%result_row, %result_column0] shape [%tile, %tile] : vector<8xf32>, view<[%rows]x[%outputs]xbf16, %output_layout>
+    vector.fragment.store<result> %zeros, %output_view[%result_row, %result_column1] shape [%tile, %tile] : vector<8xf32>, view<[%rows]x[%outputs]xbf16, %output_layout>
+  }
+  template.return
+}
+
+amdgpu.target<gfx11-generic> @tensor_projection_wide_rdna3
+
+template.decl @projection.linear_wide_bf16(%rows: index, %inputs: index, %outputs: index, %row_tile_group_size: index, %output_layout: encoding<layout>, %input: buffer, %weight: buffer, %output: buffer)
+
+// t_embedder.mlp.0
+kernel.def target(@dit_projection_wave32) @zimage_time_linear_256_1024() {
+  %rows = index.constant 16 : index
+  %tile = index.constant 16 : index
+  %row_tiles = index.div %rows, %tile : index
+  %output_tiles = index.constant 64 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %rows = index.constant 16 : index
+  %inputs = index.constant 256 : index
+  %outputs = index.constant 1024 : index
+  %projection_tile = index.constant 16 : index
+  %row_tile_id = kernel.workgroup.id<x> : index
+  %output_tile = kernel.workgroup.id<y> : index
+  %row_origin = index.mul %row_tile_id, %projection_tile : index
+  %output_origin = index.mul %output_tile, %projection_tile : index
+  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+  %weight_is_bf16 = scalar.constant true : i1
+  %biased = template.apply<@projection.bias_storage_bf16>(%outputs, %output_origin, %weight_is_bf16, %result, %bias) : (index, index, i1, vector<8xf32>, buffer) -> (vector<8xf32>)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %biased, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  kernel.return
+}
+
+// t_embedder.mlp.2
+kernel.def target(@dit_projection_wave32) @zimage_time_linear_1024_256() {
+  %rows = index.constant 16 : index
+  %tile = index.constant 16 : index
+  %row_tiles = index.div %rows, %tile : index
+  %output_tiles = index.constant 16 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %rows = index.constant 16 : index
+  %inputs = index.constant 1024 : index
+  %outputs = index.constant 256 : index
+  %projection_tile = index.constant 16 : index
+  %row_tile_id = kernel.workgroup.id<x> : index
+  %output_tile = kernel.workgroup.id<y> : index
+  %row_origin = index.mul %row_tile_id, %projection_tile : index
+  %output_origin = index.mul %output_tile, %projection_tile : index
+  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+  %weight_is_bf16 = scalar.constant true : i1
+  %biased = template.apply<@projection.bias_storage_bf16>(%outputs, %output_origin, %weight_is_bf16, %result, %bias) : (index, index, i1, vector<8xf32>, buffer) -> (vector<8xf32>)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %biased, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  kernel.return
+}
+
+// adaLN_modulation of the noise refiner and main layers
+kernel.def target(@dit_projection_wave32) @zimage_time_linear_256_15360() {
+  %rows = index.constant 16 : index
+  %tile = index.constant 16 : index
+  %row_tiles = index.div %rows, %tile : index
+  %output_tiles = index.constant 960 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %rows = index.constant 16 : index
+  %inputs = index.constant 256 : index
+  %outputs = index.constant 15360 : index
+  %projection_tile = index.constant 16 : index
+  %row_tile_id = kernel.workgroup.id<x> : index
+  %output_tile = kernel.workgroup.id<y> : index
+  %row_origin = index.mul %row_tile_id, %projection_tile : index
+  %output_origin = index.mul %output_tile, %projection_tile : index
+  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+  %weight_is_bf16 = scalar.constant true : i1
+  %biased = template.apply<@projection.bias_storage_bf16>(%outputs, %output_origin, %weight_is_bf16, %result, %bias) : (index, index, i1, vector<8xf32>, buffer) -> (vector<8xf32>)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %biased, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  kernel.return
+}
+
+// final_layer.adaLN_modulation
+kernel.def target(@dit_projection_wave32) @zimage_time_linear_256_3840() {
+  %rows = index.constant 16 : index
+  %tile = index.constant 16 : index
+  %row_tiles = index.div %rows, %tile : index
+  %output_tiles = index.constant 240 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %rows = index.constant 16 : index
+  %inputs = index.constant 256 : index
+  %outputs = index.constant 3840 : index
+  %projection_tile = index.constant 16 : index
+  %row_tile_id = kernel.workgroup.id<x> : index
+  %output_tile = kernel.workgroup.id<y> : index
+  %row_origin = index.mul %row_tile_id, %projection_tile : index
+  %output_origin = index.mul %output_tile, %projection_tile : index
+  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+  %weight_is_bf16 = scalar.constant true : i1
+  %biased = template.apply<@projection.bias_storage_bf16>(%outputs, %output_origin, %weight_is_bf16, %result, %bias) : (index, index, i1, vector<8xf32>, buffer) -> (vector<8xf32>)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %biased, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  kernel.return
+}
+
+// x_embedder
+kernel.def target(@dit_projection_wave32) @zimage_image_linear_64_3840() {
+  %rows = config.get @zimage.image_tokens : index
+  %tile = index.constant 16 : index
+  %row_tiles = index.div %rows, %tile : index
+  %output_tiles = index.constant 240 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %rows = config.get @zimage.image_tokens : index
+  %inputs = index.constant 64 : index
+  %outputs = index.constant 3840 : index
+  %projection_tile = index.constant 16 : index
+  %row_tile_id = kernel.workgroup.id<x> : index
+  %output_tile = kernel.workgroup.id<y> : index
+  %row_origin = index.mul %row_tile_id, %projection_tile : index
+  %output_origin = index.mul %output_tile, %projection_tile : index
+  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+  %weight_is_bf16 = scalar.constant true : i1
+  %biased = template.apply<@projection.bias_storage_bf16>(%outputs, %output_origin, %weight_is_bf16, %result, %bias) : (index, index, i1, vector<8xf32>, buffer) -> (vector<8xf32>)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %biased, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  kernel.return
+}
+
+// cap_embedder
+kernel.def target(@dit_projection_wave32) @zimage_text_linear_2560_3840() {
+  %rows = config.get @zimage.text_tokens : index
+  %tile = index.constant 16 : index
+  %row_tiles = index.div %rows, %tile : index
+  %output_tiles = index.constant 240 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %inputs = index.constant 2560 : index
+  %outputs = index.constant 3840 : index
+  %projection_tile = index.constant 16 : index
+  %row_tile_id = kernel.workgroup.id<x> : index
+  %output_tile = kernel.workgroup.id<y> : index
+  %row_origin = index.mul %row_tile_id, %projection_tile : index
+  %output_origin = index.mul %output_tile, %projection_tile : index
+  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+  %weight_is_bf16 = scalar.constant true : i1
+  %biased = template.apply<@projection.bias_storage_bf16>(%outputs, %output_origin, %weight_is_bf16, %result, %bias) : (index, index, i1, vector<8xf32>, buffer) -> (vector<8xf32>)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %biased, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  kernel.return
+}
+
+// final_layer.linear
+kernel.def target(@dit_projection_wave32) @zimage_image_linear_3840_64() {
+  %rows = config.get @zimage.image_tokens : index
+  %tile = index.constant 16 : index
+  %row_tiles = index.div %rows, %tile : index
+  %output_tiles = index.constant 4 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %bias: buffer, %output: buffer) {
+  %rows = config.get @zimage.image_tokens : index
+  %inputs = index.constant 3840 : index
+  %outputs = index.constant 64 : index
+  %projection_tile = index.constant 16 : index
+  %row_tile_id = kernel.workgroup.id<x> : index
+  %output_tile = kernel.workgroup.id<y> : index
+  %row_origin = index.mul %row_tile_id, %projection_tile : index
+  %output_origin = index.mul %output_tile, %projection_tile : index
+  %result = template.apply<@projection.linear_bf16>(%rows, %inputs, %outputs, %row_origin, %output_origin, %input, %weight) : (index, index, index, index, index, buffer, buffer) -> (vector<8xf32>)
+  %weight_is_bf16 = scalar.constant true : i1
+  %biased = template.apply<@projection.bias_storage_bf16>(%outputs, %output_origin, %weight_is_bf16, %result, %bias) : (index, index, i1, vector<8xf32>, buffer) -> (vector<8xf32>)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.store_bf16>(%rows, %outputs, %row_origin, %output_origin, %output_layout, %biased, %output) : (index, index, index, index, encoding<layout>, vector<8xf32>, buffer)
+  kernel.return
+}
+
+// image query, key, and attention output
+kernel.def target(@dit_projection_wave32) @zimage_image_linear_3840_3840() {
+  %rows = config.get @zimage.image_tokens : index
+  %minimum_wide_rows = index.constant 2048 : index
+  %wide_row_tile = index.constant 256 : index
+  %long_enough = index.cmp uge, %rows, %minimum_wide_rows : index
+  %row_remainder = index.rem %rows, %wide_row_tile : index
+  %c0_rows = index.constant 0 : index
+  %whole_tiles = index.cmp eq, %row_remainder, %c0_rows : index
+  %wide = scalar.andi %long_enough, %whole_tiles : i1
+  %tiled_row_tile = index.constant 64 : index
+  %workgroup_tile = scf.select %wide, %wide_row_tile, %tiled_row_tile : index
+  %c1 = index.constant 1 : index
+  %row_rounding = index.sub %workgroup_tile, %c1 : index
+  %padded_rows = index.add %rows, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %wide_output_tiles = index.constant 30 : index
+  %tiled_output_tiles = index.constant 60 : index
+  %output_tiles = scf.select %wide, %wide_output_tiles, %tiled_output_tiles : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @zimage.image_tokens : index
+  %inputs = index.constant 3840 : index
+  %outputs = index.constant 3840 : index
+  %output_layout = encoding.layout.dense : encoding<layout>
+  %minimum_wide_rows = index.constant 2048 : index
+  %wide_row_tile = index.constant 256 : index
+  %long_enough = index.cmp uge, %rows, %minimum_wide_rows : index
+  %row_remainder = index.rem %rows, %wide_row_tile : index
+  %c0_rows = index.constant 0 : index
+  %whole_tiles = index.cmp eq, %row_remainder, %c0_rows : index
+  %wide = scalar.andi %long_enough, %whole_tiles : i1
+  scf.if %wide {
+    %group_size = index.constant 4 : index
+    template.apply<@projection.linear_wide_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  } else {
+    %minimum_grouped_rows = index.constant 2048 : index
+    %group_size = template.apply<@zimage.projection_row_group_size>(%rows, %minimum_grouped_rows) : (index, index) -> (index)
+    template.apply<@projection.linear_tiled_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  }
+  kernel.return
+}
+
+// caption query, key, and attention output
+kernel.def target(@dit_projection_wave32) @zimage_text_linear_3840_3840() {
+  %rows = config.get @zimage.text_tokens : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %rows, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 60 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %inputs = index.constant 3840 : index
+  %outputs = index.constant 3840 : index
+  %minimum_grouped_rows = index.constant 2048 : index
+  %group_size = template.apply<@zimage.projection_row_group_size>(%rows, %minimum_grouped_rows) : (index, index) -> (index)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.linear_tiled_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  kernel.return
+}
+
+// image feed-forward gate and up
+kernel.def target(@dit_projection_wave32) @zimage_image_linear_3840_10240() {
+  %rows = config.get @zimage.image_tokens : index
+  %minimum_wide_rows = index.constant 2048 : index
+  %wide_row_tile = index.constant 256 : index
+  %long_enough = index.cmp uge, %rows, %minimum_wide_rows : index
+  %row_remainder = index.rem %rows, %wide_row_tile : index
+  %c0_rows = index.constant 0 : index
+  %whole_tiles = index.cmp eq, %row_remainder, %c0_rows : index
+  %wide = scalar.andi %long_enough, %whole_tiles : i1
+  %tiled_row_tile = index.constant 64 : index
+  %workgroup_tile = scf.select %wide, %wide_row_tile, %tiled_row_tile : index
+  %c1 = index.constant 1 : index
+  %row_rounding = index.sub %workgroup_tile, %c1 : index
+  %padded_rows = index.add %rows, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %wide_output_tiles = index.constant 80 : index
+  %tiled_output_tiles = index.constant 160 : index
+  %output_tiles = scf.select %wide, %wide_output_tiles, %tiled_output_tiles : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @zimage.image_tokens : index
+  %inputs = index.constant 3840 : index
+  %outputs = index.constant 10240 : index
+  %output_layout = encoding.layout.dense : encoding<layout>
+  %minimum_wide_rows = index.constant 2048 : index
+  %wide_row_tile = index.constant 256 : index
+  %long_enough = index.cmp uge, %rows, %minimum_wide_rows : index
+  %row_remainder = index.rem %rows, %wide_row_tile : index
+  %c0_rows = index.constant 0 : index
+  %whole_tiles = index.cmp eq, %row_remainder, %c0_rows : index
+  %wide = scalar.andi %long_enough, %whole_tiles : i1
+  scf.if %wide {
+    %group_size = index.constant 4 : index
+    template.apply<@projection.linear_wide_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  } else {
+    %minimum_grouped_rows = index.constant 2048 : index
+    %group_size = template.apply<@zimage.projection_row_group_size>(%rows, %minimum_grouped_rows) : (index, index) -> (index)
+    template.apply<@projection.linear_tiled_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  }
+  kernel.return
+}
+
+// caption feed-forward gate and up
+kernel.def target(@dit_projection_wave32) @zimage_text_linear_3840_10240() {
+  %rows = config.get @zimage.text_tokens : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %rows, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 160 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %inputs = index.constant 3840 : index
+  %outputs = index.constant 10240 : index
+  %minimum_grouped_rows = index.constant 2048 : index
+  %group_size = template.apply<@zimage.projection_row_group_size>(%rows, %minimum_grouped_rows) : (index, index) -> (index)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.linear_tiled_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  kernel.return
+}
+
+// image feed-forward down
+kernel.def target(@dit_projection_wave32) @zimage_image_linear_10240_3840() {
+  %rows = config.get @zimage.image_tokens : index
+  %minimum_wide_rows = index.constant 2048 : index
+  %wide_row_tile = index.constant 256 : index
+  %long_enough = index.cmp uge, %rows, %minimum_wide_rows : index
+  %row_remainder = index.rem %rows, %wide_row_tile : index
+  %c0_rows = index.constant 0 : index
+  %whole_tiles = index.cmp eq, %row_remainder, %c0_rows : index
+  %wide = scalar.andi %long_enough, %whole_tiles : i1
+  %tiled_row_tile = index.constant 64 : index
+  %workgroup_tile = scf.select %wide, %wide_row_tile, %tiled_row_tile : index
+  %c1 = index.constant 1 : index
+  %row_rounding = index.sub %workgroup_tile, %c1 : index
+  %padded_rows = index.add %rows, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %wide_output_tiles = index.constant 30 : index
+  %tiled_output_tiles = index.constant 60 : index
+  %output_tiles = scf.select %wide, %wide_output_tiles, %tiled_output_tiles : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @zimage.image_tokens : index
+  %inputs = index.constant 10240 : index
+  %outputs = index.constant 3840 : index
+  %output_layout = encoding.layout.dense : encoding<layout>
+  %minimum_wide_rows = index.constant 2048 : index
+  %wide_row_tile = index.constant 256 : index
+  %long_enough = index.cmp uge, %rows, %minimum_wide_rows : index
+  %row_remainder = index.rem %rows, %wide_row_tile : index
+  %c0_rows = index.constant 0 : index
+  %whole_tiles = index.cmp eq, %row_remainder, %c0_rows : index
+  %wide = scalar.andi %long_enough, %whole_tiles : i1
+  scf.if %wide {
+    %group_size = index.constant 4 : index
+    template.apply<@projection.linear_wide_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  } else {
+    %minimum_grouped_rows = index.constant 2048 : index
+    %group_size = template.apply<@zimage.projection_row_group_size>(%rows, %minimum_grouped_rows) : (index, index) -> (index)
+    template.apply<@projection.linear_tiled_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  }
+  kernel.return
+}
+
+// caption feed-forward down
+kernel.def target(@dit_projection_wave32) @zimage_text_linear_10240_3840() {
+  %rows = config.get @zimage.text_tokens : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %rows, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 60 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %inputs = index.constant 10240 : index
+  %outputs = index.constant 3840 : index
+  %minimum_grouped_rows = index.constant 2048 : index
+  %group_size = template.apply<@zimage.projection_row_group_size>(%rows, %minimum_grouped_rows) : (index, index) -> (index)
+  %output_layout = encoding.layout.dense : encoding<layout>
+  template.apply<@projection.linear_tiled_bf16>(%rows, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  kernel.return
+}
+
+// Unified-layer caption leaves skip whole 64-row tiles the key mask leaves
+// unattended and store zeros there, so those rows stay finite.
+kernel.def target(@dit_projection_wave32) @zimage_caption_linear_3840_3840() {
+  %texts = config.get @zimage.text_tokens : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %texts, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 60 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %mask: buffer, %output: buffer) {
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %inputs = index.constant 3840 : index
+  %outputs = index.constant 3840 : index
+  %output_layout = encoding.layout.dense : encoding<layout>
+  // Caption tiles always traverse whole-height, so workgroup x is the row tile.
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %texts, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %row_tile = kernel.workgroup.id<x> : index
+  %row_origin = index.mul %row_tile, %workgroup_tile : index
+  // The key mask is a prefix: once a row is unattended, every later row is too.
+  %mask_view = buffer.view %mask[%origin] : buffer -> view<[%texts]xi8>
+  %state = view.load %mask_view[%row_origin] : view<[%texts]xi8> -> i8
+  %unattended = scalar.constant 0 : i8
+  %attended = scalar.cmpi ne, %state, %unattended : i8
+  scf.if %attended {
+    template.apply<@projection.linear_tiled_bf16>(%texts, %inputs, %outputs, %row_tiles, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  } else {
+    template.apply<@zimage.caption_tile_zero>(%texts, %outputs, %output_layout, %output) : (index, index, encoding<layout>, buffer)
+  }
+  kernel.return
+}
+
+kernel.def target(@dit_projection_wave32) @zimage_caption_linear_3840_10240() {
+  %texts = config.get @zimage.text_tokens : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %texts, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 160 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %mask: buffer, %output: buffer) {
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %inputs = index.constant 3840 : index
+  %outputs = index.constant 10240 : index
+  %output_layout = encoding.layout.dense : encoding<layout>
+  // Caption tiles always traverse whole-height, so workgroup x is the row tile.
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %texts, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %row_tile = kernel.workgroup.id<x> : index
+  %row_origin = index.mul %row_tile, %workgroup_tile : index
+  // The key mask is a prefix: once a row is unattended, every later row is too.
+  %mask_view = buffer.view %mask[%origin] : buffer -> view<[%texts]xi8>
+  %state = view.load %mask_view[%row_origin] : view<[%texts]xi8> -> i8
+  %unattended = scalar.constant 0 : i8
+  %attended = scalar.cmpi ne, %state, %unattended : i8
+  scf.if %attended {
+    template.apply<@projection.linear_tiled_bf16>(%texts, %inputs, %outputs, %row_tiles, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  } else {
+    template.apply<@zimage.caption_tile_zero>(%texts, %outputs, %output_layout, %output) : (index, index, encoding<layout>, buffer)
+  }
+  kernel.return
+}
+
+kernel.def target(@dit_projection_wave32) @zimage_caption_linear_10240_3840() {
+  %texts = config.get @zimage.text_tokens : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %texts, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 60 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %mask: buffer, %output: buffer) {
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %inputs = index.constant 10240 : index
+  %outputs = index.constant 3840 : index
+  %output_layout = encoding.layout.dense : encoding<layout>
+  // Caption tiles always traverse whole-height, so workgroup x is the row tile.
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %texts, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %row_tile = kernel.workgroup.id<x> : index
+  %row_origin = index.mul %row_tile, %workgroup_tile : index
+  // The key mask is a prefix: once a row is unattended, every later row is too.
+  %mask_view = buffer.view %mask[%origin] : buffer -> view<[%texts]xi8>
+  %state = view.load %mask_view[%row_origin] : view<[%texts]xi8> -> i8
+  %unattended = scalar.constant 0 : i8
+  %attended = scalar.cmpi ne, %state, %unattended : i8
+  scf.if %attended {
+    template.apply<@projection.linear_tiled_bf16>(%texts, %inputs, %outputs, %row_tiles, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  } else {
+    template.apply<@zimage.caption_tile_zero>(%texts, %outputs, %output_layout, %output) : (index, index, encoding<layout>, buffer)
+  }
+  kernel.return
+}
+
+// Value leaves store column-major [3840, tokens] for the attention value
+// contraction. The unified layers write the image and caption columns of one
+// shared [3840, image + text] sequence.
+// noise refiner: [3840, image]
+kernel.def target(@dit_projection_wave32) @zimage_image_value_3840_3840() {
+  %images = config.get @zimage.image_tokens : index
+  %minimum_wide_rows = index.constant 2048 : index
+  %wide_row_tile = index.constant 256 : index
+  %long_enough = index.cmp uge, %images, %minimum_wide_rows : index
+  %row_remainder = index.rem %images, %wide_row_tile : index
+  %c0_rows = index.constant 0 : index
+  %whole_tiles = index.cmp eq, %row_remainder, %c0_rows : index
+  %wide = scalar.andi %long_enough, %whole_tiles : i1
+  %tiled_row_tile = index.constant 64 : index
+  %workgroup_tile = scf.select %wide, %wide_row_tile, %tiled_row_tile : index
+  %c1 = index.constant 1 : index
+  %row_rounding = index.sub %workgroup_tile, %c1 : index
+  %padded_rows = index.add %images, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %wide_output_tiles = index.constant 30 : index
+  %tiled_output_tiles = index.constant 60 : index
+  %output_tiles = scf.select %wide, %wide_output_tiles, %tiled_output_tiles : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %inputs = index.constant 3840 : index
+  %outputs = index.constant 3840 : index
+  %output_layout = encoding.layout.strided [1, %images] : encoding<layout>
+  %minimum_wide_rows = index.constant 2048 : index
+  %wide_row_tile = index.constant 256 : index
+  %long_enough = index.cmp uge, %images, %minimum_wide_rows : index
+  %row_remainder = index.rem %images, %wide_row_tile : index
+  %c0_rows = index.constant 0 : index
+  %whole_tiles = index.cmp eq, %row_remainder, %c0_rows : index
+  %wide = scalar.andi %long_enough, %whole_tiles : i1
+  scf.if %wide {
+    %group_size = index.constant 4 : index
+    template.apply<@projection.linear_wide_bf16>(%images, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  } else {
+    %minimum_grouped_rows = index.constant 2048 : index
+    %group_size = template.apply<@zimage.projection_row_group_size>(%images, %minimum_grouped_rows) : (index, index) -> (index)
+    template.apply<@projection.linear_tiled_bf16>(%images, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  }
+  kernel.return
+}
+
+// context refiner: [3840, text]
+kernel.def target(@dit_projection_wave32) @zimage_text_value_3840_3840() {
+  %texts = config.get @zimage.text_tokens : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %texts, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 60 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %texts = config.get @zimage.text_tokens : index
+  %inputs = index.constant 3840 : index
+  %outputs = index.constant 3840 : index
+  %minimum_grouped_rows = index.constant 2048 : index
+  %group_size = template.apply<@zimage.projection_row_group_size>(%texts, %minimum_grouped_rows) : (index, index) -> (index)
+  %output_layout = encoding.layout.strided [1, %texts] : encoding<layout>
+  template.apply<@projection.linear_tiled_bf16>(%texts, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  kernel.return
+}
+
+// unified layers, image columns of [3840, image + text]
+kernel.def target(@dit_projection_wave32) @zimage_unified_image_value_3840_3840() {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %tokens = index.add %images, %texts : index
+  %minimum_wide_rows = index.constant 2048 : index
+  %wide_row_tile = index.constant 256 : index
+  %long_enough = index.cmp uge, %images, %minimum_wide_rows : index
+  %row_remainder = index.rem %images, %wide_row_tile : index
+  %c0_rows = index.constant 0 : index
+  %whole_tiles = index.cmp eq, %row_remainder, %c0_rows : index
+  %wide = scalar.andi %long_enough, %whole_tiles : i1
+  %tiled_row_tile = index.constant 64 : index
+  %workgroup_tile = scf.select %wide, %wide_row_tile, %tiled_row_tile : index
+  %c1 = index.constant 1 : index
+  %row_rounding = index.sub %workgroup_tile, %c1 : index
+  %padded_rows = index.add %images, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %wide_output_tiles = index.constant 30 : index
+  %tiled_output_tiles = index.constant 60 : index
+  %output_tiles = scf.select %wide, %wide_output_tiles, %tiled_output_tiles : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %tokens = index.add %images, %texts : index
+  %inputs = index.constant 3840 : index
+  %outputs = index.constant 3840 : index
+  %output_layout = encoding.layout.strided [1, %tokens] : encoding<layout>
+  %minimum_wide_rows = index.constant 2048 : index
+  %wide_row_tile = index.constant 256 : index
+  %long_enough = index.cmp uge, %images, %minimum_wide_rows : index
+  %row_remainder = index.rem %images, %wide_row_tile : index
+  %c0_rows = index.constant 0 : index
+  %whole_tiles = index.cmp eq, %row_remainder, %c0_rows : index
+  %wide = scalar.andi %long_enough, %whole_tiles : i1
+  scf.if %wide {
+    %group_size = index.constant 4 : index
+    template.apply<@projection.linear_wide_bf16>(%images, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  } else {
+    %minimum_grouped_rows = index.constant 2048 : index
+    %group_size = template.apply<@zimage.projection_row_group_size>(%images, %minimum_grouped_rows) : (index, index) -> (index)
+    template.apply<@projection.linear_tiled_bf16>(%images, %inputs, %outputs, %group_size, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  }
+  kernel.return
+}
+
+// unified layers, caption columns of [3840, image + text]
+kernel.def target(@dit_projection_wave32) @zimage_unified_text_value_3840_3840() {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %tokens = index.add %images, %texts : index
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %texts, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %output_tiles = index.constant 60 : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_tiles, %output_tiles, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %weight: buffer, %mask: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %tokens = index.add %images, %texts : index
+  %origin = index.constant 0 : offset
+  %inputs = index.constant 3840 : index
+  %outputs = index.constant 3840 : index
+  %output_layout = encoding.layout.strided [1, %tokens] : encoding<layout>
+  // Caption tiles always traverse whole-height, so workgroup x is the row tile.
+  %workgroup_tile = index.constant 64 : index
+  %row_rounding = index.constant 63 : index
+  %padded_rows = index.add %texts, %row_rounding : index
+  %row_tiles = index.div %padded_rows, %workgroup_tile : index
+  %row_tile = kernel.workgroup.id<x> : index
+  %row_origin = index.mul %row_tile, %workgroup_tile : index
+  // The key mask is a prefix: once a row is unattended, every later row is too.
+  %mask_view = buffer.view %mask[%origin] : buffer -> view<[%texts]xi8>
+  %state = view.load %mask_view[%row_origin] : view<[%texts]xi8> -> i8
+  %unattended = scalar.constant 0 : i8
+  %attended = scalar.cmpi ne, %state, %unattended : i8
+  scf.if %attended {
+    template.apply<@projection.linear_tiled_bf16>(%texts, %inputs, %outputs, %row_tiles, %output_layout, %input, %weight, %output) : (index, index, index, index, encoding<layout>, buffer, buffer, buffer)
+  } else {
+    template.apply<@zimage.caption_tile_zero>(%texts, %outputs, %output_layout, %output) : (index, index, encoding<layout>, buffer)
+  }
+  kernel.return
+}
+
+// Commands bind checkpoint tensors to the leaves above.
+command.def public @zimage.time_linear_1() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %rows = index.constant 16 : index
+  %origin = index.constant 0 : offset
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x256xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x1024xbf16>
+  %weight = command.parameter %parameters, "t_embedder.mlp.0.weight" : view<1024x256xbf16>
+  %bias = command.parameter %parameters, "t_embedder.mlp.0.bias" : view<1024xbf16>
+  kernel.launch @zimage_time_linear_256_1024(%input_view, %weight, %bias, %output_view) : (view<[%rows]x256xbf16>, view<1024x256xbf16>, view<1024xbf16>, view<[%rows]x1024xbf16>)
+  command.return
+}
+
+command.def public @zimage.time_linear_2() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %rows = index.constant 16 : index
+  %origin = index.constant 0 : offset
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x1024xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x256xbf16>
+  %weight = command.parameter %parameters, "t_embedder.mlp.2.weight" : view<256x1024xbf16>
+  %bias = command.parameter %parameters, "t_embedder.mlp.2.bias" : view<256xbf16>
+  kernel.launch @zimage_time_linear_1024_256(%input_view, %weight, %bias, %output_view) : (view<[%rows]x1024xbf16>, view<256x1024xbf16>, view<256xbf16>, view<[%rows]x256xbf16>)
+  command.return
+}
+
+command.def public @zimage.time_layer_modulation(%layer: index, %output_offset: offset) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %rows = index.constant 16 : index
+  %origin = index.constant 0 : offset
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x256xbf16>
+  %output_view = buffer.view %output[%output_offset] : buffer -> view<[%rows]x15360xbf16>
+  %weight = command.parameter %parameters, "layers.{}.adaLN_modulation.0.weight"[%layer] : view<15360x256xbf16>
+  %bias = command.parameter %parameters, "layers.{}.adaLN_modulation.0.bias"[%layer] : view<15360xbf16>
+  kernel.launch @zimage_time_linear_256_15360(%input_view, %weight, %bias, %output_view) : (view<[%rows]x256xbf16>, view<15360x256xbf16>, view<15360xbf16>, view<[%rows]x15360xbf16>)
+  command.return
+}
+
+command.def public @zimage.time_refiner_modulation(%layer: index, %output_offset: offset) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %rows = index.constant 16 : index
+  %origin = index.constant 0 : offset
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x256xbf16>
+  %output_view = buffer.view %output[%output_offset] : buffer -> view<[%rows]x15360xbf16>
+  %weight = command.parameter %parameters, "noise_refiner.{}.adaLN_modulation.0.weight"[%layer] : view<15360x256xbf16>
+  %bias = command.parameter %parameters, "noise_refiner.{}.adaLN_modulation.0.bias"[%layer] : view<15360xbf16>
+  kernel.launch @zimage_time_linear_256_15360(%input_view, %weight, %bias, %output_view) : (view<[%rows]x256xbf16>, view<15360x256xbf16>, view<15360xbf16>, view<[%rows]x15360xbf16>)
+  command.return
+}
+
+command.def public @zimage.time_output_modulation(%output_offset: offset) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %rows = index.constant 16 : index
+  %origin = index.constant 0 : offset
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x256xbf16>
+  %output_view = buffer.view %output[%output_offset] : buffer -> view<[%rows]x3840xbf16>
+  %weight = command.parameter %parameters, "final_layer.adaLN_modulation.1.weight" : view<3840x256xbf16>
+  %bias = command.parameter %parameters, "final_layer.adaLN_modulation.1.bias" : view<3840xbf16>
+  kernel.launch @zimage_time_linear_256_3840(%input_view, %weight, %bias, %output_view) : (view<[%rows]x256xbf16>, view<3840x256xbf16>, view<3840xbf16>, view<[%rows]x3840xbf16>)
+  command.return
+}
+
+// BF16 latent patches [image, 64] to image rows [image, 3840].
+command.def public @zimage.image_embedding() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %image = config.get @zimage.image_tokens : index
+  %origin = index.constant 0 : offset
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%image]x64xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%image]x3840xbf16>
+  %weight = command.parameter %parameters, "x_embedder.weight" : view<3840x64xbf16>
+  %bias = command.parameter %parameters, "x_embedder.bias" : view<3840xbf16>
+  kernel.launch @zimage_image_linear_64_3840(%input_view, %weight, %bias, %output_view) : (view<[%image]x64xbf16>, view<3840x64xbf16>, view<3840xbf16>, view<[%image]x3840xbf16>)
+  command.return
+}
+
+// RMS-normalized caption features [text, 2560] to caption rows [text, 3840].
+command.def public @zimage.caption_embedding() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %text = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%text]x2560xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%text]x3840xbf16>
+  %weight = command.parameter %parameters, "cap_embedder.1.weight" : view<3840x2560xbf16>
+  %bias = command.parameter %parameters, "cap_embedder.1.bias" : view<3840xbf16>
+  kernel.launch @zimage_text_linear_2560_3840(%input_view, %weight, %bias, %output_view) : (view<[%text]x2560xbf16>, view<3840x2560xbf16>, view<3840xbf16>, view<[%text]x3840xbf16>)
+  command.return
+}
+
+// Modulated image rows [image, 3840] to packed velocity [image, 64].
+command.def public @zimage.dit_output() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %image = config.get @zimage.image_tokens : index
+  %origin = index.constant 0 : offset
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%image]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%image]x64xbf16>
+  %weight = command.parameter %parameters, "final_layer.linear.weight" : view<64x3840xbf16>
+  %bias = command.parameter %parameters, "final_layer.linear.bias" : view<64xbf16>
+  kernel.launch @zimage_image_linear_3840_64(%input_view, %weight, %bias, %output_view) : (view<[%image]x3840xbf16>, view<64x3840xbf16>, view<64xbf16>, view<[%image]x64xbf16>)
+  command.return
+}
+
+command.def public @zimage.refiner_query(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %origin = index.constant 0 : offset
+  %fused = command.parameter %parameters, "noise_refiner.{}.attention.qkv.weight"[%layer] : view<11520x3840xbf16>
+  %weight = view.subview %fused[0, 0] : view<11520x3840xbf16> -> view<3840x3840xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%images]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%images]x3840xbf16>
+  kernel.launch @zimage_image_linear_3840_3840(%input_view, %weight, %output_view) : (view<[%images]x3840xbf16>, view<3840x3840xbf16>, view<[%images]x3840xbf16>)
+  command.return
+}
+
+command.def public @zimage.refiner_key(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %origin = index.constant 0 : offset
+  %fused = command.parameter %parameters, "noise_refiner.{}.attention.qkv.weight"[%layer] : view<11520x3840xbf16>
+  %weight = view.subview %fused[3840, 0] : view<11520x3840xbf16> -> view<3840x3840xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%images]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%images]x3840xbf16>
+  kernel.launch @zimage_image_linear_3840_3840(%input_view, %weight, %output_view) : (view<[%images]x3840xbf16>, view<3840x3840xbf16>, view<[%images]x3840xbf16>)
+  command.return
+}
+
+command.def public @zimage.refiner_attention_output(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %origin = index.constant 0 : offset
+  %weight = command.parameter %parameters, "noise_refiner.{}.attention.out.weight"[%layer] : view<3840x3840xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%images]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%images]x3840xbf16>
+  kernel.launch @zimage_image_linear_3840_3840(%input_view, %weight, %output_view) : (view<[%images]x3840xbf16>, view<3840x3840xbf16>, view<[%images]x3840xbf16>)
+  command.return
+}
+
+command.def public @zimage.refiner_gate(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %origin = index.constant 0 : offset
+  %weight = command.parameter %parameters, "noise_refiner.{}.feed_forward.w1.weight"[%layer] : view<10240x3840xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%images]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%images]x10240xbf16>
+  kernel.launch @zimage_image_linear_3840_10240(%input_view, %weight, %output_view) : (view<[%images]x3840xbf16>, view<10240x3840xbf16>, view<[%images]x10240xbf16>)
+  command.return
+}
+
+command.def public @zimage.refiner_up(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %origin = index.constant 0 : offset
+  %weight = command.parameter %parameters, "noise_refiner.{}.feed_forward.w3.weight"[%layer] : view<10240x3840xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%images]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%images]x10240xbf16>
+  kernel.launch @zimage_image_linear_3840_10240(%input_view, %weight, %output_view) : (view<[%images]x3840xbf16>, view<10240x3840xbf16>, view<[%images]x10240xbf16>)
+  command.return
+}
+
+command.def public @zimage.refiner_down(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %origin = index.constant 0 : offset
+  %weight = command.parameter %parameters, "noise_refiner.{}.feed_forward.w2.weight"[%layer] : view<3840x10240xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%images]x10240xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%images]x3840xbf16>
+  kernel.launch @zimage_image_linear_10240_3840(%input_view, %weight, %output_view) : (view<[%images]x10240xbf16>, view<3840x10240xbf16>, view<[%images]x3840xbf16>)
+  command.return
+}
+
+command.def public @zimage.refiner_value(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %origin = index.constant 0 : offset
+  %fused = command.parameter %parameters, "noise_refiner.{}.attention.qkv.weight"[%layer] : view<11520x3840xbf16>
+  %weight = view.subview %fused[7680, 0] : view<11520x3840xbf16> -> view<3840x3840xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%images]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<3840x[%images]xbf16>
+  kernel.launch @zimage_image_value_3840_3840(%input_view, %weight, %output_view) : (view<[%images]x3840xbf16>, view<3840x3840xbf16>, view<3840x[%images]xbf16>)
+  command.return
+}
+
+command.def public @zimage.context_query(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %fused = command.parameter %parameters, "context_refiner.{}.attention.qkv.weight"[%layer] : view<11520x3840xbf16>
+  %weight = view.subview %fused[0, 0] : view<11520x3840xbf16> -> view<3840x3840xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%texts]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%texts]x3840xbf16>
+  kernel.launch @zimage_text_linear_3840_3840(%input_view, %weight, %output_view) : (view<[%texts]x3840xbf16>, view<3840x3840xbf16>, view<[%texts]x3840xbf16>)
+  command.return
+}
+
+command.def public @zimage.context_key(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %fused = command.parameter %parameters, "context_refiner.{}.attention.qkv.weight"[%layer] : view<11520x3840xbf16>
+  %weight = view.subview %fused[3840, 0] : view<11520x3840xbf16> -> view<3840x3840xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%texts]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%texts]x3840xbf16>
+  kernel.launch @zimage_text_linear_3840_3840(%input_view, %weight, %output_view) : (view<[%texts]x3840xbf16>, view<3840x3840xbf16>, view<[%texts]x3840xbf16>)
+  command.return
+}
+
+command.def public @zimage.context_attention_output(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %weight = command.parameter %parameters, "context_refiner.{}.attention.out.weight"[%layer] : view<3840x3840xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%texts]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%texts]x3840xbf16>
+  kernel.launch @zimage_text_linear_3840_3840(%input_view, %weight, %output_view) : (view<[%texts]x3840xbf16>, view<3840x3840xbf16>, view<[%texts]x3840xbf16>)
+  command.return
+}
+
+command.def public @zimage.context_gate(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %weight = command.parameter %parameters, "context_refiner.{}.feed_forward.w1.weight"[%layer] : view<10240x3840xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%texts]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%texts]x10240xbf16>
+  kernel.launch @zimage_text_linear_3840_10240(%input_view, %weight, %output_view) : (view<[%texts]x3840xbf16>, view<10240x3840xbf16>, view<[%texts]x10240xbf16>)
+  command.return
+}
+
+command.def public @zimage.context_up(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %weight = command.parameter %parameters, "context_refiner.{}.feed_forward.w3.weight"[%layer] : view<10240x3840xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%texts]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%texts]x10240xbf16>
+  kernel.launch @zimage_text_linear_3840_10240(%input_view, %weight, %output_view) : (view<[%texts]x3840xbf16>, view<10240x3840xbf16>, view<[%texts]x10240xbf16>)
+  command.return
+}
+
+command.def public @zimage.context_down(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %weight = command.parameter %parameters, "context_refiner.{}.feed_forward.w2.weight"[%layer] : view<3840x10240xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%texts]x10240xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%texts]x3840xbf16>
+  kernel.launch @zimage_text_linear_10240_3840(%input_view, %weight, %output_view) : (view<[%texts]x10240xbf16>, view<3840x10240xbf16>, view<[%texts]x3840xbf16>)
+  command.return
+}
+
+command.def public @zimage.context_value(%layer: index) launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %fused = command.parameter %parameters, "context_refiner.{}.attention.qkv.weight"[%layer] : view<11520x3840xbf16>
+  %weight = view.subview %fused[7680, 0] : view<11520x3840xbf16> -> view<3840x3840xbf16>
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%texts]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<3840x[%texts]xbf16>
+  kernel.launch @zimage_text_value_3840_3840(%input_view, %weight, %output_view) : (view<[%texts]x3840xbf16>, view<3840x3840xbf16>, view<3840x[%texts]xbf16>)
+  command.return
+}
+
+command.def public @zimage.layer_query(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %fused = command.parameter %parameters, "layers.{}.attention.qkv.weight"[%layer] : view<11520x3840xbf16>
+  %weight = view.subview %fused[0, 0] : view<11520x3840xbf16> -> view<3840x3840xbf16>
+  %input_row_bytes = index.constant 7680 : offset
+  %output_row_bytes = index.constant 7680 : offset
+  %mask_element_bytes = index.constant 1 : offset
+  %input_text = index.scale %images, %input_row_bytes : index, offset -> offset
+  %output_text = index.scale %images, %output_row_bytes : index, offset -> offset
+  %mask_text = index.scale %images, %mask_element_bytes : index, offset -> offset
+  %text_mask = buffer.view %mask[%mask_text] : buffer -> view<[%texts]xi8>
+  %image_input = buffer.view %input[%origin] : buffer -> view<[%images]x3840xbf16>
+  %text_input = buffer.view %input[%input_text] : buffer -> view<[%texts]x3840xbf16>
+  %image_output = buffer.view %output[%origin] : buffer -> view<[%images]x3840xbf16>
+  %text_output = buffer.view %output[%output_text] : buffer -> view<[%texts]x3840xbf16>
+  command.concurrent {
+    kernel.launch @zimage_image_linear_3840_3840(%image_input, %weight, %image_output) : (view<[%images]x3840xbf16>, view<3840x3840xbf16>, view<[%images]x3840xbf16>)
+    kernel.launch @zimage_caption_linear_3840_3840(%text_input, %weight, %text_mask, %text_output) : (view<[%texts]x3840xbf16>, view<3840x3840xbf16>, view<[%texts]xi8>, view<[%texts]x3840xbf16>)
+  }
+  command.return
+}
+
+command.def public @zimage.layer_key(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %fused = command.parameter %parameters, "layers.{}.attention.qkv.weight"[%layer] : view<11520x3840xbf16>
+  %weight = view.subview %fused[3840, 0] : view<11520x3840xbf16> -> view<3840x3840xbf16>
+  %input_row_bytes = index.constant 7680 : offset
+  %output_row_bytes = index.constant 7680 : offset
+  %mask_element_bytes = index.constant 1 : offset
+  %input_text = index.scale %images, %input_row_bytes : index, offset -> offset
+  %output_text = index.scale %images, %output_row_bytes : index, offset -> offset
+  %mask_text = index.scale %images, %mask_element_bytes : index, offset -> offset
+  %text_mask = buffer.view %mask[%mask_text] : buffer -> view<[%texts]xi8>
+  %image_input = buffer.view %input[%origin] : buffer -> view<[%images]x3840xbf16>
+  %text_input = buffer.view %input[%input_text] : buffer -> view<[%texts]x3840xbf16>
+  %image_output = buffer.view %output[%origin] : buffer -> view<[%images]x3840xbf16>
+  %text_output = buffer.view %output[%output_text] : buffer -> view<[%texts]x3840xbf16>
+  command.concurrent {
+    kernel.launch @zimage_image_linear_3840_3840(%image_input, %weight, %image_output) : (view<[%images]x3840xbf16>, view<3840x3840xbf16>, view<[%images]x3840xbf16>)
+    kernel.launch @zimage_caption_linear_3840_3840(%text_input, %weight, %text_mask, %text_output) : (view<[%texts]x3840xbf16>, view<3840x3840xbf16>, view<[%texts]xi8>, view<[%texts]x3840xbf16>)
+  }
+  command.return
+}
+
+command.def public @zimage.layer_attention_output(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %weight = command.parameter %parameters, "layers.{}.attention.out.weight"[%layer] : view<3840x3840xbf16>
+  %input_row_bytes = index.constant 7680 : offset
+  %output_row_bytes = index.constant 7680 : offset
+  %mask_element_bytes = index.constant 1 : offset
+  %input_text = index.scale %images, %input_row_bytes : index, offset -> offset
+  %output_text = index.scale %images, %output_row_bytes : index, offset -> offset
+  %mask_text = index.scale %images, %mask_element_bytes : index, offset -> offset
+  %text_mask = buffer.view %mask[%mask_text] : buffer -> view<[%texts]xi8>
+  %image_input = buffer.view %input[%origin] : buffer -> view<[%images]x3840xbf16>
+  %text_input = buffer.view %input[%input_text] : buffer -> view<[%texts]x3840xbf16>
+  %image_output = buffer.view %output[%origin] : buffer -> view<[%images]x3840xbf16>
+  %text_output = buffer.view %output[%output_text] : buffer -> view<[%texts]x3840xbf16>
+  command.concurrent {
+    kernel.launch @zimage_image_linear_3840_3840(%image_input, %weight, %image_output) : (view<[%images]x3840xbf16>, view<3840x3840xbf16>, view<[%images]x3840xbf16>)
+    kernel.launch @zimage_caption_linear_3840_3840(%text_input, %weight, %text_mask, %text_output) : (view<[%texts]x3840xbf16>, view<3840x3840xbf16>, view<[%texts]xi8>, view<[%texts]x3840xbf16>)
+  }
+  command.return
+}
+
+command.def public @zimage.layer_gate(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %weight = command.parameter %parameters, "layers.{}.feed_forward.w1.weight"[%layer] : view<10240x3840xbf16>
+  %input_row_bytes = index.constant 7680 : offset
+  %output_row_bytes = index.constant 20480 : offset
+  %mask_element_bytes = index.constant 1 : offset
+  %input_text = index.scale %images, %input_row_bytes : index, offset -> offset
+  %output_text = index.scale %images, %output_row_bytes : index, offset -> offset
+  %mask_text = index.scale %images, %mask_element_bytes : index, offset -> offset
+  %text_mask = buffer.view %mask[%mask_text] : buffer -> view<[%texts]xi8>
+  %image_input = buffer.view %input[%origin] : buffer -> view<[%images]x3840xbf16>
+  %text_input = buffer.view %input[%input_text] : buffer -> view<[%texts]x3840xbf16>
+  %image_output = buffer.view %output[%origin] : buffer -> view<[%images]x10240xbf16>
+  %text_output = buffer.view %output[%output_text] : buffer -> view<[%texts]x10240xbf16>
+  command.concurrent {
+    kernel.launch @zimage_image_linear_3840_10240(%image_input, %weight, %image_output) : (view<[%images]x3840xbf16>, view<10240x3840xbf16>, view<[%images]x10240xbf16>)
+    kernel.launch @zimage_caption_linear_3840_10240(%text_input, %weight, %text_mask, %text_output) : (view<[%texts]x3840xbf16>, view<10240x3840xbf16>, view<[%texts]xi8>, view<[%texts]x10240xbf16>)
+  }
+  command.return
+}
+
+command.def public @zimage.layer_up(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %weight = command.parameter %parameters, "layers.{}.feed_forward.w3.weight"[%layer] : view<10240x3840xbf16>
+  %input_row_bytes = index.constant 7680 : offset
+  %output_row_bytes = index.constant 20480 : offset
+  %mask_element_bytes = index.constant 1 : offset
+  %input_text = index.scale %images, %input_row_bytes : index, offset -> offset
+  %output_text = index.scale %images, %output_row_bytes : index, offset -> offset
+  %mask_text = index.scale %images, %mask_element_bytes : index, offset -> offset
+  %text_mask = buffer.view %mask[%mask_text] : buffer -> view<[%texts]xi8>
+  %image_input = buffer.view %input[%origin] : buffer -> view<[%images]x3840xbf16>
+  %text_input = buffer.view %input[%input_text] : buffer -> view<[%texts]x3840xbf16>
+  %image_output = buffer.view %output[%origin] : buffer -> view<[%images]x10240xbf16>
+  %text_output = buffer.view %output[%output_text] : buffer -> view<[%texts]x10240xbf16>
+  command.concurrent {
+    kernel.launch @zimage_image_linear_3840_10240(%image_input, %weight, %image_output) : (view<[%images]x3840xbf16>, view<10240x3840xbf16>, view<[%images]x10240xbf16>)
+    kernel.launch @zimage_caption_linear_3840_10240(%text_input, %weight, %text_mask, %text_output) : (view<[%texts]x3840xbf16>, view<10240x3840xbf16>, view<[%texts]xi8>, view<[%texts]x10240xbf16>)
+  }
+  command.return
+}
+
+command.def public @zimage.layer_down(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %weight = command.parameter %parameters, "layers.{}.feed_forward.w2.weight"[%layer] : view<3840x10240xbf16>
+  %input_row_bytes = index.constant 20480 : offset
+  %output_row_bytes = index.constant 7680 : offset
+  %mask_element_bytes = index.constant 1 : offset
+  %input_text = index.scale %images, %input_row_bytes : index, offset -> offset
+  %output_text = index.scale %images, %output_row_bytes : index, offset -> offset
+  %mask_text = index.scale %images, %mask_element_bytes : index, offset -> offset
+  %text_mask = buffer.view %mask[%mask_text] : buffer -> view<[%texts]xi8>
+  %image_input = buffer.view %input[%origin] : buffer -> view<[%images]x10240xbf16>
+  %text_input = buffer.view %input[%input_text] : buffer -> view<[%texts]x10240xbf16>
+  %image_output = buffer.view %output[%origin] : buffer -> view<[%images]x3840xbf16>
+  %text_output = buffer.view %output[%output_text] : buffer -> view<[%texts]x3840xbf16>
+  command.concurrent {
+    kernel.launch @zimage_image_linear_10240_3840(%image_input, %weight, %image_output) : (view<[%images]x10240xbf16>, view<3840x10240xbf16>, view<[%images]x3840xbf16>)
+    kernel.launch @zimage_caption_linear_10240_3840(%text_input, %weight, %text_mask, %text_output) : (view<[%texts]x10240xbf16>, view<3840x10240xbf16>, view<[%texts]xi8>, view<[%texts]x3840xbf16>)
+  }
+  command.return
+}
+
+command.def public @zimage.layer_value(%layer: index) launch(%parameters: buffer, %input: buffer, %mask: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %tokens = index.add %images, %texts : index
+  %origin = index.constant 0 : offset
+  %fused = command.parameter %parameters, "layers.{}.attention.qkv.weight"[%layer] : view<11520x3840xbf16>
+  %weight = view.subview %fused[7680, 0] : view<11520x3840xbf16> -> view<3840x3840xbf16>
+  // Caption columns start image tokens into each channel row; each view spans
+  // from its first column to its last column of channel 3839.
+  %input_row_bytes = index.constant 7680 : offset
+  %element_bytes = index.constant 2 : offset
+  %mask_element_bytes = index.constant 1 : offset
+  %input_text = index.scale %images, %input_row_bytes : index, offset -> offset
+  %output_text = index.scale %images, %element_bytes : index, offset -> offset
+  %mask_text = index.scale %images, %mask_element_bytes : index, offset -> offset
+  %text_mask = buffer.view %mask[%mask_text] : buffer -> view<[%texts]xi8>
+  %last_channel = index.constant 3839 : index
+  %image_span = index.madd %last_channel, %tokens, %images : index
+  %text_span = index.madd %last_channel, %tokens, %texts : index
+  %image_input = buffer.view %input[%origin] : buffer -> view<[%images]x3840xbf16>
+  %text_input = buffer.view %input[%input_text] : buffer -> view<[%texts]x3840xbf16>
+  %image_output = buffer.view %output[%origin] : buffer -> view<[%image_span]xbf16>
+  %text_output = buffer.view %output[%output_text] : buffer -> view<[%text_span]xbf16>
+  command.concurrent {
+    kernel.launch @zimage_unified_image_value_3840_3840(%image_input, %weight, %image_output) : (view<[%images]x3840xbf16>, view<3840x3840xbf16>, view<[%image_span]xbf16>)
+    kernel.launch @zimage_unified_text_value_3840_3840(%text_input, %weight, %text_mask, %text_output) : (view<[%texts]x3840xbf16>, view<3840x3840xbf16>, view<[%texts]xi8>, view<[%text_span]xbf16>)
+  }
+  command.return
+}

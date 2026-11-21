@@ -1,0 +1,72 @@
+// Decoder residual blocks over F32 NCHW state with BF16 checkpoint weights:
+// GroupNorm+SiLU, 3x3 conv, GroupNorm+SiLU, 3x3 conv, plus the skip. The
+// convolution and GroupNorm kernels take geometry as launch immediates, so
+// one body serves the full latent grid and every decoder-tile scale; callers
+// pass the block's affine and convolution parameters as views.
+//
+// The last convolution fuses the skip addition. Its spatial input is the
+// second-normalization buffer, so the block may run in place: every reader of
+// the original input has retired before the only write to it.
+
+kernel.decl @zimage_vae_wide_convolution(%height: index, %width: index, %inputs: index, %outputs: index, %extent: index, %upsample: index, %residual_flag: index) launch(%height: index, %width: index, %inputs: index, %outputs: index, %extent: index, %upsample: index, %residual_flag: index, %input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024), range(%inputs, 32, 512), multiple_of(%inputs, 32), range(%outputs, 64, 512), multiple_of(%outputs, 64), range(%extent, 1, 3), range(%upsample, 1, 2), range(%residual_flag, 0, 1)]
+
+command.decl @zimage.vae_group_norm(%channels: index, %height: index, %width: index, %silu_flag: index) launch(%input: buffer, %gamma: buffer, %beta: buffer, %output: buffer)
+
+// Equal-width block with an identity skip.
+command.def public @zimage.vae_resnet(%channels: index, %height: index, %width: index) launch(%input: buffer, %norm1_weight: buffer, %norm1_bias: buffer, %conv1_weight: buffer, %conv1_bias: buffer, %norm2_weight: buffer, %norm2_bias: buffer, %conv2_weight: buffer, %conv2_bias: buffer, %output: buffer) where [range(%channels, 64, 512), multiple_of(%channels, 64), range(%height, 1, 1024), range(%width, 1, 1024)] {
+  %pixels = index.mul %height, %width : index
+  %elements = index.mul %pixels, %channels : index
+  %element_bytes = index.constant 4 : offset
+  %bytes = index.scale %elements, %element_bytes : index, offset -> offset
+  %normalized = buffer.alloca<global> align(256) %bytes : buffer
+  %convolved = buffer.alloca<global> align(256) %bytes : buffer
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  command.launch @zimage.vae_group_norm[%channels, %height, %width, %c1](%input, %norm1_weight, %norm1_bias, %normalized) : [index, index, index, index](buffer, buffer, buffer, buffer)
+  kernel.launch @zimage_vae_wide_convolution[%height, %width, %channels, %channels, %c3, %c1, %c0](%height, %width, %channels, %channels, %c3, %c1, %c0, %normalized, %conv1_weight, %conv1_bias, %convolved, %convolved) : [index, index, index, index, index, index, index](index, index, index, index, index, index, index, buffer, buffer, buffer, buffer, buffer)
+  command.launch @zimage.vae_group_norm[%channels, %height, %width, %c1](%convolved, %norm2_weight, %norm2_bias, %convolved) : [index, index, index, index](buffer, buffer, buffer, buffer)
+  kernel.launch @zimage_vae_wide_convolution[%height, %width, %channels, %channels, %c3, %c1, %c1](%height, %width, %channels, %channels, %c3, %c1, %c1, %convolved, %conv2_weight, %conv2_bias, %input, %output) : [index, index, index, index, index, index, index](index, index, index, index, index, index, index, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+// Narrowing block with a 1x1 shortcut convolution. The shortcut writes the
+// output concurrently with the first normalization reading the input, so
+// input and output must be distinct allocations.
+command.def public @zimage.vae_resnet_shortcut(%inputs: index, %outputs: index, %height: index, %width: index) launch(%input: buffer, %norm1_weight: buffer, %norm1_bias: buffer, %conv1_weight: buffer, %conv1_bias: buffer, %norm2_weight: buffer, %norm2_bias: buffer, %conv2_weight: buffer, %conv2_bias: buffer, %shortcut_weight: buffer, %shortcut_bias: buffer, %output: buffer) where [range(%inputs, 32, 512), multiple_of(%inputs, 32), range(%outputs, 64, 512), multiple_of(%outputs, 64), range(%height, 1, 1024), range(%width, 1, 1024)] {
+  %pixels = index.mul %height, %width : index
+  %input_elements = index.mul %pixels, %inputs : index
+  %output_elements = index.mul %pixels, %outputs : index
+  %element_bytes = index.constant 4 : offset
+  %input_bytes = index.scale %input_elements, %element_bytes : index, offset -> offset
+  %output_bytes = index.scale %output_elements, %element_bytes : index, offset -> offset
+  %normalized = buffer.alloca<global> align(256) %input_bytes : buffer
+  %convolved = buffer.alloca<global> align(256) %output_bytes : buffer
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  command.concurrent {
+    command.launch @zimage.vae_group_norm[%inputs, %height, %width, %c1](%input, %norm1_weight, %norm1_bias, %normalized) : [index, index, index, index](buffer, buffer, buffer, buffer)
+    kernel.launch @zimage_vae_wide_convolution[%height, %width, %inputs, %outputs, %c1, %c1, %c0](%height, %width, %inputs, %outputs, %c1, %c1, %c0, %input, %shortcut_weight, %shortcut_bias, %output, %output) : [index, index, index, index, index, index, index](index, index, index, index, index, index, index, buffer, buffer, buffer, buffer, buffer)
+  }
+  kernel.launch @zimage_vae_wide_convolution[%height, %width, %inputs, %outputs, %c3, %c1, %c0](%height, %width, %inputs, %outputs, %c3, %c1, %c0, %normalized, %conv1_weight, %conv1_bias, %convolved, %convolved) : [index, index, index, index, index, index, index](index, index, index, index, index, index, index, buffer, buffer, buffer, buffer, buffer)
+  command.launch @zimage.vae_group_norm[%outputs, %height, %width, %c1](%convolved, %norm2_weight, %norm2_bias, %convolved) : [index, index, index, index](buffer, buffer, buffer, buffer)
+  kernel.launch @zimage_vae_wide_convolution[%height, %width, %outputs, %outputs, %c3, %c1, %c1](%height, %width, %outputs, %outputs, %c3, %c1, %c1, %convolved, %conv2_weight, %conv2_bias, %output, %output) : [index, index, index, index, index, index, index](index, index, index, index, index, index, index, buffer, buffer, buffer, buffer, buffer)
+  command.return
+}
+
+// Mid-block residual: block 0 runs on the full latent grid before attention,
+// block 1 opens the (possibly tiled) decoder body.
+command.def public @zimage.vae_mid_residual(%block: index, %height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)] {
+  %channels = index.constant 512 : index
+  %norm1_weight = command.parameter %parameters, "decoder.mid_block.resnets.{}.norm1.weight"[%block] : view<512xbf16>
+  %norm1_bias = command.parameter %parameters, "decoder.mid_block.resnets.{}.norm1.bias"[%block] : view<512xbf16>
+  %conv1_weight = command.parameter %parameters, "decoder.mid_block.resnets.{}.conv1.weight"[%block] : view<512x512x3x3xbf16>
+  %conv1_bias = command.parameter %parameters, "decoder.mid_block.resnets.{}.conv1.bias"[%block] : view<512xbf16>
+  %norm2_weight = command.parameter %parameters, "decoder.mid_block.resnets.{}.norm2.weight"[%block] : view<512xbf16>
+  %norm2_bias = command.parameter %parameters, "decoder.mid_block.resnets.{}.norm2.bias"[%block] : view<512xbf16>
+  %conv2_weight = command.parameter %parameters, "decoder.mid_block.resnets.{}.conv2.weight"[%block] : view<512x512x3x3xbf16>
+  %conv2_bias = command.parameter %parameters, "decoder.mid_block.resnets.{}.conv2.bias"[%block] : view<512xbf16>
+  command.launch @zimage.vae_resnet[%channels, %height, %width](%input, %norm1_weight, %norm1_bias, %conv1_weight, %conv1_bias, %norm2_weight, %norm2_bias, %conv2_weight, %conv2_bias, %output) : [index, index, index](buffer, view<512xbf16>, view<512xbf16>, view<512x512x3x3xbf16>, view<512xbf16>, view<512xbf16>, view<512xbf16>, view<512x512x3x3xbf16>, view<512xbf16>, buffer)
+  command.return
+}
