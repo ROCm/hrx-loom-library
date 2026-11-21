@@ -4,7 +4,7 @@
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
-func.decl @flash_next_q8_channel4_partial(%width: index, %group_size: index, %batch_size: index, %first: index, %end: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (vector<[%group_size]xf32>)
+func.decl @flash_next_q8_projection_partial(%prepared: i1, %width: index, %group_size: index, %batch_size: index, %first: index, %end: index, %row: index, %lane: index, %stride: index, %input: buffer, %weight: buffer) -> (vector<[%group_size]xf32>)
 
 // GDN QKV consumes four-channel Q8 scale/code planes. Each workgroup shares
 // exact integer-code BF16 operands across a 64-channel by 32-token tile, then
@@ -13,7 +13,7 @@ func.decl @flash_next_q8_channel4_partial(%width: index, %group_size: index, %ba
 // A live tail below four rows takes that dot path within larger epochs.
 amdgpu.target<gfx11-generic> @flash_next_qkv_wave32 {subgroup_size = 32}
 
-kernel.def target(@flash_next_qkv_wave32) @flash_next_project_qkv(%output_width: index) {
+kernel.def target(@flash_next_qkv_wave32) @flash_next_project_qkv(%active_rows: index, %output_width: index) {
   %outputs = index.assume %output_width [range(%output_width, 4, 262144), multiple_of(%output_width, 4)] : index
   %c32 = index.constant 32 : index
   %c31 = index.constant 31 : index
@@ -23,15 +23,14 @@ kernel.def target(@flash_next_qkv_wave32) @flash_next_project_qkv(%output_width:
   %c7 = index.constant 7 : index
   %padded_channels = index.add %outputs, %c7 : index
   %channels = index.div %padded_channels, %c8 : index
-  %tokens = config.get @flash_next.token_count : index
-  %padded = index.add %tokens, %c31 : index
+  %padded = index.add %active_rows, %c31 : index
   %batches = index.div %padded, %c32 : index
   kernel.launch.config workgroups(%channels, %batches, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%output_width: index, %span_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
+} launch(%row_capacity: index, %output_width: index, %span_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %output_arg: buffer) {
   %span, %input, %weight, %output = buffer.assume.noalias %span_arg, %input_arg, %weight_arg, %output_arg : buffer, buffer, buffer, buffer
   %inputs = index.constant 2560 : index
   %outputs = index.assume %output_width [range(%output_width, 4, 262144), multiple_of(%output_width, 4)] : index
-  %tokens = config.get @flash_next.token_count : index
+  %tokens = index.assume %row_capacity [range(%row_capacity, 1, 32768)] : index
   // The immutable epoch count is uniform across the workgroup; all threads
   // agree on the branch enclosing the cooperative staging barriers.
   %header_origin = index.constant 0 : offset
@@ -59,13 +58,14 @@ kernel.def target(@flash_next_qkv_wave32) @flash_next_project_qkv(%output_width:
   scf.if %active {
     %live_rows = index.sub %end, %first : index
     %short_tail = index.cmp ult, %live_rows, %c4 : index
-    %small_bucket = index.cmp ule, %tokens, %c4 : index
+    %small_bucket = index.cmp ule, %end, %c4 : index
     %small = scalar.ori %short_tail, %small_bucket : i1
     scf.if %small {
       %row = index.madd %group, %c8, %wave : index
       %valid = index.cmp ult, %row, %outputs : index
       scf.if %valid {
-        %partial = func.call @flash_next_q8_channel4_partial(%inputs, %c4, %c4, %first, %end, %row, %lane, %c32, %input, %weight) : (index, index, index, index, index, index, index, index, buffer, buffer) -> (vector<[%c4]xf32>)
+        %prepared = scalar.constant true : i1
+        %partial = func.call @flash_next_q8_projection_partial(%prepared, %inputs, %c4, %c4, %first, %end, %row, %lane, %c32, %input, %weight) : (i1, index, index, index, index, index, index, index, index, buffer, buffer) -> (vector<[%c4]xf32>)
         %sums = kernel.subgroup.reduce<addf> %partial : vector<[%c4]xf32>
         %leader = index.cmp eq, %lane, %c0 : index
         scf.if %leader {

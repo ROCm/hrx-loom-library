@@ -2,6 +2,22 @@
 // and share them across 128 tokens. Native matrix instructions accumulate in
 // F32; the coefficient projections publish F32 without an output truncation.
 
+config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
+
+amdgpu.target<gfx11-generic> @flash_next_coefficient_wave32 {subgroup_size = 32}
+
+// The router and recurrent coefficients share a precision policy. Through
+// 1,024 live rows their narrow kernels consume full F32 weights. With more
+// rows, a K64 coefficient panel rounded to BF16 serves up to 128 input rows.
+func.def public pure inline @flash_next_coefficient_rows(%rows: index) -> (index, index) {
+  %panel_limit = index.constant 1024 : index
+  %c0 = index.constant 0 : index
+  %use_matrix = index.cmp ugt, %rows, %panel_limit : index
+  %full_precision_rows = scf.select %use_matrix, %c0, %rows : index
+  %matrix_rows = scf.select %use_matrix, %rows, %c0 : index
+  func.return %full_precision_rows, %matrix_rows : index, index
+}
+
 template.decl @flash_next.coefficient_contract(%capacity: index, %inputs: index, %first_outputs: index, %second_outputs: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %input: buffer, %first_weight: buffer, %second_weight: buffer) -> (vector<[%fragment_count]x8xf32>)
 
 template.def<@flash_next.coefficient_contract> device @flash_next_coefficient_contract(%capacity: index, %inputs: index, %first_outputs: index, %second_outputs: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %input_arg: buffer, %first_weight_arg: buffer, %second_weight_arg: buffer) -> (vector<[%fragment_count]x8xf32>) {
@@ -218,17 +234,37 @@ func.def inline @flash_next_coefficient_matrix(%capacity: index, %first_outputs:
   func.return
 }
 
-func.def public inline @flash_next_route_matrix(%capacity: index, %epoch: buffer, %input: buffer, %weight: buffer, %shared: buffer, %logits: buffer, %gate: buffer) {
+kernel.def target(@flash_next_coefficient_wave32) @flash_next_route_matrix(%active_rows: index) {
+  %rows = index.constant 5 : index
+  %tile = index.constant 128 : index
+  %tail = index.constant 127 : index
+  %rounded = index.add %active_rows, %tail : index
+  %batches = index.div %rounded, %tile : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %batches, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%epoch: buffer, %input: buffer, %weight: buffer, %shared: buffer, %logits: buffer, %gate: buffer) {
+  %capacity = config.get @flash_next.token_count : index
   %experts = index.constant 512 : index
   %c1_index = index.constant 1 : index
   %sigmoid = scalar.constant true : i1
   func.call @flash_next_coefficient_matrix(%capacity, %experts, %c1_index, %sigmoid, %epoch, %input, %weight, %shared, %logits, %gate) : (index, index, index, i1, buffer, buffer, buffer, buffer, buffer, buffer)
-  func.return
+  kernel.return
 }
 
-func.def public inline @flash_next_alpha_beta_matrix(%capacity: index, %epoch: buffer, %input: buffer, %alpha_weight: buffer, %beta_weight: buffer, %alpha: buffer, %beta: buffer) {
+kernel.def target(@flash_next_coefficient_wave32) @flash_next_alpha_beta_matrix(%active_rows: index) {
+  %rows = index.constant 1 : index
+  %tile = index.constant 128 : index
+  %tail = index.constant 127 : index
+  %rounded = index.add %active_rows, %tail : index
+  %batches = index.div %rounded, %tile : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %batches, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%epoch: buffer, %input: buffer, %alpha_weight: buffer, %beta_weight: buffer, %alpha: buffer, %beta: buffer) {
+  %capacity = config.get @flash_next.token_count : index
   %heads = index.constant 48 : index
   %sigmoid = scalar.constant false : i1
   func.call @flash_next_coefficient_matrix(%capacity, %heads, %heads, %sigmoid, %epoch, %input, %alpha_weight, %beta_weight, %alpha, %beta) : (index, index, index, i1, buffer, buffer, buffer, buffer, buffer, buffer)
-  func.return
+  kernel.return
 }

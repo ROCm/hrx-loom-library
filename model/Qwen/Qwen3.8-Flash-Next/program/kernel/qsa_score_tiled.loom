@@ -11,9 +11,11 @@ config.decl @flash_next.pool_capacity : %value: index where [range(%value, 64, 2
 
 config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
 
-config.decl @qsa.query_tile : %value: index where [range(%value, 1, 32768)]
+func.decl pure @qsa_score_layout(%tokens: index, %context: index) -> (index, offset, offset) where [range(%tokens, 1, 32768), range(%context, 64, 262144), multiple_of(%context, 64)]
 
 func.decl @flash_next_span_count(%epoch: buffer) -> (index)
+
+func.decl pure @qsa_tile_rows(%end: index, %begin: index, %capacity: index) -> (index)
 
 func.decl @flash_next_cache_origin(%rows: buffer, %row: index, %plane_origin: offset) -> (offset)
 
@@ -25,11 +27,9 @@ amdgpu.target<gfx11-generic> @qsa_score_tiled_wave32 {subgroup_size = 32}
 // spans, windows, and key panels are strided over the physical worker grid.
 // Each four-query phase keeps the existing matrix/reduction arithmetic.
 // Both shared panels retire before a worker moves to its next key panel.
-kernel.def target(@qsa_score_tiled_wave32) @qsa_score_tiled(%neural_enabled: i1) {
+kernel.def target(@qsa_score_tiled_wave32) @qsa_score_tiled(%tile_rows_arg: index) {
   %tokens = config.get @flash_next.token_count : index
-  %tile_limit = config.get @qsa.query_tile : index
-  %short = index.cmp ult, %tokens, %tile_limit : index
-  %query_capacity = scf.select %short, %tokens, %tile_limit : index
+  %tile_rows = index.assume %tile_rows_arg [range(%tile_rows_arg, 0, %tokens)] : index
   %capacity = config.get @flash_next.context_capacity : index
   %spans = config.get @flash_next.span_capacity : index
   %c1 = index.constant 1 : index
@@ -41,31 +41,27 @@ kernel.def target(@qsa_score_tiled_wave32) @qsa_score_tiled(%neural_enabled: i1)
   %blocks = index.div %capacity, %c4 : index
   %rounded_blocks = index.add %blocks, %round_keys : index
   %key_groups = index.div %rounded_blocks, %key_tile : index
-  %rounded_queries = index.add %query_capacity, %round_queries : index
+  %rounded_queries = index.add %tile_rows, %round_queries : index
   %query_groups = index.div %rounded_queries, %group_queries : index
   %units = target.execution.unit.count : index
   %groups_per_unit = index.constant 32 : index
   %budget = index.mul %units, %groups_per_unit : index
   %span_limit = index.constant 16 : index
-  %span_fits = index.cmp ult, %spans, %span_limit : index
-  %span_workers = scf.select %span_fits, %spans, %span_limit : index
-  %query_budget = index.div %budget, %span_workers : index
-  %query_fits = index.cmp ult, %query_groups, %query_budget : index
-  %query_workers = scf.select %query_fits, %query_groups, %query_budget : index
-  %owners = index.mul %span_workers, %query_workers : index
+  %span_capacity = index.min %spans, %span_limit : index
+  %span_workers = index.min %span_capacity, %tile_rows : index
+  %span_divisor = index.max %span_workers, %c1 : index
+  %query_budget = index.div %budget, %span_divisor : index
+  %query_workers = index.min %query_groups, %query_budget : index
+  %row_workers = index.mul %span_workers, %query_workers : index
+  %owners = index.max %row_workers, %c1 : index
   %key_budget = index.div %budget, %owners : index
-  %key_fits = index.cmp ult, %key_groups, %key_budget : index
-  %key_workers = scf.select %key_fits, %key_groups, %key_budget : index
+  %key_workers = index.min %key_groups, %key_budget : index
   %threads = index.constant 128 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %key_workers, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %query_workers, %span_workers) workgroup_size(%threads, %c1, %c1) : index
+  kernel.launch.config workgroups(%key_workers, %query_workers, %span_workers) workgroup_size(%threads, %c1, %c1) : index
 } launch(%query_begin_arg: index, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer) {
   %tokens = config.get @flash_next.token_count : index
-  %tile_limit = config.get @qsa.query_tile : index
-  %short = index.cmp ult, %tokens, %tile_limit : index
-  %query_capacity = scf.select %short, %tokens, %tile_limit : index
   %capacity = config.get @flash_next.context_capacity : index
+  %query_capacity, %output_bytes, %workspace_bytes = func.call pure @qsa_score_layout(%tokens, %capacity) : (index, index) -> (index, offset, offset)
   %pool = config.get @flash_next.pool_capacity : index
   %spans = config.get @flash_next.span_capacity : index
   %live_span_value = func.call @flash_next_span_count(%epoch) : (buffer) -> (index)
@@ -106,9 +102,13 @@ kernel.def target(@qsa_score_tiled_wave32) @qsa_score_tiled(%neural_enabled: i1)
     %query_worker = kernel.workgroup.id<y> : index
     %query_workers = kernel.workgroup.count<y> : index
     %query_round = index.constant 127 : index
-    %rounded_queries = index.add %query_capacity, %query_round : index
+    %first_row = func.call pure @qsa_tile_rows(%span_begin, %query_begin, %query_capacity) : (index, index, index) -> (index)
+    %last_row = func.call pure @qsa_tile_rows(%span_end, %query_begin, %query_capacity) : (index, index, index) -> (index)
+    %first_group = index.div %first_row, %group_queries : index
+    %first_owned = index.add %first_group, %query_worker : index
+    %rounded_queries = index.add %last_row, %query_round : index
     %query_groups = index.div %rounded_queries, %group_queries : index
-    scf.for %query_group = [%query_worker to %query_groups step %query_workers] {
+    scf.for %query_group = [%first_owned to %query_groups step %query_workers] {
       %group_begin = index.madd %query_group, %group_queries, %query_begin : index
       %group_end = index.add %group_begin, %group_queries : index
       %earlier_begin = index.cmp ult, %group_begin, %span_begin : index

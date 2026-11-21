@@ -41,7 +41,8 @@ func.decl @initialize_q6(%uniform: i1, %quantized: i1, %rows: index, %inputs: in
 func.decl @q6_reference(%quantized: i1, %matrix_operands: i1, %rows: index, %inputs: index, %outputs: index, %input_base: offset, %weight_base: offset, %output_base: offset, %input: buffer, %weight: buffer, %output: buffer)
 
 // Every row count uses a final partial tile and multiple grid strides.
-// A second M1 case also clamps a budget larger than the useful tile count.
+// Additional M1 cases exercise a budget above the useful tile count and
+// a disabled projection whose complete output must retain its initial value.
 func.def pure inline @panel_case_shape(%configuration: index) -> (index, index, index, index, index, index, index, index) {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -55,7 +56,8 @@ func.def pure inline @panel_case_shape(%configuration: index) -> (index, index, 
   %c210 = index.constant 210 : index
   %c256 = index.constant 256 : index
   %c768 = index.constant 768 : index
-  %clamped = index.cmp eq, %configuration, %c32 : index
+  %clamped = index.cmp uge, %configuration, %c32 : index
+  %disabled = index.cmp ugt, %configuration, %c32 : index
   %cohort_rows = index.add %configuration, %c1 : index
   %rows = scf.select %clamped, %c1, %cohort_rows : index
   %medium = index.cmp ule, %rows, %c8 : index
@@ -68,7 +70,8 @@ func.def pure inline @panel_case_shape(%configuration: index) -> (index, index, 
   %full_channels = index.mul %panels, %c16 : index
   %outputs = index.add %full_channels, %c1 : index
   %ordinary_budget = index.add %parity, %c1 : index
-  %budget = scf.select %clamped, %c32, %ordinary_budget : index
+  %worker_limit = scf.select %clamped, %c32, %ordinary_budget : index
+  %budget = scf.select %disabled, %c0, %worker_limit : index
   %q8_groups = index.div %inputs, %c128 : index
   %q8_row_bytes = index.mul %q8_groups, %c144 : index
   %input_bytes = index.mul %rows, %q8_row_bytes : index
@@ -98,7 +101,11 @@ func.def @panel_reference(%input_storage: buffer, %weight_storage: buffer, %outp
   %rows, %inputs, %outputs, %budget, %input_bytes, %weight_bytes, %input_storage_bytes, %weight_storage_bytes = func.call pure @panel_case_shape(%configuration) : (index) -> (index, index, index, index, index, index, index, index)
   %quantized = scalar.constant true : i1
   %matrix_operands = scalar.constant false : i1
-  func.call @q6_reference(%quantized, %matrix_operands, %rows, %inputs, %outputs, %payload, %weight_payload, %payload, %input_storage, %weight_storage, %output_storage) : (i1, i1, index, index, index, offset, offset, offset, buffer, buffer, buffer)
+  %enabled_cases = index.constant 33 : index
+  %enabled = index.cmp ult, %configuration, %enabled_cases : index
+  scf.if %enabled {
+    func.call @q6_reference(%quantized, %matrix_operands, %rows, %inputs, %outputs, %payload, %weight_payload, %payload, %input_storage, %weight_storage, %output_storage) : (i1, i1, index, index, index, offset, offset, offset, buffer, buffer, buffer)
+  }
   func.return
 }
 
@@ -135,7 +142,7 @@ command.def @panel_projection(%configuration: index) launch(%input_storage: buff
   command.return
 }
 
-check.scenario public @q6_q8_panel_cohorts configure[33](%configuration: index, %configuration_entropy: check.entropy) {
+check.scenario public @q6_q8_panel_cohorts configure[34](%configuration: index, %configuration_entropy: check.entropy) {
   check.trial[1](%trial: index, %entropy: check.entropy) {
     %rows, %inputs, %outputs, %budget, %input_bytes, %weight_bytes, %input_storage_bytes, %weight_storage_bytes = check.generate<@panel_case_shape>(%configuration) : (index) -> (index, index, index, index, index, index, index, index)
     %input_seed = check.entropy.read %entropy[0] : check.entropy -> i64

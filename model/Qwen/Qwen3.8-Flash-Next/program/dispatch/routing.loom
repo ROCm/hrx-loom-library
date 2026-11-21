@@ -4,18 +4,52 @@
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
-kernel.decl @route_project(%neural_enabled: i1) launch(%span_arg: buffer, %input_arg: buffer, %route_weight_arg: buffer, %shared_weight_arg: buffer, %logits_arg: buffer, %gate_arg: buffer)
+kernel.decl @route_project_single(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %route_weight_arg: buffer, %shared_weight_arg: buffer, %logits_arg: buffer, %gate_arg: buffer)
 
-kernel.decl @route_top10(%neural_enabled: i1) launch(%span_arg: buffer, %logits_arg: buffer, %ids_arg: buffer, %weights_arg: buffer)
+kernel.decl @route_project_shared(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %route_weight_arg: buffer, %shared_weight_arg: buffer, %logits_arg: buffer, %gate_arg: buffer)
 
-command.def public @flash_next_route(%neural_enabled: i1, %layer: index) launch(%parameters: buffer, %span: buffer, %input: buffer, %ids: buffer, %weights: buffer, %shared_gate: buffer) {
+kernel.decl @route_project_tile(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %route_weight_arg: buffer, %shared_weight_arg: buffer, %logits_arg: buffer, %gate_arg: buffer)
+
+kernel.decl @flash_next_route_matrix(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %route_weight_arg: buffer, %shared_weight_arg: buffer, %logits_arg: buffer, %gate_arg: buffer)
+
+func.decl pure @flash_next_coefficient_rows(%rows: index) -> (index, index)
+
+func.def public pure inline @route_projection_rows(%workload_count: index) -> (index, index, index, index) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %tile_begin = index.constant 64 : index
+  %full_precision_rows, %matrix_rows = func.call pure @flash_next_coefficient_rows(%workload_count) : (index) -> (index, index)
+  %single = index.cmp eq, %full_precision_rows, %c1 : index
+  %multiple = index.cmp ugt, %full_precision_rows, %c1 : index
+  %below_tile = index.cmp ult, %full_precision_rows, %tile_begin : index
+  %shared = scalar.andi %multiple, %below_tile : i1
+  %single_rows = scf.select %single, %c1, %c0 : index
+  %shared_rows = scf.select %shared, %full_precision_rows, %c0 : index
+  %tile_rows = scf.select %below_tile, %c0, %full_precision_rows : index
+  func.return %single_rows, %shared_rows, %tile_rows, %matrix_rows : index, index, index, index
+}
+
+command.def public @route_project(%workload_count: index) launch(%span_arg: buffer, %input_arg: buffer, %route_weight_arg: buffer, %shared_weight_arg: buffer, %logits_arg: buffer, %gate_arg: buffer) {
+  %single_rows, %shared_rows, %tile_rows, %matrix_rows = func.call pure @route_projection_rows(%workload_count) : (index) -> (index, index, index, index)
+  command.concurrent {
+    kernel.launch @route_project_single[%single_rows](%span_arg, %input_arg, %route_weight_arg, %shared_weight_arg, %logits_arg, %gate_arg) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @route_project_shared[%shared_rows](%span_arg, %input_arg, %route_weight_arg, %shared_weight_arg, %logits_arg, %gate_arg) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @route_project_tile[%tile_rows](%span_arg, %input_arg, %route_weight_arg, %shared_weight_arg, %logits_arg, %gate_arg) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_route_matrix[%matrix_rows](%span_arg, %input_arg, %route_weight_arg, %shared_weight_arg, %logits_arg, %gate_arg) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  command.return
+}
+
+kernel.decl @route_top10(%active_rows: index) launch(%span_arg: buffer, %logits_arg: buffer, %ids_arg: buffer, %weights_arg: buffer)
+
+command.def public @flash_next_route(%workload_count: index, %layer: index) launch(%parameters: buffer, %span: buffer, %input: buffer, %ids: buffer, %weights: buffer, %shared_gate: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %row_bytes = index.constant 2048 : offset
   %bytes = index.scale %tokens, %row_bytes : index, offset -> offset
   %logits = buffer.alloca<global> align(256) %bytes : buffer
   %route_weight = command.parameter %parameters, "blk.{}.ffn_gate_inp.weight"[%layer] : view<512x2560xf32>
   %shared_weight = command.parameter %parameters, "blk.{}.ffn_gate_inp_shexp.weight"[%layer] : view<2560xf32>
-  kernel.launch @route_project[%neural_enabled](%span, %input, %route_weight, %shared_weight, %logits, %shared_gate) : [i1](buffer, buffer, view<512x2560xf32>, view<2560xf32>, buffer, buffer)
-  kernel.launch @route_top10[%neural_enabled](%span, %logits, %ids, %weights) : [i1](buffer, buffer, buffer, buffer)
+  command.launch @route_project[%workload_count](%span, %input, %route_weight, %shared_weight, %logits, %shared_gate) : [index](buffer, buffer, view<512x2560xf32>, view<2560xf32>, buffer, buffer)
+  kernel.launch @route_top10[%workload_count](%span, %logits, %ids, %weights) : [index](buffer, buffer, buffer, buffer)
   command.return
 }

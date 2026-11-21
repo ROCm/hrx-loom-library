@@ -6,6 +6,8 @@ config.decl @flash_next.token_count : %value: index where [range(%value, 1, 3276
 
 config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 func.decl pure @flash_next_finish_capacity() -> (index)
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
@@ -90,12 +92,12 @@ kernel.def @flash_next_finish_plan() {
 // two launches make overlapping source/destination indices harmless without
 // allocating another prompt-sized residual. Staging retains only the selected query cohorts.
 func.def inline @flash_next_finish_copy(%gather: i1, %epoch: buffer, %origins: buffer, %residual: buffer, %mixed: buffer, %injection: buffer, %staging: buffer) {
-  %row = kernel.workgroup.id<x> : index
+  %first = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %thread = kernel.workitem.id<x> : index
   %capacity = func.call pure @flash_next_finish_capacity() : () -> (index)
   %count = func.call @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
-  %active = index.cmp ult, %row, %count : index
-  scf.if %active {
+  scf.for %row = [%first to %count step %workers] {
     %tokens = config.get @flash_next.token_count : index
     %c0_index = index.constant 0 : index
     %origin = index.constant 0 : offset
@@ -149,22 +151,24 @@ func.def inline @flash_next_finish_copy(%gather: i1, %epoch: buffer, %origins: b
   func.return
 }
 
-kernel.def @flash_next_finish_gather() {
-  %rows = func.call pure @flash_next_finish_capacity() : () -> (index)
+kernel.def @flash_next_finish_gather(%workload_count: index) {
   %threads = index.constant 128 : index
   %c1_index = index.constant 1 : index
-  kernel.launch.config workgroups(%rows, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%workload_count, %c1_index, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%workers, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
 } launch(%epoch: buffer, %origins: buffer, %residual: buffer, %mixed: buffer, %injection: buffer, %staging: buffer) {
   %gather = scalar.constant true : i1
   func.call @flash_next_finish_copy(%gather, %epoch, %origins, %residual, %mixed, %injection, %staging) : (i1, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.return
 }
 
-kernel.def @flash_next_finish_publish() {
-  %rows = func.call pure @flash_next_finish_capacity() : () -> (index)
+kernel.def @flash_next_finish_publish(%workload_count: index) {
   %threads = index.constant 128 : index
   %c1_index = index.constant 1 : index
-  kernel.launch.config workgroups(%rows, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%workload_count, %c1_index, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%workers, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
 } launch(%epoch: buffer, %origins: buffer, %residual: buffer, %mixed: buffer, %injection: buffer, %staging: buffer) {
   %gather = scalar.constant false : i1
   func.call @flash_next_finish_copy(%gather, %epoch, %origins, %residual, %mixed, %injection, %staging) : (i1, buffer, buffer, buffer, buffer, buffer, buffer)
@@ -173,18 +177,19 @@ kernel.def @flash_next_finish_publish() {
 
 // The finished compact source is distinct from the caller-owned residual.
 // Restore original row indices so the ordinary output head remains unchanged.
-kernel.def @flash_next_finish_scatter() {
-  %rows = func.call pure @flash_next_finish_capacity() : () -> (index)
+kernel.def @flash_next_finish_scatter(%workload_count: index) {
   %threads = index.constant 128 : index
   %c1_index = index.constant 1 : index
-  kernel.launch.config workgroups(%rows, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%workload_count, %c1_index, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%workers, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
 } launch(%epoch: buffer, %origins: buffer, %input: buffer, %output: buffer) {
-  %row = kernel.workgroup.id<x> : index
+  %first = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
   %thread = kernel.workitem.id<x> : index
   %capacity = func.call pure @flash_next_finish_capacity() : () -> (index)
   %count = func.call @flash_next_token_count(%epoch, %capacity) : (buffer, index) -> (index)
-  %active = index.cmp ult, %row, %count : index
-  scf.if %active {
+  scf.for %row = [%first to %count step %workers] {
     %tokens = config.get @flash_next.token_count : index
     %c0_index = index.constant 0 : index
     %origin = index.constant 0 : offset

@@ -97,15 +97,15 @@ func.def @finalize_fixture(%mixed_value: index, %depth_value: index, %round_valu
   view.store %extent_word, %header[0] : i32, view<3xi32>
   view.store %extent_word, %header[2] : i32, view<3xi32>
   scf.if %finished {
-    %feedback = buffer.view %results[%origin] : buffer -> view<30xi32>
+    %feedback = buffer.view %results[%origin] : buffer -> view<38xi32>
     %count = index.cast %next : index to i32
     %offset = index.constant 9 : index
     %slot = index.add %offset, %round : index
     %c0_i32 = scalar.constant 0 : i32
     %c4_i32 = scalar.constant 4 : i32
-    view.store %count, %feedback[8] : i32, view<30xi32>
-    view.store %c0_i32, %feedback[%slot] : i32, view<30xi32>
-    view.store %c4_i32, %feedback[29] : i32, view<30xi32>
+    view.store %count, %feedback[8] : i32, view<38xi32>
+    view.store %c0_i32, %feedback[%slot] : i32, view<38xi32>
+    view.store %c4_i32, %feedback[37] : i32, view<38xi32>
   }
   func.return
 }
@@ -124,17 +124,17 @@ check.scenario public @finalize_stopped_cohort configure[7](%round: index, %conf
     %minimum_probability = check.literal value(0.84999999999999998) : f32
     %epoch = check.generate.fill value(-99) : tensor<934xi32>
     %tokens = check.generate.iota offset(0) step(1) : tensor<32x8xi32>
-    %results = check.generate.fill value(-99) : tensor<30xi32>
+    %results = check.generate.fill value(-99) : tensor<38xi32>
     %draft = check.generate.fill value(0) : tensor<27xi32>
     %origins = check.generate.fill value(-99) : tensor<4x3xi32>
     %predictions = check.generate.fill value(-99) : tensor<4x2xi32>
     %ids = check.generate.fill value(-99) : tensor<4xi32>
     %no = check.literal value(false) : i1
-    check.generate<@finalize_fixture>(%mixed, %depth, %round, %no, %epoch, %tokens, %results) : (index, index, index, i1, tensor<934xi32>, tensor<32x8xi32>, tensor<30xi32>) -> ()
-    check.compare<@qwen38_mtp_proposal_advance_confident, @finalize_reference>[%round](%mixed, %round, %depth, %minimum_probability, %capacity, %c4, %draft, %origins, %predictions, %ids, %tokens, %results, %epoch) : [index](index, index, index, f32, index, index, tensor<27xi32>, tensor<4x3xi32>, tensor<4x2xi32>, tensor<4xi32>, tensor<32x8xi32>, tensor<30xi32>, tensor<934xi32>) -> () {
+    check.generate<@finalize_fixture>(%mixed, %depth, %round, %no, %epoch, %tokens, %results) : (index, index, index, i1, tensor<934xi32>, tensor<32x8xi32>, tensor<38xi32>) -> ()
+    check.compare<@qwen38_mtp_proposal_advance_confident, @finalize_reference>[%round](%mixed, %round, %depth, %minimum_probability, %capacity, %c4, %draft, %origins, %predictions, %ids, %tokens, %results, %epoch) : [index](index, index, index, f32, index, index, tensor<27xi32>, tensor<4x3xi32>, tensor<4x2xi32>, tensor<4xi32>, tensor<32x8xi32>, tensor<38xi32>, tensor<934xi32>) -> () {
       check.expect.bitwise actual(%epoch) expected(%epoch) : tensor<934xi32>
       check.expect.bitwise actual(%tokens) expected(%tokens) : tensor<32x8xi32>
-      check.expect.bitwise actual(%results) expected(%results) : tensor<30xi32>
+      check.expect.bitwise actual(%results) expected(%results) : tensor<38xi32>
       check.expect.bitwise actual(%draft) expected(%draft) : tensor<27xi32>
       check.expect.bitwise actual(%origins) expected(%origins) : tensor<4x3xi32>
       check.expect.bitwise actual(%predictions) expected(%predictions) : tensor<4x2xi32>
@@ -145,3 +145,64 @@ check.scenario public @finalize_stopped_cohort configure[7](%round: index, %conf
 }
 
 check.benchmark<@finalize_stopped_cohort> @finalize_check
+
+// A missed history lookup reserved sixteen target rows. The verifier must
+// receive just the anchor and seven initialized neural predictions.
+kernel.def @reserve_history_span() {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%epoch: buffer, %draft: buffer, %predictions: buffer) {
+  %origin = index.constant 0 : offset
+  %c1_i32 = scalar.constant 1 : i32
+  %c16_i32 = scalar.constant 16 : i32
+  %packet = buffer.view %epoch[%origin] : buffer -> view<4xi32>
+  view.store %c16_i32, %packet[0] : i32, view<4xi32>
+  view.store %c1_i32, %packet[1] : i32, view<4xi32>
+  view.store %c16_i32, %packet[2] : i32, view<4xi32>
+  view.store %c16_i32, %packet[3] : i32, view<4xi32>
+  %capacity = index.constant 16 : index
+  %options_origin = func.call @qwen38_packet_options_origin(%capacity) : (index) -> (offset)
+  %options = buffer.view %epoch[%options_origin] : buffer -> view<2xi32>
+  %generated = scalar.constant 2 : i32
+  view.store %generated, %options[0] : i32, view<2xi32>
+  view.store %c16_i32, %options[1] : i32, view<2xi32>
+  %neural = buffer.view %draft[%origin] : buffer -> view<4xi32>
+  view.store %c1_i32, %neural[0] : i32, view<4xi32>
+  view.store %c1_i32, %neural[1] : i32, view<4xi32>
+  view.store %c1_i32, %neural[2] : i32, view<4xi32>
+  view.store %c1_i32, %neural[3] : i32, view<4xi32>
+  %prediction = buffer.view %predictions[%origin] : buffer -> view<2xi32>
+  %token = scalar.constant 42 : i32
+  %confident = scalar.constant 1.0 : f32
+  %bits = scalar.bitcast %confident : f32 to i32
+  view.store %token, %prediction[0] : i32, view<2xi32>
+  view.store %bits, %prediction[1] : i32, view<2xi32>
+  kernel.return
+}
+
+check.case public @final_neural_prediction_bounds_verification {
+  %ordinary = check.literal value(0) : index
+  %last = check.literal value(6) : index
+  %depth = check.literal value(7) : index
+  %threshold = check.literal value(0.5) : f32
+  %capacity = check.literal value(16) : index
+  %one = check.literal value(1) : index
+  %epoch = check.generate.fill value(0) : tensor<456xi32>
+  %draft = check.generate.fill value(0) : tensor<9xi32>
+  %origins = check.generate.fill value(0) : tensor<1x3xi32>
+  %predictions = check.generate.fill value(0) : tensor<1x2xi32>
+  %ids = check.generate.fill value(-1) : tensor<1xi32>
+  %tokens = check.generate.iota offset(100) step(1) : tensor<16xi32>
+  %feedback = check.generate.fill value(-1) : tensor<38xi32>
+  kernel.launch @reserve_history_span(%epoch, %draft, %predictions) : (tensor<456xi32>, tensor<9xi32>, tensor<1x2xi32>)
+  kernel.launch @qwen38_mtp_proposal_advance_confident[%last](%ordinary, %last, %depth, %threshold, %capacity, %one, %draft, %origins, %predictions, %ids, %tokens, %feedback, %epoch) : [index](index, index, index, f32, index, index, tensor<9xi32>, tensor<1x3xi32>, tensor<1x2xi32>, tensor<1xi32>, tensor<16xi32>, tensor<38xi32>, tensor<456xi32>)
+  %selected_and_reserved = check.tensor.view %epoch offset(8) : tensor<456xi32> -> tensor<2xi32>
+  %initialized = check.generate.fill value(8) : tensor<2xi32>
+  check.expect.bitwise actual(%selected_and_reserved) expected(%initialized) : tensor<2xi32>
+  %last_token = check.tensor.view %tokens offset(28) : tensor<16xi32> -> tensor<1xi32>
+  %prediction = check.generate.fill value(42) : tensor<1xi32>
+  check.expect.bitwise actual(%last_token) expected(%prediction) : tensor<1xi32>
+  check.return
+}
+
+check.benchmark<@final_neural_prediction_bounds_verification> @last_prediction_check

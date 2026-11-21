@@ -1,17 +1,22 @@
 # Device dispatch composition
 
-These commands bind the checkpoint's named tensors and sequence launches over
-prepared epoch capacities. The enclosing model supplies parameter handles,
+These commands bind the checkpoint's named tensors and size launches from
+the live packet. The enclosing model supplies parameter handles,
 immutable span descriptors, retained-state reader/writer origins, and output
 buffers. Each command owns its transient intermediates through their final
 consumer. It does not allocate another persistent parameter bank.
 
 GDN dispatch chooses the small recurrence or cooperative four-token window
-from the prepared capacity. Fused projection/convolution publishes boundary
+from the packet's token count. Fused projection/convolution publishes boundary
 halos before a separate owner advances history. Both forms consume the same
 rounded BF16 convolution values. Capture is below the layer composition so
 GDN and PLE can record speculative inputs without depending on the parent
 verification program.
+
+The router and GDN alpha/beta projections keep F32 coefficients through 1,024
+input rows. Above that count their BF16 matrix kernels share each coefficient
+panel across up to 128 rows and accumulate in F32. A partial final panel
+reads and writes only its live rows.
 
 Hyperconnection dispatch binds the target's F32 injection weights or the
 predictor's Q8_0 injection weights. Expert dispatch selects the checkpoint's

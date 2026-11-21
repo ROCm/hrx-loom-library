@@ -23,6 +23,25 @@ func.def public pure inline @qsa_cohort_capacity() -> (index) {
   func.return %capacity : index
 }
 
+// A span of n queries contributes ceil(n/4) groups. Summing the
+// per-span rounding allowance bounds the shared live prefix for every
+// partition of the epoch. Its suffix never needs clearing or reading.
+func.def public readonly inline @qsa_cohort_extent(%epoch: buffer) -> (index) {
+  %origin = index.constant 0 : offset
+  %header = buffer.view %epoch[%origin] : buffer -> view<3xi32>
+  %token_word = view.load %header[0] : view<3xi32> -> i32
+  %span_word = view.load %header[1] : view<3xi32> -> i32
+  %token_value = index.cast %token_word : i32 to index
+  %span_value = index.cast %span_word : i32 to index
+  %tokens = index.assume %token_value [range(%token_value, 0, 32768)] : index
+  %spans = index.assume %span_value [ge(%span_value, 0), le(%span_value, %tokens)] : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %rounded = index.madd %spans, %c3, %tokens : index
+  %groups = index.div %rounded, %c4 : index
+  func.return %groups : index
+}
+
 // Resolve a cohort once in the producer. Four-query groups cannot cross an
 // authoritative span, even when resident rows share physical prefix pages.
 // Inactive capacity groups return a zero query count.
@@ -191,20 +210,12 @@ func.def inline @qsa_cohort_walk(%publish: i1, %lists: view<4x516xi32>, %p0: ind
 // plus their causal tails. A descriptor packs a 16-bit logical block ID and
 // four 4-bit membership masks, one per query. Zero membership marks padding;
 // block 65,535 remains a valid ID. Only live records and aligned tails are
-// written; inactive capacity records publish a zero descriptor count.
+// written. Empty records within the live bound publish a zero count.
 //
 // Threads partition the sorted inputs by reference-row quantiles, count their
 // union, scan counts, and publish disjoint intervals. The consumer uses the
 // resolved row and visibility directly, without repeating span lookup or sort.
-kernel.def target(@qsa_cohort_wave32) @qsa_merge_cohorts(%neural_enabled: i1) {
-  %groups = func.call pure @qsa_cohort_capacity() : () -> (index)
-  %threads = index.constant 128 : index
-  %c1 = index.constant 1 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
-} launch(%epoch: buffer, %selected: buffer, %cohorts: buffer) {
-  %group = kernel.workgroup.id<x> : index
+func.def inline @qsa_merge_cohort(%group: index, %epoch: buffer, %selected: buffer, %cohorts: buffer) {
   %thread = kernel.workitem.id<x> : index
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -356,6 +367,25 @@ kernel.def target(@qsa_cohort_wave32) @qsa_merge_cohorts(%neural_enabled: i1) {
       %c0_i32 = scalar.constant 0 : i32
       view.store %c0_i32, %header[3] : i32, view<4xi32>
     }
+  }
+  func.return
+}
+
+kernel.def target(@qsa_cohort_wave32) @qsa_merge_cohorts(%cohort_tokens: index) {
+  %units = target.execution.unit.count : index
+  %groups_per_unit = index.constant 8 : index
+  %budget = index.mul %units, %groups_per_unit : index
+  %workers = index.min %cohort_tokens, %budget : index
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%workers, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%epoch: buffer, %selected: buffer, %cohorts: buffer) {
+  %first = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
+  %count = func.call readonly @qsa_cohort_extent(%epoch) : (buffer) -> (index)
+  scf.for %group = [%first to %count step %workers] {
+    func.call @qsa_merge_cohort(%group, %epoch, %selected, %cohorts) : (index, buffer, buffer, buffer)
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   }
   kernel.return
 }

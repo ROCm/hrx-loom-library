@@ -253,6 +253,13 @@ def run(address, model, reference):
         label: len(rows) for label, rows in reference["responses"].items()
     }, consumed
 
+    # With one output left the model receives zero draft credit, including
+    # when the same installation used speculative feedback for earlier rows.
+    _, arithmetic, answer = cases[0]
+    last = request(address, prefix + "-one-token", messages(arithmetic), 1, model=model)
+    assert last["text"] == answer and last["finish_reason"] == "length", last
+    assert last["usage"]["completion_tokens"] == 1, last
+
     # Reset an admitted streaming peer. Completion may win the race; either
     # outcome must retire ownership and allow a fresh request to finish.
     connection = http.client.HTTPConnection(address.hostname, address.port)

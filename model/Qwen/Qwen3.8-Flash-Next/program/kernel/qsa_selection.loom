@@ -10,6 +10,8 @@ config.decl @flash_next.pool_capacity : %value: index where [range(%value, 64, 2
 
 func.decl @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
+func.decl pure @flash_next_token_workers(%capacity: index, %groups_per_token: index, %units: index) -> (index)
+
 func.decl @flash_next_token_binding(%mapping: buffer, %token: index) -> (index, index, index, index)
 
 func.decl @flash_next_physical_token(%rows: buffer, %row: index, %position: index) -> (index)
@@ -20,33 +22,62 @@ config.decl @qsa.query_tile : %value: index where [range(%value, 1, 32768)]
 
 amdgpu.target<gfx11-generic> @qsa_selection_wave32 {subgroup_size = 32}
 
-// Each wave scores one completed block through the resident row page map.
-kernel.def target(@qsa_selection_wave32) @qsa_score_blocks(%neural_enabled: i1) {
-  %tokens = config.get @flash_next.token_count : index
-  %tile_limit = config.get @qsa.query_tile : index
-  %short = index.cmp ult, %tokens, %tile_limit : index
-  %query_capacity = scf.select %short, %tokens, %tile_limit : index
+// Each packed query needs 6144 bf16 outputs after selection. Its scores use
+// one f32 per four context positions, or context_capacity bytes per query.
+// Tile as many rows as the output can hold, with room for up to 512 rows even
+// at long contexts. The configured row limit can further subdivide the tile.
+func.def public pure inline @qsa_score_layout(%tokens: index, %context: index) -> (index, offset, offset) where [range(%tokens, 1, 32768), range(%context, 64, 262144), multiple_of(%context, 64)] {
+  %limit = config.get @qsa.query_tile : index
+  %output_row_bytes = index.constant 12288 : index
+  %output_length = index.mul %tokens, %output_row_bytes : index
+  %reusable_rows = index.div %output_length, %context : index
+  %minimum_tile = index.constant 512 : index
+  %available = index.max %reusable_rows, %minimum_tile : index
+  %bounded = index.min %available, %limit : index
+  %rows = index.min %tokens, %bounded : index
+  %output_bytes = index.cast %output_length : index to offset
+  %score_length = index.mul %rows, %context : index
+  %workspace_length = index.max %output_length, %score_length : index
+  %workspace_bytes = index.cast %workspace_length : index to offset
+  func.return %rows, %output_bytes, %workspace_bytes : index, offset, offset
+}
+
+// The intersection of the packed prefix with a score tile, in query rows.
+func.def public pure inline @qsa_tile_rows(%end: index, %begin: index, %capacity: index) -> (index) {
+  %live_begin = index.min %begin, %end : index
+  %remaining = index.sub %end, %live_begin : index
+  %clipped = index.min %remaining, %capacity : index
+  %rows = index.assume %clipped [range(%clipped, 0, %capacity)] : index
+  func.return %rows : index
+}
+
+// Each wave visits its share of completed blocks through the resident page map.
+kernel.def target(@qsa_selection_wave32) @qsa_score_blocks(%tile_rows: index) {
   %capacity = config.get @flash_next.context_capacity : index
   %c4 = index.constant 4 : index
   %blocks = index.div %capacity, %c4 : index
   %threads = index.constant 32 : index
   %c1 = index.constant 1 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %blocks, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %query_capacity, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %row_limit = index.constant 16 : index
+  %row_workers = index.min %tile_rows, %row_limit : index
+  %owners = index.max %row_workers, %c1 : index
+  %units = target.execution.unit.count : index
+  %key_workers = func.call pure @flash_next_token_workers(%blocks, %owners, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%key_workers, %row_workers, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%query_begin_arg: index, %index_origin: offset, %span: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer) {
   %tokens = config.get @flash_next.token_count : index
-  %tile_limit = config.get @qsa.query_tile : index
-  %short = index.cmp ult, %tokens, %tile_limit : index
-  %query_capacity = scf.select %short, %tokens, %tile_limit : index
   %capacity = config.get @flash_next.context_capacity : index
+  %query_capacity, %output_bytes, %workspace_bytes = func.call pure @qsa_score_layout(%tokens, %capacity) : (index, index) -> (index, offset, offset)
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
   %query_begin = index.assume %query_begin_arg [range(%query_begin_arg, 0, %tokens)] : index
-  %row = kernel.workgroup.id<y> : index
-  %token = index.add %query_begin, %row : index
-  %block = kernel.workgroup.id<x> : index
-  %active_row = index.cmp ult, %token, %end : index
-  scf.if %active_row {
+  %live_rows = func.call pure @qsa_tile_rows(%end, %query_begin, %query_capacity) : (index, index, index) -> (index)
+  %row_worker = kernel.workgroup.id<y> : index
+  %row_workers = kernel.workgroup.count<y> : index
+  %key_worker = kernel.workgroup.id<x> : index
+  %key_workers = kernel.workgroup.count<x> : index
+  scf.for %row = [%row_worker to %live_rows step %row_workers] {
+    %token_value = index.add %query_begin, %row : index
+    %token = index.assume %token_value [lt(%token_value, %tokens)] : index
     %c0_index = index.constant 0 : index
     %c1 = index.constant 1 : index
     %c4 = index.constant 4 : index
@@ -58,10 +89,8 @@ kernel.def target(@qsa_selection_wave32) @qsa_score_blocks(%neural_enabled: i1) 
     %complete = index.assume %complete_value [range(%complete_value, 0, %capacity_blocks)] : index
     %block_capacity = index.div %capacity, %c4 : index
     %sparse = index.cmp ugt, %complete, %budget : index
-    %causal = index.cmp ult, %block, %complete : index
-    %active_block = scalar.andi %active_row, %causal : i1
-    %active = scalar.andi %active_block, %sparse : i1
-    scf.if %active {
+    %key_count = scf.select %sparse, %complete, %c0_index : index
+    scf.for %block = [%key_worker to %key_count step %key_workers] {
       %lane = kernel.subgroup.lane.id : index
       %channel = index.mul %lane, %c4 : index
       %origin = index.constant 0 : offset
@@ -96,11 +125,7 @@ kernel.def target(@qsa_selection_wave32) @qsa_score_blocks(%neural_enabled: i1) 
 }
 
 // A narrow cohort exposes few independent rows, so each row uses more waves.
-func.def pure inline @qsa_histogram_threads() -> (index) {
-  %tokens = config.get @flash_next.token_count : index
-  %limit = config.get @qsa.query_tile : index
-  %short = index.cmp ult, %tokens, %limit : index
-  %queries = scf.select %short, %tokens, %limit : index
+func.def pure inline @qsa_histogram_threads(%queries: index) -> (index) {
   %narrow_capacity = index.constant 4 : index
   %narrow = index.cmp ule, %queries, %narrow_capacity : index
   %small = index.constant 256 : index
@@ -407,26 +432,35 @@ func.def pure inline @qsa_first_set_bits(%mask: i32, %count: i32) -> (i32) {
 // Nonnegative F32 keys preserve score order. Histograms narrow the exact
 // top-512 threshold; final compaction preserves logical order and earliest
 // ties. Bounded LDS candidates replace repeated full-row threshold scans.
-kernel.def target(@qsa_selection_wave32) @qsa_select_blocks(%neural_enabled: i1) {
+kernel.def target(@qsa_selection_wave32) @qsa_select_blocks(%tile_rows: index) {
   %tokens = config.get @flash_next.token_count : index
-  %limit = config.get @qsa.query_tile : index
-  %short = index.cmp ult, %tokens, %limit : index
-  %queries = scf.select %short, %tokens, %limit : index
-  %threads = func.call pure @qsa_histogram_threads() : () -> (index)
+  %capacity = config.get @flash_next.context_capacity : index
+  %query_capacity, %output_bytes, %workspace_bytes = func.call pure @qsa_score_layout(%tokens, %capacity) : (index, index) -> (index, offset, offset)
+  %threads = func.call pure @qsa_histogram_threads(%query_capacity) : (index) -> (index)
   %c1_index = index.constant 1 : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %queries, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
+  %wave_size = index.constant 32 : index
+  %waves = index.div %threads, %wave_size : index
+  %units = target.execution.unit.count : index
+  %workers = func.call pure @flash_next_token_workers(%tile_rows, %waves, %units) : (index, index, index) -> (index)
+  kernel.launch.config workgroups(%workers, %c1_index, %c1_index) workgroup_size(%threads, %c1_index, %c1_index) : index
 } launch(%query_begin_arg: index, %span: buffer, %mapping: buffer, %scores: buffer, %selected: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %capacity = config.get @flash_next.context_capacity : index
-  %threads = func.call pure @qsa_histogram_threads() : () -> (index)
+  %query_capacity, %output_bytes, %workspace_bytes = func.call pure @qsa_score_layout(%tokens, %capacity) : (index, index) -> (index, offset, offset)
+  %threads = func.call pure @qsa_histogram_threads(%query_capacity) : (index) -> (index)
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
   %query_begin = index.assume %query_begin_arg [range(%query_begin_arg, 0, %tokens)] : index
-  %row = kernel.workgroup.id<x> : index
-  %token = index.add %query_begin, %row : index
-  %active = index.cmp ult, %token, %end : index
-  scf.if %active {
+  %rows = func.call pure @qsa_tile_rows(%end, %query_begin, %query_capacity) : (index, index, index) -> (index)
+  %worker = kernel.workgroup.id<x> : index
+  %workers = kernel.workgroup.count<x> : index
+  scf.for %row = [%worker to %rows step %workers] {
+    %next_row = index.cmp ne, %row, %worker : index
+    scf.if %next_row {
+      // Retire the previous row's histogram readers before reusing their LDS.
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    }
+    %token_value = index.add %query_begin, %row : index
+    %token = index.assume %token_value [lt(%token_value, %tokens)] : index
     %c0_index = index.constant 0 : index
     %c1_index = index.constant 1 : index
     %block_width = index.constant 4 : index

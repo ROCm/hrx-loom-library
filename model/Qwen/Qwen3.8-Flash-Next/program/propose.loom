@@ -2,15 +2,17 @@
 // predictor history advances during proposal; committed carry changes only
 // after target acceptance and catch-up.
 
-kernel.decl @flash_next_lookup_query() launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer)
+func.decl readonly @flash_next_span_count(%epoch: buffer) -> (index)
 
-kernel.decl @flash_next_lookup_scan() launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer)
+kernel.decl @flash_next_lookup_query(%round_owners: index) launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer)
 
-kernel.decl @flash_next_lookup_select() launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer, %output: buffer)
+kernel.decl @flash_next_lookup_scan(%round_owners: index) launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer)
 
-kernel.decl @flash_next_lookup_parameters(%round: index) launch(%round_value: index, %epoch: buffer, %draft: buffer, %origins: buffer, %target_tokens: buffer, %parameters: buffer)
+kernel.decl @flash_next_lookup_select(%round_owners: index) launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer, %output: buffer)
 
-kernel.decl @flash_next_lookup_publish(%round: index) launch(%round_value: index, %rows: buffer, %cache: buffer, %parameters: buffer, %selected: buffer, %draft: buffer, %origins: buffer, %ids: buffer, %plan: buffer, %target_tokens: buffer, %moves: buffer, %count_buffer: buffer)
+kernel.decl @flash_next_lookup_parameters(%round_owners: index) launch(%round_value: index, %epoch: buffer, %draft: buffer, %origins: buffer, %target_tokens: buffer, %parameters: buffer)
+
+kernel.decl @flash_next_lookup_publish(%round: index) launch(%round_value: index, %epoch: buffer, %rows: buffer, %cache: buffer, %parameters: buffer, %selected: buffer, %draft: buffer, %origins: buffer, %ids: buffer, %plan: buffer, %target_tokens: buffer, %moves: buffer, %count_buffer: buffer)
 
 kernel.decl @flash_next_lookup_hidden(%count_buffer: buffer) launch(%moves: buffer, %hidden: buffer, %compacted: buffer)
 
@@ -46,9 +48,9 @@ kernel.decl @flash_next_mtp_restore() launch(%epoch: buffer, %rows: buffer, %car
 
 kernel.decl @flash_next_draft_plan() launch(%epoch: buffer, %ids: buffer, %carry: buffer, %plan: buffer)
 
-kernel.decl @flash_next_draft_sample(%neural_enabled: i1) launch(%epoch: buffer, %plan: buffer, %carry: buffer, %logits: buffer, %output: buffer)
+kernel.decl @flash_next_draft_sample(%live_rows: index) launch(%epoch: buffer, %plan: buffer, %carry: buffer, %logits: buffer, %output: buffer)
 
-kernel.decl @qwen38_continue_dispatch() launch(%mixed_inputs: index, %context: index, %capacity: index, %feedback_capacity: index, %epoch: buffer, %tokens: buffer, %results: buffer)
+func.decl @qwen38_continue_spans(%mixed_inputs: index, %context: index, %capacity: index, %feedback_capacity: index, %epoch: buffer, %tokens: buffer, %results: buffer)
 
 command.decl @flash_next_mtp_input(%neural_enabled: i1) launch(%parameters: buffer, %target_parameters: buffer, %epoch: buffer, %ids: buffer, %hidden: buffer, %residual: buffer)
 
@@ -56,7 +58,7 @@ command.decl @flash_next_qsa_residual(%workload_count: index, %layer: index, %ke
 
 command.decl @flash_next_ffn_residual(%workload_count: index, %layer: index) launch(%parameters: buffer, %span: buffer, %residual: buffer, %output: buffer)
 
-command.decl @flash_next_project_draft_logits(%neural_enabled: i1, %expanded: i1) launch(%parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %plan: buffer, %carry: buffer, %residual: buffer, %logits: buffer)
+command.decl @flash_next_project_draft_logits(%live_rows: index, %expanded: i1) launch(%parameters: buffer, %vocabulary_parameters: buffer, %epoch: buffer, %plan: buffer, %carry: buffer, %residual: buffer, %logits: buffer)
 
 // Recursive proposals use private working history. Committed carry is
 // read once and remains immutable until accepted target inputs warm the cache.
@@ -132,11 +134,12 @@ command.def public @flash_next_mtp_propose() launch(%parameters: buffer, %embedd
   %c1 = index.constant 1 : index
   %depth = config.get @flash_next.draft_depth : index
   scf.for %round = [%c0 to %depth step %c1] unroll {
-    kernel.launch @flash_next_lookup_parameters[%round](%round, %epoch, %draft, %origins, %target_tokens, %lookup_parameters) : [index](index, buffer, buffer, buffer, buffer, buffer)
-    kernel.launch @flash_next_lookup_query(%rows, %cache, %lookup_parameters, %lookup_query) : (buffer, buffer, buffer, buffer)
-    kernel.launch @flash_next_lookup_scan(%rows, %cache, %lookup_parameters, %lookup_query, %lookup_bits, %lookup_summaries) : (buffer, buffer, buffer, buffer, buffer, buffer)
-    kernel.launch @flash_next_lookup_select(%rows, %cache, %lookup_parameters, %lookup_query, %lookup_bits, %lookup_summaries, %lookup_selected) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
-    kernel.launch @flash_next_lookup_publish[%round](%round, %rows, %cache, %lookup_parameters, %lookup_selected, %draft, %origins, %ids, %plan, %target_tokens, %lookup_moves, %lookup_gate) : [index](index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    %round_owners = func.call readonly @flash_next_span_count(%draft) : (buffer) -> (index)
+    kernel.launch @flash_next_lookup_parameters[%round_owners](%round, %epoch, %draft, %origins, %target_tokens, %lookup_parameters) : [index](index, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_lookup_query[%round_owners](%rows, %cache, %lookup_parameters, %lookup_query) : [index](buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_lookup_scan[%round_owners](%rows, %cache, %lookup_parameters, %lookup_query, %lookup_bits, %lookup_summaries) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_lookup_select[%round_owners](%rows, %cache, %lookup_parameters, %lookup_query, %lookup_bits, %lookup_summaries, %lookup_selected) : [index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_lookup_publish[%round](%round, %epoch, %rows, %cache, %lookup_parameters, %lookup_selected, %draft, %origins, %ids, %plan, %target_tokens, %lookup_moves, %lookup_gate) : [index](index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
     // One GPU observation controls every neural launch in this round.
     %lookup_origin = index.constant 0 : offset
     %lookup_counts = buffer.view %lookup_gate[%lookup_origin] : buffer -> view<1xi32>
@@ -151,19 +154,22 @@ command.def public @flash_next_mtp_propose() launch(%parameters: buffer, %embedd
     command.launch @flash_next_qsa_residual[%workload_count, %layer, %key_origin, %value_origin, %index_origin, %tail_origin, %ordinary_inputs](%parameters, %draft, %mapping, %residual, %rows, %cache, %carry, %attention, %hidden, %ids) : [index, index, offset, offset, offset, offset, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
     command.launch @flash_next_ffn_residual[%workload_count, %layer](%parameters, %draft, %attention, %hidden) : [index, index](buffer, buffer, buffer, buffer)
     %expanded = scalar.constant false : i1
-    command.launch @flash_next_project_draft_logits[%neural_enabled, %expanded](%parameters, %vocabulary_parameters, %draft, %plan, %carry, %hidden, %logits) : [i1, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
-    kernel.launch @flash_next_draft_sample[%neural_enabled](%draft, %plan, %carry, %logits, %predictions) : [i1](buffer, buffer, buffer, buffer, buffer)
+    command.launch @flash_next_project_draft_logits[%workload_count, %expanded](%parameters, %vocabulary_parameters, %draft, %plan, %carry, %hidden, %logits) : [index, i1](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_draft_sample[%workload_count](%draft, %plan, %carry, %logits, %predictions) : [index](buffer, buffer, buffer, buffer, buffer)
     %minimum_probability = scalar.constant 0.84999999999999998 : f32
     kernel.launch @qwen38_mtp_proposal_advance_confident[%round](%mixed_inputs, %round, %depth, %minimum_probability, %target_capacity, %tokens, %draft, %origins, %predictions, %ids, %target_tokens, %results, %epoch) : [index](index, index, index, f32, index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   }
   command.return
 }
 
-command.def public @flash_next_continue() launch(%epoch: buffer, %tokens: buffer, %results: buffer) {
+kernel.def export("flash_next_continue") @flash_next_continue() {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%epoch: buffer, %tokens: buffer, %results: buffer) {
   %mixed_inputs = config.get @runner.qwen38.mixed_inputs : index
   %context = config.get @flash_next.context_capacity : index
   %capacity = config.get @flash_next.epoch_capacity : index
   %feedback_capacity = config.get @qwen38.feedback_capacity : index
-  kernel.launch @qwen38_continue_dispatch(%mixed_inputs, %context, %capacity, %feedback_capacity, %epoch, %tokens, %results) : (index, index, index, index, buffer, buffer, buffer)
-  command.return
+  func.call @qwen38_continue_spans(%mixed_inputs, %context, %capacity, %feedback_capacity, %epoch, %tokens, %results) : (index, index, index, index, buffer, buffer, buffer)
+  kernel.return
 }

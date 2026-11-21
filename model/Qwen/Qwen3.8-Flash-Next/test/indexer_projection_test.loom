@@ -10,7 +10,17 @@
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
-kernel.decl @qsa_linear_bf16(%neural_enabled: i1, %configured_width: index) launch(%width: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+func.decl pure @qsa_index_projection_rows(%count: index) -> (index, index)
+
+kernel.decl @qsa_index_dot(%count: index, %width: index) launch(%width_arg: index, %input: buffer, %weight: buffer, %output: buffer)
+
+kernel.decl @qsa_index_matrix(%count: index, %width: index) launch(%width_arg: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+
+func.def pure @indexer_fixture_count(%requested: index) -> (index) {
+  %capacity = config.get @flash_next.token_count : index
+  %live = index.min %requested, %capacity : index
+  func.return %live : index
+}
 
 // The packed epoch owns a live prefix. Poison all remaining backing rows,
 // including storage beyond the configured capacity, independently of the dot.
@@ -91,7 +101,6 @@ kernel.def @indexer_reference(%width: index) {
 }
 
 check.case public @indexer_projection {
-  %neural_enabled = check.literal value(true) : i1
   check.requires<hal.amdgpu.target> {target = "gfx11-generic"}
   %requested = check.param.choice values([0, 1, 15, 16, 127, 128, 129, 257]) name("active") : index
   %width = check.param.choice values([128, 132, 512]) name("features") : index
@@ -104,7 +113,10 @@ check.case public @indexer_projection {
   %expected = check.generate.fill value(-17.0) : tensor<259x[%width]xbf16>
   kernel.launch @indexer_fixture(%requested, %epoch, %input) : (index, tensor<3xi32>, tensor<259x2560xbf16>)
   kernel.launch @indexer_reference[%width](%requested, %width, %input, %weight, %expected) : [index](index, index, tensor<259x2560xbf16>, tensor<[%width]x2560xbf16>, tensor<259x[%width]xbf16>)
-  kernel.launch @qsa_linear_bf16[%neural_enabled, %width](%width, %epoch, %input, %weight, %actual) : [i1, index](index, tensor<3xi32>, tensor<259x2560xbf16>, tensor<[%width]x2560xbf16>, tensor<259x[%width]xbf16>)
+  %live = func.call pure @indexer_fixture_count(%requested) : (index) -> (index)
+  %dots, %matrix = func.call pure @qsa_index_projection_rows(%live) : (index) -> (index, index)
+  kernel.launch @qsa_index_dot[%dots, %width](%width, %input, %weight, %actual) : [index, index](index, tensor<259x2560xbf16>, tensor<[%width]x2560xbf16>, tensor<259x[%width]xbf16>)
+  kernel.launch @qsa_index_matrix[%matrix, %width](%width, %epoch, %input, %weight, %actual) : [index, index](index, tensor<3xi32>, tensor<259x2560xbf16>, tensor<[%width]x2560xbf16>, tensor<259x[%width]xbf16>)
   check.expect.approximate actual(%actual) expected(%expected) atol(6.103515625e-05) rtol(0.0078125) nan(different) : tensor<259x[%width]xbf16>, tensor<259x[%width]xbf16>
   check.return
 }

@@ -8,31 +8,34 @@
 
 config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
 
-kernel.decl @flash_next_lookup_parameters(%round: index) launch(%round_value: index, %epoch: buffer, %draft: buffer, %origins: buffer, %target_tokens: buffer, %parameters: buffer)
+func.decl readonly @flash_next_span_count(%epoch: buffer) -> (index)
 
-kernel.decl @flash_next_lookup_query() launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer)
+kernel.decl @flash_next_lookup_parameters(%round_owners: index) launch(%round_value: index, %epoch: buffer, %draft: buffer, %origins: buffer, %target_tokens: buffer, %parameters: buffer)
 
-kernel.decl @flash_next_lookup_scan() launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer)
+kernel.decl @flash_next_lookup_query(%round_owners: index) launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer)
 
-kernel.decl @flash_next_lookup_select() launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer, %output: buffer)
+kernel.decl @flash_next_lookup_scan(%round_owners: index) launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer)
 
-kernel.decl @flash_next_lookup_publish(%round: index) launch(%round_value: index, %rows: buffer, %cache: buffer, %parameters: buffer, %selected: buffer, %draft: buffer, %origins: buffer, %ids: buffer, %plan: buffer, %target_tokens: buffer, %moves: buffer, %count_buffer: buffer)
+kernel.decl @flash_next_lookup_select(%round_owners: index) launch(%maps: buffer, %history: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer, %output: buffer)
+
+kernel.decl @flash_next_lookup_publish(%round: index) launch(%round_value: index, %epoch: buffer, %rows: buffer, %cache: buffer, %parameters: buffer, %selected: buffer, %draft: buffer, %origins: buffer, %ids: buffer, %plan: buffer, %target_tokens: buffer, %moves: buffer, %count_buffer: buffer)
 
 kernel.decl @flash_next_lookup_hidden(%count_buffer: buffer) launch(%moves: buffer, %hidden: buffer, %compacted: buffer)
 
-// A 24-token pattern ends at 65, crossing a page and a subgroup boundary.
+// A pattern ends at 65, crossing a page and a subgroup boundary. Seven
+// matching tokens miss, eight qualify, and longer matches exercise selection.
 // A second copy ends at 129. Seventeen newer three-token matches hide the
 // original from a selector bounded to sixteen candidates. The query ends
 // with the same pattern across committed history and the pending chain.
-func.def @token(%slot: index, %position: index, %round: index, %match: i1, %newer: i1, %dense: i1, %crowded: i1) -> (i32) {
+func.def @token(%slot: index, %position: index, %round: index, %pattern_size: index, %match: i1, %newer: i1, %dense: i1, %crowded: i1) -> (i32) {
   %c3 = index.constant 3 : index
   %c5 = index.constant 5 : index
-  %pattern_size = index.constant 24 : index
-  %first_begin = index.constant 41 : index
   %first_end = index.constant 65 : index
-  %second_begin = index.constant 105 : index
+  %first_begin = index.sub %first_end, %pattern_size : index
   %second_end = index.constant 129 : index
-  %query_base = index.constant 169 : index
+  %second_begin = index.sub %second_end, %pattern_size : index
+  %query_end = index.constant 193 : index
+  %query_base = index.sub %query_end, %pattern_size : index
   %query_begin = index.add %query_base, %round : index
   %first_after = index.cmp uge, %position, %first_begin : index
   %first_before = index.cmp ult, %position, %first_end : index
@@ -95,6 +98,9 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
   %expected_spans = buffer.view %expected_draft[%descriptors] : buffer -> view<33x6xi32>
   %mapping = buffer.view %origins[%origin] : buffer -> view<33x3xi32>
   %expected_mapping = buffer.view %expected_origins[%origin] : buffer -> view<33x3xi32>
+  %reservations = buffer.view %epoch[%descriptors] : buffer -> view<512x6xi32>
+  %options_origin = index.constant 28684 : offset
+  %options = buffer.view %epoch[%options_origin] : buffer -> view<1024x2xi32>
   %policies = buffer.view %epoch[%policy_origin] : buffer -> view<1024x6xf32>
   %identities = buffer.view %epoch[%identity_origin] : buffer -> view<1024x2xi32>
   %directory = buffer.view %rows[%origin] : buffer -> view<64x5xi64>
@@ -128,7 +134,7 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
   %match_end = index.constant 65 : index
   %newer_end = index.constant 129 : index
   %dense_end = index.constant 191 : index
-  %match_length = index.constant 24 : index
+  %long_match = index.constant 24 : index
   %dense_length = index.constant 64 : index
   %c0_word = scalar.constant 0 : i32
   %c1_word = scalar.constant 1 : i32
@@ -136,7 +142,6 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
   %c1_float = scalar.constant 1.0 : f32
   %round = index.mul %configuration, %c3 : index
   %tail = index.add %round, %c1 : index
-  %remaining = index.sub %c7, %round : index
   %position = index.add %committed, %round : index
   %position_word = index.cast %position : index to i32
   %count_word = index.cast %count : index to i32
@@ -146,7 +151,10 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
   %mixed = config.get @runner.qwen38.mixed_inputs : index
   %is_mixed = index.cmp ne, %mixed, %c0 : index
   %input_stride = scf.select %is_mixed, %c8, %c1 : index
-  %none = index.cmp eq, %mode, %c0 : index
+  %too_short = index.cmp eq, %mode, %c0 : index
+  %all_match = index.cmp eq, %mode, %c1 : index
+  %positive_length = scf.select %all_match, %c8, %long_match : index
+  %match_length = scf.select %too_short, %c7, %positive_length : index
   %mixed_cohort = index.cmp eq, %mode, %c2 : index
   %all_sampled = index.cmp eq, %mode, %c3 : index
   %dense = index.cmp eq, %mode, %c4 : index
@@ -162,9 +170,9 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
     %sampled_slot = index.cmp eq, %flavor, %c3 : index
     %newer_slot = index.cmp eq, %flavor, %c2 : index
     %mixed_miss = scalar.andi %mixed_cohort, %no_match_slot : i1
-    %missing = scalar.ori %none, %mixed_miss : i1
+    %missing = scalar.ori %too_short, %mixed_miss : i1
     %true = scalar.constant true : i1
-    %match = scalar.xori %missing, %true : i1
+    %match = scalar.xori %mixed_miss, %true : i1
     %mixed_sampled = scalar.andi %mixed_cohort, %sampled_slot : i1
     %sampled = scalar.ori %all_sampled, %mixed_sampled : i1
     %newer = scalar.andi %mixed_cohort, %newer_slot : i1
@@ -183,6 +191,26 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
     %slot_word = index.cast %slot : index to i32
     %target_span = index.add %slot, %c33 : index
     %target_span_word = index.cast %target_span : index to i32
+    // Within the same round include full, short, and exhausted reservations.
+    // The one remaining token may go through either learned or copied history.
+    %room = index.sub %c7, %round : index
+    %short = index.min %room, %c1 : index
+    %short_or_full = scf.select %newer_slot, %short, %room : index
+    %remaining = scf.select %sampled_slot, %c0, %short_or_full : index
+    %width = index.add %tail, %remaining : index
+    %width_word = index.cast %width : index to i32
+    // A full history match remains usable even after the neural budget ends.
+    %budget = scf.select %all_match, %c2, %c8 : index
+    %budget_word = index.cast %budget : index to i32
+    view.store %budget_word, %options[%target_span, 0] : i32, view<1024x2xi32>
+    // Some owners have a full physical reservation but can emit only the
+    // shorter prefix. Others have room to emit beyond their reservation.
+    %credit_limited = scalar.ori %newer_slot, %sampled_slot : i1
+    %full_width = index.cast %c8 : index to i32
+    %reservation = scf.select %credit_limited, %full_width, %width_word : i32
+    %credit = scf.select %credit_limited, %width_word, %full_width : i32
+    view.store %reservation, %reservations[%target_span, 0] : i32, view<512x6xi32>
+    view.store %credit, %options[%target_span, 1] : i32, view<1024x2xi32>
     %source_base = scalar.constant 900 : i32
     %source_position = scalar.addi %slot_word, %source_base : i32
     view.store %c1_word, %spans[%slot, 0] : i32, view<33x6xi32>
@@ -226,19 +254,19 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
       scf.for %within = [%c0 to %page_tokens step %c1] {
         %logical = index.madd %page, %page_tokens, %within : index
         %physical = index.madd %physical_page, %page_tokens, %within : index
-        %id = func.call @token(%slot, %logical, %round, %match, %newer, %dense, %crowded) : (index, index, index, i1, i1, i1, i1) -> (i32)
+        %id = func.call @token(%slot, %logical, %round, %match_length, %match, %newer, %dense, %crowded) : (index, index, index, index, i1, i1, i1, i1) -> (i32)
         view.store %id, %history[%physical] : i32, view<6400xi32>
       }
     }
     scf.for %relative = [%c0 to %tail step %c1] {
       %logical = index.add %committed, %relative : index
-      %id = func.call @token(%slot, %logical, %round, %match, %newer, %dense, %crowded) : (index, index, index, i1, i1, i1, i1) -> (i32)
+      %id = func.call @token(%slot, %logical, %round, %match_length, %match, %newer, %dense, %crowded) : (index, index, index, index, i1, i1, i1, i1) -> (i32)
       %input = index.add %input_begin, %relative : index
       %word = index.mul %input, %input_stride : index
       view.store %id, %inputs[%word] : i32, view<4096xi32>
       view.store %id, %expected_inputs[%word] : i32, view<4096xi32>
     }
-    %anchor = func.call @token(%slot, %position, %round, %match, %newer, %dense, %crowded) : (index, index, index, i1, i1, i1, i1) -> (i32)
+    %anchor = func.call @token(%slot, %position, %round, %match_length, %match, %newer, %dense, %crowded) : (index, index, index, index, i1, i1, i1, i1) -> (i32)
     view.store %anchor, %draft_ids[%slot] : i32, view<33xi32>
     view.store %anchor, %expected_draft_ids[%slot] : i32, view<33xi32>
     %unavailable = scalar.ori %missing, %sampled : i1
@@ -255,11 +283,13 @@ func.def @fixture(%mode: index, %configuration_value: index, %count_value: index
     %source_end = index.add %selected_end, %remaining : index
     %has_match = index.cmp ne, %selected_end, %c0 : index
     %fits = index.cmp ule, %source_end, %committed : index
-    %copied = scalar.andi %has_match, %fits : i1
+    %found = scalar.andi %has_match, %fits : i1
+    %exhausted = index.cmp eq, %remaining, %c0 : index
+    %copied = scalar.ori %found, %exhausted : i1
     %new_count = scf.if %copied -> (index) {
       scf.for %relative = [%c0 to %remaining step %c1] {
         %logical = index.add %selected_end, %relative : index
-        %id = func.call @token(%slot, %logical, %round, %match, %newer, %dense, %crowded) : (index, index, index, i1, i1, i1, i1) -> (i32)
+        %id = func.call @token(%slot, %logical, %round, %match_length, %match, %newer, %dense, %crowded) : (index, index, index, index, i1, i1, i1, i1) -> (i32)
         %after_pending = index.add %input_begin, %tail : index
         %input = index.add %after_pending, %relative : index
         %word = index.mul %input, %input_stride : index
@@ -320,11 +350,12 @@ func.def @geometry(%trial: index) -> (index, index) {
 command.def @lookup_round(%configuration: index) launch(%epoch: buffer, %draft: buffer, %origins: buffer, %target: buffer, %rows: buffer, %cache: buffer, %ids: buffer, %plan: buffer, %hidden: buffer, %compacted: buffer, %counts: buffer, %expected_draft: buffer, %expected_origins: buffer, %expected_target: buffer, %expected_ids: buffer, %expected_plan: buffer, %expected_hidden: buffer, %expected_count: buffer, %expected_selected: buffer, %parameters: buffer, %query: buffer, %matches: buffer, %summaries: buffer, %selected: buffer, %moves: buffer) {
   %c3 = index.constant 3 : index
   %round = index.mul %configuration, %c3 : index
-  kernel.launch @flash_next_lookup_parameters[%round](%round, %epoch, %draft, %origins, %target, %parameters) : [index](index, buffer, buffer, buffer, buffer, buffer)
-  kernel.launch @flash_next_lookup_query(%rows, %cache, %parameters, %query) : (buffer, buffer, buffer, buffer)
-  kernel.launch @flash_next_lookup_scan(%rows, %cache, %parameters, %query, %matches, %summaries) : (buffer, buffer, buffer, buffer, buffer, buffer)
-  kernel.launch @flash_next_lookup_select(%rows, %cache, %parameters, %query, %matches, %summaries, %selected) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer)
-  kernel.launch @flash_next_lookup_publish[%round](%round, %rows, %cache, %parameters, %selected, %draft, %origins, %ids, %plan, %target, %moves, %counts) : [index](index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  %round_owners = func.call readonly @flash_next_span_count(%draft) : (buffer) -> (index)
+  kernel.launch @flash_next_lookup_parameters[%round_owners](%round, %epoch, %draft, %origins, %target, %parameters) : [index](index, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_lookup_query[%round_owners](%rows, %cache, %parameters, %query) : [index](buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_lookup_scan[%round_owners](%rows, %cache, %parameters, %query, %matches, %summaries) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_lookup_select[%round_owners](%rows, %cache, %parameters, %query, %matches, %summaries, %selected) : [index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_lookup_publish[%round](%round, %epoch, %rows, %cache, %parameters, %selected, %draft, %origins, %ids, %plan, %target, %moves, %counts) : [index](index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   kernel.launch @flash_next_lookup_hidden[%counts](%moves, %hidden, %compacted) : [buffer](buffer, buffer, buffer)
   command.return
 }
@@ -372,7 +403,7 @@ check.scenario public @copied_and_neural_cohorts configure[3](%configuration: in
     %expected_plan = check.generate.fill value(-7) : tensor<42xi32>
     %expected_hidden = check.generate.fill value(-7) : tensor<33x5120xi32>
     %expected_count = check.generate.fill value(-7) : tensor<1xi32>
-    %expected_selected = check.generate.fill value(0) : tensor<33x2xi32>
+    %expected_selected = check.generate.fill value(-7) : tensor<33x2xi32>
     check.generate<@fixture>(%mode, %configuration, %count, %epoch, %draft, %origins, %target, %rows, %cache, %ids, %plan, %hidden, %expected_draft, %expected_origins, %expected_target, %expected_ids, %expected_plan, %expected_hidden, %expected_count, %expected_selected) : (index, index, index, tensor<28682xi32>, tensor<201xi32>, tensor<33x3xi32>, tensor<4096xi32>, tensor<1376xi64>, tensor<3385632xi32>, tensor<33xi32>, tensor<42xi32>, tensor<33x5120xi32>, tensor<201xi32>, tensor<33x3xi32>, tensor<4096xi32>, tensor<33xi32>, tensor<42xi32>, tensor<33x5120xi32>, tensor<1xi32>, tensor<33x2xi32>) -> ()
     %parameters = check.generate.fill value(-7) : tensor<33x16xi32>
     %query = check.generate.fill value(-7) : tensor<33x65xi32>

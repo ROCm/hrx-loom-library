@@ -1,6 +1,6 @@
-kernel.decl @qsa_score_blocks(%neural_enabled: i1) launch(%query_begin: index, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
+kernel.decl @qsa_score_blocks(%tile_rows: index) launch(%query_begin: index, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
 
-kernel.decl @qsa_score_tiled(%neural_enabled: i1) launch(%query_begin: index, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
+kernel.decl @qsa_score_tiled(%tile_rows: index) launch(%query_begin: index, %index_origin: offset, %epoch: buffer, %mapping: buffer, %rows: buffer, %queries: buffer, %arena: buffer, %scores: buffer)
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
@@ -9,7 +9,7 @@ config.decl @qsa.query_tile : %value: index where [range(%value, 1, 32768)]
 // Three unrelated histories cut across query tiles, or one shared history
 // crosses the dense/sparse boundary. Capacities 4/8/16/32 exercise narrow and
 // wide matrix cohorts, ragged live prefixes, and a final partial query tile.
-func.def @fixture(%trial: index, %epoch: buffer, %mapping: buffer, %rows: buffer) -> (index) {
+func.def @fixture(%trial: index, %epoch: buffer, %mapping: buffer, %rows: buffer) -> (index, index) {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
@@ -107,7 +107,10 @@ func.def @fixture(%trial: index, %epoch: buffer, %mapping: buffer, %rows: buffer
   %later_start = scf.select %second_trial, %last_token, %c0 : index
   %fragment_start = scf.select %first_trial, %c2, %later_start : index
   %query_begin = scf.select %shared, %c0, %fragment_start : index
-  func.return %query_begin : index
+  %tile_limit = config.get @qsa.query_tile : index
+  %remaining = index.sub %active, %query_begin : index
+  %tile_rows = index.min %remaining, %tile_limit : index
+  func.return %query_begin, %tile_rows : index, index
 }
 
 // Full F64 scalar products provide an independent numerical oracle. Addressing
@@ -192,10 +195,9 @@ check.scenario public @paged_matrix_index_scores {
     %rows = check.generate.fill value(0) : tensor<2752xi8>
     %queries = check.generate.random.uniform seed(%query_seed) range(-2.0 to 2.0) : tensor<32x4x128xbf16>
     %arena = check.generate.random.uniform seed(%key_seed) range(-2.0 to 2.0) : tensor<203072xbf16>
-    %begin = check.generate<@fixture>(%trial, %epoch, %mapping, %rows) : (index, tensor<99xi32>, tensor<32x4xi32>, tensor<2752xi8>) -> (index)
+    %begin, %tile_rows = check.generate<@fixture>(%trial, %epoch, %mapping, %rows) : (index, tensor<99xi32>, tensor<32x4xi32>, tensor<2752xi8>) -> (index, index)
     %scores = check.generate.fill value(-99.0) : tensor<13x528xf32>
-    %neural_enabled = check.literal value(true) : i1
-    check.compare<@qsa_score_tiled, @reference>[%neural_enabled](%begin, %index_origin, %epoch, %mapping, %rows, %queries, %arena, %scores) : [i1](index, offset, tensor<99xi32>, tensor<32x4xi32>, tensor<2752xi8>, tensor<32x4x128xbf16>, tensor<203072xbf16>, tensor<13x528xf32>) -> () {
+    check.compare<@qsa_score_tiled, @reference>[%tile_rows](%begin, %index_origin, %epoch, %mapping, %rows, %queries, %arena, %scores) : [index](index, offset, tensor<99xi32>, tensor<32x4xi32>, tensor<2752xi8>, tensor<32x4x128xbf16>, tensor<203072xbf16>, tensor<13x528xf32>) -> () {
       check.expect.approximate actual(%scores) expected(%scores) atol(3.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<13x528xf32>, tensor<13x528xf32>
     }
   }
@@ -213,10 +215,9 @@ check.scenario public @paged_scalar_index_scores {
     %rows = check.generate.fill value(0) : tensor<2752xi8>
     %queries = check.generate.random.uniform seed(%query_seed) range(-2.0 to 2.0) : tensor<32x4x128xbf16>
     %arena = check.generate.random.uniform seed(%key_seed) range(-2.0 to 2.0) : tensor<203072xbf16>
-    %begin = check.generate<@fixture>(%trial, %epoch, %mapping, %rows) : (index, tensor<99xi32>, tensor<32x4xi32>, tensor<2752xi8>) -> (index)
+    %begin, %tile_rows = check.generate<@fixture>(%trial, %epoch, %mapping, %rows) : (index, tensor<99xi32>, tensor<32x4xi32>, tensor<2752xi8>) -> (index, index)
     %scores = check.generate.fill value(-99.0) : tensor<13x528xf32>
-    %neural_enabled = check.literal value(true) : i1
-    check.compare<@qsa_score_blocks, @reference>[%neural_enabled](%begin, %index_origin, %epoch, %mapping, %rows, %queries, %arena, %scores) : [i1](index, offset, tensor<99xi32>, tensor<32x4xi32>, tensor<2752xi8>, tensor<32x4x128xbf16>, tensor<203072xbf16>, tensor<13x528xf32>) -> () {
+    check.compare<@qsa_score_blocks, @reference>[%tile_rows](%begin, %index_origin, %epoch, %mapping, %rows, %queries, %arena, %scores) : [index](index, offset, tensor<99xi32>, tensor<32x4xi32>, tensor<2752xi8>, tensor<32x4x128xbf16>, tensor<203072xbf16>, tensor<13x528xf32>) -> () {
       check.expect.approximate actual(%scores) expected(%scores) atol(3.0000000000000001e-05) rtol(1.0000000000000001e-05) nan(different) : tensor<13x528xf32>, tensor<13x528xf32>
     }
   }

@@ -1,13 +1,14 @@
+func.decl readonly @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
+
 // A live prefix longer than the gfx11 worker grid forces shared-storage reuse.
 // Zero Q/K make attention uniform. V repeats [0, 1, 2, 3] plus a KV-head bias,
 // so an independent closed-form average checks each causal/sparse prefix.
 // The final partial cohort must preserve the three inactive output rows.
-
 func.decl pure @qsa_cohort_capacity() -> (index)
 
-kernel.decl @qsa_merge_cohorts(%enabled: i1) launch(%epoch: buffer, %selected: buffer, %cohorts: buffer)
+kernel.decl @qsa_merge_cohorts(%cohort_tokens: index) launch(%epoch: buffer, %selected: buffer, %cohorts: buffer)
 
-kernel.decl @qsa_cohort_attention(%enabled: i1) launch(%key_origin: offset, %value_origin: offset, %rows: buffer, %queries: buffer, %gates: buffer, %arena: buffer, %cohorts: buffer, %output: buffer)
+kernel.decl @qsa_cohort_attention(%cohort_tokens: index) launch(%key_origin: offset, %value_origin: offset, %epoch: buffer, %rows: buffer, %queries: buffer, %gates: buffer, %arena: buffer, %cohorts: buffer, %output: buffer)
 
 func.def @fixture(%epoch: buffer, %rows: buffer, %arena: buffer, %selected: buffer) {
   %origin = index.constant 0 : offset
@@ -62,15 +63,16 @@ func.def @fixture(%epoch: buffer, %rows: buffer, %arena: buffer, %selected: buff
 }
 
 command.def @attention() launch(%epoch: buffer, %rows: buffer, %zeros: buffer, %arena: buffer, %selected: buffer, %output: buffer) {
-  %enabled = scalar.constant true : i1
+  %row_capacity = index.constant 3080 : index
+  %count = func.call readonly @flash_next_token_count(%epoch, %row_capacity) : (buffer, index) -> (index)
   %groups = func.call pure @qsa_cohort_capacity() : () -> (index)
   %stride = index.constant 8224 : offset
   %bytes = index.scale %groups, %stride : index, offset -> offset
   %cohorts = buffer.alloca<global> align(16) %bytes : buffer
   %key_origin = index.constant 0 : offset
   %value_origin = index.constant 2048 : offset
-  kernel.launch @qsa_merge_cohorts[%enabled](%epoch, %selected, %cohorts) : [i1](buffer, buffer, buffer)
-  kernel.launch @qsa_cohort_attention[%enabled](%key_origin, %value_origin, %rows, %zeros, %zeros, %arena, %cohorts, %output) : [i1](offset, offset, buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @qsa_merge_cohorts[%count](%epoch, %selected, %cohorts) : [index](buffer, buffer, buffer)
+  kernel.launch @qsa_cohort_attention[%count](%key_origin, %value_origin, %epoch, %rows, %zeros, %zeros, %arena, %cohorts, %output) : [index](offset, offset, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   command.return
 }
 

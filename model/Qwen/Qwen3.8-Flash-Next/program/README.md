@@ -16,9 +16,10 @@ three contain tensor payloads. The predictor scope contains one Q8_0 file.
 Parameter identities allow its identical embedding and vocabulary tensors to
 share the target's storage.
 
-Preparation declares the stage catalog and immutable capacities. Packed
-epochs carry the live token count, spans, row ownership, page IDs, and
-recurrent frontiers. `weights.loom` is an explicit auxiliary compiler input:
+Preparation declares the command programs for each enabled phase and sizes
+their storage from the token and span budgets. Each packed epoch supplies its
+live token and span counts, row ownership, page IDs, and recurrent frontiers.
+`weights.loom` is an explicit auxiliary compiler input:
 it configures one in-place preparation command for the QKV, gate, and output
 matrices in all 36 GDN layers. Each disjoint four-channel group is read into
 workgroup storage before publishing contiguous scale and code planes. The
@@ -41,30 +42,20 @@ PLE adds hashed n-gram lookup and its own token and convolution history.
 Read anchors and writable endpoints are distinct arguments, allowing forks
 to share immutable history while publishing into private state.
 
-`ple_prepare.loom` declares the request and independent-prefix catalogs plus
-one cached-host request root. `ple_control.loom` implements the shared epoch
-template with a finite HAL file batch: request dispatch, producer fence,
-independent layer-zero work, and a completion join before the suffix. The file
-resolver supplies the retained checkpoint handle and exact tensor byte window;
-ordinary queue capture retains the file and buffers through completion. The
-source stores only stable stage/parameter/storage ordinals and one cache
-initialization flag; row growth preserves them. No host request-list readback,
-per-row host submission, or model-specific runtime API is involved.
+Every input layout has a file-request program. It reads the old token history
+and writes the live byte ranges for the PLE embedding table. The file resolver
+supplies the retained checkpoint handle and exact tensor window. Queue capture
+keeps the file and buffers alive until the rows reach the packed row cache.
+The source retains the stage and storage handles across resident growth.
 
-The finite PLE stages separate request generation, layer zero, and the remaining
-target layers. The requester reads the old token history and writes a live byte
-range list without advancing that history. Layer zero has no PLE dependency and
-can execute while file reads fill the packed row cache. The suffix starts after
-read completion, publishes filled cache entries, and uses the same decoding,
-projection, and convolution as the resident path. Layer bounds and input mode
-specialize the existing unfused, normalized, and fused bodies; they do not
-introduce runtime layer dispatch.
-
-Speculative verification retains both prefix and suffix weight domains, captures
-all transition inputs, and replays only accepted history. Its layer-zero replay
-uses the prefix domain. Resident verification supplies one domain for both and
-retains the complete-body root. No request or cache-planning stage publishes
-speculative state on behalf of the verifier.
+Without a drafter, layer zero runs while the embedding file reads are in
+flight. The target suffix joins those reads before consuming PLE rows. With a
+drafter, a single verifier owns layer zero and the remaining target layers.
+It accepts packets containing known prompt tokens, speculative candidates, or
+both. Known input advances history directly. A speculative span captures its
+transition inputs and replays the accepted prefix. Each path writes progress
+and selected tokens into the same feedback bank, including the last ordinary
+token of a response. The model records the target once for all these packets.
 
 Each sparse-attention layer pairs K and V within four-token, single-head
 records. A record contains a 2 KiB K tile followed by a 2 KiB V tile. K keeps
@@ -85,21 +76,26 @@ accepted prefix into non-page state. Catch-up uses accepted target hidden
 rows to advance predictor state. Draft vocabulary membership is learned from
 accepted tokens and is retained with the request.
 
-Text preparation registers shorter paired proposal/verifier stages for rounded
-cohorts of four and eight requests. The shared packet owner selects both stage
-identities before enqueue; queued work keeps its captured choice while later
-cohorts can choose another. A three- or four-owner cohort uses at most two
-proposals, and a five- through eight-owner cohort uses one. One or two owners
-retain the configured ceiling. Alternative stages borrow the same parameters
-and retained storage; preparation adds no copies or model-specific host policy.
+The text service records four command programs for speculative generation.
+They gather embedding rows, propose tokens, verify the live packet, and bring
+accepted state up to date. A fixed-grid kernel then prepares a queued packet
+directly from device feedback. Each stage takes its work from the live packet,
+including when a request enters or leaves a batch.
+
+Each packet carries the target reservation and the neural budget for each
+owner. For ordinary text decoding, the model budgets two neural proposals
+each for three or four owners, and one each for five through eight owners.
+The reservation can accommodate a longer match from accepted history.
+Both queued packets carry the scheduling decision across compaction. The
+same recorded programs serve the next cohort as owners arrive or finish.
 
 Within each recursive chain, a predicted probability below 0.85 stops that
 owner's subsequent neural steps. The current prediction remains a target
 verification candidate. Stable compaction retains the original target span in
 shared proposal origins, so removing stopped owners cannot change request or
 media identity. The threshold and cohort policy do not modify target sampling
-or accepted-prefix verification. Prefill, media, supplied candidates, and
-cohorts beyond the prepared alternatives retain their ordinary stage pairing.
+or accepted-prefix verification. Prefill, media, and supplied candidates
+retain their ordinary reservations.
 
 The input-content kernels distinguish ordinary IDs from media records using
 composition facts. Target embedding reads original Q8 vocabulary rows or F32
@@ -130,7 +126,7 @@ No per-context coordinate history, packet copy, or extra dispatch is required.
 Greedy proposal rounds first search accepted token history. A trigram bitset
 locates the newest sixteen occurrences, and backward comparison selects the
 longest suffix, breaking ties toward the newest occurrence. A match of at least
-twelve tokens supplies the complete remaining proposal tail only when those
+eight tokens supplies the complete remaining proposal tail only when those
 IDs are already committed. The target still verifies every proposed token.
 Sampled requests retain neural drafting.
 
@@ -151,15 +147,17 @@ Target verification still uses the full vocabulary and unchanged sampling and
 acceptance rules; the confidence threshold changes only how much draft work
 is attempted.
 
-Output-only stages at capacities of 128 tokens and above compact the final
-attention layer after every input row has been appended to its cache. Only
-selected query cohorts continue through attention and experts; results
-scatter back to their original packed rows.
-The normalized path retains its separate normalization and injection below
-2,048-token capacity, while larger shapes retain the fused arithmetic.
-Speculative verification and predictor catch-up consume the full hidden-state
-root and keep every row. Packet and scratch extents follow the configured
-span and token capacities rather than a fixed client count.
+Output-only stages append every input row to the attention cache, then compact
+the final layer to the query cohorts that need outputs. Their results scatter
+back to the original packed rows. Verification and predictor catch-up keep
+every row because they consume the full hidden state.
+
+The original packet's live token count selects the hyperconnection projection.
+Up to 64 tokens use dot products. Larger packets use matrix instructions, with
+integer activation packing for 1,025 through 2,048 tokens in the intermediate
+projections. The final feed-forward projection always uses floating-point
+inputs. Compaction changes the number of rows it computes while preserving the
+arithmetic it would have used on the full packet.
 
 The vocabulary projection shares each decoded Q8 row across four selected
 queries for small output capacities and eight for larger ones. A device-sized
@@ -181,11 +179,10 @@ state layout and accepted-prefix replay contract are unchanged.
 ## Original image and video projector
 
 Image-enabled variants set `flash_next.image_inputs` and add the image service
-exports. Preparation declares ordinary and mixed-input target, proposal, warm,
-verification, and continuation stages using one catalog builder and the same
-immutable parameter handles. The shared controller chooses the corresponding
-catalog from each packet's actual input representation. Text-only variants
-retain only the ordinary catalog.
+exports. Preparation binds target, proposal, catch-up, verification, and
+continuation programs to the same immutable parameters for each enabled input
+layout. A packet containing image or video placeholders selects the mixed-input
+handles. Text-only variants prepare the ordinary layout.
 
 The projector reads original BF16 matrices and F32 affine parameters from the
 separate `vision` scope. `vision_projector.loom` owns the complete resize,
