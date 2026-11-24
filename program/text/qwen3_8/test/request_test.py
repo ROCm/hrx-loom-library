@@ -85,6 +85,7 @@ class RequestCheckTest(unittest.TestCase):
         chunk_size=0,
         defaults=None,
         truncated=False,
+        count_only=False,
     ):
         request_path = self.directory / "request.json"
         request_path.write_text(
@@ -105,6 +106,8 @@ class RequestCheckTest(unittest.TestCase):
             f"--response_truncated={'true' if truncated else 'false'}",
             f"--options={defaults_json}",
         ]
+        if count_only:
+            command.append("--count_only=true")
         if response is not None:
             response_path = self.directory / "response.txt"
             response_path.write_text(response, encoding="utf-8", newline="\n")
@@ -1201,6 +1204,55 @@ class RequestCheckTest(unittest.TestCase):
         )
         value = self.success(self.execute(request, capacity=1048576))
         self.assertGreater(len(value["tokens"]), 262144)
+
+    def test_oversized_count_matches_complete_generation_input(self):
+        cases = {
+            "text": self.request(),
+            "tools": self.request(tools=TOOLS),
+            "video": self.request(
+                messages=[{"role": "user", "content": [self.video(3)]}],
+                media_io_kwargs=self.video_options([0.0, 0.5, 1.0]),
+            ),
+            "image": self.request(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Look here."},
+                            self.image((255, 0, 0)),
+                        ],
+                    }
+                ]
+            ),
+        }
+        for name, request in cases.items():
+            with self.subTest(name=name):
+                prepared = self.success(self.execute(request))
+                result = self.execute(request, capacity=16, count_only=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                measured = json.loads(result.stdout)
+                self.assertGreater(len(prepared["tokens"]), 16)
+                self.assertEqual(measured["input_tokens"], len(prepared["tokens"]))
+                self.assertEqual(measured["media_spans"], prepared["media_spans"])
+                self.assertNotIn("tokens", measured)
+
+    def test_oversized_count_validates_the_projected_marker_encoding(self):
+        tokenizer = json.loads(self.tokenizer.read_text(encoding="utf-8"))
+        tokenizer["added_tokens"] = [
+            token
+            for token in tokenizer["added_tokens"]
+            if token["content"] != "<|image_pad|>"
+        ]
+        self.tokenizer.write_text(json.dumps(tokenizer), encoding="utf-8")
+        request = self.request(
+            messages=[{"role": "user", "content": [self.image((255, 0, 0))]}]
+        )
+        for capacity, count_only in ((4096, False), (16, True)):
+            with self.subTest(capacity=capacity):
+                result = self.execute(request, capacity=capacity, count_only=count_only)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("media marker does not encode", result.stderr)
 
     def test_capacity_and_model_identity_rejections_are_atomic(self):
         for request, capacity, diagnostic in (

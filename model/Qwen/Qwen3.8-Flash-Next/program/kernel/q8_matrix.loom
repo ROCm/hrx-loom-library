@@ -1,6 +1,7 @@
 // Flash-Next owns precision and launch policy. The shared Q8 motifs receive
 // explicit geometry and storage facts, while this composition chooses F16
-// reconstructed coefficients for wide cohorts and F32 block scaling otherwise.
+// reconstructed coefficients for wide cohorts and projections that require
+// them. Other contractions apply each block scale in F32.
 // Dense entries unpack the model epoch header before contracting a live tile.
 
 template.decl @ggml.q8_0_bf16.contract(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>)
@@ -9,11 +10,12 @@ template.decl @ggml.q8_0_f16.contract(%capacity: index, %inputs: index, %outputs
 
 template.decl @ggml.q8_0_f16.contract_k64(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>)
 
-template.decl @flash_next.q8_contract(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>)
+template.decl @flash_next.q8_contract(%require_f16: i1, %capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>)
 
-template.def<@flash_next.q8_contract> device @flash_next_q8_contract(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>) {
+template.def<@flash_next.q8_contract> device @flash_next_q8_contract(%require_f16: i1, %capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>) {
   %threshold = index.constant 4096 : index
-  %use_half = index.cmp uge, %capacity, %threshold : index
+  %wide = index.cmp uge, %capacity, %threshold : index
+  %use_half = scalar.ori %require_f16, %wide : i1
   %result = scf.if %use_half -> (vector<[%fragment_count]x8xf32>) {
     %tile = template.apply<@ggml.q8_0_f16.contract>(%capacity, %inputs, %outputs, %streams, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %fragment_count, %first, %end, %channel_base, %split_scales, %row_bytes, %weight_origin, %input, %weight) : (index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%fragment_count]x8xf32>)
     scf.yield %tile : vector<[%fragment_count]x8xf32>
@@ -28,7 +30,7 @@ template.decl @tensor.matrix.store_bf16_wave32(%remaining_rows: index, %outputs:
 
 // Full F16 panels share two original Q8 blocks per stage. The paired stage
 // preserves contraction order while halving LDS publication/retirement phases.
-template.def<@flash_next.q8_contract> device priority(20) @flash_next_q8_contract_k64(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>) where [ge(%capacity, 4096), ge(%inputs, 2560), eq(%tile_rows, 128), eq(%tile_columns, 128), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 2)] {
+template.def<@flash_next.q8_contract> device priority(20) @flash_next_q8_contract_k64(%require_f16: i1, %capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>) where [ge(%capacity, 4096), ge(%inputs, 2560), eq(%tile_rows, 128), eq(%tile_columns, 128), eq(%wave_rows, 4), eq(%wave_columns, 2), eq(%pipeline_depth, 2)] {
   %tile = template.apply<@ggml.q8_0_f16.contract_k64>(%capacity, %inputs, %outputs, %streams, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %fragment_count, %first, %end, %channel_base, %split_scales, %row_bytes, %weight_origin, %input, %weight) : (index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%fragment_count]x8xf32>)
   template.return %tile : vector<[%fragment_count]x8xf32>
 }
@@ -99,7 +101,8 @@ template.def<@flash_next.q8_tile_stage> device @flash_next_q8_tiled_stage(%split
       %stage_tile = template.apply<@ggml.q8_0_f16.contract_k64>(%capacity, %inputs, %outputs, %c1, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %fragment_count, %first, %end, %channel_base, %split_scales, %row_bytes, %weight_origin, %input, %weight) : (index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%fragment_count]x8xf32>)
       scf.yield %stage_tile : vector<[%fragment_count]x8xf32>
     } else {
-      %small_tile = template.apply<@flash_next.q8_contract>(%capacity, %inputs, %outputs, %c1, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %fragment_count, %first, %end, %channel_base, %split_scales, %row_bytes, %weight_origin, %input, %weight) : (index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%fragment_count]x8xf32>)
+      %require_f16 = scalar.constant false : i1
+      %small_tile = template.apply<@flash_next.q8_contract>(%require_f16, %capacity, %inputs, %outputs, %c1, %tile_rows, %tile_columns, %wave_rows, %wave_columns, %pipeline_depth, %fragment_count, %first, %end, %channel_base, %split_scales, %row_bytes, %weight_origin, %input, %weight) : (i1, index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%fragment_count]x8xf32>)
       scf.yield %small_tile : vector<[%fragment_count]x8xf32>
     }
     scf.for %ordinal = [%c0 to %fragment_count step %c1] unroll schedule(linear) {

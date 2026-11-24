@@ -12,17 +12,17 @@ kernel.decl @expert_bucket_gate_up_q5k(%neural_enabled: i1) launch(%input_arg: b
 
 kernel.decl @expert_bucket_gate_up_q8(%neural_enabled: i1) launch(%input_arg: buffer, %tasks_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
 
-kernel.decl @expert_down_q51(%neural_enabled: i1) launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %weight_arg: buffer, %output_arg: buffer)
+kernel.decl @expert_down_q51(%workload_count: index) launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %weight_arg: buffer, %output_arg: buffer)
 
-kernel.decl @expert_down_q8(%neural_enabled: i1) launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %weight_arg: buffer, %output_arg: buffer)
+kernel.decl @expert_down_q8(%workload_count: index) launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %weight_arg: buffer, %output_arg: buffer)
 
 func.decl pure @expert_gate_input_is_prepacked() -> (i1)
 
-kernel.decl @expert_gate_up_q4k(%neural_enabled: i1) launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
+kernel.decl @expert_gate_up_q4k(%workload_count: index) launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
 
-kernel.decl @expert_gate_up_q5k(%neural_enabled: i1) launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
+kernel.decl @expert_gate_up_q5k(%workload_count: index) launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
 
-kernel.decl @expert_gate_up_q8(%neural_enabled: i1) launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
+kernel.decl @expert_gate_up_q8(%workload_count: index) launch(%span_arg: buffer, %input_arg: buffer, %ids_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
 
 kernel.decl @expert_input_half(%neural_enabled: i1) launch(%input_arg: buffer, %epoch_arg: buffer, %output_arg: buffer)
 
@@ -32,61 +32,36 @@ func.decl pure @expert_record_extent(%capacity: index, %record_rows: index) -> (
 
 kernel.decl @expert_routes(%neural_enabled: i1) launch(%record_rows_arg: index, %epoch_arg: buffer, %ids_arg: buffer, %ranks_arg: buffer, %tasks_arg: buffer)
 
-kernel.decl @experts_combine(%neural_enabled: i1) launch(%span_arg: buffer, %experts_arg: buffer, %weights_arg: buffer, %shared_arg: buffer, %gate_arg: buffer, %output_arg: buffer)
+kernel.decl @experts_combine(%workload_count: index) launch(%span_arg: buffer, %experts_arg: buffer, %weights_arg: buffer, %shared_arg: buffer, %gate_arg: buffer, %output_arg: buffer)
 
 template.decl @flash_next.project_dense_q8(%split_scales: i1, %workload_count: index, %inputs: index, %outputs: index, %blocks: index, %span: buffer, %input: buffer, %weight: view<[%outputs]x[%blocks]x34xi8>, %output: buffer)
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
-config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 8)]
+config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 16)]
 
-kernel.decl @shared_gate_up(%neural_enabled: i1) launch(%span_arg: buffer, %input_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
+kernel.decl @shared_gate_up(%workload_count: index) launch(%span_arg: buffer, %input_arg: buffer, %gate_weight_arg: buffer, %up_weight_arg: buffer, %output_arg: buffer)
 
-kernel.decl @shared_matrix(%neural_enabled: i1) launch(%span: buffer, %input: buffer, %weight: buffer, %up_weight: buffer, %output: buffer)
+kernel.decl @shared_matrix(%workload_count: index) launch(%span: buffer, %input: buffer, %weight: buffer, %up_weight: buffer, %output: buffer)
 
-command.def public @flash_next_experts(%workload_count: index, %layer: index) launch(%parameters: buffer, %span: buffer, %input: buffer, %ids: buffer, %weights: buffer, %shared_gate: buffer, %output: buffer) {
-  %empty_count = index.constant 0 : index
-  %neural_enabled = index.cmp ne, %workload_count, %empty_count : index
+// Each recorded path uses one physical route format for its producer and both
+// contractions. The caller gives exactly one path work for this epoch. All
+// three can therefore share the hidden, down, rank, and route storage.
+command.def @flash_next_routed_experts(%record_rows: index, %active_tokens: index, %layer: index) launch(%parameters: buffer, %span: buffer, %input: buffer, %ids: buffer, %ranks: buffer, %tasks: buffer, %hidden: buffer, %down: buffer) {
   %tokens = config.get @flash_next.token_count : index
-  %expert_hidden_row_bytes = index.constant 12800 : offset
-  %expert_output_row_bytes = index.constant 51200 : offset
-  %shared_hidden_row_bytes = index.constant 1280 : offset
-  %shared_output_row_bytes = index.constant 5120 : offset
-  %expert_hidden_bytes = index.scale %tokens, %expert_hidden_row_bytes : index, offset -> offset
-  %expert_output_bytes = index.scale %tokens, %expert_output_row_bytes : index, offset -> offset
-  %shared_hidden_bytes = index.scale %tokens, %shared_hidden_row_bytes : index, offset -> offset
-  %shared_output_bytes = index.scale %tokens, %shared_output_row_bytes : index, offset -> offset
-  %hidden = buffer.alloca<global> align(256) %expert_hidden_bytes : buffer
-  %down = buffer.alloca<global> align(256) %expert_output_bytes : buffer
-  %shared_hidden = buffer.alloca<global> align(256) %shared_hidden_bytes : buffer
-  %shared = buffer.alloca<global> align(256) %shared_output_bytes : buffer
   %c2 = index.constant 2 : index
+
   %c4 = index.constant 4 : index
   %c30 = index.constant 30 : index
   %c46 = index.constant 46 : index
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c3 = index.constant 3 : index
-  // Matrix work shares decoded F16 panels across 128-route records. The same
-  // row count owns table allocation and both consumers' specialization.
-  %matrix_threshold = index.constant 256 : index
   %matrix_rows = index.constant 128 : index
-  %matrix = index.cmp uge, %tokens, %matrix_threshold : index
-  %record_rows = scf.select %matrix, %matrix_rows, %c4 : index
-  // Verification supplies a cohort of anchor and proposed tokens, even
-  // at capacity four. Share expert weights across those correlated rows.
-  // Ordinary one-token epochs retain the direct route path. One table feeds
-  // both contractions; rank scratch dies after table production.
-  %verification_width = config.get @flash_next.verification_width : index
-  %verification_cohort = index.cmp ugt, %verification_width, %c1 : index
-  %large_capacity = index.cmp ugt, %tokens, %c4 : index
-  %bucketed = scalar.ori %large_capacity, %verification_cohort : i1
+  %matrix = index.cmp eq, %record_rows, %matrix_rows : index
+  %bucketed = index.cmp ne, %record_rows, %c1 : index
+  %neural_enabled = index.cmp ne, %active_tokens, %c0 : index
   %routing = scf.if %bucketed -> (buffer) {
-    %rank_row_bytes = index.constant 40 : offset
-    %rank_bytes = index.scale %tokens, %rank_row_bytes : index, offset -> offset
-    %record_capacity, %record_fields, %task_bytes = func.call pure @expert_record_extent(%tokens, %record_rows) : (index, index) -> (index, index, offset)
-    %ranks = buffer.alloca<global> align(16) %rank_bytes : buffer
-    %tasks = buffer.alloca<global> align(16) %task_bytes : buffer
     kernel.launch @expert_routes[%neural_enabled](%record_rows, %span, %ids, %ranks, %tasks) : [i1](index, buffer, buffer, buffer, buffer)
     scf.yield %tasks : buffer
   } else {
@@ -111,7 +86,7 @@ command.def public @flash_next_experts(%workload_count: index, %layer: index) la
         kernel.launch @expert_bucket_gate_up_q8[%neural_enabled](%input, %routing, %gate_weight, %up_weight, %hidden) : [i1](buffer, buffer, view<512x640x80x34xi8>, view<512x640x80x34xi8>, buffer)
       }
     } else {
-      kernel.launch @expert_gate_up_q8[%neural_enabled](%span, %input, %routing, %gate_weight, %up_weight, %hidden) : [i1](buffer, buffer, buffer, view<512x640x80x34xi8>, view<512x640x80x34xi8>, buffer)
+      kernel.launch @expert_gate_up_q8[%active_tokens](%span, %input, %routing, %gate_weight, %up_weight, %hidden) : [index](buffer, buffer, buffer, view<512x640x80x34xi8>, view<512x640x80x34xi8>, buffer)
     }
   } else {
     scf.if %q5_encoding {
@@ -134,7 +109,7 @@ command.def public @flash_next_experts(%workload_count: index, %layer: index) la
           kernel.launch @expert_bucket_gate_up_q5k[%neural_enabled](%input, %routing, %gate_weight, %up_weight, %hidden) : [i1](buffer, buffer, view<512x640x10x176xi8>, view<512x640x10x176xi8>, buffer)
         }
       } else {
-        kernel.launch @expert_gate_up_q5k[%neural_enabled](%span, %input, %routing, %gate_weight, %up_weight, %hidden) : [i1](buffer, buffer, buffer, view<512x640x10x176xi8>, view<512x640x10x176xi8>, buffer)
+        kernel.launch @expert_gate_up_q5k[%active_tokens](%span, %input, %routing, %gate_weight, %up_weight, %hidden) : [index](buffer, buffer, buffer, view<512x640x10x176xi8>, view<512x640x10x176xi8>, buffer)
       }
     } else {
       %gate_weight = command.parameter %parameters, "blk.{}.ffn_gate_exps.weight"[%layer] : view<512x640x10x144xi8>
@@ -156,7 +131,7 @@ command.def public @flash_next_experts(%workload_count: index, %layer: index) la
           kernel.launch @expert_bucket_gate_up_q4k[%neural_enabled](%input, %routing, %gate_weight, %up_weight, %hidden) : [i1](buffer, buffer, view<512x640x10x144xi8>, view<512x640x10x144xi8>, buffer)
         }
       } else {
-        kernel.launch @expert_gate_up_q4k[%neural_enabled](%span, %input, %routing, %gate_weight, %up_weight, %hidden) : [i1](buffer, buffer, buffer, view<512x640x10x144xi8>, view<512x640x10x144xi8>, buffer)
+        kernel.launch @expert_gate_up_q4k[%active_tokens](%span, %input, %routing, %gate_weight, %up_weight, %hidden) : [index](buffer, buffer, buffer, view<512x640x10x144xi8>, view<512x640x10x144xi8>, buffer)
       }
     }
   }
@@ -169,7 +144,7 @@ command.def public @flash_next_experts(%workload_count: index, %layer: index) la
         kernel.launch @expert_bucket_down_q8[%neural_enabled](%hidden, %routing, %down_weight, %down) : [i1](buffer, buffer, view<512x2560x20x34xi8>, buffer)
       }
     } else {
-      kernel.launch @expert_down_q8[%neural_enabled](%span, %hidden, %routing, %down_weight, %down) : [i1](buffer, buffer, buffer, view<512x2560x20x34xi8>, buffer)
+      kernel.launch @expert_down_q8[%active_tokens](%span, %hidden, %routing, %down_weight, %down) : [index](buffer, buffer, buffer, view<512x2560x20x34xi8>, buffer)
     }
   } else {
     %down_weight = command.parameter %parameters, "blk.{}.ffn_down_exps.weight"[%layer] : view<512x2560x20x24xi8>
@@ -180,8 +155,55 @@ command.def public @flash_next_experts(%workload_count: index, %layer: index) la
         kernel.launch @expert_bucket_down_q51[%neural_enabled](%hidden, %routing, %down_weight, %down) : [i1](buffer, buffer, view<512x2560x20x24xi8>, buffer)
       }
     } else {
-      kernel.launch @expert_down_q51[%neural_enabled](%span, %hidden, %routing, %down_weight, %down) : [i1](buffer, buffer, buffer, view<512x2560x20x24xi8>, buffer)
+      kernel.launch @expert_down_q51[%active_tokens](%span, %hidden, %routing, %down_weight, %down) : [index](buffer, buffer, buffer, view<512x2560x20x24xi8>, buffer)
     }
+  }
+  command.return
+}
+
+command.def public @flash_next_experts(%workload_count: index, %layer: index) launch(%parameters: buffer, %span: buffer, %input: buffer, %ids: buffer, %weights: buffer, %shared_gate: buffer, %output: buffer) {
+  %tokens = config.get @flash_next.token_count : index
+  %expert_hidden_row_bytes = index.constant 12800 : offset
+  %expert_output_row_bytes = index.constant 51200 : offset
+  %shared_hidden_row_bytes = index.constant 1280 : offset
+  %shared_output_row_bytes = index.constant 5120 : offset
+  %expert_hidden_bytes = index.scale %tokens, %expert_hidden_row_bytes : index, offset -> offset
+  %expert_output_bytes = index.scale %tokens, %expert_output_row_bytes : index, offset -> offset
+  %shared_hidden_bytes = index.scale %tokens, %shared_hidden_row_bytes : index, offset -> offset
+  %shared_output_bytes = index.scale %tokens, %shared_output_row_bytes : index, offset -> offset
+  %hidden = buffer.alloca<global> align(256) %expert_hidden_bytes : buffer
+  %down = buffer.alloca<global> align(256) %expert_output_bytes : buffer
+  %shared_hidden = buffer.alloca<global> align(256) %shared_hidden_bytes : buffer
+  %shared = buffer.alloca<global> align(256) %shared_output_bytes : buffer
+  %none = index.constant 0 : index
+  %direct_rows = index.constant 1 : index
+  %grouped_rows = index.constant 4 : index
+  %matrix_rows = index.constant 128 : index
+  // Matrix instructions consume 16-row tiles. Each expert's record carries
+  // its live route count, so a packet can select this path with partial records.
+  %matrix_tile = index.constant 16 : index
+  %verification_width = config.get @flash_next.verification_width : index
+  %verification = index.cmp ugt, %verification_width, %direct_rows : index
+  %many_tokens = index.cmp ugt, %workload_count, %grouped_rows : index
+  %use_records = scalar.ori %many_tokens, %verification : i1
+  %use_matrix = index.cmp uge, %workload_count, %matrix_tile : index
+  %direct_count = scf.select %use_records, %none, %workload_count : index
+  %record_count = scf.select %use_records, %workload_count, %none : index
+  %grouped_count = scf.select %use_matrix, %none, %record_count : index
+  %matrix_count = scf.select %use_matrix, %record_count, %none : index
+
+  %rank_row_bytes = index.constant 40 : offset
+  %rank_bytes = index.scale %tokens, %rank_row_bytes : index, offset -> offset
+  %grouped_records, %grouped_fields, %grouped_bytes = func.call pure @expert_record_extent(%tokens, %grouped_rows) : (index, index) -> (index, index, offset)
+  %matrix_records, %matrix_fields, %matrix_bytes = func.call pure @expert_record_extent(%tokens, %matrix_rows) : (index, index) -> (index, index, offset)
+  %grouped_is_larger = index.cmp ugt, %grouped_bytes, %matrix_bytes : offset
+  %task_bytes = scf.select %grouped_is_larger, %grouped_bytes, %matrix_bytes : offset
+  %ranks = buffer.alloca<global> align(16) %rank_bytes : buffer
+  %tasks = buffer.alloca<global> align(16) %task_bytes : buffer
+  command.concurrent {
+    command.launch @flash_next_routed_experts[%direct_rows, %direct_count, %layer](%parameters, %span, %input, %ids, %ranks, %tasks, %hidden, %down) : [index, index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    command.launch @flash_next_routed_experts[%grouped_rows, %grouped_count, %layer](%parameters, %span, %input, %ids, %ranks, %tasks, %hidden, %down) : [index, index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+    command.launch @flash_next_routed_experts[%matrix_rows, %matrix_count, %layer](%parameters, %span, %input, %ids, %ranks, %tasks, %hidden, %down) : [index, index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   }
   %shared_gate_weight = command.parameter %parameters, "blk.{}.ffn_gate_shexp.weight"[%layer] : view<640x80x34xi8>
   %shared_up_weight = command.parameter %parameters, "blk.{}.ffn_up_shexp.weight"[%layer] : view<640x80x34xi8>
@@ -189,17 +211,18 @@ command.def public @flash_next_experts(%workload_count: index, %layer: index) la
   %hidden_width = index.constant 640 : index
   %output_width = index.constant 2560 : index
   %shared_threshold = index.constant 64 : index
-  %shared_matrix = index.cmp uge, %tokens, %shared_threshold : index
-  scf.if %shared_matrix {
-    kernel.launch @shared_matrix[%neural_enabled](%span, %input, %shared_gate_weight, %shared_up_weight, %shared_hidden) : [i1](buffer, buffer, view<640x80x34xi8>, view<640x80x34xi8>, buffer)
-  } else {
-    kernel.launch @shared_gate_up[%neural_enabled](%span, %input, %shared_gate_weight, %shared_up_weight, %shared_hidden) : [i1](buffer, buffer, view<640x80x34xi8>, view<640x80x34xi8>, buffer)
+  %shared_matrix = index.cmp uge, %workload_count, %shared_threshold : index
+  %shared_matrix_count = scf.select %shared_matrix, %workload_count, %none : index
+  %shared_dot_count = scf.select %shared_matrix, %none, %workload_count : index
+  command.concurrent {
+    kernel.launch @shared_matrix[%shared_matrix_count](%span, %input, %shared_gate_weight, %shared_up_weight, %shared_hidden) : [index](buffer, buffer, view<640x80x34xi8>, view<640x80x34xi8>, buffer)
+    kernel.launch @shared_gate_up[%shared_dot_count](%span, %input, %shared_gate_weight, %shared_up_weight, %shared_hidden) : [index](buffer, buffer, view<640x80x34xi8>, view<640x80x34xi8>, buffer)
   }
   %shared_down_weight_block_size = index.constant 32 : index
   %shared_down_weight_blocks = index.div %hidden_width, %shared_down_weight_block_size : index
   %shared_down_weight_shaped = view.refine %shared_down_weight : view<2560x20x34xi8> -> view<[%output_width]x[%shared_down_weight_blocks]x34xi8>
   %dense_weight_layout0 = scalar.constant false : i1
   template.apply<@flash_next.project_dense_q8>(%dense_weight_layout0, %workload_count, %hidden_width, %output_width, %shared_down_weight_blocks, %span, %shared_hidden, %shared_down_weight_shaped, %shared) : (i1, index, index, index, index, buffer, buffer, view<[%output_width]x[%shared_down_weight_blocks]x34xi8>, buffer)
-  kernel.launch @experts_combine[%neural_enabled](%span, %down, %weights, %shared, %shared_gate, %output) : [i1](buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @experts_combine[%workload_count](%span, %down, %weights, %shared, %shared_gate, %output) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
   command.return
 }

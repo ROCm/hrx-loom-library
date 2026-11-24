@@ -4,7 +4,7 @@
 
 config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
 
-config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 8)]
+config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 16)]
 
 config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
 
@@ -146,75 +146,79 @@ func.def inline @qsa_bf16_matrix(%capacity: index, %end: index, %outputs: index,
   func.return
 }
 
-// Packed BF16 parameters and activations accumulate in F32. Large cohorts
-// share panels across 128 tokens; tiny cohorts keep independent wave dots.
-// Capacity specializes the launch, while the epoch supplies the live prefix.
-kernel.def target(@qsa_wave32) @qsa_linear_bf16(%neural_enabled: i1, %width: index) {
+// Short indexer projections use one wave per dot. With a full tile of live
+// tokens, the matrix projection shares both input and weight panels in LDS.
+func.def public pure inline @qsa_index_projection_rows(%count: index) -> (index, index) {
+  %tile = index.constant 128 : index
+  %c0 = index.constant 0 : index
+  %dense = index.cmp uge, %count, %tile : index
+  %dots = scf.select %dense, %c0, %count : index
+  %matrix = scf.select %dense, %count, %c0 : index
+  func.return %dots, %matrix : index, index
+}
+
+kernel.def target(@qsa_wave32) @qsa_index_dot(%count: index, %width: index) {
+  %c4 = index.constant 4 : index
+  %groups = index.div %width, %c4 : index
+  %threads = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %count, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%width: index, %input: buffer, %weight: buffer, %output: buffer) {
   %rows = index.assume %width [range(%width, 128, 512), multiple_of(%width, 4)] : index
   %tokens = config.get @flash_next.token_count : index
-  %c1 = index.constant 1 : index
+  %token = kernel.workgroup.id<y> : index
+  %group = kernel.workgroup.id<x> : index
+  %wave = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %first_lane = index.constant 0 : index
   %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %stride = index.constant 256 : index
+  %hidden = index.constant 2560 : index
+  %row = index.madd %group, %c4, %wave : index
+  %valid_row = index.cmp ult, %row, %rows : index
+  %valid_token = index.cmp ult, %token, %tokens : index
+  %valid = scalar.andi %valid_row, %valid_token : i1
+  scf.if %valid {
+    %first = index.mul %lane, %c8 : index
+    %origin = index.constant 0 : offset
+    %inputs = buffer.view %input[%origin] : buffer -> view<[%tokens]x2560xbf16>
+    %weights = buffer.view %weight[%origin] : buffer -> view<[%rows]x2560xbf16>
+    %outputs = buffer.view %output[%origin] : buffer -> view<[%tokens]x[%rows]xbf16>
+    %c0v = vector.splatf 0.0 : vector<4xf32>
+    %partial = scf.for %channel = [%first to %hidden step %stride](%accumulator = %c0v : vector<4xf32>) -> (vector<4xf32>) {
+      %values = vector.load %inputs[%token, %channel] : view<[%tokens]x2560xbf16> -> vector<8xbf16>
+      %coefficients = vector.load %weights[%row, %channel] : view<[%rows]x2560xbf16> -> vector<8xbf16>
+      %next = vector.dot2f %values, %coefficients, %accumulator : vector<8xbf16>, vector<8xbf16>, vector<4xf32>
+      scf.yield %next : vector<4xf32>
+    }
+    %c0 = scalar.constant 0.0 : f32
+    %lane_sum = vector.reduce<addf> %partial, %c0 : vector<4xf32>, f32
+    %sum = kernel.subgroup.reduce<addf> %lane_sum : f32
+    %leader = index.cmp eq, %lane, %first_lane : index
+    scf.if %leader {
+      %packed = scalar.fptrunc %sum : f32 to bf16
+      view.store %packed, %outputs[%token, %row] : bf16, view<[%tokens]x[%rows]xbf16>
+    }
+  }
+  kernel.return
+}
+
+kernel.def target(@qsa_wave32) @qsa_index_matrix(%count: index, %width: index) {
   %tile = index.constant 128 : index
-  %rounding = index.constant 127 : index
-  %matrix_threads = index.constant 256 : index
-  %matrix = index.cmp uge, %tokens, %tile : index
-  %dot_groups = index.div %rows, %c4 : index
-  %padded_columns = index.add %rows, %rounding : index
-  %matrix_groups = index.div %padded_columns, %tile : index
-  %padded_tokens = index.add %tokens, %rounding : index
-  %matrix_batches = index.div %padded_tokens, %tile : index
-  %groups = scf.select %matrix, %matrix_groups, %dot_groups : index
-  %batches = scf.select %matrix, %matrix_batches, %tokens : index
-  %threads = scf.select %matrix, %matrix_threads, %tile : index
-  %c0_index = index.constant 0 : index
-  %active_groups = scf.select %neural_enabled, %groups, %c0_index : index
-  kernel.launch.config workgroups(%active_groups, %batches, %c1) workgroup_size(%threads, %c1, %c1) : index
+  %padding = index.constant 127 : index
+  %padded_width = index.add %width, %padding : index
+  %padded_count = index.add %count, %padding : index
+  %columns = index.div %padded_width, %tile : index
+  %batches = index.div %padded_count, %tile : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%columns, %batches, %c1) workgroup_size(%threads, %c1, %c1) : index
 } launch(%width: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer) {
   %rows = index.assume %width [range(%width, 128, 512), multiple_of(%width, 4)] : index
   %tokens = config.get @flash_next.token_count : index
   %end = func.call @flash_next_token_count(%span, %tokens) : (buffer, index) -> (index)
-  %tile = index.constant 128 : index
-  %matrix = index.cmp uge, %tokens, %tile : index
-  scf.if %matrix {
-    func.call @qsa_bf16_matrix(%tokens, %end, %rows, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
-  } else {
-    %token = kernel.workgroup.id<y> : index
-    %active = index.cmp ult, %token, %end : index
-    scf.if %active {
-      %group = kernel.workgroup.id<x> : index
-      %wave = kernel.subgroup.id : index
-      %lane = kernel.subgroup.lane.id : index
-      %first_lane = index.constant 0 : index
-      %c4 = index.constant 4 : index
-      %c8 = index.constant 8 : index
-      %stride = index.constant 256 : index
-      %hidden = index.constant 2560 : index
-      %row = index.madd %group, %c4, %wave : index
-      %valid = index.cmp ult, %row, %rows : index
-      scf.if %valid {
-        %first = index.mul %lane, %c8 : index
-        %origin = index.constant 0 : offset
-        %inputs = buffer.view %input[%origin] : buffer -> view<[%tokens]x2560xbf16>
-        %weights = buffer.view %weight[%origin] : buffer -> view<[%rows]x2560xbf16>
-        %outputs = buffer.view %output[%origin] : buffer -> view<[%tokens]x[%rows]xbf16>
-        %c0v = vector.splatf 0.0 : vector<4xf32>
-        %partial = scf.for %channel = [%first to %hidden step %stride](%accumulator = %c0v : vector<4xf32>) -> (vector<4xf32>) {
-          %values = vector.load %inputs[%token, %channel] : view<[%tokens]x2560xbf16> -> vector<8xbf16>
-          %coefficients = vector.load %weights[%row, %channel] : view<[%rows]x2560xbf16> -> vector<8xbf16>
-          %next = vector.dot2f %values, %coefficients, %accumulator : vector<8xbf16>, vector<8xbf16>, vector<4xf32>
-          scf.yield %next : vector<4xf32>
-        }
-        %c0 = scalar.constant 0.0 : f32
-        %lane_sum = vector.reduce<addf> %partial, %c0 : vector<4xf32>, f32
-        %sum = kernel.subgroup.reduce<addf> %lane_sum : f32
-        %leader = index.cmp eq, %lane, %first_lane : index
-        scf.if %leader {
-          %packed = scalar.fptrunc %sum : f32 to bf16
-          view.store %packed, %outputs[%token, %row] : bf16, view<[%tokens]x[%rows]xbf16>
-        }
-      }
-    }
-  }
+  func.call @qsa_bf16_matrix(%tokens, %end, %rows, %input, %weight, %output) : (index, index, index, buffer, buffer, buffer)
   kernel.return
 }
 

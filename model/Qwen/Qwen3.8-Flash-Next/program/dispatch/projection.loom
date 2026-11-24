@@ -6,23 +6,44 @@ template.decl @flash_next.project_dense_q8(%split_scales: i1, %workload_count: i
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
-command.decl @flash_next_gdn_fused_state(%layer: index, %state_origin: offset) launch(%parameters: buffer, %epoch: buffer, %rows: buffer, %input: buffer, %z: buffer, %alpha: buffer, %beta: buffer, %arena: buffer, %output: buffer, %capture: buffer)
+command.decl @flash_next_gdn_state(%workload_count: index, %span_count: index, %layer: index, %state_origin: offset) launch(%parameters: buffer, %span: buffer, %rows: buffer, %input: buffer, %z: buffer, %alpha: buffer, %beta: buffer, %arena: buffer, %output: buffer, %capture: buffer)
 
-command.decl @flash_next_gdn_state(%layer: index, %state_origin: offset) launch(%parameters: buffer, %span: buffer, %rows: buffer, %qkv: buffer, %z: buffer, %alpha: buffer, %beta: buffer, %arena: buffer, %output: buffer, %capture: buffer)
+kernel.decl @gdn_alpha_beta_dot(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %alpha_weight_arg: buffer, %beta_weight_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer)
 
-kernel.decl @flash_next_project_qkv(%configured_output_width: index) launch(%output_width: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @gdn_alpha_beta_panels(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %alpha_weight_arg: buffer, %beta_weight_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer)
 
-kernel.decl @gdn_project_alpha_beta() launch(%span_arg: buffer, %input_arg: buffer, %alpha_weight_arg: buffer, %beta_weight_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer)
+kernel.decl @flash_next_alpha_beta_matrix(%active_rows: index) launch(%span_arg: buffer, %input_arg: buffer, %alpha_weight_arg: buffer, %beta_weight_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer)
+
+func.decl pure @flash_next_coefficient_rows(%rows: index) -> (index, index)
+
+func.def public pure inline @gdn_projection_rows(%workload_count: index) -> (index, index, index) {
+  %c0 = index.constant 0 : index
+  %dot_limit = index.constant 64 : index
+  %full_precision_rows, %matrix_rows = func.call pure @flash_next_coefficient_rows(%workload_count) : (index) -> (index, index)
+  %dot = index.cmp ule, %full_precision_rows, %dot_limit : index
+  %dot_rows = scf.select %dot, %full_precision_rows, %c0 : index
+  %panel_rows = scf.select %dot, %c0, %full_precision_rows : index
+  func.return %dot_rows, %panel_rows, %matrix_rows : index, index, index
+}
+
+command.def public @gdn_project_alpha_beta(%workload_count: index) launch(%span_arg: buffer, %input_arg: buffer, %alpha_weight_arg: buffer, %beta_weight_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer) {
+  %dot_rows, %panel_rows, %matrix_rows = func.call pure @gdn_projection_rows(%workload_count) : (index) -> (index, index, index)
+  command.concurrent {
+    kernel.launch @gdn_alpha_beta_dot[%dot_rows](%span_arg, %input_arg, %alpha_weight_arg, %beta_weight_arg, %alpha_arg, %beta_arg) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @gdn_alpha_beta_panels[%panel_rows](%span_arg, %input_arg, %alpha_weight_arg, %beta_weight_arg, %alpha_arg, %beta_arg) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @flash_next_alpha_beta_matrix[%matrix_rows](%span_arg, %input_arg, %alpha_weight_arg, %beta_weight_arg, %alpha_arg, %beta_arg) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  command.return
+}
 
 // GDN QKV, gate, and output projections share prepared code/scale planes.
 // These projections surround the packed state command. Input
 // and output have the model's hidden width; state/history advance only through
 // the active span. Scratch activation publications remain BF16 except for the
 // small per-head alpha/beta vectors and Q/K inverse norms.
-command.def public @flash_next_gdn_attention(%workload_count: index, %layer: index, %state_origin: offset) launch(%parameters: buffer, %span: buffer, %input: buffer, %rows: buffer, %arena: buffer, %output: buffer, %capture: buffer) {
+command.def public @flash_next_gdn_attention(%workload_count: index, %span_count: index, %layer: index, %state_origin: offset) launch(%parameters: buffer, %span: buffer, %input: buffer, %rows: buffer, %arena: buffer, %output: buffer, %capture: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %hidden = index.constant 2560 : index
-  %conv_width = index.constant 10240 : index
   %value_width = index.constant 6144 : index
   %value_row_bytes = index.constant 12288 : offset
   %scalar_row_bytes = index.constant 192 : offset
@@ -41,21 +62,8 @@ command.def public @flash_next_gdn_attention(%workload_count: index, %layer: ind
   %z_weight_shaped = view.refine %z_weight : view<6144x80x34xi8> -> view<[%value_width]x[%z_weight_blocks]x34xi8>
   %dense_weight_layout0 = scalar.constant true : i1
   template.apply<@flash_next.project_dense_q8>(%dense_weight_layout0, %workload_count, %hidden, %value_width, %z_weight_blocks, %span, %input, %z_weight_shaped, %z) : (i1, index, index, index, index, buffer, buffer, view<[%value_width]x[%z_weight_blocks]x34xi8>, buffer)
-  kernel.launch @gdn_project_alpha_beta(%span, %input, %alpha_weight, %beta_weight, %alpha, %beta) : (buffer, buffer, view<48x2560xf32>, view<48x2560xf32>, buffer, buffer)
-  // Large epochs keep raw QKV in LDS except for compact session/tile halos.
-  // Small epochs and sparse speculative replay retain their wave bodies.
-  %fused_threshold = index.constant 128 : index
-  %use_fusion = index.cmp uge, %tokens, %fused_threshold : index
-  scf.if %use_fusion {
-    command.launch @flash_next_gdn_fused_state[%layer, %state_origin](%parameters, %span, %rows, %input, %z, %alpha, %beta, %arena, %gated, %capture) : [index, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
-  } else {
-    %qkv_row_bytes = index.constant 20480 : offset
-    %qkv_bytes = index.scale %tokens, %qkv_row_bytes : index, offset -> offset
-    %qkv = buffer.alloca<global> align(256) %qkv_bytes : buffer
-    %qkv_weight = command.parameter %parameters, "blk.{}.attn_qkv.weight"[%layer] : view<10240x80x34xi8>
-    kernel.launch @flash_next_project_qkv[%conv_width](%conv_width, %span, %input, %qkv_weight, %qkv) : [index](index, buffer, buffer, view<10240x80x34xi8>, buffer)
-    command.launch @flash_next_gdn_state[%layer, %state_origin](%parameters, %span, %rows, %qkv, %z, %alpha, %beta, %arena, %gated, %capture) : [index, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
-  }
+  command.launch @gdn_project_alpha_beta[%workload_count](%span, %input, %alpha_weight, %beta_weight, %alpha, %beta) : [index](buffer, buffer, view<48x2560xf32>, view<48x2560xf32>, buffer, buffer)
+  command.launch @flash_next_gdn_state[%workload_count, %span_count, %layer, %state_origin](%parameters, %span, %rows, %input, %z, %alpha, %beta, %arena, %gated, %capture) : [index, index, index, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   %output_weight_block_size = index.constant 32 : index
   %output_weight_blocks = index.div %value_width, %output_weight_block_size : index
   %output_weight_shaped = view.refine %output_weight : view<2560x192x34xi8> -> view<[%hidden]x[%output_weight_blocks]x34xi8>

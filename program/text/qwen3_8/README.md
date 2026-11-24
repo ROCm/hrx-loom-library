@@ -2,7 +2,7 @@
 
 The dense Qwen3.8 and Flash-Next compositions share chat framing, sampling
 options, and queued text execution. The providers expose Loom's text-service
-v1 exports; each composing model supplies `text_model_name_v1`, its tokenizer,
+v2 exports; each composing model supplies `text_model_name_v2`, its tokenizer,
 preparation, and numerical stages. The program chooses no physical device and
 contains no checkpoint paths.
 
@@ -14,9 +14,9 @@ proposal algorithm or numerical stages.
 
 | Provider | Inputs and ownership | Result |
 | --- | --- | --- |
-| `encode` | Validated ownership events, host plans, and retained host packet storage. `text_encode_state_v1` updates resident origins; `text_encode_epoch_v1` packs the first and continuation cohorts. | Borrowed, exact upload ranges. The caller retains their backing until transfer completion. |
-| `epoch` | Prepared stage IDs and retained device bindings. `text_step_v1` submits an isolated step; `text_epoch_v1` composes proposal, verification, and accepted-state catch-up for one or two cohorts. | Work completion. Feedback transfer has its own completion and can overlap catch-up. |
-| `publish` | Immutable completed feedback banks, their original host plans, and caller-owned progress arrays. `text_publish_epoch_v1` resolves continuation owner tags. | Consumed/output counts, accepted tokens, source positions, and actual proposal counts in original-request order. |
+| `encode` | Validated ownership events, host plans, and retained host packet storage. `text_encode_state_v2` updates resident origins; `text_encode_epoch_v2` packs the first and continuation cohorts. | Borrowed, exact upload ranges. The caller retains their backing until transfer completion. |
+| `epoch` | Prepared stage IDs and retained device bindings. `text_step_v2` submits an isolated step; `text_epoch_v2` composes proposal, verification, and accepted-state catch-up for one or two cohorts. | Work completion. Feedback transfer has its own completion and can overlap catch-up. |
+| `publish` | Immutable completed feedback banks, their original host plans, and caller-owned progress arrays. `text_publish_epoch_v2` resolves continuation owner tags. | Consumed/output counts, accepted tokens, source positions, and actual proposal counts in original-request order. |
 
 ```text
 host plans --encode--> retained host packets --uploads--> device stages
@@ -41,7 +41,7 @@ the linking contract.
 
 `publish.cxx` implements publication using the shared
 [`EpochPublication`](../publication.h) argument record. The importer flattens its
-members into the native v1 signature, so existing Loom callers and tests consume
+members into the native publication signature, so existing Loom callers and tests consume
 the same ABI. Feedback origins and packed counts remain calls to the shared
 Qwen feedback motif. The provider imports once into bytecode; source publications
 carry its declared header, while bytecode publications omit compiler-only inputs.
@@ -56,6 +56,14 @@ history preserves the exact emitted bytes. Partial reasoning and tool markers
 remain withheld during streaming and are resolved at completion. Returned
 buffers have VM ownership; request-local scalar state remains opaque to the
 service caller.
+
+Clients compacting a conversation can count its full Qwen prompt even when
+it exceeds the deployment's execution window. The reported positions include
+ChatML framing, tools, and image or video features. A text-only measurement
+streams through the tokenizer with fixed ID scratch. When media markers are
+present, the source also checks their actual token IDs and produces the same
+projection spans as generation. Generation continues to enforce the window
+before admitting the request.
 
 Completion receives the native stop cause. A token-limit stop omits an unfinished
 XML tool call while preserving preceding complete calls, content, and reasoning;
@@ -78,7 +86,7 @@ checkpoint's xhigh policy. Explicit effort and enable/disable controls must
 agree. The sampling packet and device execution are independent of this prompt
 selection.
 
-The cold `text_chat_reasoning_v1` declaration advertises `none`, `low`, `medium`,
+The cold `text_chat_reasoning_v2` declaration advertises `none`, `low`, `medium`,
 and `xhigh` for model discovery, with `none` as the omission default. Accepted
 aliases do not appear as distinct trained policies in the client selector.
 
@@ -126,9 +134,9 @@ control allocation; packet encoding returns only live upload ranges. Resident
 growth preserves stage handles and existing sampling policies without deriving
 packet capacity from the resident count.
 
-Token and request-span capacities come from separate columns of the prepared
-shape catalog. Token capacity sizes input packets; span capacity sizes feedback
-and fixes its two bank offsets. Live counts determine the records written and
+Preparation receives explicit token and span storage budgets. Token capacity
+sizes input packets. Span capacity sizes feedback and fixes its two bank
+offsets. Live counts determine the records written and
 consumed. The queued bank packs owner tags immediately after its live records,
 so the host can download the admitted request bound without another count
 readback. Unused feedback requires no initialization and is never consumed.
@@ -152,9 +160,12 @@ immutable feedback may be published. Continuations preserve their first-cohort
 owner while compacting live rows. Neither policy transforms nor packet writers
 wait for a device or infer ownership from buffer contents.
 
-The shared epoch calls `qwen38.epoch.target` after proposal and before feedback
-and predictor catch-up. A model links one provider with its stage catalog and
-buffer layout. `epoch_dispatch.loom` supplies the ordinary single-command target
+The shared epoch gets its target, proposal, catch-up, verification, and
+continuation command IDs from the model's `qwen38.epoch.stages`. Flash-Next
+uses the submitted token count to choose its dot-product or general suffix.
+The same file-request and layer-zero programs serve both. The
+controller calls `qwen38.epoch.target` after proposal and before feedback and
+predictor catch-up. `epoch_dispatch.loom` supplies the ordinary single-command target
 and verifier paths. A model-specific provider can split that target computation
 around asynchronous input readiness while retaining the shared packet encoding,
 speculation selection, feedback, and continuation policy. The returned completion
@@ -178,17 +189,15 @@ publication callback receives the model's retained control state alongside
 both immutable feedback banks. Measurements do not themselves change proposal
 selection.
 
-`speculation.loom` consumes an optional model-prepared catalog of shorter
-proposal/verifier pairs. Each record supplies its verification width and both
-program identities; the composing model owns the cost policy. The configured
-depth remains the reservation ceiling. Selection inspects the live host plan,
-compacts generated spans to the chosen width, and keeps both queued banks on
-the same pair. Final ordinary decodes preserve their one-token spans beside
-proposing peers. Prefill, media, supplied candidates, and cohorts outside the
-catalog use the ordinary prepared stages. No request-time compilation, device
-readback, weight copy, or extra synchronization is involved. The catalog occupies
-48 host bytes per model and survives resident growth without entering newly
-admitted sampling rows.
+`speculation.loom` lets each model choose a shorter proposal chain from the
+submitted work. Flash-Next registers widths and uses the same proposal and
+verifier programs at each width. Dense DFlash can also register a paired
+proposal and verifier for a width. The configured depth bounds the reservation.
+The controller inspects the host plan, compacts proposing spans, and records
+the same choice for both queued packets. An ordinary decode beside proposing
+peers keeps its one-token span. Prefill, media, and supplied candidates use the
+ordinary model phases. The policy occupies 48 host bytes per model and survives
+resident growth.
 
 `chat_media.loom` plans and renders ordered images and timestamped video frames.
 Native inspection supplies decoded dimensions, source ranges, and finite,

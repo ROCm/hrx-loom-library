@@ -4,7 +4,7 @@
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
-kernel.decl @hc_down_inject(%neural_enabled: i1) launch(%span: buffer, %normalized: buffer, %down_weight: buffer, %injection_weight: buffer, %lowrank: buffer, %injection: buffer)
+kernel.decl @hc_down_inject(%active_rows: index) launch(%span: buffer, %normalized: buffer, %down_weight: buffer, %injection_weight: buffer, %lowrank: buffer, %injection: buffer)
 
 kernel.decl @hc_down_inject_q8(%neural_enabled: i1) launch(%span: buffer, %normalized: buffer, %down_weight: buffer, %injection_weight: buffer, %lowrank: buffer, %injection: buffer)
 
@@ -12,13 +12,13 @@ kernel.decl @hc_inject_only(%neural_enabled: i1) launch(%span: buffer, %normaliz
 
 kernel.decl @hc_inject_only_q8(%neural_enabled: i1) launch(%span: buffer, %normalized: buffer, %down_weight: buffer, %injection_weight: buffer, %lowrank: buffer, %injection: buffer)
 
-kernel.decl @hc_matrix_down(%neural_enabled: i1) launch(%span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @hc_matrix_down(%active_rows: index) launch(%span: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
-kernel.decl @hc_matrix_down_half(%neural_enabled: i1) launch(%epoch: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @hc_matrix_down_half(%active_rows: index) launch(%epoch: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
-kernel.decl @hc_matrix_down_int8() launch(%epoch_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %output_arg: buffer)
+kernel.decl @hc_matrix_down_int8(%active_rows: index) launch(%epoch_arg: buffer, %input_arg: buffer, %weight_arg: buffer, %output_arg: buffer)
 
-kernel.decl @hc_matrix_up(%neural_enabled: i1) launch(%span: buffer, %normalized: buffer, %input: buffer, %weight: buffer, %output: buffer)
+kernel.decl @hc_matrix_up(%active_rows: index) launch(%span: buffer, %normalized: buffer, %input: buffer, %weight: buffer, %output: buffer)
 
 kernel.decl @hc_normalize(%neural_enabled: i1, %row_capacity: index) launch(%capacity_argument: index, %span: buffer, %residual: buffer, %gamma: buffer, %normalized: buffer)
 
@@ -39,24 +39,28 @@ command.def @flash_next_hc(%neural_enabled: i1, %injection_bytes: index, %q8_inj
   %threshold = index.constant 128 : index
   %matrix = index.cmp uge, %tokens, %threshold : index
   scf.if %matrix {
+    %c0 = index.constant 0 : index
+    %active_rows = scf.select %neural_enabled, %tokens, %c0 : index
     %half_threshold = index.constant 4096 : index
     %use_half = index.cmp uge, %tokens, %half_threshold : index
     scf.if %use_half {
-      kernel.launch @hc_matrix_down_half[%neural_enabled](%span, %normalized, %down_weight, %lowrank) : [i1](buffer, buffer, view<3481600xi8>, buffer)
+      kernel.launch @hc_matrix_down_half[%active_rows](%span, %normalized, %down_weight, %lowrank) : [index](buffer, buffer, view<3481600xi8>, buffer)
     } else {
-      kernel.launch @hc_matrix_down[%neural_enabled](%span, %normalized, %down_weight, %lowrank) : [i1](buffer, buffer, view<3481600xi8>, buffer)
+      kernel.launch @hc_matrix_down[%active_rows](%span, %normalized, %down_weight, %lowrank) : [index](buffer, buffer, view<3481600xi8>, buffer)
     }
     scf.if %q8_injection {
       kernel.launch @hc_inject_only_q8[%neural_enabled](%span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : [i1](buffer, buffer, view<3481600xi8>, view<[%injection_bytes]xi8>, buffer, buffer)
     } else {
       kernel.launch @hc_inject_only[%neural_enabled](%span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : [i1](buffer, buffer, view<3481600xi8>, view<[%injection_bytes]xi8>, buffer, buffer)
     }
-    kernel.launch @hc_matrix_up[%neural_enabled](%span, %normalized, %lowrank, %up_weight, %mixed) : [i1](buffer, buffer, buffer, view<3481600xi8>, buffer)
+    kernel.launch @hc_matrix_up[%active_rows](%span, %normalized, %lowrank, %up_weight, %mixed) : [index](buffer, buffer, buffer, view<3481600xi8>, buffer)
   } else {
     scf.if %q8_injection {
       kernel.launch @hc_down_inject_q8[%neural_enabled](%span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : [i1](buffer, buffer, view<3481600xi8>, view<[%injection_bytes]xi8>, buffer, buffer)
     } else {
-      kernel.launch @hc_down_inject[%neural_enabled](%span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : [i1](buffer, buffer, view<3481600xi8>, view<[%injection_bytes]xi8>, buffer, buffer)
+      %c0 = index.constant 0 : index
+      %active_rows = scf.select %neural_enabled, %tokens, %c0 : index
+      kernel.launch @hc_down_inject[%active_rows](%span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : [index](buffer, buffer, view<3481600xi8>, view<[%injection_bytes]xi8>, buffer, buffer)
     }
     kernel.launch @hc_up_mix[%neural_enabled, %tokens](%tokens, %span, %normalized, %lowrank, %up_weight, %mixed) : [i1, index](index, buffer, buffer, buffer, view<3481600xi8>, buffer)
   }
@@ -91,91 +95,76 @@ command.def public @flash_next_hc_ffn(%neural_enabled: i1, %layer: index) launch
   command.return
 }
 
-command.def @flash_next_hc_normalized(%injection_bytes: index, %q8_injection: i1, %down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>, %injection_weight: view<[%injection_bytes]xi8>) launch(%span: buffer, %normalized: buffer, %injection: buffer, %mixed: buffer) {
-  %neural_enabled = scalar.constant true : i1
+kernel.decl @hc_combine_normalize(%live_rows: index) launch(%span: buffer, %residual: buffer, %projected: buffer, %injection: buffer, %gamma: buffer, %output: buffer, %normalized: buffer)
+
+kernel.decl @hc_normalize_inject(%live_rows: index) launch(%span: buffer, %residual: buffer, %gamma: buffer, %normalized: buffer, %weight: buffer, %injection: buffer)
+
+kernel.decl @hc_combine_normalize_inject(%live_rows: index) launch(%span: buffer, %residual: buffer, %projected: buffer, %injection: buffer, %gamma: buffer, %output: buffer, %normalized: buffer, %weight: buffer, %next_injection: buffer)
+
+kernel.decl @hc_normalize_inject_int8(%live_rows: index) launch(%span: buffer, %residual: buffer, %gamma: buffer, %normalized: buffer, %weight: buffer, %injection: buffer, %quantized: buffer)
+
+kernel.decl @hc_combine_normalize_inject_int8(%live_rows: index) launch(%span: buffer, %residual: buffer, %projected: buffer, %injection: buffer, %gamma: buffer, %output: buffer, %normalized: buffer, %weight: buffer, %next_injection: buffer, %quantized: buffer)
+
+func.decl pure @flash_next_hc_projection_rows(%packet: index, %active: index, %allow_quantized: i1) -> (index, index, index, index)
+
+func.decl pure @flash_next_hc_workspace(%capacity: index, %allow_quantized: i1) -> (index, index, offset, offset)
+
+command.def @flash_next_hc_mix_normalized(%dot_rows: index, %full_rows: index, %integer_rows: index, %half_rows: index, %down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>, %injection_weight: view<4x10240xf32>) launch(%span: buffer, %normalized: buffer, %quantized: buffer, %injection: buffer, %mixed: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %rank_row_bytes = index.constant 640 : offset
   %rank_bytes = index.scale %tokens, %rank_row_bytes : index, offset -> offset
   %lowrank = buffer.alloca<global> align(256) %rank_bytes : buffer
-  // Capacities of at least 128 select the matrix schedule.
-  // The immutable live extent still guards partial and empty workgroups.
-  %threshold = index.constant 128 : index
-  %matrix = index.cmp uge, %tokens, %threshold : index
-  scf.if %matrix {
-    %half_threshold = index.constant 4096 : index
-    %use_half = index.cmp uge, %tokens, %half_threshold : index
-    scf.if %use_half {
-      kernel.launch @hc_matrix_down_half[%neural_enabled](%span, %normalized, %down_weight, %lowrank) : [i1](buffer, buffer, view<3481600xi8>, buffer)
-    } else {
-      kernel.launch @hc_matrix_down[%neural_enabled](%span, %normalized, %down_weight, %lowrank) : [i1](buffer, buffer, view<3481600xi8>, buffer)
-    }
-    scf.if %q8_injection {
-      kernel.launch @hc_inject_only_q8[%neural_enabled](%span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : [i1](buffer, buffer, view<3481600xi8>, view<[%injection_bytes]xi8>, buffer, buffer)
-    } else {
-      kernel.launch @hc_inject_only[%neural_enabled](%span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : [i1](buffer, buffer, view<3481600xi8>, view<[%injection_bytes]xi8>, buffer, buffer)
-    }
-    kernel.launch @hc_matrix_up[%neural_enabled](%span, %normalized, %lowrank, %up_weight, %mixed) : [i1](buffer, buffer, buffer, view<3481600xi8>, buffer)
-  } else {
-    scf.if %q8_injection {
-      kernel.launch @hc_down_inject_q8[%neural_enabled](%span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : [i1](buffer, buffer, view<3481600xi8>, view<[%injection_bytes]xi8>, buffer, buffer)
-    } else {
-      kernel.launch @hc_down_inject[%neural_enabled](%span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : [i1](buffer, buffer, view<3481600xi8>, view<[%injection_bytes]xi8>, buffer, buffer)
-    }
-    kernel.launch @hc_up_mix[%neural_enabled, %tokens](%tokens, %span, %normalized, %lowrank, %up_weight, %mixed) : [i1, index](index, buffer, buffer, buffer, view<3481600xi8>, buffer)
+  %c0 = index.constant 0 : index
+  %dot = index.cmp ne, %dot_rows, %c0 : index
+  %floating_rows = index.add %full_rows, %half_rows : index
+  %matrix_rows = index.add %floating_rows, %integer_rows : index
+  command.concurrent {
+    kernel.launch @hc_down_inject[%dot_rows](%span, %normalized, %down_weight, %injection_weight, %lowrank, %injection) : [index](buffer, buffer, view<3481600xi8>, view<4x10240xf32>, buffer, buffer)
+    kernel.launch @hc_matrix_down[%full_rows](%span, %normalized, %down_weight, %lowrank) : [index](buffer, buffer, view<3481600xi8>, buffer)
+    kernel.launch @hc_matrix_down_int8[%integer_rows](%span, %quantized, %down_weight, %lowrank) : [index](buffer, buffer, view<3481600xi8>, buffer)
+    kernel.launch @hc_matrix_down_half[%half_rows](%span, %normalized, %down_weight, %lowrank) : [index](buffer, buffer, view<3481600xi8>, buffer)
+  }
+  command.concurrent {
+    kernel.launch @hc_up_mix[%dot, %dot_rows](%tokens, %span, %normalized, %lowrank, %up_weight, %mixed) : [i1, index](index, buffer, buffer, buffer, view<3481600xi8>, buffer)
+    kernel.launch @hc_matrix_up[%matrix_rows](%span, %normalized, %lowrank, %up_weight, %mixed) : [index](buffer, buffer, buffer, view<3481600xi8>, buffer)
   }
   command.return
 }
 
-command.def public @flash_next_hc_ffn_normalized(%layer: index) launch(%parameters: buffer, %span: buffer, %normalized: buffer, %injection: buffer, %mixed: buffer) {
-  %down_weight = command.parameter %parameters, "blk.{}.hc_ffn_down.weight"[%layer] : view<3481600xi8>
-  %up_weight = command.parameter %parameters, "blk.{}.hc_ffn_up.weight"[%layer] : view<3481600xi8>
-  %predictor_layer = index.constant 48 : index
-  %q8_injection = index.cmp eq, %layer, %predictor_layer : index
-  %q8_bytes = index.constant 43520 : index
-  %f32_bytes = index.constant 163840 : index
-  %injection_bytes = scf.select %q8_injection, %q8_bytes, %f32_bytes : index
-  %injection_weight = command.parameter %parameters, "blk.{}.hc_ffn_inject.weight"[%layer] : view<[%injection_bytes]xi8>
-  command.launch @flash_next_hc_normalized[%injection_bytes, %q8_injection, %down_weight, %up_weight, %injection_weight](%span, %normalized, %injection, %mixed) : [index, i1, view<3481600xi8>, view<3481600xi8>, view<[%injection_bytes]xi8>](buffer, buffer, buffer, buffer)
-  command.return
-}
-
-command.def public @flash_next_hc_attn_normalized(%layer: index) launch(%parameters: buffer, %span: buffer, %normalized: buffer, %injection: buffer, %mixed: buffer) {
-  %down_weight = command.parameter %parameters, "blk.{}.hc_attn_down.weight"[%layer] : view<3481600xi8>
-  %up_weight = command.parameter %parameters, "blk.{}.hc_attn_up.weight"[%layer] : view<3481600xi8>
-  %predictor_layer = index.constant 48 : index
-  %q8_injection = index.cmp eq, %layer, %predictor_layer : index
-  %q8_bytes = index.constant 43520 : index
-  %f32_bytes = index.constant 163840 : index
-  %injection_bytes = scf.select %q8_injection, %q8_bytes, %f32_bytes : index
-  %injection_weight = command.parameter %parameters, "blk.{}.hc_attn_inject.weight"[%layer] : view<[%injection_bytes]xi8>
-  command.launch @flash_next_hc_normalized[%injection_bytes, %q8_injection, %down_weight, %up_weight, %injection_weight](%span, %normalized, %injection, %mixed) : [index, i1, view<3481600xi8>, view<3481600xi8>, view<[%injection_bytes]xi8>](buffer, buffer, buffer, buffer)
-  command.return
-}
-
-command.def public @flash_next_hc_mix_normalized(%down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>) launch(%span: buffer, %normalized: buffer, %mixed: buffer) {
-  %neural_enabled = scalar.constant true : i1
+command.def public @flash_next_hc_normalize_mix(%workload_count: index, %gamma: view<4x2560xf32>, %down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>, %injection_weight: view<4x10240xf32>) launch(%span: buffer, %residual: buffer, %injection: buffer, %mixed: buffer) {
   %tokens = config.get @flash_next.token_count : index
-  %rank_row_bytes = index.constant 640 : offset
-  %rank_bytes = index.scale %tokens, %rank_row_bytes : index, offset -> offset
-  %lowrank = buffer.alloca<global> align(256) %rank_bytes : buffer
-  %half_threshold = index.constant 4096 : index
-  %use_half = index.cmp uge, %tokens, %half_threshold : index
-  scf.if %use_half {
-    kernel.launch @hc_matrix_down_half[%neural_enabled](%span, %normalized, %down_weight, %lowrank) : [i1](buffer, buffer, view<3481600xi8>, buffer)
-  } else {
-    kernel.launch @hc_matrix_down[%neural_enabled](%span, %normalized, %down_weight, %lowrank) : [i1](buffer, buffer, view<3481600xi8>, buffer)
+  %allow_quantized = scalar.constant true : i1
+  %bound, %tiles, %packed_origin, %bytes = func.call pure @flash_next_hc_workspace(%tokens, %allow_quantized) : (index, i1) -> (index, index, offset, offset)
+  %normalized = buffer.alloca<global> align(256) %bytes : buffer
+  %origin = index.constant 0 : offset
+  %integer_normalized = buffer.view %normalized[%origin] : buffer -> view<[%bound]x10240xbf16>
+  %quantized = buffer.view %normalized[%packed_origin] : buffer -> view<[%tiles]x184320xi8>
+  %dot_rows, %full_rows, %integer_rows, %half_rows = func.call pure @flash_next_hc_projection_rows(%workload_count, %workload_count, %allow_quantized) : (index, index, i1) -> (index, index, index, index)
+  %floating_rows = index.add %full_rows, %half_rows : index
+  %enabled = scalar.constant true : i1
+  command.concurrent {
+    kernel.launch @hc_normalize[%enabled, %dot_rows](%tokens, %span, %residual, %gamma, %normalized) : [i1, index](index, buffer, buffer, view<4x2560xf32>, buffer)
+    kernel.launch @hc_normalize_inject[%floating_rows](%span, %residual, %gamma, %normalized, %injection_weight, %injection) : [index](buffer, buffer, view<4x2560xf32>, buffer, view<4x10240xf32>, buffer)
+    kernel.launch @hc_normalize_inject_int8[%integer_rows](%span, %residual, %gamma, %integer_normalized, %injection_weight, %injection, %quantized) : [index](buffer, buffer, view<4x2560xf32>, view<[%bound]x10240xbf16>, view<4x10240xf32>, buffer, view<[%tiles]x184320xi8>)
   }
-  kernel.launch @hc_matrix_up[%neural_enabled](%span, %normalized, %lowrank, %up_weight, %mixed) : [i1](buffer, buffer, buffer, view<3481600xi8>, buffer)
+  command.launch @flash_next_hc_mix_normalized[%dot_rows, %full_rows, %integer_rows, %half_rows, %down_weight, %up_weight, %injection_weight](%span, %normalized, %quantized, %injection, %mixed) : [index, index, index, index, view<3481600xi8>, view<3481600xi8>, view<4x10240xf32>](buffer, buffer, view<[%tiles]x184320xi8>, buffer, buffer)
   command.return
 }
 
-command.def public @flash_next_hc_mix_quantized(%down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>) launch(%span: buffer, %normalized: buffer, %quantized: buffer, %mixed: buffer) {
-  %neural_enabled = scalar.constant true : i1
+command.def public @flash_next_hc_combine_mix(%packet_count: index, %workload_count: index, %allow_quantized: i1, %gamma: view<4x2560xf32>, %down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>, %injection_weight: view<4x10240xf32>) launch(%span: buffer, %residual: buffer, %projected: buffer, %previous_injection: buffer, %output: buffer, %injection: buffer, %mixed: buffer) {
   %tokens = config.get @flash_next.token_count : index
-  %rank_row_bytes = index.constant 640 : offset
-  %rank_bytes = index.scale %tokens, %rank_row_bytes : index, offset -> offset
-  %lowrank = buffer.alloca<global> align(256) %rank_bytes : buffer
-  kernel.launch @hc_matrix_down_int8(%span, %quantized, %down_weight, %lowrank) : (buffer, buffer, view<3481600xi8>, buffer)
-  kernel.launch @hc_matrix_up[%neural_enabled](%span, %normalized, %lowrank, %up_weight, %mixed) : [i1](buffer, buffer, buffer, view<3481600xi8>, buffer)
+  %bound, %tiles, %packed_origin, %bytes = func.call pure @flash_next_hc_workspace(%tokens, %allow_quantized) : (index, i1) -> (index, index, offset, offset)
+  %normalized = buffer.alloca<global> align(256) %bytes : buffer
+  %origin = index.constant 0 : offset
+  %integer_normalized = buffer.view %normalized[%origin] : buffer -> view<[%bound]x10240xbf16>
+  %quantized = buffer.view %normalized[%packed_origin] : buffer -> view<[%tiles]x184320xi8>
+  %dot_rows, %full_rows, %integer_rows, %half_rows = func.call pure @flash_next_hc_projection_rows(%packet_count, %workload_count, %allow_quantized) : (index, index, i1) -> (index, index, index, index)
+  %floating_rows = index.add %full_rows, %half_rows : index
+  command.concurrent {
+    kernel.launch @hc_combine_normalize[%dot_rows](%span, %residual, %projected, %previous_injection, %gamma, %output, %normalized) : [index](buffer, buffer, buffer, buffer, view<4x2560xf32>, buffer, buffer)
+    kernel.launch @hc_combine_normalize_inject[%floating_rows](%span, %residual, %projected, %previous_injection, %gamma, %output, %normalized, %injection_weight, %injection) : [index](buffer, buffer, buffer, buffer, view<4x2560xf32>, buffer, buffer, view<4x10240xf32>, buffer)
+    kernel.launch @hc_combine_normalize_inject_int8[%integer_rows](%span, %residual, %projected, %previous_injection, %gamma, %output, %integer_normalized, %injection_weight, %injection, %quantized) : [index](buffer, buffer, buffer, buffer, view<4x2560xf32>, buffer, view<[%bound]x10240xbf16>, view<4x10240xf32>, buffer, view<[%tiles]x184320xi8>)
+  }
+  command.launch @flash_next_hc_mix_normalized[%dot_rows, %full_rows, %integer_rows, %half_rows, %down_weight, %up_weight, %injection_weight](%span, %normalized, %quantized, %injection, %mixed) : [index, index, index, index, view<3481600xi8>, view<3481600xi8>, view<4x10240xf32>](buffer, buffer, view<[%tiles]x184320xi8>, buffer, buffer)
   command.return
 }

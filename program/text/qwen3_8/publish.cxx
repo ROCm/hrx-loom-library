@@ -9,12 +9,16 @@
 
 #include <loomcxx/index.h>
 #include <loomcxx/predicate.h>
+#include <loomcxx/template.h>
 #include <loomcxx/view.h>
 
 using text_service::Buffer;
 using Index = loom::type::index;
 using Offset = loom::type::offset;
 constexpr auto Dynamic = loom::type::dynamic;
+
+LOOM_TEMPLATE_DECL("qwen38.epoch.feedback_bank")
+bool uses_feedback_bank(Buffer state, int requested);
 
 // The feedback motif owns its bank layout and packed output/proposal counts.
 Offset qwen38_feedback_records_origin();
@@ -26,7 +30,7 @@ void publish_media_positions(Buffer plan, Buffer media_plan, Index count,
 
 namespace {
 
-// Native v1 request and progress fields. Causal and source positions are
+// Native request and progress fields. Causal and source positions are
 // independent; media publication recovers the latter from the original plan.
 enum RequestField : unsigned {
   Length = 0,
@@ -44,7 +48,7 @@ enum ProgressField : unsigned {
 };
 constexpr unsigned RequestWords = 9;
 constexpr unsigned ProgressWords = 21;
-constexpr unsigned FeedbackWords = 10;
+constexpr unsigned FeedbackWords = 18;
 constexpr unsigned MaximumBankOutputs = FeedbackWords - 2;
 // The live span count follows the three queue timestamps and input-token count.
 constexpr unsigned FeedbackLiveCountBytes = 28;
@@ -64,8 +68,8 @@ using ProgressRows =
                                         unsigned count,
                                         ProgressRows destination,
                                         unsigned owner, unsigned output_begin) {
-  // Verification bounds each bank to eight tokens; two banks share one output
-  // record. These are producer invariants, not new runtime validation.
+  // Both verifications spend the same per-request output credit. The queued
+  // bank starts after the tokens already published by the first bank.
   loom::assume(count <= MaximumBankOutputs);
   loom::assume(output_begin <= MaximumBankOutputs);
   for (unsigned i = 0; i < count; ++i) {
@@ -77,7 +81,7 @@ using ProgressRows =
 
 } // namespace
 
-void text_publish_epoch_v1(text_service::EpochPublication epoch) {
+void text_publish_epoch_v2(text_service::EpochPublication epoch) {
   loom::assume(epoch.inputs.request_count >= 0);
   unsigned extent = static_cast<unsigned>(epoch.inputs.request_count);
   auto requests = loom::buffer::view<Dynamic, RequestWords>(
@@ -89,6 +93,8 @@ void text_publish_epoch_v1(text_service::EpochPublication epoch) {
   loom::buffer::fill(0, epoch.outputs.progress, Offset{0},
                      loom::buffer::length(epoch.outputs.progress));
 
+  const bool banked =
+      uses_feedback_bank(epoch.inputs.control_state, epoch.completed.verified);
   unsigned ordinary_index = 0;
   for (unsigned row = 0; row < extent; ++row) {
     int consumed;
@@ -96,7 +102,7 @@ void text_publish_epoch_v1(text_service::EpochPublication epoch) {
     unsigned outputs;
     int verifications;
     int proposed;
-    if (epoch.completed.verified) {
+    if (banked) {
       auto records = feedback_rows(epoch.completed.first_feedback, extent);
       consumed = records[row, 0u];
       int counts = records[row, 1u];

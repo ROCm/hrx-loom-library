@@ -22,13 +22,13 @@ The resident target bank occupies approximately 76.86 GiB before request state, 
 | --- | --- | --- |
 | `chat` | `ud-q4-k-xl` | Four execution rows and 16,384-position contexts. |
 | `mtp` | `ud-q4-k-xl-mtp` | The same capacities with a seven-proposal ceiling and adaptive text cohorts. |
-| `mtp-continuation` | `ud-q4-k-xl-mtp` | Adaptive text cohorts and two-epoch continuation. |
+| `mtp-continuation` | `ud-q4-k-xl-mtp` | Up to fifteen proposals from accepted history, seven neural steps, and a device-fed second epoch. |
 | `long-context` | `ud-q4-k-xl` | Eight rows and 262,144-position contexts. |
 | `long-context-mtp` | `ud-q4-k-xl-mtp` | The same native-context capacities with adaptive text cohorts. |
 | `vision` | `ud-q4-k-xl-vision` | Chat capacities with the original BF16 image projector. |
 | `vision-mtp` | `ud-q4-k-xl-vision-mtp` | Images and video frames with three recursive predictor proposals. |
 
-Text MTP treats draft depth as a ceiling. One or two active requests can use up to seven proposals, three or four use at most two, and five through eight use one. Each request's predicted probability can stop its chain earlier; every proposed token still goes through target verification. These choices update during a response as peers arrive and retire, without a calibration request or device readback. Lower configured ceilings remain respected. Prefill, media, supplied candidates, and larger cohorts use the ordinary prepared stages.
+The target verifies a pending token and its proposed continuation together. A greedy request can fill its reservation from its own accepted history, up to fifteen proposals in the continuation preset. The neural predictor can supply up to seven tokens and stops early on low confidence. The model budgets neural work according to the active requests. A request can still use a long history match when its neural budget is small. The same recorded verifier handles prefill, media, externally supplied candidates, and the final token of a response.
 
 MTP remains part of the text service. The model card selects the predictor parameter scope and JIT configuration; deployment decides devices, process memory, and request admission. Request-time sampling remains a service option. These capacities are configuration contracts, not throughput or peak-memory estimates.
 

@@ -2,8 +2,8 @@
 // directory at stable offsets. Model-owned preparation facts, the speculation
 // catalog, and a cold layout recipe precede the upload table.
 // Growth changes capacity without declaring stages or touching parameters.
-// Header fields are isolated prefill/decode, shape count, ordinary proposal,
-// draft kind, ordinary/mixed target, mixed proposal, and ordinary/mixed warm.
+// The isolated step reads the first two words for its prefill and decode
+// handles. Each model owns the packed phase handles in its provider payload.
 
 // Writes one of eleven {bytes, alignment, initial_zero_bytes} bootstrap
 // records. Each requests 256-byte alignment; sizes and zeroing extents come
@@ -34,36 +34,14 @@ func.def public @qwen38.row_view(%records: buffer, %row_count: index, %row: inde
   func.return
 }
 
-// Packet storage covers isolated prefill and every selected packed token shape,
-// rounded upward to an even capacity. Feedback covers the largest prepared
-// span shape, or one isolated request. The same validated {tokens, spans}
-// catalog establishes both capacities; resident growth changes neither.
-func.def public @qwen38.packet_capacities(%shapes: buffer, %shape_count: i64, %prefill: i64) -> (i64, i64) {
-  %origin = index.constant 0 : offset
-  %c0 = index.constant 0 : index
-  %c1 = index.constant 1 : index
-  %count_word = scalar.assume %shape_count [range(%shape_count, 0, 2147483647)] : i64
-  %count_value = index.cast %count_word : i64 to index
-  %storage_bytes = buffer.length %shapes
-  %storage_length = index.cast %storage_bytes : offset to index
-  %record_length = index.constant 16 : index
-  %storage_count = index.div %storage_length, %record_length : index
-  %count = index.assume %count_value [le(%count_value, %storage_count)] : index
-  %records = buffer.view %shapes[%origin] : buffer -> view<[%count]x2xi64>
-  %isolated = scalar.constant 1 : i64
-  %maximum, %span_capacity = scf.for %i = [%c0 to %count step %c1](%largest = %prefill : i64, %most_spans = %isolated : i64) -> (i64, i64) {
-    %tokens = view.load %records[%i, 0] : view<[%count]x2xi64> -> i64
-    %spans = view.load %records[%i, 1] : view<[%count]x2xi64> -> i64
-    %next = scalar.maxui %tokens, %largest : i64
-    %next_spans = scalar.maxui %spans, %most_spans : i64
-    scf.yield %next, %next_spans : i64, i64
-  }
-  %alignment = scalar.constant 2 : i64
-  %bias = scalar.constant 1 : i64
-  %padded = scalar.addi %maximum, %bias : i64
-  %units = scalar.divui %padded, %alignment : i64
-  %capacity = scalar.muli %units, %alignment : i64
-  func.return %capacity, %span_capacity : i64, i64
+// The token planes are sized in pairs; submitted work can use any prefix.
+func.def public pure @qwen38.padded_tokens(%tokens: i64) -> (i64) {
+  %pair = scalar.constant 2 : i64
+  %c1_i64 = scalar.constant 1 : i64
+  %rounded = scalar.addi %tokens, %c1_i64 : i64
+  %pairs = scalar.divui %rounded, %pair : i64
+  %extent = scalar.muli %pairs, %pair : i64
+  func.return %extent : i64
 }
 
 // Proposal catalogs contain capacities 1, 2, 4, ... . The level rounds a
@@ -77,12 +55,27 @@ func.def public @qwen38.proposal_level(%count: i32) -> (i32) {
   func.return %level : i32
 }
 
+// Each host upload describes two buffer ranges with five 64-bit words.
+func.def public pure inline @qwen38.transfer_bytes() -> (offset) {
+  %size = index.constant 520 : offset
+  func.return %size : offset
+}
+
+func.def pure inline @control_trailer_bytes() -> (offset) {
+  %recipe_bytes = index.constant 72 : offset
+  %transfer_bytes = func.call pure @qwen38.transfer_bytes() : () -> (offset)
+  %bytes = index.add %recipe_bytes, %transfer_bytes : offset
+  func.return %bytes : offset
+}
+
 // The source's speculation catalog moves with resident growth; neither device
 // commands nor the native service interpret it. The trailing recipe and upload
 // table retain their offsets relative to the end of control storage.
 func.def public pure @qwen38.speculation_origin(%state: buffer) -> (offset) {
   %bytes = buffer.length %state
-  %tail = index.constant 680 : offset
+  %catalog_bytes = index.constant 48 : offset
+  %trailer = func.call pure @control_trailer_bytes() : () -> (offset)
+  %tail = index.add %catalog_bytes, %trailer : offset
   %origin = index.sub %bytes, %tail : offset
   func.return %origin : offset
 }
@@ -100,7 +93,7 @@ func.def public @qwen38.control_create(%packet_capacity: i64, %feedback_capacity
   %catalog_origin = index.add %provider_origin, %provider_bytes : offset
   %catalog_bytes = index.constant 48 : offset
   %recipe_origin = index.add %catalog_origin, %catalog_bytes : offset
-  %trailer_bytes = index.constant 632 : offset
+  %trailer_bytes = func.call pure @control_trailer_bytes() : () -> (offset)
   %state_bytes = index.add %recipe_origin, %trailer_bytes : offset
   %state = buffer.alloca<private> align(8) %state_bytes : buffer
   %c0_i32 = scalar.constant 0 : i32
@@ -121,12 +114,26 @@ func.def public @qwen38.control_create(%packet_capacity: i64, %feedback_capacity
   func.return %state : buffer
 }
 
+func.def pure inline @control_recipe_origin(%state: buffer) -> (offset) {
+  %length = buffer.length %state
+  %trailer = func.call pure @control_trailer_bytes() : () -> (offset)
+  %origin = index.sub %length, %trailer : offset
+  func.return %origin : offset
+}
+
+func.def public readonly @qwen38.control_has_draft(%state: buffer) -> (i1) {
+  %origin = func.call pure @control_recipe_origin(%state) : (buffer) -> (offset)
+  %recipe = buffer.view %state[%origin] : buffer -> view<9xi64>
+  %word = view.load %recipe[6] : view<9xi64> -> i64
+  %c0_i64 = scalar.constant 0 : i64
+  %enabled = scalar.cmpi ne, %word, %c0_i64 : i64
+  func.return %enabled : i1
+}
+
 // Returns prepared packet capacity and the model-owned payload origin. The
 // storage owner interprets its recipe; model providers interpret only their bytes.
 func.def public @qwen38.control_context(%state: buffer) -> (i64, offset) {
-  %length = buffer.length %state
-  %trailer_bytes = index.constant 632 : offset
-  %recipe_origin = index.sub %length, %trailer_bytes : offset
+  %recipe_origin = func.call pure @control_recipe_origin(%state) : (buffer) -> (offset)
   %recipe = buffer.view %state[%recipe_origin] : buffer -> view<9xi64>
   %packet_capacity = view.load %recipe[0] : view<9xi64> -> i64
   %rows_word = view.load %recipe[3] : view<9xi64> -> i64
@@ -140,9 +147,7 @@ func.def public @qwen38.control_context(%state: buffer) -> (i64, offset) {
 
 func.def public @qwen38.control_resize(%state: buffer, %rows: i64) -> (buffer, i64, i64, i64, i64, i64, i1, i1, i1) {
   %origin = index.constant 0 : offset
-  %old_bytes = buffer.length %state
-  %trailer_bytes = index.constant 632 : offset
-  %recipe_origin = index.sub %old_bytes, %trailer_bytes : offset
+  %recipe_origin = func.call pure @control_recipe_origin(%state) : (buffer) -> (offset)
   %recipe = buffer.view %state[%recipe_origin] : buffer -> view<9xi64>
   %packet_capacity = view.load %recipe[0] : view<9xi64> -> i64
   %context = view.load %recipe[1] : view<9xi64> -> i64

@@ -2,7 +2,7 @@
 // Tile/session halos carry boundary inputs to a separate history owner, which
 // resolves retained anchors before mutating a possibly aliased writer.
 
-config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 8)]
+config.decl @flash_next.verification_width : %value: index where [range(%value, 0, 16)]
 
 config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 2147483647)]
 
@@ -20,7 +20,7 @@ func.decl pure @flash_next_span_workers(%capacity: index) -> (index)
 
 func.decl @flash_next_span_state(%epoch: buffer, %rows: buffer, %span: index, %layer_origin: offset, %capacity: index) -> (index, index, i1, offset, offset)
 
-template.decl @flash_next.q8_contract(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>)
+template.decl @ggml.q8_0_bf16.contract(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>)
 
 template.decl @ggml.q8_0_f16.contract_k64(%capacity: index, %inputs: index, %outputs: index, %streams: index, %tile_rows: index, %tile_columns: index, %wave_rows: index, %wave_columns: index, %pipeline_depth: index, %fragment_count: index, %first: index, %end: index, %channel_base: index, %split_scales: i1, %row_bytes: offset, %weight_origin: offset, %input: buffer, %weight: buffer) -> (vector<[%fragment_count]x8xf32>)
 
@@ -130,6 +130,12 @@ func.def inline @gdn_fused_convolve_head(%capacity: index, %span_capacity: index
       %segment_index = index.add %tile_index, %span : index
       %segment_origin = index.scale %segment_index, %segment_bytes : index, offset -> offset
       %boundary = buffer.view %halo[%segment_origin] : buffer -> view<6x10240xbf16>
+      // The halo owns the first three rows and the convolution owns the
+      // interior. Each publishes its raw projection for accepted-prefix replay.
+      %known = func.call @flash_next_span_publishes(%verification, %epoch, %span) : (index, buffer, index) -> (i1)
+      %no = scalar.constant false : i1
+      %capture_rows = scalar.cmpi eq, %known, %no : i1
+      %destination = buffer.view %capture[%capture_origin] : buffer -> view<[%capacity]x10240xbf16>
       %prefix_wave = index.cmp ult, %wave, %c3 : index
       %prefix_live = index.cmp ult, %wave, %segment_length : index
       %prefix = scalar.andi %prefix_wave, %prefix_live : i1
@@ -138,6 +144,11 @@ func.def inline @gdn_fused_convolve_head(%capacity: index, %span_capacity: index
         %row = index.assume %row_value [range(%row_value, 0, 127)] : index
         %values = vector.load %stage_view[%row, %local_channel] : view<128x132xbf16> -> vector<4xbf16>
         vector.store %values, %boundary[%wave, %channel] : vector<4xbf16>, view<6x10240xbf16>
+        scf.if %capture_rows {
+          %position = index.add %segment_begin, %wave : index
+          %token = index.assume %position [ge(%position, 0), lt(%position, %capacity)] : index
+          vector.store %values, %destination[%token, %channel] : vector<4xbf16>, view<[%capacity]x10240xbf16>
+        }
       }
       %after_prefix = index.cmp uge, %wave, %c3 : index
       %before_suffix_end = index.cmp ult, %wave, %c6 : index
@@ -152,26 +163,11 @@ func.def inline @gdn_fused_convolve_head(%capacity: index, %span_capacity: index
         %values = vector.load %stage_view[%row, %local_channel] : view<128x132xbf16> -> vector<4xbf16>
         vector.store %values, %boundary[%wave, %channel] : vector<4xbf16>, view<6x10240xbf16>
       }
-      %captures = index.cmp ugt, %verification, %c0 : index
-      scf.if %captures {
-        %known = func.call @flash_next_span_publishes(%verification, %epoch, %span) : (index, buffer, index) -> (i1)
-        %no = scalar.constant false : i1
-        %speculative = scalar.cmpi eq, %known, %no : i1
-        %selected = scalar.andi %speculative, %prefix_live : i1
-        scf.if %selected {
-          %row_value = index.add %local_begin, %wave : index
-          %row = index.assume %row_value [range(%row_value, 0, 127)] : index
-          %token_value = index.add %segment_begin, %wave : index
-          %token = index.assume %token_value [ge(%token_value, 0), lt(%token_value, %capacity)] : index
-          %destination = buffer.view %capture[%capture_origin] : buffer -> view<[%capacity]x10240xbf16>
-          %values = vector.load %stage_view[%row, %local_channel] : view<128x132xbf16> -> vector<4xbf16>
-          vector.store %values, %destination[%token, %channel] : vector<4xbf16>, view<[%capacity]x10240xbf16>
-        }
-      }
       %interior_begin = index.add %local_begin, %c3 : index
       %wave_begin = index.add %interior_begin, %wave : index
       scf.for %row3 = [%wave_begin to %local_end step %c8] {
-        %token = index.add %first, %row3 : index
+        %position = index.add %first, %row3 : index
+        %token = index.assume %position [ge(%position, 0), lt(%position, %capacity)] : index
         %row2 = index.sub %row3, %c1 : index
         %row1 = index.sub %row3, %c2 : index
         %row0 = index.sub %row3, %c3 : index
@@ -179,6 +175,9 @@ func.def inline @gdn_fused_convolve_head(%capacity: index, %span_capacity: index
         %stored1 = vector.load %stage_view[%row1, %local_channel] : view<128x132xbf16> -> vector<4xbf16>
         %stored2 = vector.load %stage_view[%row2, %local_channel] : view<128x132xbf16> -> vector<4xbf16>
         %stored3 = vector.load %stage_view[%row3, %local_channel] : view<128x132xbf16> -> vector<4xbf16>
+        scf.if %capture_rows {
+          vector.store %stored3, %destination[%token, %channel] : vector<4xbf16>, view<[%capacity]x10240xbf16>
+        }
         %history0 = vector.extf %stored0 : vector<4xbf16> to vector<4xf32>
         %history1 = vector.extf %stored1 : vector<4xbf16> to vector<4xf32>
         %history2 = vector.extf %stored2 : vector<4xbf16> to vector<4xf32>
@@ -319,11 +318,11 @@ func.def inline @gdn_register_contract(%capacity: index, %first: index, %end: in
   func.return %result : vector<16x8xf32>
 }
 
-kernel.def target(@gdn_fused_wave32) @gdn_fused_projection() {
+kernel.def target(@gdn_fused_wave32) @gdn_fused_projection(%active_rows: index) {
   %capacity = config.get @flash_next.token_count : index
   %rounding = index.constant 127 : index
   %tile = index.constant 128 : index
-  %padded = index.add %capacity, %rounding : index
+  %padded = index.add %active_rows, %rounding : index
   %tiles = index.div %padded, %tile : index
   %narrow_heads = index.constant 80 : index
   %wide_heads = index.constant 40 : index
@@ -419,7 +418,7 @@ kernel.def target(@gdn_fused_wave32) @gdn_fused_projection() {
         %tile_result = template.apply<@ggml.q8_0_f16.contract_k64>(%capacity, %inputs, %outputs, %c1, %tile, %tile, %c4, %c2, %c2, %c8, %first, %end, %channel_base, %split_scales, %row_bytes, %origin, %input, %weight) : (index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%c8]x8xf32>)
         scf.yield %tile_result : vector<[%c8]x8xf32>
       } else {
-        %tile_result = template.apply<@flash_next.q8_contract>(%capacity, %inputs, %outputs, %c1, %tile, %tile, %c4, %c2, %c2, %c8, %first, %end, %channel_base, %split_scales, %row_bytes, %origin, %input, %weight) : (index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%c8]x8xf32>)
+        %tile_result = template.apply<@ggml.q8_0_bf16.contract>(%capacity, %inputs, %outputs, %c1, %tile, %tile, %c4, %c2, %c2, %c8, %first, %end, %channel_base, %split_scales, %row_bytes, %origin, %input, %weight) : (index, index, index, index, index, index, index, index, index, index, index, index, index, i1, offset, offset, buffer, buffer) -> (vector<[%c8]x8xf32>)
         scf.yield %tile_result : vector<[%c8]x8xf32>
       }
       %stage_bytes = index.constant 33792 : offset
@@ -449,10 +448,9 @@ kernel.def target(@gdn_fused_wave32) @gdn_fused_projection() {
 
 // A channel group strides across live spans. Each span consumes every boundary
 // before publishing its history, including when its reader and writer alias.
-kernel.def target(@gdn_fused_wave32) @gdn_fused_boundary() {
+kernel.def target(@gdn_fused_wave32) @gdn_fused_boundary(%active_spans: index) {
   %groups = index.constant 20 : index
-  %span_capacity = config.get @flash_next.span_capacity : index
-  %spans = func.call pure @flash_next_span_workers(%span_capacity) : (index) -> (index)
+  %spans = func.call pure @flash_next_span_workers(%active_spans) : (index) -> (index)
   %threads = index.constant 128 : index
   %c1 = index.constant 1 : index
   kernel.launch.config workgroups(%groups, %spans, %c1) workgroup_size(%threads, %c1, %c1) : index

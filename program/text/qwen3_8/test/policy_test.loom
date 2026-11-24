@@ -1,11 +1,15 @@
 // Request policies belong to resident sessions. An epoch gathers only its
 // participants, and compacted continuations keep the original policy owners.
 
-func.decl @text_bind_request_v1(%state: buffer, %row: i32, %options: buffer)
+func.decl @qwen38_feedback_records_origin() -> (offset)
+
+func.decl @qwen38_feedback_bytes(%capacity: index) -> (offset)
+
+func.decl @text_bind_request_v2(%state: buffer, %row: i32, %options: buffer)
 
 func.decl @qwen38.control_create(%packet_capacity: i64, %feedback_capacity: i64, %context: i64, %pool: i64, %rows: i64, %pins: i64, %packed: i1, %enabled: i1, %dflash: i1, %provider_bytes: offset) -> (buffer)
 
-func.decl @text_encode_epoch_v1(%control_state: buffer, %plan: buffer, %inputs: buffer, %media_plan: buffer, %first_count: i32, %next_count: i32, %input_count: i32, %first_media_count: i32, %next_media_count: i32, %first_packet_capacity: i32, %next_packet_capacity: i32, %eos: i32, %metadata: buffer, %tokens: buffer) -> (i32, buffer, i64, i64)
+func.decl @text_encode_epoch_v2(%control_state: buffer, %plan: buffer, %inputs: buffer, %media_plan: buffer, %first_count: i32, %next_count: i32, %input_count: i32, %first_media_count: i32, %next_media_count: i32, %first_reserved_tokens: i32, %next_reserved_tokens: i32, %eos: i32, %metadata: buffer, %tokens: buffer) -> (i32, buffer, i64, i64)
 
 func.decl @qwen38_continue_spans(%mixed_inputs: index, %context: index, %capacity: index, %feedback_capacity: index, %epoch: buffer, %tokens: buffer, %results: buffer)
 
@@ -46,10 +50,7 @@ func.def @sampling_policy_ownership(%count_value: index) -> (i1) {
   %metadata_bytes = index.add %packet_header, %packet_payload : offset
   %input_stride = index.constant 8 : offset
   %input_bytes = index.scale %capacity, %input_stride : index, offset -> offset
-  %result_stride = index.constant 84 : offset
-  %result_payload = index.scale %capacity, %result_stride : index, offset -> offset
-  %result_headers = index.constant 240 : offset
-  %result_bytes = index.add %result_payload, %result_headers : offset
+  %result_bytes = func.call @qwen38_feedback_bytes(%capacity) : (index) -> (offset)
   %plan = buffer.alloca<private> align(4) %plan_bytes : buffer
   %metadata = buffer.alloca<private> align(8) %metadata_bytes : buffer
   %inputs = buffer.alloca<private> align(4) %input_bytes : buffer
@@ -68,8 +69,8 @@ func.def @sampling_policy_ownership(%count_value: index) -> (i1) {
   buffer.fill %c0_i32, %results[%origin], %result_bytes : i32
   %requests = buffer.view %plan[%origin] : buffer -> view<[%plan_count]x9xi32>
   %policy = buffer.view %options[%origin] : buffer -> view<6xi32>
-  %result_origin = index.constant 120 : offset
-  %prior = buffer.view %results[%result_origin] : buffer -> view<[%capacity]x10xi32>
+  %result_origin = func.call @qwen38_feedback_records_origin() : () -> (offset)
+  %prior = buffer.view %results[%result_origin] : buffer -> view<[%capacity]x18xi32>
   %last = index.sub %resident_count, %c1 : index
   scf.for %i = [%c0 to %c4 step %c1] {
     %resident = index.sub %last, %i : index
@@ -79,7 +80,7 @@ func.def @sampling_policy_ownership(%count_value: index) -> (i1) {
       %value = scalar.addi %row, %word : i32
       view.store %value, %policy[%field] : i32, view<6xi32>
     }
-    func.call @text_bind_request_v1(%state, %row, %options) : (buffer, i32, buffer)
+    func.call @text_bind_request_v2(%state, %row, %options) : (buffer, i32, buffer)
     %input = index.cast %i : index to i32
     view.store %c1_i32, %requests[%i, 0] : i32, view<[%plan_count]x9xi32>
     view.store %row, %requests[%i, 3] : i32, view<[%plan_count]x9xi32>
@@ -87,8 +88,8 @@ func.def @sampling_policy_ownership(%count_value: index) -> (i1) {
     view.store %c1_i32, %requests[%i, 5] : i32, view<[%plan_count]x9xi32>
     view.store %c1_i32, %requests[%i, 6] : i32, view<[%plan_count]x9xi32>
     view.store %input, %requests[%i, 8] : i32, view<[%plan_count]x9xi32>
-    view.store %c1_i32, %prior[%i, 0] : i32, view<[%capacity]x10xi32>
-    view.store %c1_i32, %prior[%i, 1] : i32, view<[%capacity]x10xi32>
+    view.store %c1_i32, %prior[%i, 0] : i32, view<[%capacity]x18xi32>
+    view.store %c1_i32, %prior[%i, 1] : i32, view<[%capacity]x18xi32>
   }
   // Reverse the cohort and omit its first participant.
   scf.for %i = [%c0 to %c3 step %c1] {
@@ -106,7 +107,7 @@ func.def @sampling_policy_ownership(%count_value: index) -> (i1) {
     view.store %c1_i32, %requests[%record, 6] : i32, view<[%plan_count]x9xi32>
     view.store %owner_word, %requests[%record, 8] : i32, view<[%plan_count]x9xi32>
   }
-  %outputs, %transfers, %begin, %length = func.call @text_encode_epoch_v1(%state, %plan, %inputs, %inputs, %c4_i32, %c3_i32, %c7_i32, %c0_i32, %c0_i32, %c0_i32, %c0_i32, %sentinel, %metadata, %tokens) : (buffer, buffer, buffer, buffer, i32, i32, i32, i32, i32, i32, i32, i32, buffer, buffer) -> (i32, buffer, i64, i64)
+  %outputs, %transfers, %begin, %length = func.call @text_encode_epoch_v2(%state, %plan, %inputs, %inputs, %c4_i32, %c3_i32, %c7_i32, %c0_i32, %c0_i32, %c4_i32, %c3_i32, %sentinel, %metadata, %tokens) : (buffer, buffer, buffer, buffer, i32, i32, i32, i32, i32, i32, i32, i32, buffer, buffer) -> (i32, buffer, i64, i64)
   %tail_header = index.constant 32 : offset
   %policy_scale = index.constant 76 : offset
   %policy_relative = index.scale %capacity, %policy_scale : index, offset -> offset
@@ -144,11 +145,11 @@ func.def @sampling_policy_ownership(%count_value: index) -> (i1) {
   %table_prefix = index.constant 160 : offset
   %table_origin = index.add %table_prefix, %policy_bytes : offset
   %expected_begin = index.cast %table_origin : offset to i64
-  %expected_length = scalar.constant 560 : i64
+  %expected_length = scalar.constant 520 : i64
   %begin_matches = scalar.cmpi eq, %begin, %expected_begin : i64
   %length_matches = scalar.cmpi eq, %length, %expected_length : i64
-  %table = buffer.view %transfers[%table_origin] : buffer -> view<14x5xi64>
-  %policy_transfer_bytes = view.load %table[9, 4] : view<14x5xi64> -> i64
+  %table = buffer.view %transfers[%table_origin] : buffer -> view<13x5xi64>
+  %policy_transfer_bytes = view.load %table[9, 4] : view<13x5xi64> -> i64
   %live_policy_bytes = index.scale %count, %policy_stride : index, offset -> offset
   %expected_policy_bytes = index.cast %live_policy_bytes : offset to i64
   %transfer_matches = scalar.cmpi eq, %policy_transfer_bytes, %expected_policy_bytes : i64

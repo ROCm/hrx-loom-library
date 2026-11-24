@@ -4,6 +4,8 @@
 
 config.decl @runner.qwen38.mixed_inputs : %value: index where [range(%value, 0, 1)]
 
+config.decl @flash_next.dot_packet : %value: index where [range(%value, 0, 1)]
+
 func.decl readonly @flash_next_token_count(%epoch: buffer, %capacity: index) -> (index)
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
@@ -14,19 +16,13 @@ config.decl @flash_next.span_capacity : %value: index where [range(%value, 1, 21
 
 kernel.decl @flash_next_finish_plan() launch(%epoch: buffer, %compact: buffer, %origins: buffer)
 
-kernel.decl @flash_next_finish_gather() launch(%epoch: buffer, %origins: buffer, %residual: buffer, %mixed: buffer, %injection: buffer, %staging: buffer)
+kernel.decl @flash_next_finish_gather(%workload_count: index) launch(%epoch: buffer, %origins: buffer, %residual: buffer, %mixed: buffer, %injection: buffer, %staging: buffer)
 
-kernel.decl @flash_next_finish_publish() launch(%epoch: buffer, %origins: buffer, %residual: buffer, %mixed: buffer, %injection: buffer, %staging: buffer)
+kernel.decl @flash_next_finish_publish(%workload_count: index) launch(%epoch: buffer, %origins: buffer, %residual: buffer, %mixed: buffer, %injection: buffer, %staging: buffer)
 
-kernel.decl @flash_next_finish_scatter() launch(%epoch: buffer, %origins: buffer, %input: buffer, %output: buffer)
+kernel.decl @flash_next_finish_scatter(%workload_count: index) launch(%epoch: buffer, %origins: buffer, %input: buffer, %output: buffer)
 
 kernel.decl @flash_next_map_tokens(%neural_enabled: i1) launch(%epoch: buffer, %mapping: buffer)
-
-kernel.decl @hc_combine_normalize() launch(%span: buffer, %residual: buffer, %projected: buffer, %injection: buffer, %gamma: buffer, %output: buffer, %normalized: buffer)
-
-command.decl @flash_next_hc_ffn_normalized(%layer: index) launch(%parameters: buffer, %span: buffer, %normalized: buffer, %injection: buffer, %mixed: buffer)
-
-kernel.decl @hc_combine_normalize_inject() launch(%span: buffer, %residual: buffer, %projected: buffer, %injection: buffer, %gamma: buffer, %output: buffer, %normalized: buffer, %weight: buffer, %next_injection: buffer)
 
 kernel.decl @hc_combine(%neural_enabled: i1) launch(%span: buffer, %residual: buffer, %projected: buffer, %injection: buffer, %output: buffer)
 
@@ -34,9 +30,9 @@ command.decl @flash_next_qsa_append(%workload_count: index, %layer: index, %key_
 
 command.decl @flash_next_qsa_queries(%workload_count: index, %layer: index, %key_origin: offset, %value_origin: offset, %index_origin: offset, %tail_origin: offset, %mixed_inputs: index, %remapped: i1, %origin_capacity: index) launch(%parameters: buffer, %span: buffer, %mapping: buffer, %rows: buffer, %input: buffer, %arena: buffer, %output: buffer, %capture: buffer, %inputs: buffer, %origins: buffer)
 
-command.decl @flash_next_hc_mix_normalized(%down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>) launch(%span: buffer, %normalized: buffer, %mixed: buffer)
+command.decl @flash_next_hc_combine_mix(%packet_count: index, %workload_count: index, %allow_quantized: i1, %gamma: view<4x2560xf32>, %down_weight: view<3481600xi8>, %up_weight: view<3481600xi8>, %injection_weight: view<4x10240xf32>) launch(%span: buffer, %residual: buffer, %projected: buffer, %previous_injection: buffer, %output: buffer, %injection: buffer, %mixed: buffer)
 
-command.decl @flash_next_route(%neural_enabled: i1, %layer: index) launch(%parameters: buffer, %span: buffer, %input: buffer, %ids: buffer, %weights: buffer, %shared_gate: buffer)
+command.decl @flash_next_route(%workload_count: index, %layer: index) launch(%parameters: buffer, %span: buffer, %input: buffer, %ids: buffer, %weights: buffer, %shared_gate: buffer)
 
 command.decl @flash_next_experts(%workload_count: index, %layer: index) launch(%parameters: buffer, %span: buffer, %input: buffer, %ids: buffer, %weights: buffer, %shared_gate: buffer, %output: buffer)
 
@@ -64,9 +60,27 @@ command.def public @flash_next_finish_output(%workload_count: index, %layer: ind
   %origins = buffer.alloca<global> align(16) %origin_bytes : buffer
   %staging = buffer.alloca<global> align(256) %staging_bytes : buffer
   kernel.launch @flash_next_finish_plan(%epoch, %compact, %origins) : (buffer, buffer, buffer)
-  %compact_count = func.call readonly @flash_next_token_count(%compact, %capacity) : (buffer, index) -> (index)
-  kernel.launch @flash_next_finish_gather(%compact, %origins, %residual, %mixed, %injection, %staging) : (buffer, buffer, buffer, buffer, buffer, buffer)
-  kernel.launch @flash_next_finish_publish(%compact, %origins, %residual, %mixed, %injection, %staging) : (buffer, buffer, buffer, buffer, buffer, buffer)
+  // Sample both counts after the plan publishes the compact packet. One
+  // indirect grid then selects the arithmetic and its live row extent.
+  %mode = config.get @flash_next.dot_packet : index
+  %c0 = index.constant 0 : index
+  %short_packet = index.cmp ne, %mode, %c0 : index
+  %live_packet_count = func.call readonly @flash_next_token_count(%epoch, %source_capacity) : (buffer, index) -> (index)
+  %packet_count = scf.if %short_packet -> (index) {
+    %short_packet_count = index.assume %live_packet_count [range(%live_packet_count, 1, 15)] : index
+    scf.yield %short_packet_count : index
+  } else {
+    scf.yield %live_packet_count : index
+  }
+  %live_compact_count = func.call readonly @flash_next_token_count(%compact, %capacity) : (buffer, index) -> (index)
+  %compact_count = scf.if %short_packet -> (index) {
+    %short_compact_count = index.assume %live_compact_count [range(%live_compact_count, 0, 15)] : index
+    scf.yield %short_compact_count : index
+  } else {
+    scf.yield %live_compact_count : index
+  }
+  kernel.launch @flash_next_finish_gather[%compact_count](%compact, %origins, %residual, %mixed, %injection, %staging) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_finish_publish[%compact_count](%compact, %origins, %residual, %mixed, %injection, %staging) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
   // The full mapping has no remaining consumer after cache append. Compact
   // descriptors preserve absolute positions and resident physical-page owners.
   kernel.launch @flash_next_map_tokens[%neural_enabled](%compact, %mapping) : [i1](buffer, buffer)
@@ -84,32 +98,25 @@ command.def public @flash_next_finish_output(%workload_count: index, %layer: ind
   %projected = buffer.alloca<global> align(256) %hidden_bytes : buffer
   command.launch @flash_next_qsa_queries[%compact_count, %layer, %key_origin, %value_origin, %index_origin, %tail_origin, %mixed_inputs, %remapped, %capacity](%parameters, %compact, %mapping, %rows, %mixed, %arena, %projected, %capture, %inputs, %origins) : [index, index, offset, offset, offset, offset, index, i1, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   %attention = buffer.alloca<global> align(256) %residual_bytes : buffer
-  %normalized = buffer.alloca<global> align(256) %residual_bytes : buffer
   %ffn_injection = buffer.alloca<global> align(256) %injection_bytes : buffer
   %gamma = command.parameter %parameters, "blk.{}.hc_ffn_norm.weight"[%layer] : view<4x2560xf32>
   %ffn_mixed = buffer.alloca<global> align(256) %hidden_bytes : buffer
-  // Preserve the body variant's arithmetic while reducing only live rows.
-  %fusion_threshold = index.constant 2048 : index
-  %fused = index.cmp uge, %tokens, %fusion_threshold : index
-  scf.if %fused {
-    %down_weight = command.parameter %parameters, "blk.{}.hc_ffn_down.weight"[%layer] : view<3481600xi8>
-    %up_weight = command.parameter %parameters, "blk.{}.hc_ffn_up.weight"[%layer] : view<3481600xi8>
-    %inject_weight = command.parameter %parameters, "blk.{}.hc_ffn_inject.weight"[%layer] : view<4x10240xf32>
-    kernel.launch @hc_combine_normalize_inject(%compact, %residual, %projected, %injection, %gamma, %attention, %normalized, %inject_weight, %ffn_injection) : (buffer, buffer, buffer, buffer, view<4x2560xf32>, buffer, buffer, view<4x10240xf32>, buffer)
-    command.launch @flash_next_hc_mix_normalized[%down_weight, %up_weight](%compact, %normalized, %ffn_mixed) : [view<3481600xi8>, view<3481600xi8>](buffer, buffer, buffer)
-  } else {
-    kernel.launch @hc_combine_normalize(%compact, %residual, %projected, %injection, %gamma, %attention, %normalized) : (buffer, buffer, buffer, buffer, view<4x2560xf32>, buffer, buffer)
-    command.launch @flash_next_hc_ffn_normalized[%layer](%parameters, %compact, %normalized, %ffn_injection, %ffn_mixed) : [index](buffer, buffer, buffer, buffer, buffer)
-  }
+  // Selection changes row ownership alone. The full-hidden and compact final
+  // mixers use the same packet precision and keep the final projection floating.
+  %final_quantized = scalar.constant false : i1
+  %down_weight = command.parameter %parameters, "blk.{}.hc_ffn_down.weight"[%layer] : view<3481600xi8>
+  %up_weight = command.parameter %parameters, "blk.{}.hc_ffn_up.weight"[%layer] : view<3481600xi8>
+  %inject_weight = command.parameter %parameters, "blk.{}.hc_ffn_inject.weight"[%layer] : view<4x10240xf32>
+  command.launch @flash_next_hc_combine_mix[%packet_count, %compact_count, %final_quantized, %gamma, %down_weight, %up_weight, %inject_weight](%compact, %residual, %projected, %injection, %attention, %ffn_injection, %ffn_mixed) : [index, index, i1, view<4x2560xf32>, view<3481600xi8>, view<3481600xi8>, view<4x10240xf32>](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   %ids = buffer.alloca<global> align(256) %selection_bytes : buffer
   %weights = buffer.alloca<global> align(256) %selection_bytes : buffer
   %shared_gate = buffer.alloca<global> align(256) %gate_bytes : buffer
-  command.launch @flash_next_route[%neural_enabled, %layer](%parameters, %compact, %ffn_mixed, %ids, %weights, %shared_gate) : [i1, index](buffer, buffer, buffer, buffer, buffer, buffer)
+  command.launch @flash_next_route[%compact_count, %layer](%parameters, %compact, %ffn_mixed, %ids, %weights, %shared_gate) : [index, index](buffer, buffer, buffer, buffer, buffer, buffer)
   %branch = buffer.alloca<global> align(256) %hidden_bytes : buffer
   command.launch @flash_next_experts[%compact_count, %layer](%parameters, %compact, %ffn_mixed, %ids, %weights, %shared_gate, %branch) : [index, index](buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   // Input residual is dead after the normalization/combine above. Reuse its
   // storage for compact results, then scatter to the distinct caller output.
   kernel.launch @hc_combine[%neural_enabled](%compact, %attention, %branch, %ffn_injection, %residual) : [i1](buffer, buffer, buffer, buffer, buffer)
-  kernel.launch @flash_next_finish_scatter(%compact, %origins, %residual, %output) : (buffer, buffer, buffer, buffer)
+  kernel.launch @flash_next_finish_scatter[%compact_count](%compact, %origins, %residual, %output) : [index](buffer, buffer, buffer, buffer)
   command.return
 }

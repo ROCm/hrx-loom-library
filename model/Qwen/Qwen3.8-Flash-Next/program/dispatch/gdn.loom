@@ -4,19 +4,23 @@
 
 config.decl @flash_next.token_count : %value: index where [range(%value, 1, 32768)]
 
+command.decl @flash_next_gdn_fused_convolve(%active_rows: index, %active_spans: index, %history_origin: offset, %capture_origin: offset) launch(%epoch: buffer, %rows: buffer, %input: buffer, %weight: buffer, %conv_weight: buffer, %arena: buffer, %convolved: buffer, %inverse_norm: buffer, %capture: buffer)
+
+kernel.decl @flash_next_project_qkv(%active_rows: index, %output_width: index) launch(%row_capacity: index, %width: index, %span: buffer, %input: buffer, %weight: buffer, %output: buffer)
+
 command.decl @flash_next_capture_inputs(%neural_enabled: i1, %prefix_bytes: offset, %row_bytes: offset) launch(%epoch: buffer, %input: buffer, %capture: buffer)
 
-kernel.decl @gdn_convolve() launch(%span_arg: buffer, %origins_arg: buffer, %layer_origin: offset, %qkv_arg: buffer, %weight_arg: buffer, %history_arg: buffer, %convolved_arg: buffer, %norm_arg: buffer)
+kernel.decl @gdn_convolve(%active_spans: index) launch(%row_capacity: index, %span_arg: buffer, %origins_arg: buffer, %layer_origin: offset, %qkv_arg: buffer, %weight_arg: buffer, %history_arg: buffer, %convolved_arg: buffer, %norm_arg: buffer)
 
-kernel.decl @gdn_gate() launch(%span_arg: buffer, %raw_arg: buffer, %z_arg: buffer, %weight_arg: buffer, %output_arg: buffer)
+kernel.decl @gdn_gate(%live_rows: index) launch(%span_arg: buffer, %raw_arg: buffer, %z_arg: buffer, %weight_arg: buffer, %output_arg: buffer)
 
-kernel.decl @gdn_recur() launch(%span_arg: buffer, %origins_arg: buffer, %layer_origin: offset, %qkv_arg: buffer, %norm_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer, %a_arg: buffer, %bias_arg: buffer, %state_arg: buffer, %output_arg: buffer)
+kernel.decl @gdn_recur(%active_spans: index) launch(%span_arg: buffer, %origins_arg: buffer, %layer_origin: offset, %qkv_arg: buffer, %norm_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer, %a_arg: buffer, %bias_arg: buffer, %state_arg: buffer, %output_arg: buffer)
 
-kernel.decl @gdn_recur_window() launch(%span_arg: buffer, %origins_arg: buffer, %layer_origin: offset, %qkv_arg: buffer, %norm_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer, %a_arg: buffer, %bias_arg: buffer, %state_arg: buffer, %output_arg: buffer)
+kernel.decl @gdn_recur_window(%active_spans: index) launch(%span_arg: buffer, %origins_arg: buffer, %layer_origin: offset, %qkv_arg: buffer, %norm_arg: buffer, %alpha_arg: buffer, %beta_arg: buffer, %a_arg: buffer, %bias_arg: buffer, %state_arg: buffer, %output_arg: buffer)
 
 // Recurrence and gating consume the same rounded convolution publications,
 // regardless of whether projection and convolution shared an LDS tile.
-command.def public @flash_next_gdn_finish(%layer: index, %state_origin: offset) launch(%parameters: buffer, %epoch: buffer, %rows: buffer, %convolved: buffer, %inverse_norm: buffer, %z: buffer, %alpha: buffer, %beta: buffer, %arena: buffer, %output: buffer) {
+command.def @flash_next_gdn_finish(%workload_count: index, %span_count: index, %layer: index, %state_origin: offset) launch(%parameters: buffer, %epoch: buffer, %rows: buffer, %convolved: buffer, %inverse_norm: buffer, %z: buffer, %alpha: buffer, %beta: buffer, %arena: buffer, %output: buffer) {
   %tokens = config.get @flash_next.token_count : index
   %value_row_bytes = index.constant 12288 : offset
   %value_bytes = index.scale %tokens, %value_row_bytes : index, offset -> offset
@@ -24,23 +28,23 @@ command.def public @flash_next_gdn_finish(%layer: index, %state_origin: offset) 
   %a = command.parameter %parameters, "blk.{}.ssm_a"[%layer] : view<48xf32>
   %bias = command.parameter %parameters, "blk.{}.ssm_dt.bias"[%layer] : view<48xf32>
   %norm_weight = command.parameter %parameters, "blk.{}.ssm_norm.weight"[%layer] : view<128xf32>
-  // Epoch capacity selects cooperative staging or the small wave body,
-  // independently of individual span lengths. Replay keeps the small body.
+  %c0 = index.constant 0 : index
   %window_threshold = index.constant 32 : index
-  %use_windows = index.cmp uge, %tokens, %window_threshold : index
-  scf.if %use_windows {
-    kernel.launch @gdn_recur_window(%epoch, %rows, %state_origin, %convolved, %inverse_norm, %alpha, %beta, %a, %bias, %arena, %raw) : (buffer, buffer, offset, buffer, buffer, buffer, buffer, view<48xf32>, view<48xf32>, buffer, buffer)
-  } else {
-    kernel.launch @gdn_recur(%epoch, %rows, %state_origin, %convolved, %inverse_norm, %alpha, %beta, %a, %bias, %arena, %raw) : (buffer, buffer, offset, buffer, buffer, buffer, buffer, view<48xf32>, view<48xf32>, buffer, buffer)
+  %use_windows = index.cmp uge, %workload_count, %window_threshold : index
+  %window_spans = scf.select %use_windows, %span_count, %c0 : index
+  %direct_spans = scf.select %use_windows, %c0, %span_count : index
+  command.concurrent {
+    kernel.launch @gdn_recur_window[%window_spans](%epoch, %rows, %state_origin, %convolved, %inverse_norm, %alpha, %beta, %a, %bias, %arena, %raw) : [index](buffer, buffer, offset, buffer, buffer, buffer, buffer, view<48xf32>, view<48xf32>, buffer, buffer)
+    kernel.launch @gdn_recur[%direct_spans](%epoch, %rows, %state_origin, %convolved, %inverse_norm, %alpha, %beta, %a, %bias, %arena, %raw) : [index](buffer, buffer, offset, buffer, buffer, buffer, buffer, view<48xf32>, view<48xf32>, buffer, buffer)
   }
-  kernel.launch @gdn_gate(%epoch, %raw, %z, %norm_weight, %output) : (buffer, buffer, buffer, view<128xf32>, buffer)
+  kernel.launch @gdn_gate[%workload_count](%epoch, %raw, %z, %norm_weight, %output) : [index](buffer, buffer, buffer, view<128xf32>, buffer)
   command.return
 }
 
 // A layer stores its F32 recurrence followed by three BF16 convolution rows.
 // Rows publish into a private writer selected by the retained-state pool. A
 // fresh conversation synthesizes zeros in registers without clearing storage.
-command.def public @flash_next_gdn_state(%layer: index, %state_origin: offset) launch(%parameters: buffer, %epoch: buffer, %rows: buffer, %qkv: buffer, %z: buffer, %alpha: buffer, %beta: buffer, %arena: buffer, %output: buffer, %capture: buffer) where [range(%layer, 0, 47)] {
+command.def public @flash_next_gdn_state(%workload_count: index, %span_count: index, %layer: index, %state_origin: offset) launch(%parameters: buffer, %epoch: buffer, %rows: buffer, %input: buffer, %z: buffer, %alpha: buffer, %beta: buffer, %arena: buffer, %output: buffer, %capture: buffer) where [range(%layer, 0, 47)] {
   %neural_enabled = scalar.constant true : i1
   %tokens = config.get @flash_next.token_count : index
   %layer_group_size = index.constant 4 : index
@@ -52,7 +56,6 @@ command.def public @flash_next_gdn_state(%layer: index, %state_origin: offset) l
   %gate_extent = index.constant 192 : offset
   %alpha_prefix = index.add %prefix, %qkv_extent : offset
   %beta_prefix = index.add %alpha_prefix, %gate_extent : offset
-  command.launch @flash_next_capture_inputs[%neural_enabled, %prefix, %qkv_extent](%epoch, %qkv, %capture) : [i1, offset, offset](buffer, buffer, buffer)
   command.launch @flash_next_capture_inputs[%neural_enabled, %alpha_prefix, %gate_extent](%epoch, %alpha, %capture) : [i1, offset, offset](buffer, buffer, buffer)
   command.launch @flash_next_capture_inputs[%neural_enabled, %beta_prefix, %gate_extent](%epoch, %beta, %capture) : [i1, offset, offset](buffer, buffer, buffer)
   %qkv_row_bytes = index.constant 20480 : offset
@@ -64,7 +67,31 @@ command.def public @flash_next_gdn_state(%layer: index, %state_origin: offset) l
   %convolved = buffer.alloca<global> align(256) %qkv_bytes : buffer
   %inverse_norm = buffer.alloca<global> align(256) %norm_bytes : buffer
   %conv_weight = command.parameter %parameters, "blk.{}.ssm_conv1d.weight"[%layer] : view<10240x4xf32>
-  kernel.launch @gdn_convolve(%epoch, %rows, %history_origin, %qkv, %conv_weight, %arena, %convolved, %inverse_norm) : (buffer, buffer, offset, buffer, view<10240x4xf32>, buffer, buffer, buffer)
-  command.launch @flash_next_gdn_finish[%layer, %state_origin](%parameters, %epoch, %rows, %convolved, %inverse_norm, %z, %alpha, %beta, %arena, %output) : [index, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  %weight = command.parameter %parameters, "blk.{}.attn_qkv.weight"[%layer] : view<10240x80x34xi8>
+  %capture_origin = index.scale %tokens, %prefix : index, offset -> offset
+  %threshold = index.constant 128 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %direct = index.cmp ult, %workload_count, %threshold : index
+  %direct_rows = scf.select %direct, %workload_count, %c0 : index
+  %direct_spans = scf.select %direct, %span_count, %c0 : index
+  %fused_rows = scf.select %direct, %c0, %workload_count : index
+  %fused_spans = scf.select %direct, %c0, %span_count : index
+  // Only the direct contraction materializes a raw QKV plane. Its largest
+  // possible extent follows from the same predicate that enables its grid.
+  %direct_limit = index.sub %threshold, %c1 : index
+  %direct_capacity = index.min %tokens, %direct_limit : index
+  %direct_bytes = index.scale %direct_capacity, %qkv_row_bytes : index, offset -> offset
+  command.concurrent {
+    command.serial {
+      %qkv = buffer.alloca<global> align(256) %direct_bytes : buffer
+      %width = index.constant 10240 : index
+      kernel.launch @flash_next_project_qkv[%direct_rows, %width](%direct_capacity, %width, %epoch, %input, %weight, %qkv) : [index, index](index, index, buffer, buffer, view<10240x80x34xi8>, buffer)
+      command.launch @flash_next_capture_inputs[%direct, %prefix, %qkv_extent](%epoch, %qkv, %capture) : [i1, offset, offset](buffer, buffer, buffer)
+      kernel.launch @gdn_convolve[%direct_spans](%direct_capacity, %epoch, %rows, %history_origin, %qkv, %conv_weight, %arena, %convolved, %inverse_norm) : [index](index, buffer, buffer, offset, buffer, view<10240x4xf32>, buffer, buffer, buffer)
+    }
+    command.launch @flash_next_gdn_fused_convolve[%fused_rows, %fused_spans, %history_origin, %capture_origin](%epoch, %rows, %input, %weight, %conv_weight, %arena, %convolved, %inverse_norm, %capture) : [index, index, offset, offset](buffer, buffer, buffer, view<10240x80x34xi8>, view<10240x4xf32>, buffer, buffer, buffer, buffer)
+  }
+  command.launch @flash_next_gdn_finish[%workload_count, %span_count, %layer, %state_origin](%parameters, %epoch, %rows, %convolved, %inverse_norm, %z, %alpha, %beta, %arena, %output) : [index, index, index, offset](buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
   command.return
 }
