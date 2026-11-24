@@ -1,0 +1,60 @@
+// Encode the framed prompt into the penultimate BF16 hidden state per text
+// row. The reference takes hidden_states[-2]: the output of block 34. Only
+// those 35 of the checkpoint's 36 blocks run, and no final norm applies. The
+// blocks update the caller's output in place, so no history is kept.
+
+config.decl @zimage.text_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+amdgpu.target<gfx11-generic> @encoder_gather_wave32 {subgroup_size = 32}
+
+template.decl @embedding.lookup_bf16(%vocabulary: index, %width: index, %token_id: i32, %channel: index, %weight: buffer) -> (bf16)
+
+command.decl @zimage.encoder_block(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %output: buffer)
+
+kernel.def target(@encoder_gather_wave32) @encoder_embedding() {
+  %rows = config.get @zimage.text_tokens : index
+  %columns = index.constant 10 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%rows, %columns, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%token_ids: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %vocabulary = index.constant 151936 : index
+  %width = index.constant 2560 : index
+  %threads = index.constant 256 : index
+  %row = kernel.workgroup.id<x> : index
+  %group = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %channel = index.madd %group, %threads, %lane : index
+  %origin = index.constant 0 : offset
+  %ids = buffer.view %token_ids[%origin] : buffer -> view<[%rows]xi32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%width]xbf16>
+  %id = view.load %ids[%row] : view<[%rows]xi32> -> i32
+  %value = template.apply<@embedding.lookup_bf16>(%vocabulary, %width, %id, %channel, %weight) : (index, index, i32, index, buffer) -> (bf16)
+  view.store %value, %output_view[%row, %channel] : bf16, view<[%rows]x[%width]xbf16>
+  kernel.return
+}
+
+// IDs cover all text_tokens rows, each validated in [0,151936). Padding rows
+// hold <|endoftext|> (151643) and are embedded like any other token.
+command.def public @zimage.encoder_embedding() launch(%parameters: buffer, %token_ids: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "model.embed_tokens.weight" : view<151936x2560xbf16>
+  kernel.launch @encoder_embedding(%token_ids, %weight, %output) : (buffer, view<151936x2560xbf16>, buffer)
+  command.return
+}
+
+// Input IDs are the chat-framed prompt right-padded to text_tokens.
+// Cosine/sine are BF16[text_tokens,128] for positions 0..text_tokens-1, and the
+// byte key mask is the tokenizer attention mask. The immutable inputs may not
+// alias the output. Output is BF16[text_tokens,2560]; the transformer reads
+// only its live rows.
+command.def public @text_encoder() launch(%parameters: buffer, %token_ids: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %hidden: buffer) {
+  command.launch @zimage.encoder_embedding(%parameters, %token_ids, %hidden) : (buffer, buffer, buffer)
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %layers = index.constant 35 : index
+  scf.for %layer = [%c0 to %layers step %c1] unroll {
+    command.launch @zimage.encoder_block[%layer](%parameters, %hidden, %cosine, %sine, %mask, %hidden) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+  }
+  command.return
+}

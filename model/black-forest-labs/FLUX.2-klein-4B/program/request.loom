@@ -1,0 +1,477 @@
+// Turn the prepared request into device-side noise, prompt rows, the key mask,
+// rotary tables, timestep values, and Euler step sizes. The payload's seed and
+// token IDs determine these values without a host RNG or generated input
+// files. Geometry comes from the image stage's validated configuration;
+// callers provide separate output buffers with the declared logical extents.
+//
+// Reference semantics are diffusers' Flux2KleinPipeline: the chat-framed prompt
+// is right-padded or right-truncated to text_tokens, the Qwen3 encoder uses
+// positions 0..text_tokens-1 for every row, and FlowMatchEulerDiscreteScheduler
+// shifts linspace(1, 1/4, 4) by the empirical mu for the image token count.
+
+config.decl @klein.image_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+config.decl @klein.text_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+config.decl @klein.latent_width : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+amdgpu.target<gfx11-generic> @request_wave32 {subgroup_size = 32}
+
+template.decl @random.philox4x32(%counter0: i32, %counter1: i32, %counter2: i32, %counter3: i32, %seed0: i32, %seed1: i32) -> (i32, i32, i32, i32)
+
+template.decl @random.normal_pair(%radius_word: i32, %angle_word: i32) -> (f32, f32)
+
+template.decl @klein.cosine_sine(%angle: f64) -> (f64, f64)
+
+template.decl @klein.dyadic_power(%base: f64, %numerator: index, %levels: index, %top_bit: index) -> (f64)
+
+// base^(numerator / 2^levels) for numerator < 2^levels, where top_bit is
+// 2^(levels-1). The target has no F64 power recipe, so repeated correctly
+// rounded square roots give base^(2^-l) and the numerator's set bits select
+// which roots multiply in; the result is within a few F64 units of the exact
+// power, far below the F32 rounding the tables apply afterwards.
+template.def<@klein.dyadic_power> @klein_dyadic_power(%base: f64, %numerator: index, %levels: index, %top_bit: index) -> (f64) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %identity = scalar.constant 1.0 : f64
+  %result, %root, %bit = scf.for %level = [%c0 to %levels step %c1](%product = %identity : f64, %previous = %base : f64, %weight = %top_bit : index) -> (f64, f64, index) {
+    %current = scalar.sqrtf %previous : f64
+    %quotient = index.div %numerator, %weight : index
+    %digit = index.rem %quotient, %c2 : index
+    %set = index.cmp eq, %digit, %c1 : index
+    %scaled = scalar.mulf %product, %current : f64
+    %next = scf.select %set, %scaled, %product : f64
+    %half = index.div %weight, %c2 : index
+    scf.yield %next, %current, %half : f64, f64, index
+  }
+  template.return %result : f64
+}
+
+// F64 cosine and sine of a non-negative angle from F64 arithmetic alone, since
+// the target has no F64 trigonometric recipe. The angle reduces by quarter
+// turns against a 33-bit head of pi/2, whose integer multiples are exact, and
+// its tail; Taylor polynomials through degree 17 and 18 then cover the
+// residual in [-pi/4, pi/4] to below F64 rounding. Results round to F32 the
+// same way the reference's F64 cosine and sine do.
+template.def<@klein.cosine_sine> @klein_cosine_sine(%angle: f64) -> (f64, f64) {
+  %inverse_half_pi = scalar.constant 0.63661977236758138 : f64
+  %half_pi_head = scalar.constant 1.5707963267341256 : f64
+  %half_pi_tail = scalar.constant 6.0771005065061922e-11 : f64
+  %quarter_turns = scalar.mulf %angle, %inverse_half_pi : f64
+  %rounded = scalar.roundevenf %quarter_turns : f64
+  %head = scalar.mulf %rounded, %half_pi_head : f64
+  %tail = scalar.mulf %rounded, %half_pi_tail : f64
+  %partial = scalar.subf %angle, %head : f64
+  %residual = scalar.subf %partial, %tail : f64
+  %square = scalar.mulf %residual, %residual : f64
+  %s8 = scalar.constant 2.8114572543455206e-15 : f64
+  %s7 = scalar.constant -7.6471637318198164e-13 : f64
+  %s6 = scalar.constant 1.6059043836821613e-10 : f64
+  %s5 = scalar.constant -2.505210838544172e-08 : f64
+  %s4 = scalar.constant 2.7557319223985893e-06 : f64
+  %s3 = scalar.constant -0.00019841269841269841 : f64
+  %s2 = scalar.constant 0.0083333333333333332 : f64
+  %s1 = scalar.constant -0.16666666666666666 : f64
+  %leading = scalar.constant 1.0 : f64
+  %sa = scalar.mulf %s8, %square : f64
+  %sb = scalar.addf %sa, %s7 : f64
+  %sc = scalar.mulf %sb, %square : f64
+  %sd = scalar.addf %sc, %s6 : f64
+  %se = scalar.mulf %sd, %square : f64
+  %sf = scalar.addf %se, %s5 : f64
+  %sg = scalar.mulf %sf, %square : f64
+  %sh = scalar.addf %sg, %s4 : f64
+  %si = scalar.mulf %sh, %square : f64
+  %sj = scalar.addf %si, %s3 : f64
+  %sk = scalar.mulf %sj, %square : f64
+  %sl = scalar.addf %sk, %s2 : f64
+  %sm = scalar.mulf %sl, %square : f64
+  %sn = scalar.addf %sm, %s1 : f64
+  %so = scalar.mulf %sn, %square : f64
+  %cubic = scalar.mulf %so, %residual : f64
+  %sine_residual = scalar.addf %residual, %cubic : f64
+  %c9 = scalar.constant -1.5619206968586225e-16 : f64
+  %c8 = scalar.constant 4.7794773323873853e-14 : f64
+  %c7 = scalar.constant -1.1470745597729725e-11 : f64
+  %c6 = scalar.constant 2.08767569878681e-09 : f64
+  %c5 = scalar.constant -2.7557319223985888e-07 : f64
+  %c4 = scalar.constant 2.4801587301587302e-05 : f64
+  %c3 = scalar.constant -0.0013888888888888889 : f64
+  %c2 = scalar.constant 0.041666666666666664 : f64
+  %c1 = scalar.constant -0.5 : f64
+  %ca = scalar.mulf %c9, %square : f64
+  %cb = scalar.addf %ca, %c8 : f64
+  %cc = scalar.mulf %cb, %square : f64
+  %cd = scalar.addf %cc, %c7 : f64
+  %ce = scalar.mulf %cd, %square : f64
+  %cf = scalar.addf %ce, %c6 : f64
+  %cg = scalar.mulf %cf, %square : f64
+  %ch = scalar.addf %cg, %c5 : f64
+  %ci = scalar.mulf %ch, %square : f64
+  %cj = scalar.addf %ci, %c4 : f64
+  %ck = scalar.mulf %cj, %square : f64
+  %cl = scalar.addf %ck, %c3 : f64
+  %cm = scalar.mulf %cl, %square : f64
+  %cn = scalar.addf %cm, %c2 : f64
+  %co = scalar.mulf %cn, %square : f64
+  %cp = scalar.addf %co, %c1 : f64
+  %cq = scalar.mulf %cp, %square : f64
+  %cosine_residual = scalar.addf %cq, %leading : f64
+  %quadrant = scalar.fptoui %rounded : f64 to i32
+  %c1_i32 = scalar.constant 1 : i32
+  %c2_i32 = scalar.constant 2 : i32
+  %c0_i32 = scalar.constant 0 : i32
+  %odd_bit = scalar.andi %quadrant, %c1_i32 : i32
+  %odd = scalar.cmpi ne, %odd_bit, %c0_i32 : i32
+  %cosine_magnitude = scf.select %odd, %sine_residual, %cosine_residual : f64
+  %sine_magnitude = scf.select %odd, %cosine_residual, %sine_residual : f64
+  %next_quadrant = scalar.addi %quadrant, %c1_i32 : i32
+  %cosine_bit = scalar.andi %next_quadrant, %c2_i32 : i32
+  %sine_bit = scalar.andi %quadrant, %c2_i32 : i32
+  %negate_cosine = scalar.cmpi ne, %cosine_bit, %c0_i32 : i32
+  %negate_sine = scalar.cmpi ne, %sine_bit, %c0_i32 : i32
+  %negative_cosine = scalar.negf %cosine_magnitude : f64
+  %negative_sine = scalar.negf %sine_magnitude : f64
+  %cosine = scf.select %negate_cosine, %negative_cosine, %cosine_magnitude : f64
+  %sine = scf.select %negate_sine, %negative_sine, %sine_magnitude : f64
+  template.return %cosine, %sine : f64, f64
+}
+
+// The compact request header is seed:u64, framed-token-count:u32, reserved:i32,
+// all little endian, followed by the framed token IDs. Each counter produces
+// four packed latent BF16 values in [image_tokens,128] row-major order; no
+// host-generated noise or mutable RNG state is consumed.
+kernel.def target(@request_wave32) @request_noise() {
+  %images = config.get @klein.image_tokens : index
+  %c32 = index.constant 32 : index
+  %count = index.mul %images, %c32 : index
+  %threads = index.constant 256 : index
+  %padding = index.constant 255 : index
+  %padded = index.add %count, %padding : index
+  %groups = index.div %padded, %threads : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%request: buffer, %output: buffer) {
+  %images = config.get @klein.image_tokens : index
+  %c32 = index.constant 32 : index
+  %c128 = index.constant 128 : index
+  %count = index.mul %images, %c32 : index
+  %elements = index.mul %images, %c128 : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %counter = index.madd %group, %threads, %lane : index
+  %valid = index.cmp ult, %counter, %count : index
+  scf.if %valid {
+    %origin = index.constant 0 : offset
+    %c0 = index.constant 0 : index
+    %c1 = index.constant 1 : index
+    %c2 = index.constant 2 : index
+    %c3 = index.constant 3 : index
+    %c4 = index.constant 4 : index
+    %header = buffer.view %request[%origin] : buffer -> view<4xi32>
+    %seed0 = view.load %header[%c0] : view<4xi32> -> i32
+    %seed1 = view.load %header[%c1] : view<4xi32> -> i32
+    %counter32 = index.cast %counter : index to i32
+    %zero32 = scalar.constant 0 : i32
+    %a, %b, %c, %d = template.apply<@random.philox4x32>(%counter32, %zero32, %zero32, %zero32, %seed0, %seed1) : (i32, i32, i32, i32, i32, i32) -> (i32, i32, i32, i32)
+    %n0, %n1 = template.apply<@random.normal_pair>(%a, %b) : (i32, i32) -> (f32, f32)
+    %n2, %n3 = template.apply<@random.normal_pair>(%c, %d) : (i32, i32) -> (f32, f32)
+    %v0 = scalar.fptrunc %n0 : f32 to bf16
+    %v1 = scalar.fptrunc %n1 : f32 to bf16
+    %v2 = scalar.fptrunc %n2 : f32 to bf16
+    %v3 = scalar.fptrunc %n3 : f32 to bf16
+    %out = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
+    %i0 = index.mul %counter, %c4 : index
+    %i1 = index.add %i0, %c1 : index
+    %i2 = index.add %i0, %c2 : index
+    %i3 = index.add %i0, %c3 : index
+    view.store %v0, %out[%i0] : bf16, view<[%elements]xbf16>
+    view.store %v1, %out[%i1] : bf16, view<[%elements]xbf16>
+    view.store %v2, %out[%i2] : bf16, view<[%elements]xbf16>
+    view.store %v3, %out[%i3] : bf16, view<[%elements]xbf16>
+  }
+  kernel.return
+}
+
+command.def public @prepare_noise() launch(%request: buffer, %output: buffer) {
+  kernel.launch @request_noise(%request, %output) : (buffer, buffer)
+  command.return
+}
+
+// The payload holds the whole framed prompt: chat prefix, prompt text, and the
+// assistant suffix, contiguous. Rows below the framed count take its IDs; the
+// rest hold <|endoftext|> (151643). A framed count above text_tokens keeps the
+// first text_tokens IDs and drops the rest, as the tokenizer's right
+// truncation does. The byte key mask marks the retained framed rows.
+kernel.def target(@request_wave32) @request_prompt() {
+  %rows = config.get @klein.text_tokens : index
+  %threads = index.constant 256 : index
+  %extra = index.constant 255 : index
+  %padded = index.add %rows, %extra : index
+  %groups = index.div %padded, %threads : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%request: buffer, %tokens: buffer, %mask: buffer) {
+  %rows = config.get @klein.text_tokens : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %row = index.madd %group, %threads, %lane : index
+  %valid = index.cmp ult, %row, %rows : index
+  scf.if %valid {
+    %origin = index.constant 0 : offset
+    %c2 = index.constant 2 : index
+    %header = buffer.view %request[%origin] : buffer -> view<4xi32>
+    %framed32 = view.load %header[%c2] : view<4xi32> -> i32
+    %framed = index.cast %framed32 : i32 to index
+    %live = index.cmp ult, %row, %framed : index
+    %yes = scalar.constant 1 : i8
+    %no = scalar.constant 0 : i8
+    %visible = scf.select %live, %yes, %no : i8
+    %mask_view = buffer.view %mask[%origin] : buffer -> view<[%rows]xi8>
+    view.store %visible, %mask_view[%row] : i8, view<[%rows]xi8>
+    %header_bytes = index.constant 16 : offset
+    %source = buffer.view %request[%header_bytes] : buffer -> view<[%rows]xi32>
+    %id = scf.if %live -> (i32) {
+      %token = view.load %source[%row] : view<[%rows]xi32> -> i32
+      scf.yield %token : i32
+    } else {
+      %padding_token = scalar.constant 151643 : i32
+      scf.yield %padding_token : i32
+    }
+    %target = buffer.view %tokens[%origin] : buffer -> view<[%rows]xi32>
+    view.store %id, %target[%row] : i32, view<[%rows]xi32>
+  }
+  kernel.return
+}
+
+// Qwen3 rotary tables for positions 0..text_tokens-1 (theta 1e6, head width
+// 128), BF16[text_tokens,128] with channel c and c+64 sharing a frequency. The
+// frequency is the F32 reciprocal of F32 1e6^(c/64), and the angle is their F32
+// product, as transformers builds inv_freq and freqs. Cosine and sine evaluate
+// in F64 because angles reach several hundred radians, then round through F32
+// to BF16.
+kernel.def target(@request_wave32) @request_encoder_rotary() {
+  %rows = config.get @klein.text_tokens : index
+  %channels = index.constant 64 : index
+  %count = index.mul %rows, %channels : index
+  %threads = index.constant 256 : index
+  %extra = index.constant 255 : index
+  %padded = index.add %count, %extra : index
+  %groups = index.div %padded, %threads : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%cosine: buffer, %sine: buffer) {
+  %rows = config.get @klein.text_tokens : index
+  %channels = index.constant 64 : index
+  %count = index.mul %rows, %channels : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %element = index.madd %group, %threads, %lane : index
+  %valid = index.cmp ult, %element, %count : index
+  scf.if %valid {
+    %row = index.div %element, %channels : index
+    %channel = index.rem %element, %channels : index
+    %c1_f64 = scalar.constant 1.0 : f64
+    %base = scalar.constant 1000000.0 : f64
+    %levels = index.constant 6 : index
+    %top_bit = index.constant 32 : index
+    %power = template.apply<@klein.dyadic_power>(%base, %channel, %levels, %top_bit) : (f64, index, index, index) -> (f64)
+    %power32 = scalar.fptrunc %power : f64 to f32
+    %rounded_power = scalar.extf %power32 : f32 to f64
+    %reciprocal = scalar.divf %c1_f64, %rounded_power : f64
+    %frequency = scalar.fptrunc %reciprocal : f64 to f32
+    %row64 = index.cast %row : index to i64
+    %position = scalar.uitofp %row64 : i64 to f32
+    %angle32 = scalar.mulf %position, %frequency : f32
+    %angle = scalar.extf %angle32 : f32 to f64
+    %cosine64, %sine64 = template.apply<@klein.cosine_sine>(%angle) : (f64) -> (f64, f64)
+    %cosine32 = scalar.fptrunc %cosine64 : f64 to f32
+    %sine32 = scalar.fptrunc %sine64 : f64 to f32
+    %c = scalar.fptrunc %cosine32 : f32 to bf16
+    %s = scalar.fptrunc %sine32 : f32 to bf16
+    %width = index.constant 128 : index
+    %first = index.madd %row, %width, %channel : index
+    %second = index.add %first, %channels : index
+    %extent = index.mul %rows, %width : index
+    %origin = index.constant 0 : offset
+    %cv = buffer.view %cosine[%origin] : buffer -> view<[%extent]xbf16>
+    %sv = buffer.view %sine[%origin] : buffer -> view<[%extent]xbf16>
+    view.store %c, %cv[%first] : bf16, view<[%extent]xbf16>
+    view.store %c, %cv[%second] : bf16, view<[%extent]xbf16>
+    view.store %s, %sv[%first] : bf16, view<[%extent]xbf16>
+    view.store %s, %sv[%second] : bf16, view<[%extent]xbf16>
+  }
+  kernel.return
+}
+
+// Transformer rotary tables, F32[text_tokens+image_tokens,128], text rows first.
+// Four 32-wide axes (t, h, w, l) with theta 2000; each frequency's cosine and
+// sine repeat on two adjacent channels. Text row r has position (0, 0, 0, r);
+// image token y*columns+x has (0, y, x, 0). Frequencies, angles, cosine, and
+// sine are F64 before one rounding to F32, as Flux2PosEmbed computes them.
+kernel.def target(@request_wave32) @request_rotary() {
+  %texts = config.get @klein.text_tokens : index
+  %images = config.get @klein.image_tokens : index
+  %tokens = index.add %texts, %images : index
+  %pairs = index.constant 64 : index
+  %count = index.mul %tokens, %pairs : index
+  %threads = index.constant 256 : index
+  %extra = index.constant 255 : index
+  %padded = index.add %count, %extra : index
+  %groups = index.div %padded, %threads : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%cosine: buffer, %sine: buffer) {
+  %texts = config.get @klein.text_tokens : index
+  %images = config.get @klein.image_tokens : index
+  %width = config.get @klein.latent_width : index
+  %c2 = index.constant 2 : index
+  %columns = index.div %width, %c2 : index
+  %tokens = index.add %texts, %images : index
+  %pairs = index.constant 64 : index
+  %count = index.mul %tokens, %pairs : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %element = index.madd %group, %threads, %lane : index
+  %valid = index.cmp ult, %element, %count : index
+  scf.if %valid {
+    %token = index.div %element, %pairs : index
+    %pair = index.rem %element, %pairs : index
+    %c0 = index.constant 0 : index
+    %c1 = index.constant 1 : index
+    %c3 = index.constant 3 : index
+    %c16 = index.constant 16 : index
+    %axis = index.div %pair, %c16 : index
+    %index = index.rem %pair, %c16 : index
+    %text = index.cmp ult, %token, %texts : index
+    %image_index = index.sub %token, %texts : index
+    %image = scf.select %text, %c0, %image_index : index
+    %y = index.div %image, %columns : index
+    %x = index.rem %image, %columns : index
+    %is_height = index.cmp eq, %axis, %c1 : index
+    %is_width = index.cmp eq, %axis, %c2 : index
+    %is_length = index.cmp eq, %axis, %c3 : index
+    %image_spatial = scf.select %is_height, %y, %x : index
+    %image_axis = scalar.ori %is_height, %is_width : i1
+    %image_position = scf.select %image_axis, %image_spatial, %c0 : index
+    %text_position = scf.select %is_length, %token, %c0 : index
+    %position = scf.select %text, %text_position, %image_position : index
+    %c1_f64 = scalar.constant 1.0 : f64
+    %theta = scalar.constant 2000.0 : f64
+    %levels = index.constant 4 : index
+    %top_bit = index.constant 8 : index
+    %power = template.apply<@klein.dyadic_power>(%theta, %index, %levels, %top_bit) : (f64, index, index, index) -> (f64)
+    %frequency = scalar.divf %c1_f64, %power : f64
+    %position64 = index.cast %position : index to i64
+    %position_value = scalar.uitofp %position64 : i64 to f64
+    %angle = scalar.mulf %position_value, %frequency : f64
+    %cosine64, %sine64 = template.apply<@klein.cosine_sine>(%angle) : (f64) -> (f64, f64)
+    %c = scalar.fptrunc %cosine64 : f64 to f32
+    %s = scalar.fptrunc %sine64 : f64 to f32
+    %first = index.mul %element, %c2 : index
+    %second = index.add %first, %c1 : index
+    %extent = index.mul %count, %c2 : index
+    %origin = index.constant 0 : offset
+    %cv = buffer.view %cosine[%origin] : buffer -> view<[%extent]xf32>
+    %sv = buffer.view %sine[%origin] : buffer -> view<[%extent]xf32>
+    view.store %c, %cv[%first] : f32, view<[%extent]xf32>
+    view.store %c, %cv[%second] : f32, view<[%extent]xf32>
+    view.store %s, %sv[%first] : f32, view<[%extent]xf32>
+    view.store %s, %sv[%second] : f32, view<[%extent]xf32>
+  }
+  kernel.return
+}
+
+// Four-step schedule for the configured image token count. mu follows
+// compute_empirical_mu(image_tokens, 4) in F64; the shifted sigmas are
+// e/(e + 1/s - 1) in F32 with e = F32(exp(mu)) and s = 1, 3/4, 1/2, 1/4.
+// Times are the BF16 values the transformer embeds: the pipeline rounds
+// 1000*sigma to BF16, divides by 1000, and the transformer multiplies by 1000,
+// each in BF16. Deltas are the F32 Euler step sizes sigma[i+1] - sigma[i],
+// with a final sigma of zero. mu depends only on configuration, so its F64
+// exponential folds during compilation; the target has no F64 exp recipe.
+kernel.def target(@request_wave32) @request_constants() {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%times: buffer, %deltas: buffer) {
+  %images = config.get @klein.image_tokens : index
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %threshold = index.constant 4300 : index
+  %images64 = index.cast %images : index to i64
+  %sequence = scalar.uitofp %images64 : i64 to f64
+  %a1 = scalar.constant 8.7380952400000004e-05 : f64
+  %b1 = scalar.constant 1.89833333 : f64
+  %a2 = scalar.constant 0.00016927000000000001 : f64
+  %b2 = scalar.constant 0.45666666 : f64
+  %scaled200 = scalar.mulf %a2, %sequence : f64
+  %mu200 = scalar.addf %scaled200, %b2 : f64
+  %large = index.cmp ugt, %images, %threshold : index
+  %mu = scf.if %large -> (f64) {
+    scf.yield %mu200 : f64
+  } else {
+    %scaled10 = scalar.mulf %a1, %sequence : f64
+    %mu10 = scalar.addf %scaled10, %b1 : f64
+    %c190 = scalar.constant 190.0 : f64
+    %c200 = scalar.constant 200.0 : f64
+    %steps_f64 = scalar.constant 4.0 : f64
+    %rise = scalar.subf %mu200, %mu10 : f64
+    %slope = scalar.divf %rise, %c190 : f64
+    %span = scalar.mulf %c200, %slope : f64
+    %intercept = scalar.subf %mu200, %span : f64
+    %stepped = scalar.mulf %slope, %steps_f64 : f64
+    %value = scalar.addf %stepped, %intercept : f64
+    scf.yield %value : f64
+  }
+  %shift64 = scalar.expf %mu : f64
+  %shift = scalar.fptrunc %shift64 : f64 to f32
+  %c1_0 = scalar.constant 1.0 : f32
+  %c0_0 = scalar.constant 0.0 : f32
+  %quarter = scalar.constant 0.25 : f32
+  %c1000_0 = scalar.constant 1000.0 : f32
+  %time_view = buffer.view %times[%origin] : buffer -> view<4xbf16>
+  %delta_view = buffer.view %deltas[%origin] : buffer -> view<4xf32>
+  scf.for %step = [%c0 to %c4 step %c1] {
+    %step32 = index.cast %step : index to i32
+    %step_f32 = scalar.uitofp %step32 : i32 to f32
+    %drop = scalar.mulf %step_f32, %quarter : f32
+    %linear = scalar.subf %c1_0, %drop : f32
+    %inverse = scalar.divf %c1_0, %linear : f32
+    %ratio = scalar.subf %inverse, %c1_0 : f32
+    %denominator = scalar.addf %shift, %ratio : f32
+    %sigma = scalar.divf %shift, %denominator : f32
+    %following = index.add %step, %c1 : index
+    %last = index.cmp eq, %following, %c4 : index
+    %next = scf.if %last -> (f32) {
+      scf.yield %c0_0 : f32
+    } else {
+      %next_step = scalar.addf %step_f32, %c1_0 : f32
+      %next_drop = scalar.mulf %next_step, %quarter : f32
+      %next_linear = scalar.subf %c1_0, %next_drop : f32
+      %next_inverse = scalar.divf %c1_0, %next_linear : f32
+      %next_ratio = scalar.subf %next_inverse, %c1_0 : f32
+      %next_denominator = scalar.addf %shift, %next_ratio : f32
+      %next_sigma = scalar.divf %shift, %next_denominator : f32
+      scf.yield %next_sigma : f32
+    }
+    %timestep = scalar.mulf %sigma, %c1000_0 : f32
+    %timestep16 = scalar.fptrunc %timestep : f32 to bf16
+    %timestep_value = scalar.extf %timestep16 : bf16 to f32
+    %scaled = scalar.divf %timestep_value, %c1000_0 : f32
+    %scaled16 = scalar.fptrunc %scaled : f32 to bf16
+    %scaled_value = scalar.extf %scaled16 : bf16 to f32
+    %restored = scalar.mulf %scaled_value, %c1000_0 : f32
+    %time = scalar.fptrunc %restored : f32 to bf16
+    %delta = scalar.subf %next, %sigma : f32
+    view.store %time, %time_view[%step] : bf16, view<4xbf16>
+    view.store %delta, %delta_view[%step] : f32, view<4xf32>
+  }
+  kernel.return
+}

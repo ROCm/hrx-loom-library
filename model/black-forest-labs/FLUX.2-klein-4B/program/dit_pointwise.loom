@@ -1,0 +1,221 @@
+// Transformer pointwise leaves. Gated residuals round the gated update before
+// the addition; text rows of the joint sequence take the text-stream gate and
+// image rows the image-stream one. SwiGLU splits each row into gate and up
+// halves, rounds SiLU before the product, and rounds the product once; the
+// single-stream blocks write it beside the attention context so one output
+// projection covers both. The Euler update applies one F32 timestep delta.
+
+config.decl @klein.text_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+config.decl @klein.image_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+amdgpu.target<gfx11-generic> @dit_pointwise_wave32 {subgroup_size = 32}
+
+template.decl @activation.silu_bf16(%value: bf16) -> (bf16)
+
+template.decl @residual.gated_bf16(%value: bf16, %update: bf16, %gate: bf16) -> (bf16)
+
+template.decl @diffusion.euler_bf16(%sample: bf16, %velocity: bf16, %delta: f32) -> (bf16)
+
+template.decl @klein.swiglu_rows(%rows: index, %output_width: index, %output_column: index, %input: buffer, %output: buffer)
+
+// Twelve 256-thread workgroups cover one 3072-wide row. Each element reads
+// only its own position, so output may alias input.
+kernel.def target(@dit_pointwise_wave32) @joint_gated_residual() {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %rows = index.add %text, %image : index
+  %groups_per_row = index.constant 12 : index
+  %groups = index.mul %rows, %groups_per_row : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %update: buffer, %text_gate: buffer, %image_gate: buffer, %output: buffer) {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %rows = index.add %text, %image : index
+  %origin = index.constant 0 : offset
+  %groups_per_row = index.constant 12 : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %row = index.div %group, %groups_per_row : index
+  %block = index.rem %group, %groups_per_row : index
+  %column = index.madd %block, %threads, %lane : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x3072xbf16>
+  %update_view = buffer.view %update[%origin] : buffer -> view<[%rows]x3072xbf16>
+  %text_view = buffer.view %text_gate[%origin] : buffer -> view<3072xbf16>
+  %image_view = buffer.view %image_gate[%origin] : buffer -> view<3072xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x3072xbf16>
+  %is_text = index.cmp ult, %row, %text : index
+  %gate = scf.if %is_text -> (bf16) {
+    %text_value = view.load %text_view[%column] : view<3072xbf16> -> bf16
+    scf.yield %text_value : bf16
+  } else {
+    %image_value = view.load %image_view[%column] : view<3072xbf16> -> bf16
+    scf.yield %image_value : bf16
+  }
+  %value = view.load %input_view[%row, %column] : view<[%rows]x3072xbf16> -> bf16
+  %change = view.load %update_view[%row, %column] : view<[%rows]x3072xbf16> -> bf16
+  %result = template.apply<@residual.gated_bf16>(%value, %change, %gate) : (bf16, bf16, bf16) -> (bf16)
+  view.store %result, %output_view[%row, %column] : bf16, view<[%rows]x3072xbf16>
+  kernel.return
+}
+
+// Input rows are [gate 9216 | up 9216]. Thirty-six 256-thread workgroups cover
+// one row; the result lands at a column offset inside a wider output row.
+template.def<@klein.swiglu_rows> device @klein_swiglu_rows(%rows: index, %output_width: index, %output_column: index, %input: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %half = index.constant 9216 : index
+  %groups_per_row = index.constant 36 : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %row = index.div %group, %groups_per_row : index
+  %block = index.rem %group, %groups_per_row : index
+  %column = index.madd %block, %threads, %lane : index
+  %up_column = index.add %column, %half : index
+  %target_column = index.add %column, %output_column : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x18432xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%output_width]xbf16>
+  %gate_value = view.load %input_view[%row, %column] : view<[%rows]x18432xbf16> -> bf16
+  %up_value = view.load %input_view[%row, %up_column] : view<[%rows]x18432xbf16> -> bf16
+  %activated = template.apply<@activation.silu_bf16>(%gate_value) : (bf16) -> (bf16)
+  %activated_f32 = scalar.extf %activated : bf16 to f32
+  %up_f32 = scalar.extf %up_value : bf16 to f32
+  %product = scalar.mulf %activated_f32, %up_f32 : f32
+  %result = scalar.fptrunc %product : f32 to bf16
+  view.store %result, %output_view[%row, %target_column] : bf16, view<[%rows]x[%output_width]xbf16>
+  template.return
+}
+
+kernel.def target(@dit_pointwise_wave32) @double_swiglu() {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %rows = index.add %text, %image : index
+  %groups_per_row = index.constant 36 : index
+  %groups = index.mul %rows, %groups_per_row : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %output: buffer) {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %rows = index.add %text, %image : index
+  %width = index.constant 9216 : index
+  %c0 = index.constant 0 : index
+  template.apply<@klein.swiglu_rows>(%rows, %width, %c0, %input, %output) : (index, index, index, buffer, buffer)
+  kernel.return
+}
+
+// Single-stream output rows are [attention 3072 | SwiGLU 9216].
+kernel.def target(@dit_pointwise_wave32) @single_swiglu() {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %rows = index.add %text, %image : index
+  %groups_per_row = index.constant 36 : index
+  %groups = index.mul %rows, %groups_per_row : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %output: buffer) {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %rows = index.add %text, %image : index
+  %width = index.constant 12288 : index
+  %column = index.constant 3072 : index
+  template.apply<@klein.swiglu_rows>(%rows, %width, %column, %input, %output) : (index, index, index, buffer, buffer)
+  kernel.return
+}
+
+// Copies the 3072-wide attention context into the leading columns of the
+// 12288-wide single-stream concat rows.
+kernel.def target(@dit_pointwise_wave32) @single_context() {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %rows = index.add %text, %image : index
+  %groups_per_row = index.constant 12 : index
+  %groups = index.mul %rows, %groups_per_row : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %output: buffer) {
+  %text = config.get @klein.text_tokens : index
+  %image = config.get @klein.image_tokens : index
+  %rows = index.add %text, %image : index
+  %origin = index.constant 0 : offset
+  %groups_per_row = index.constant 12 : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %row = index.div %group, %groups_per_row : index
+  %block = index.rem %group, %groups_per_row : index
+  %column = index.madd %block, %threads, %lane : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x3072xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x12288xbf16>
+  %value = view.load %input_view[%row, %column] : view<[%rows]x3072xbf16> -> bf16
+  view.store %value, %output_view[%row, %column] : bf16, view<[%rows]x12288xbf16>
+  kernel.return
+}
+
+// Image latents are 128 channels per token; two tokens per workgroup. The
+// delta view holds the current step's F32 delta.
+kernel.def target(@dit_pointwise_wave32) @dit_update() {
+  %rows = config.get @klein.image_tokens : index
+  %rows_per_group = index.constant 2 : index
+  %groups = index.div %rows, %rows_per_group : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%sample: buffer, %velocity: buffer, %delta: buffer, %output: buffer) {
+  %rows = config.get @klein.image_tokens : index
+  %width = index.constant 128 : index
+  %elements = index.mul %rows, %width : index
+  %origin = index.constant 0 : offset
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %element = index.madd %group, %threads, %lane : index
+  %samples = buffer.view %sample[%origin] : buffer -> view<[%elements]xbf16>
+  %velocities = buffer.view %velocity[%origin] : buffer -> view<[%elements]xbf16>
+  %duration = buffer.view %delta[%origin] : buffer -> view<1xf32>
+  %results = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
+  %previous = view.load %samples[%element] : view<[%elements]xbf16> -> bf16
+  %speed = view.load %velocities[%element] : view<[%elements]xbf16> -> bf16
+  %step = view.load %duration[0] : view<1xf32> -> f32
+  %result = template.apply<@diffusion.euler_bf16>(%previous, %speed, %step) : (bf16, bf16, f32) -> (bf16)
+  view.store %result, %results[%element] : bf16, view<[%elements]xbf16>
+  kernel.return
+}
+
+// Gate rows sit 12288 bytes past their stream's shift row in the conditioning
+// table; the immediates are the byte offsets of each stream's gate row.
+command.def public @klein.joint_gated_residual(%text_offset: offset, %image_offset: offset) launch(%modulation: buffer, %input: buffer, %update: buffer, %output: buffer) {
+  %text_gate = buffer.view %modulation[%text_offset] : buffer -> view<3072xbf16>
+  %image_gate = buffer.view %modulation[%image_offset] : buffer -> view<3072xbf16>
+  kernel.launch @joint_gated_residual(%input, %update, %text_gate, %image_gate, %output) : (buffer, buffer, view<3072xbf16>, view<3072xbf16>, buffer)
+  command.return
+}
+
+command.def public @klein.double_swiglu() launch(%input: buffer, %output: buffer) {
+  kernel.launch @double_swiglu(%input, %output) : (buffer, buffer)
+  command.return
+}
+
+command.def public @klein.single_swiglu() launch(%input: buffer, %output: buffer) {
+  kernel.launch @single_swiglu(%input, %output) : (buffer, buffer)
+  command.return
+}
+
+command.def public @klein.single_context() launch(%input: buffer, %output: buffer) {
+  kernel.launch @single_context(%input, %output) : (buffer, buffer)
+  command.return
+}
+
+command.def public @klein.dit_update(%step: index) launch(%sample: buffer, %velocity: buffer, %deltas: buffer, %output: buffer) {
+  %scalar_bytes = index.constant 4 : offset
+  %delta_offset = index.scale %step, %scalar_bytes : index, offset -> offset
+  %delta = buffer.view %deltas[%delta_offset] : buffer -> view<1xf32>
+  kernel.launch @dit_update(%sample, %velocity, %delta, %output) : (buffer, buffer, view<1xf32>, buffer)
+  command.return
+}

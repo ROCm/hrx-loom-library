@@ -1,0 +1,236 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// The decoder's axis planner partitions an even latent extent into disjoint
+// intervals owned by overlapping tiles. One runtime-parameterized function
+// exercises its production templates. The independent reference walks pixel
+// centers in order, assigning ties to the later tile; it never computes the
+// production midpoint formula. Each result contains stride, interval count,
+// then (tile origin, owned begin, owned end) triples, surrounded by sentinels.
+
+template.decl @zimage.vae_tile_axis_plan(%extent: index, %tile: index) -> (index, index)
+
+template.decl @zimage.vae_tile_axis_interval(%extent: index, %tile: index, %stride: index, %ordinal: index) -> (index, index, index)
+
+func.def @axis_plan(%extent: index, %tile: index, %output: buffer) {
+  %stride, %count = template.apply<@zimage.vae_tile_axis_plan>(%extent, %tile) : (index, index) -> (index, index)
+  %origin = index.constant 0 : offset
+  %header_bytes = index.constant 8 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %header = buffer.view %output[%origin] : buffer -> view<2xi32>
+  %intervals = buffer.view %output[%header_bytes] : buffer -> view<[%extent]x3xi32>
+  %stride_word = index.cast %stride : index to i32
+  %count_word = index.cast %count : index to i32
+  view.store %stride_word, %header[0] : i32, view<2xi32>
+  view.store %count_word, %header[1] : i32, view<2xi32>
+  // Preserve the reported count for comparison while containing an incorrect
+  // plan within the allocated capacity, so a count bug cannot corrupt memory.
+  scf.for %ordinal = [%c0 to %extent step %c1] {
+    %active = index.cmp ult, %ordinal, %count : index
+    scf.if %active {
+      %start, %begin, %end = template.apply<@zimage.vae_tile_axis_interval>(%extent, %tile, %stride, %ordinal) : (index, index, index, index) -> (index, index, index)
+      %start_word = index.cast %start : index to i32
+      %begin_word = index.cast %begin : index to i32
+      %end_word = index.cast %end : index to i32
+      view.store %start_word, %intervals[%ordinal, 0] : i32, view<[%extent]x3xi32>
+      view.store %begin_word, %intervals[%ordinal, 1] : i32, view<[%extent]x3xi32>
+      view.store %end_word, %intervals[%ordinal, 2] : i32, view<[%extent]x3xi32>
+    }
+  }
+  func.return
+}
+
+// Positive, ordered tile centers allow a monotone pixel sweep. Every pixel is
+// visited once; comparison with the next center determines ownership without
+// copying the planner's ceiling division or midpoint arithmetic.
+func.def @axis_reference(%extent: index, %tile: index, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %header_bytes = index.constant 8 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %overlap = index.constant 30 : index
+  %header = buffer.view %output[%origin] : buffer -> view<2xi32>
+  %intervals = buffer.view %output[%header_bytes] : buffer -> view<[%extent]x3xi32>
+  %untiled = index.cmp eq, %extent, %tile : index
+  %stride = scf.if %untiled -> (index) {
+    scf.yield %c1 : index
+  } else {
+    %tile_stride = index.sub %tile, %overlap : index
+    scf.yield %tile_stride : index
+  }
+  %last_origin = index.sub %extent, %tile : index
+  %final_origin, %final_begin, %count = scf.for %interval = [%c0 to %extent step %c1](%start = %c0 : index, %begin = %c0 : index, %previous_count = %c0 : index) -> (index, index, index) {
+    %remaining = index.cmp ult, %begin, %extent : index
+    %next_start, %next_begin, %next_count = scf.if %remaining -> (index, index, index) {
+      %next_candidate = index.add %start, %stride : index
+      %following_origin = index.min %next_candidate, %last_origin : index
+      %last = index.cmp eq, %start, %last_origin : index
+      %end = scf.if %last -> (index) {
+        scf.yield %extent : index
+      } else {
+        %center = index.madd %start, %c2, %tile : index
+        %next_center = index.madd %following_origin, %c2, %tile : index
+        %boundary = scf.while(%pixel = %begin : index) -> (index) {
+          %pixel_center = index.madd %pixel, %c2, %c1 : index
+          %left_max = index.max %pixel_center, %center : index
+          %left_min = index.min %pixel_center, %center : index
+          %left_distance = index.sub %left_max, %left_min : index
+          %right_max = index.max %pixel_center, %next_center : index
+          %right_min = index.min %pixel_center, %next_center : index
+          %right_distance = index.sub %right_max, %right_min : index
+          %owned = index.cmp ult, %left_distance, %right_distance : index
+          scf.condition %owned, %pixel : i1, index
+        } do(%owned_pixel: index) {
+          %next_pixel = index.add %owned_pixel, %c1 : index
+          scf.yield %next_pixel : index
+        }
+        scf.yield %boundary : index
+      }
+      %start_word = index.cast %start : index to i32
+      %begin_word = index.cast %begin : index to i32
+      %end_word = index.cast %end : index to i32
+      view.store %start_word, %intervals[%interval, 0] : i32, view<[%extent]x3xi32>
+      view.store %begin_word, %intervals[%interval, 1] : i32, view<[%extent]x3xi32>
+      view.store %end_word, %intervals[%interval, 2] : i32, view<[%extent]x3xi32>
+      %count = index.add %interval, %c1 : index
+      scf.yield %following_origin, %end, %count : index, index, index
+    } else {
+      scf.yield %start, %begin, %previous_count : index, index, index
+    }
+    scf.yield %next_start, %next_begin, %next_count : index, index, index
+  }
+  %stride_word = index.cast %stride : index to i32
+  %count_word = index.cast %count : index to i32
+  view.store %stride_word, %header[0] : i32, view<2xi32>
+  view.store %count_word, %header[1] : i32, view<2xi32>
+  func.return
+}
+
+// Enumerate the unique admissible pairs from boundary extents and seven tile
+// policies: untiled, 32/34/48/64, approximately half, and extent minus two.
+// These are runtime inputs, so the 76 trials share one compiled subject.
+func.def @axis_workload(%trial: index) -> (index, index, index, index) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %interval_words = index.constant 3 : index
+  %policies = index.constant 7 : index
+  %extent_count = index.constant 16 : index
+  %overlap = scalar.constant 30 : i32
+  %minimum = scalar.constant 2 : i32
+  %unit = scalar.constant 1 : i32
+  %tile32 = scalar.constant 32 : i32
+  %tile34 = scalar.constant 34 : i32
+  %tile48 = scalar.constant 48 : i32
+  %tile64 = scalar.constant 64 : i32
+  %extents = vector.constanti [2, 16, 30, 32, 34, 48, 64, 66, 80, 96, 112, 128, 130, 256, 1022, 1024] : vector<16xi32>
+  %initial = scalar.constant 0 : i32
+  %false_value = scalar.constant false : i1
+  %selected_extent, %selected_tile, %pair_count = scf.for %extent_index = [%c0 to %extent_count step %c1](%previous_extent = %initial : i32, %previous_tile = %initial : i32, %ordinal = %c0 : index) -> (i32, i32, index) {
+    %extent = vector.extract %extents[%extent_index] : vector<16xi32> -> i32
+    %overlapped = scalar.addi %extent, %overlap : i32
+    %half = scalar.divui %overlapped, %minimum : i32
+    %rounded_half = scalar.addi %half, %unit : i32
+    %half_pairs = scalar.divui %rounded_half, %minimum : i32
+    %half_tile = scalar.muli %half_pairs, %minimum : i32
+    %near_full = scalar.subi %extent, %minimum : i32
+    %tiles = vector.from_elements %extent, %tile32, %tile34, %tile48, %tile64, %half_tile, %near_full : vector<7xi32>
+    %found_extent, %found_tile, %next_ordinal = scf.for %policy = [%c0 to %policies step %c1](%chosen_extent = %previous_extent : i32, %chosen_tile = %previous_tile : i32, %cursor = %ordinal : index) -> (i32, i32, index) {
+      %tile = vector.extract %tiles[%policy] : vector<7xi32> -> i32
+      %large_enough = scalar.cmpi uge, %tile, %minimum : i32
+      %inside = scalar.cmpi ule, %tile, %extent : i32
+      %untiled = scalar.cmpi eq, %tile, %extent : i32
+      %has_interior = scalar.cmpi ugt, %tile, %overlap : i32
+      %supported = scalar.ori %untiled, %has_interior : i1
+      %bounded = scalar.andi %large_enough, %inside : i1
+      %admissible = scalar.andi %bounded, %supported : i1
+      %duplicate = scf.for %prior = [%c0 to %policy step %c1](%seen = %false_value : i1) -> (i1) {
+        %earlier_tile = vector.extract %tiles[%prior] : vector<7xi32> -> i32
+        %same = scalar.cmpi eq, %tile, %earlier_tile : i32
+        %repeated = scalar.ori %seen, %same : i1
+        scf.yield %repeated : i1
+      }
+      %unique = scalar.cmpi eq, %duplicate, %false_value : i1
+      %included = scalar.andi %admissible, %unique : i1
+      %wanted = index.cmp eq, %cursor, %trial : index
+      %selected = scalar.andi %included, %wanted : i1
+      %next_extent = scf.select %selected, %extent, %chosen_extent : i32
+      %next_tile = scf.select %selected, %tile, %chosen_tile : i32
+      %incremented = index.add %cursor, %c1 : index
+      %next_cursor = scf.select %included, %incremented, %cursor : index
+      scf.yield %next_extent, %next_tile, %next_cursor : i32, i32, index
+    }
+    scf.yield %found_extent, %found_tile, %next_ordinal : i32, i32, index
+  }
+  %extent = index.cast %selected_extent : i32 to index
+  %tile = index.cast %selected_tile : i32 to index
+  // At most one nonempty ownership interval per pixel. Unused capacity is
+  // checked along with both 16-word guards, independent of the subject's count.
+  %capacity = index.madd %extent, %interval_words, %c2 : index
+  %guards = index.constant 32 : index
+  %storage = index.add %capacity, %guards : index
+  func.return %extent, %tile, %capacity, %storage : index, index, index, index
+}
+
+check.scenario public @axis_partition {
+  check.trial[76](%trial: index, %entropy: check.entropy) {
+    %extent, %tile, %capacity, %storage_count = check.generate<@axis_workload>(%trial) : (index) -> (index, index, index, index)
+    %storage = check.generate.fill value(-77) : tensor<[%storage_count]xi32>
+    %output = check.tensor.view %storage offset(64) : tensor<[%storage_count]xi32> -> tensor<[%capacity]xi32>
+    check.compare<@axis_plan, @axis_reference>(%extent, %tile, %output) : (index, index, tensor<[%capacity]xi32>) -> () {
+      check.expect.bitwise actual(%storage) expected(%storage) : tensor<[%storage_count]xi32>
+    }
+  }
+  check.return
+}
+
+check.benchmark<@axis_partition> @axis_partition_benchmark
+
+// Back-propagate the eight output phases through the spatial decoder: seven
+// final-resolution convolutions, three nearest-resize/convolution stages with
+// six residual convolutions each, then two post-attention convolutions.
+// Arithmetic right shifts implement floor division for negative coordinates.
+func.def @decoder_support_bounds() -> (i32, i32) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %phases = index.constant 8 : index
+  %stages = index.constant 3 : index
+  %initial = scalar.constant 0 : i32
+  %unit = scalar.constant 1 : i32
+  %final_convolutions = scalar.constant 7 : i32
+  %residual_convolutions = scalar.constant 6 : i32
+  %middle_convolutions = scalar.constant 2 : i32
+  %minimum, %maximum = scf.for %phase = [%c0 to %phases step %c1](%first = %initial : i32, %last = %initial : i32) -> (i32, i32) {
+    %position = index.cast %phase : index to i32
+    %output_first = scalar.subi %position, %final_convolutions : i32
+    %output_last = scalar.addi %position, %final_convolutions : i32
+    %input_first, %input_last = scf.for %stage = [%c0 to %stages step %c1](%begin = %output_first : i32, %end = %output_last : i32) -> (i32, i32) {
+      %expanded_first = scalar.subi %begin, %unit : i32
+      %expanded_last = scalar.addi %end, %unit : i32
+      %source_first = scalar.shrsi %expanded_first, %unit : i32
+      %source_last = scalar.shrsi %expanded_last, %unit : i32
+      %residual_first = scalar.subi %source_first, %residual_convolutions : i32
+      %residual_last = scalar.addi %source_last, %residual_convolutions : i32
+      scf.yield %residual_first, %residual_last : i32, i32
+    }
+    %support_first = scalar.subi %input_first, %middle_convolutions : i32
+    %support_last = scalar.addi %input_last, %middle_convolutions : i32
+    %next_first = scalar.minsi %first, %support_first : i32
+    %next_last = scalar.maxsi %last, %support_last : i32
+    scf.yield %next_first, %next_last : i32, i32
+  }
+  func.return %minimum, %maximum : i32, i32
+}
+
+check.case public @decoder_support {
+  %first, %last = func.call @decoder_support_bounds() : () -> (i32, i32)
+  %negative_radius = check.literal value(-15) : i32
+  %positive_radius = check.literal value(15) : i32
+  check.expect.equal actual(%first) expected(%negative_radius) : i32
+  check.expect.equal actual(%last) expected(%positive_radius) : i32
+  check.return
+}
+
+check.benchmark<@decoder_support> @decoder_support_benchmark

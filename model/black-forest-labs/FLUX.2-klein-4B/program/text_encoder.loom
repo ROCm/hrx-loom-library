@@ -1,0 +1,100 @@
+// Encode the framed prompt and retain three BF16 layer taps per text row.
+// The reference stacks hidden_states[9], [18], and [27]: the outputs of blocks
+// 8, 17, and 26. Only those 27 of the checkpoint's 36 blocks run, and no final
+// norm applies. Each tap is copied into [text_tokens,3,2560] before the next
+// block replaces hidden state; complete per-layer histories are never kept.
+
+config.decl @klein.text_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+amdgpu.target<gfx11-generic> @encoder_gather_wave32 {subgroup_size = 32}
+
+template.decl @embedding.lookup_bf16(%vocabulary: index, %width: index, %token_id: i32, %channel: index, %weight: buffer) -> (bf16)
+
+command.decl @klein.encoder_block(%layer: index) launch(%parameters: buffer, %input: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %output: buffer)
+
+kernel.def target(@encoder_gather_wave32) @encoder_embedding() {
+  %rows = config.get @klein.text_tokens : index
+  %columns = index.constant 10 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%rows, %columns, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%token_ids: buffer, %weight: buffer, %output: buffer) {
+  %rows = config.get @klein.text_tokens : index
+  %vocabulary = index.constant 151936 : index
+  %width = index.constant 2560 : index
+  %threads = index.constant 256 : index
+  %row = kernel.workgroup.id<x> : index
+  %group = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %channel = index.madd %group, %threads, %lane : index
+  %origin = index.constant 0 : offset
+  %ids = buffer.view %token_ids[%origin] : buffer -> view<[%rows]xi32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%width]xbf16>
+  %id = view.load %ids[%row] : view<[%rows]xi32> -> i32
+  %value = template.apply<@embedding.lookup_bf16>(%vocabulary, %width, %id, %channel, %weight) : (index, index, i32, index, buffer) -> (bf16)
+  view.store %value, %output_view[%row, %channel] : bf16, view<[%rows]x[%width]xbf16>
+  kernel.return
+}
+
+// The command binding selects a tap's column offset. A shared strided kernel
+// writes every tap without creating a kernel variant for each tap index.
+kernel.def target(@encoder_gather_wave32) @encoder_tap() {
+  %rows = config.get @klein.text_tokens : index
+  %columns = index.constant 10 : index
+  %threads = index.constant 256 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%rows, %columns, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%hidden: buffer, %output: buffer) {
+  %rows = config.get @klein.text_tokens : index
+  %width = index.constant 2560 : index
+  %threads = index.constant 256 : index
+  %row = kernel.workgroup.id<x> : index
+  %group = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %channel = index.madd %group, %threads, %lane : index
+  %origin = index.constant 0 : offset
+  %layout = encoding.layout.strided [7680, 1] : encoding<layout>
+  %input_view = buffer.view %hidden[%origin] : buffer -> view<[%rows]x[%width]xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x[%width]xbf16, %layout>
+  %value = view.load %input_view[%row, %channel] : view<[%rows]x[%width]xbf16> -> bf16
+  view.store %value, %output_view[%row, %channel] : bf16, view<[%rows]x[%width]xbf16, %layout>
+  kernel.return
+}
+
+// IDs cover all text_tokens rows, each validated in [0,151936). Padding rows
+// hold <|endoftext|> (151643) and are embedded like any other token.
+command.def public @klein.encoder_embedding() launch(%parameters: buffer, %token_ids: buffer, %output: buffer) {
+  %weight = command.parameter %parameters, "model.embed_tokens.weight" : view<151936x2560xbf16>
+  kernel.launch @encoder_embedding(%token_ids, %weight, %output) : (buffer, view<151936x2560xbf16>, buffer)
+  command.return
+}
+
+// Input IDs are the chat-framed prompt right-padded to text_tokens.
+// Cosine/sine are BF16[text_tokens,128] for positions 0..text_tokens-1, and the
+// byte key mask is the tokenizer attention mask. The immutable inputs may not
+// alias hidden/taps. Output is BF16[text_tokens,3,2560] (row stride 7680).
+command.def public @text_encoder() launch(%parameters: buffer, %token_ids: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %taps: buffer) {
+  %rows = config.get @klein.text_tokens : index
+  %hidden_stride = index.constant 5120 : offset
+  %hidden_bytes = index.scale %rows, %hidden_stride : index, offset -> offset
+  %hidden = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @klein.encoder_embedding(%parameters, %token_ids, %hidden) : (buffer, buffer, buffer)
+  %c0_0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c8 = index.constant 8 : index
+  %c9 = index.constant 9 : index
+  %layers = index.constant 27 : index
+  %layout = encoding.layout.strided [7680, 1] : encoding<layout>
+  scf.for %layer = [%c0_0 to %layers step %c1] unroll {
+    command.launch @klein.encoder_block[%layer](%parameters, %hidden, %cosine, %sine, %mask, %hidden) : [index](buffer, buffer, buffer, buffer, buffer, buffer)
+    %remainder = index.rem %layer, %c9 : index
+    %selected = index.cmp eq, %remainder, %c8 : index
+    scf.if %selected {
+      %tap = index.div %layer, %c9 : index
+      %tap_offset = index.scale %tap, %hidden_stride : index, offset -> offset
+      %tap_view = buffer.view %taps[%tap_offset] : buffer -> view<[%rows]x2560xbf16, %layout>
+      kernel.launch @encoder_tap(%hidden, %tap_view) : (buffer, view<[%rows]x2560xbf16, %layout>)
+    }
+  }
+  command.return
+}

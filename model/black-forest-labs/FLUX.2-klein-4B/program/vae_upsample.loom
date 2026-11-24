@@ -1,0 +1,135 @@
+// Decoder up blocks, nearest-neighbor resizes, and the RGBA output head.
+// Stages 0 and 1 keep 512 channels; stage 2 narrows to 256 and stage 3 to 128
+// in their first block through a 1x1 shortcut. Each resize folds the 2x
+// nearest expansion into its 3x3 convolution, so geometry immediates name the
+// resize input. Callers pass the stage's own grid: 1x, 2x, 4x and 8x the
+// decoder tile.
+
+kernel.decl @klein_vae_wide_convolution(%grid_height: index, %grid_width: index, %grid_inputs: index, %grid_outputs: index, %grid_extent: index, %grid_upsample: index, %grid_residual_flag: index) launch(%height: index, %width: index, %inputs: index, %outputs: index, %extent: index, %upsample: index, %residual_flag: index, %input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024), range(%inputs, 32, 512), multiple_of(%inputs, 32), range(%outputs, 64, 512), multiple_of(%outputs, 64), range(%extent, 1, 3), range(%upsample, 1, 2), range(%residual_flag, 0, 1)]
+
+kernel.decl @klein_vae_rgba_convolution(%grid_height: index, %grid_width: index) launch(%height: index, %width: index, %input: buffer, %weight: buffer, %bias: buffer, %output: buffer) where [range(%height, 1, 8192), range(%width, 1, 8192)]
+
+command.decl @klein.vae_group_norm(%channels: index, %height: index, %width: index, %silu_flag: index) launch(%input: buffer, %gamma: buffer, %beta: buffer, %output: buffer)
+
+command.decl @klein.vae_resnet(%channels: index, %height: index, %width: index) launch(%input: buffer, %norm1_weight: buffer, %norm1_bias: buffer, %conv1_weight: buffer, %conv1_bias: buffer, %norm2_weight: buffer, %norm2_bias: buffer, %conv2_weight: buffer, %conv2_bias: buffer, %output: buffer) where [range(%channels, 64, 512), multiple_of(%channels, 64), range(%height, 1, 1024), range(%width, 1, 1024)]
+
+command.decl @klein.vae_resnet_shortcut(%inputs: index, %outputs: index, %height: index, %width: index) launch(%input: buffer, %norm1_weight: buffer, %norm1_bias: buffer, %conv1_weight: buffer, %conv1_bias: buffer, %norm2_weight: buffer, %norm2_bias: buffer, %conv2_weight: buffer, %conv2_bias: buffer, %shortcut_weight: buffer, %shortcut_bias: buffer, %output: buffer) where [range(%inputs, 32, 512), multiple_of(%inputs, 32), range(%outputs, 64, 512), multiple_of(%outputs, 64), range(%height, 1, 1024), range(%width, 1, 1024)]
+
+// Stages 0 and 1: every block is 512 -> 512 and may run in place.
+command.def public @klein.vae_up_residual(%stage: index, %block: index, %height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)] {
+  %channels = index.constant 512 : index
+  %norm1_weight = command.parameter %parameters, "decoder.up_blocks.{}.resnets.{}.norm1.weight"[%stage, %block] : view<512xbf16>
+  %norm1_bias = command.parameter %parameters, "decoder.up_blocks.{}.resnets.{}.norm1.bias"[%stage, %block] : view<512xbf16>
+  %conv1_weight = command.parameter %parameters, "decoder.up_blocks.{}.resnets.{}.conv1.weight"[%stage, %block] : view<512x512x3x3xbf16>
+  %conv1_bias = command.parameter %parameters, "decoder.up_blocks.{}.resnets.{}.conv1.bias"[%stage, %block] : view<512xbf16>
+  %norm2_weight = command.parameter %parameters, "decoder.up_blocks.{}.resnets.{}.norm2.weight"[%stage, %block] : view<512xbf16>
+  %norm2_bias = command.parameter %parameters, "decoder.up_blocks.{}.resnets.{}.norm2.bias"[%stage, %block] : view<512xbf16>
+  %conv2_weight = command.parameter %parameters, "decoder.up_blocks.{}.resnets.{}.conv2.weight"[%stage, %block] : view<512x512x3x3xbf16>
+  %conv2_bias = command.parameter %parameters, "decoder.up_blocks.{}.resnets.{}.conv2.bias"[%stage, %block] : view<512xbf16>
+  command.launch @klein.vae_resnet[%channels, %height, %width](%input, %norm1_weight, %norm1_bias, %conv1_weight, %conv1_bias, %norm2_weight, %norm2_bias, %conv2_weight, %conv2_bias, %output) : [index, index, index](buffer, view<512xbf16>, view<512xbf16>, view<512x512x3x3xbf16>, view<512xbf16>, view<512xbf16>, view<512xbf16>, view<512x512x3x3xbf16>, view<512xbf16>, buffer)
+  command.return
+}
+
+// Stage 2, blocks 1 and 2: 256 -> 256 in place.
+command.def public @klein.vae_up2_residual(%block: index, %height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)] {
+  %channels = index.constant 256 : index
+  %norm1_weight = command.parameter %parameters, "decoder.up_blocks.2.resnets.{}.norm1.weight"[%block] : view<256xbf16>
+  %norm1_bias = command.parameter %parameters, "decoder.up_blocks.2.resnets.{}.norm1.bias"[%block] : view<256xbf16>
+  %conv1_weight = command.parameter %parameters, "decoder.up_blocks.2.resnets.{}.conv1.weight"[%block] : view<256x256x3x3xbf16>
+  %conv1_bias = command.parameter %parameters, "decoder.up_blocks.2.resnets.{}.conv1.bias"[%block] : view<256xbf16>
+  %norm2_weight = command.parameter %parameters, "decoder.up_blocks.2.resnets.{}.norm2.weight"[%block] : view<256xbf16>
+  %norm2_bias = command.parameter %parameters, "decoder.up_blocks.2.resnets.{}.norm2.bias"[%block] : view<256xbf16>
+  %conv2_weight = command.parameter %parameters, "decoder.up_blocks.2.resnets.{}.conv2.weight"[%block] : view<256x256x3x3xbf16>
+  %conv2_bias = command.parameter %parameters, "decoder.up_blocks.2.resnets.{}.conv2.bias"[%block] : view<256xbf16>
+  command.launch @klein.vae_resnet[%channels, %height, %width](%input, %norm1_weight, %norm1_bias, %conv1_weight, %conv1_bias, %norm2_weight, %norm2_bias, %conv2_weight, %conv2_bias, %output) : [index, index, index](buffer, view<256xbf16>, view<256xbf16>, view<256x256x3x3xbf16>, view<256xbf16>, view<256xbf16>, view<256xbf16>, view<256x256x3x3xbf16>, view<256xbf16>, buffer)
+  command.return
+}
+
+// Stage 3, blocks 1 and 2: 128 -> 128 in place.
+command.def public @klein.vae_up3_residual(%block: index, %height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)] {
+  %channels = index.constant 128 : index
+  %norm1_weight = command.parameter %parameters, "decoder.up_blocks.3.resnets.{}.norm1.weight"[%block] : view<128xbf16>
+  %norm1_bias = command.parameter %parameters, "decoder.up_blocks.3.resnets.{}.norm1.bias"[%block] : view<128xbf16>
+  %conv1_weight = command.parameter %parameters, "decoder.up_blocks.3.resnets.{}.conv1.weight"[%block] : view<128x128x3x3xbf16>
+  %conv1_bias = command.parameter %parameters, "decoder.up_blocks.3.resnets.{}.conv1.bias"[%block] : view<128xbf16>
+  %norm2_weight = command.parameter %parameters, "decoder.up_blocks.3.resnets.{}.norm2.weight"[%block] : view<128xbf16>
+  %norm2_bias = command.parameter %parameters, "decoder.up_blocks.3.resnets.{}.norm2.bias"[%block] : view<128xbf16>
+  %conv2_weight = command.parameter %parameters, "decoder.up_blocks.3.resnets.{}.conv2.weight"[%block] : view<128x128x3x3xbf16>
+  %conv2_bias = command.parameter %parameters, "decoder.up_blocks.3.resnets.{}.conv2.bias"[%block] : view<128xbf16>
+  command.launch @klein.vae_resnet[%channels, %height, %width](%input, %norm1_weight, %norm1_bias, %conv1_weight, %conv1_bias, %norm2_weight, %norm2_bias, %conv2_weight, %conv2_bias, %output) : [index, index, index](buffer, view<128xbf16>, view<128xbf16>, view<128x128x3x3xbf16>, view<128xbf16>, view<128xbf16>, view<128xbf16>, view<128x128x3x3xbf16>, view<128xbf16>, buffer)
+  command.return
+}
+
+// Stage 2, block 0: 512 -> 256 with a shortcut. Input and output are distinct.
+command.def public @klein.vae_up2_narrow(%height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)] {
+  %inputs = index.constant 512 : index
+  %outputs = index.constant 256 : index
+  %norm1_weight = command.parameter %parameters, "decoder.up_blocks.2.resnets.0.norm1.weight" : view<512xbf16>
+  %norm1_bias = command.parameter %parameters, "decoder.up_blocks.2.resnets.0.norm1.bias" : view<512xbf16>
+  %conv1_weight = command.parameter %parameters, "decoder.up_blocks.2.resnets.0.conv1.weight" : view<256x512x3x3xbf16>
+  %conv1_bias = command.parameter %parameters, "decoder.up_blocks.2.resnets.0.conv1.bias" : view<256xbf16>
+  %norm2_weight = command.parameter %parameters, "decoder.up_blocks.2.resnets.0.norm2.weight" : view<256xbf16>
+  %norm2_bias = command.parameter %parameters, "decoder.up_blocks.2.resnets.0.norm2.bias" : view<256xbf16>
+  %conv2_weight = command.parameter %parameters, "decoder.up_blocks.2.resnets.0.conv2.weight" : view<256x256x3x3xbf16>
+  %conv2_bias = command.parameter %parameters, "decoder.up_blocks.2.resnets.0.conv2.bias" : view<256xbf16>
+  %shortcut_weight = command.parameter %parameters, "decoder.up_blocks.2.resnets.0.conv_shortcut.weight" : view<256x512x1x1xbf16>
+  %shortcut_bias = command.parameter %parameters, "decoder.up_blocks.2.resnets.0.conv_shortcut.bias" : view<256xbf16>
+  command.launch @klein.vae_resnet_shortcut[%inputs, %outputs, %height, %width](%input, %norm1_weight, %norm1_bias, %conv1_weight, %conv1_bias, %norm2_weight, %norm2_bias, %conv2_weight, %conv2_bias, %shortcut_weight, %shortcut_bias, %output) : [index, index, index, index](buffer, view<512xbf16>, view<512xbf16>, view<256x512x3x3xbf16>, view<256xbf16>, view<256xbf16>, view<256xbf16>, view<256x256x3x3xbf16>, view<256xbf16>, view<256x512x1x1xbf16>, view<256xbf16>, buffer)
+  command.return
+}
+
+// Stage 3, block 0: 256 -> 128 with a shortcut. Input and output are distinct.
+command.def public @klein.vae_up3_narrow(%height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)] {
+  %inputs = index.constant 256 : index
+  %outputs = index.constant 128 : index
+  %norm1_weight = command.parameter %parameters, "decoder.up_blocks.3.resnets.0.norm1.weight" : view<256xbf16>
+  %norm1_bias = command.parameter %parameters, "decoder.up_blocks.3.resnets.0.norm1.bias" : view<256xbf16>
+  %conv1_weight = command.parameter %parameters, "decoder.up_blocks.3.resnets.0.conv1.weight" : view<128x256x3x3xbf16>
+  %conv1_bias = command.parameter %parameters, "decoder.up_blocks.3.resnets.0.conv1.bias" : view<128xbf16>
+  %norm2_weight = command.parameter %parameters, "decoder.up_blocks.3.resnets.0.norm2.weight" : view<128xbf16>
+  %norm2_bias = command.parameter %parameters, "decoder.up_blocks.3.resnets.0.norm2.bias" : view<128xbf16>
+  %conv2_weight = command.parameter %parameters, "decoder.up_blocks.3.resnets.0.conv2.weight" : view<128x128x3x3xbf16>
+  %conv2_bias = command.parameter %parameters, "decoder.up_blocks.3.resnets.0.conv2.bias" : view<128xbf16>
+  %shortcut_weight = command.parameter %parameters, "decoder.up_blocks.3.resnets.0.conv_shortcut.weight" : view<128x256x1x1xbf16>
+  %shortcut_bias = command.parameter %parameters, "decoder.up_blocks.3.resnets.0.conv_shortcut.bias" : view<128xbf16>
+  command.launch @klein.vae_resnet_shortcut[%inputs, %outputs, %height, %width](%input, %norm1_weight, %norm1_bias, %conv1_weight, %conv1_bias, %norm2_weight, %norm2_bias, %conv2_weight, %conv2_bias, %shortcut_weight, %shortcut_bias, %output) : [index, index, index, index](buffer, view<256xbf16>, view<256xbf16>, view<128x256x3x3xbf16>, view<128xbf16>, view<128xbf16>, view<128xbf16>, view<128x128x3x3xbf16>, view<128xbf16>, view<128x256x1x1xbf16>, view<128xbf16>, buffer)
+  command.return
+}
+
+// Stage 0 and 1 resizes: 512 channels at (height, width) -> (2 height, 2 width).
+command.def public @klein.vae_resize(%stage: index, %height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)] {
+  %channels = index.constant 512 : index
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %weight = command.parameter %parameters, "decoder.up_blocks.{}.upsamplers.0.conv.weight"[%stage] : view<512x512x3x3xbf16>
+  %bias = command.parameter %parameters, "decoder.up_blocks.{}.upsamplers.0.conv.bias"[%stage] : view<512xbf16>
+  kernel.launch @klein_vae_wide_convolution[%height, %width, %channels, %channels, %c3, %c2, %c0](%height, %width, %channels, %channels, %c3, %c2, %c0, %input, %weight, %bias, %output, %output) : [index, index, index, index, index, index, index](index, index, index, index, index, index, index, buffer, view<512x512x3x3xbf16>, view<512xbf16>, buffer, buffer)
+  command.return
+}
+
+// Stage 2 resize: 256 channels.
+command.def public @klein.vae_up2_resize(%height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)] {
+  %channels = index.constant 256 : index
+  %c0 = index.constant 0 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %weight = command.parameter %parameters, "decoder.up_blocks.2.upsamplers.0.conv.weight" : view<256x256x3x3xbf16>
+  %bias = command.parameter %parameters, "decoder.up_blocks.2.upsamplers.0.conv.bias" : view<256xbf16>
+  kernel.launch @klein_vae_wide_convolution[%height, %width, %channels, %channels, %c3, %c2, %c0](%height, %width, %channels, %channels, %c3, %c2, %c0, %input, %weight, %bias, %output, %output) : [index, index, index, index, index, index, index](index, index, index, index, index, index, index, buffer, view<256x256x3x3xbf16>, view<256xbf16>, buffer, buffer)
+  command.return
+}
+
+// Output head: GroupNorm+SiLU in place over 128 channels, then the 3x3
+// convolution to packed opaque RGBA8.
+command.def public @klein.vae_output(%height: index, %width: index) launch(%parameters: buffer, %input: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024)] {
+  %channels = index.constant 128 : index
+  %c1 = index.constant 1 : index
+  %gamma = command.parameter %parameters, "decoder.conv_norm_out.weight" : view<128xbf16>
+  %beta = command.parameter %parameters, "decoder.conv_norm_out.bias" : view<128xbf16>
+  %weight = command.parameter %parameters, "decoder.conv_out.weight" : view<3x128x3x3xbf16>
+  %bias = command.parameter %parameters, "decoder.conv_out.bias" : view<3xbf16>
+  command.launch @klein.vae_group_norm[%channels, %height, %width, %c1](%input, %gamma, %beta, %input) : [index, index, index, index](buffer, view<128xbf16>, view<128xbf16>, buffer)
+  kernel.launch @klein_vae_rgba_convolution[%height, %width](%height, %width, %input, %weight, %bias, %output) : [index, index](index, index, buffer, view<3x128x3x3xbf16>, view<3xbf16>, buffer)
+  command.return
+}

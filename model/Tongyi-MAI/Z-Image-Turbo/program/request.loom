@@ -1,0 +1,532 @@
+// Turn the prepared request into device-side noise, prompt rows, key masks,
+// rotary tables, timestep values, and Euler step sizes. The payload's seed and
+// token IDs determine these values without a host RNG or generated input
+// files. Geometry comes from the image stage's validated configuration;
+// callers provide separate output buffers with the declared logical extents.
+//
+// Reference semantics are diffusers' ZImagePipeline: the chat-framed prompt is
+// right-padded or right-truncated to text_tokens, the Qwen3 encoder uses
+// positions 0..text_tokens-1 for every row, the transformer sees only the live
+// caption rows padded to a multiple of 32 with its learned pad token, and
+// FlowMatchEulerDiscreteScheduler shifts linspace(1, 1/8, 8) by 3.
+
+config.decl @zimage.image_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+config.decl @zimage.text_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+config.decl @zimage.latent_width : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+amdgpu.target<gfx11-generic> @request_wave32 {subgroup_size = 32}
+
+template.decl @random.philox4x32(%counter0: i32, %counter1: i32, %counter2: i32, %counter3: i32, %seed0: i32, %seed1: i32) -> (i32, i32, i32, i32)
+
+template.decl @random.normal_pair(%radius_word: i32, %angle_word: i32) -> (f32, f32)
+
+template.decl @zimage.cosine_sine(%angle: f64) -> (f64, f64)
+
+template.decl @zimage.dyadic_power(%base: f64, %numerator: index, %levels: index, %top_bit: index) -> (f64)
+
+template.decl @zimage.rope_frequency(%pair: index) -> (f64)
+
+// base^(numerator / 2^levels) for numerator < 2^levels, where top_bit is
+// 2^(levels-1). The target has no F64 power recipe, so repeated correctly
+// rounded square roots give base^(2^-l) and the numerator's set bits select
+// which roots multiply in; the result is within a few F64 units of the exact
+// power, far below the F32 rounding the tables apply afterwards.
+template.def<@zimage.dyadic_power> @zimage_dyadic_power(%base: f64, %numerator: index, %levels: index, %top_bit: index) -> (f64) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %identity = scalar.constant 1.0 : f64
+  %result, %root, %bit = scf.for %level = [%c0 to %levels step %c1](%product = %identity : f64, %previous = %base : f64, %weight = %top_bit : index) -> (f64, f64, index) {
+    %current = scalar.sqrtf %previous : f64
+    %quotient = index.div %numerator, %weight : index
+    %digit = index.rem %quotient, %c2 : index
+    %set = index.cmp eq, %digit, %c1 : index
+    %scaled = scalar.mulf %product, %current : f64
+    %next = scf.select %set, %scaled, %product : f64
+    %half = index.div %weight, %c2 : index
+    scf.yield %next, %current, %half : f64, f64, index
+  }
+  template.return %result : f64
+}
+
+// F64 cosine and sine of a non-negative angle from F64 arithmetic alone, since
+// the target has no F64 trigonometric recipe. The angle reduces by quarter
+// turns against a 33-bit head of pi/2, whose integer multiples are exact, and
+// its tail; Taylor polynomials through degree 17 and 18 then cover the
+// residual in [-pi/4, pi/4] to below F64 rounding.
+template.def<@zimage.cosine_sine> @zimage_cosine_sine(%angle: f64) -> (f64, f64) {
+  %inverse_half_pi = scalar.constant 0.63661977236758138 : f64
+  %half_pi_head = scalar.constant 1.5707963267341256 : f64
+  %half_pi_tail = scalar.constant 6.0771005065061922e-11 : f64
+  %quarter_turns = scalar.mulf %angle, %inverse_half_pi : f64
+  %rounded = scalar.roundevenf %quarter_turns : f64
+  %head = scalar.mulf %rounded, %half_pi_head : f64
+  %tail = scalar.mulf %rounded, %half_pi_tail : f64
+  %partial = scalar.subf %angle, %head : f64
+  %residual = scalar.subf %partial, %tail : f64
+  %square = scalar.mulf %residual, %residual : f64
+  %s8 = scalar.constant 2.8114572543455206e-15 : f64
+  %s7 = scalar.constant -7.6471637318198164e-13 : f64
+  %s6 = scalar.constant 1.6059043836821613e-10 : f64
+  %s5 = scalar.constant -2.505210838544172e-08 : f64
+  %s4 = scalar.constant 2.7557319223985893e-06 : f64
+  %s3 = scalar.constant -0.00019841269841269841 : f64
+  %s2 = scalar.constant 0.0083333333333333332 : f64
+  %s1 = scalar.constant -0.16666666666666666 : f64
+  %leading = scalar.constant 1.0 : f64
+  %sa = scalar.mulf %s8, %square : f64
+  %sb = scalar.addf %sa, %s7 : f64
+  %sc = scalar.mulf %sb, %square : f64
+  %sd = scalar.addf %sc, %s6 : f64
+  %se = scalar.mulf %sd, %square : f64
+  %sf = scalar.addf %se, %s5 : f64
+  %sg = scalar.mulf %sf, %square : f64
+  %sh = scalar.addf %sg, %s4 : f64
+  %si = scalar.mulf %sh, %square : f64
+  %sj = scalar.addf %si, %s3 : f64
+  %sk = scalar.mulf %sj, %square : f64
+  %sl = scalar.addf %sk, %s2 : f64
+  %sm = scalar.mulf %sl, %square : f64
+  %sn = scalar.addf %sm, %s1 : f64
+  %so = scalar.mulf %sn, %square : f64
+  %cubic = scalar.mulf %so, %residual : f64
+  %sine_residual = scalar.addf %residual, %cubic : f64
+  %c9 = scalar.constant -1.5619206968586225e-16 : f64
+  %c8 = scalar.constant 4.7794773323873853e-14 : f64
+  %c7 = scalar.constant -1.1470745597729725e-11 : f64
+  %c6 = scalar.constant 2.08767569878681e-09 : f64
+  %c5 = scalar.constant -2.7557319223985888e-07 : f64
+  %c4 = scalar.constant 2.4801587301587302e-05 : f64
+  %c3 = scalar.constant -0.0013888888888888889 : f64
+  %c2 = scalar.constant 0.041666666666666664 : f64
+  %c1 = scalar.constant -0.5 : f64
+  %ca = scalar.mulf %c9, %square : f64
+  %cb = scalar.addf %ca, %c8 : f64
+  %cc = scalar.mulf %cb, %square : f64
+  %cd = scalar.addf %cc, %c7 : f64
+  %ce = scalar.mulf %cd, %square : f64
+  %cf = scalar.addf %ce, %c6 : f64
+  %cg = scalar.mulf %cf, %square : f64
+  %ch = scalar.addf %cg, %c5 : f64
+  %ci = scalar.mulf %ch, %square : f64
+  %cj = scalar.addf %ci, %c4 : f64
+  %ck = scalar.mulf %cj, %square : f64
+  %cl = scalar.addf %ck, %c3 : f64
+  %cm = scalar.mulf %cl, %square : f64
+  %cn = scalar.addf %cm, %c2 : f64
+  %co = scalar.mulf %cn, %square : f64
+  %cp = scalar.addf %co, %c1 : f64
+  %cq = scalar.mulf %cp, %square : f64
+  %cosine_residual = scalar.addf %cq, %leading : f64
+  %quadrant = scalar.fptoui %rounded : f64 to i32
+  %c1_i32 = scalar.constant 1 : i32
+  %c2_i32 = scalar.constant 2 : i32
+  %c0_i32 = scalar.constant 0 : i32
+  %odd_bit = scalar.andi %quadrant, %c1_i32 : i32
+  %odd = scalar.cmpi ne, %odd_bit, %c0_i32 : i32
+  %cosine_magnitude = scf.select %odd, %sine_residual, %cosine_residual : f64
+  %sine_magnitude = scf.select %odd, %cosine_residual, %sine_residual : f64
+  %next_quadrant = scalar.addi %quadrant, %c1_i32 : i32
+  %cosine_bit = scalar.andi %next_quadrant, %c2_i32 : i32
+  %sine_bit = scalar.andi %quadrant, %c2_i32 : i32
+  %negate_cosine = scalar.cmpi ne, %cosine_bit, %c0_i32 : i32
+  %negate_sine = scalar.cmpi ne, %sine_bit, %c0_i32 : i32
+  %negative_cosine = scalar.negf %cosine_magnitude : f64
+  %negative_sine = scalar.negf %sine_magnitude : f64
+  %cosine = scf.select %negate_cosine, %negative_cosine, %cosine_magnitude : f64
+  %sine = scf.select %negate_sine, %negative_sine, %sine_magnitude : f64
+  template.return %cosine, %sine : f64, f64
+}
+
+// F64 frequency of one of the transformer's 64 rotary pairs: 16 on the
+// 32-wide frame axis, then 24 on each 48-wide spatial axis, theta 256. Pair j
+// of a d-wide axis rotates at 256^(-2j/d), which is 2^(-j/2) on the first axis
+// and 2^(-j/3) on the other two. Splitting j into whole octaves q and a
+// remainder r leaves an exact power-of-two scale on a constant root of two.
+template.def<@zimage.rope_frequency> @zimage_rope_frequency(%pair: index) -> (f64) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c16 = index.constant 16 : index
+  %c40 = index.constant 40 : index
+  %frame = index.cmp ult, %pair, %c16 : index
+  %height = index.cmp ult, %pair, %c40 : index
+  %height_pair = index.sub %pair, %c16 : index
+  %width_pair = index.sub %pair, %c40 : index
+  %spatial_pair = scf.select %height, %height_pair, %width_pair : index
+  %index = scf.select %frame, %pair, %spatial_pair : index
+  %frame_octaves = index.div %index, %c2 : index
+  %frame_remainder = index.rem %index, %c2 : index
+  %spatial_octaves = index.div %index, %c3 : index
+  %spatial_remainder = index.rem %index, %c3 : index
+  %octaves = scf.select %frame, %frame_octaves, %spatial_octaves : index
+  %remainder = scf.select %frame, %frame_remainder, %spatial_remainder : index
+  %unit = scalar.constant 1.0 : f64
+  %half_root = scalar.constant 0.70710678118654757 : f64
+  %third_root = scalar.constant 0.79370052598409979 : f64
+  %two_third_root = scalar.constant 0.6299605249474366 : f64
+  %first = index.cmp eq, %remainder, %c1 : index
+  %second = index.cmp eq, %remainder, %c2 : index
+  %spatial_one = scf.select %frame, %half_root, %third_root : f64
+  %one = scf.select %first, %spatial_one, %unit : f64
+  %root = scf.select %second, %two_third_root, %one : f64
+  %half = scalar.constant 0.5 : f64
+  %frequency = scf.for %octave = [%c0 to %octaves step %c1](%value = %root : f64) -> (f64) {
+    %halved = scalar.mulf %value, %half : f64
+    scf.yield %halved : f64
+  }
+  template.return %frequency : f64
+}
+
+// The compact request header is seed:u64, framed-token-count:u32, reserved:i32,
+// all little endian, followed by the framed token IDs. Each counter produces
+// four patch features of F32[image_tokens,64] in row-major order, each rounded
+// through BF16 so the first step sees exactly the BF16 values the reference's
+// prepared latent holds. Feature (ph*2+pw)*16+c of token y*columns+x is
+// latent channel c at pixel (2y+ph, 2x+pw).
+kernel.def target(@request_wave32) @request_noise() {
+  %images = config.get @zimage.image_tokens : index
+  %c16 = index.constant 16 : index
+  %count = index.mul %images, %c16 : index
+  %threads = index.constant 256 : index
+  %padding = index.constant 255 : index
+  %padded = index.add %count, %padding : index
+  %groups = index.div %padded, %threads : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%request: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %c16 = index.constant 16 : index
+  %c64 = index.constant 64 : index
+  %count = index.mul %images, %c16 : index
+  %elements = index.mul %images, %c64 : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %counter = index.madd %group, %threads, %lane : index
+  %valid = index.cmp ult, %counter, %count : index
+  scf.if %valid {
+    %origin = index.constant 0 : offset
+    %c0 = index.constant 0 : index
+    %c1 = index.constant 1 : index
+    %c2 = index.constant 2 : index
+    %c3 = index.constant 3 : index
+    %c4 = index.constant 4 : index
+    %header = buffer.view %request[%origin] : buffer -> view<4xi32>
+    %seed0 = view.load %header[%c0] : view<4xi32> -> i32
+    %seed1 = view.load %header[%c1] : view<4xi32> -> i32
+    %counter32 = index.cast %counter : index to i32
+    %zero32 = scalar.constant 0 : i32
+    %a, %b, %c, %d = template.apply<@random.philox4x32>(%counter32, %zero32, %zero32, %zero32, %seed0, %seed1) : (i32, i32, i32, i32, i32, i32) -> (i32, i32, i32, i32)
+    %n0, %n1 = template.apply<@random.normal_pair>(%a, %b) : (i32, i32) -> (f32, f32)
+    %n2, %n3 = template.apply<@random.normal_pair>(%c, %d) : (i32, i32) -> (f32, f32)
+    %h0 = scalar.fptrunc %n0 : f32 to bf16
+    %h1 = scalar.fptrunc %n1 : f32 to bf16
+    %h2 = scalar.fptrunc %n2 : f32 to bf16
+    %h3 = scalar.fptrunc %n3 : f32 to bf16
+    %v0 = scalar.extf %h0 : bf16 to f32
+    %v1 = scalar.extf %h1 : bf16 to f32
+    %v2 = scalar.extf %h2 : bf16 to f32
+    %v3 = scalar.extf %h3 : bf16 to f32
+    %out = buffer.view %output[%origin] : buffer -> view<[%elements]xf32>
+    %i0 = index.mul %counter, %c4 : index
+    %i1 = index.add %i0, %c1 : index
+    %i2 = index.add %i0, %c2 : index
+    %i3 = index.add %i0, %c3 : index
+    view.store %v0, %out[%i0] : f32, view<[%elements]xf32>
+    view.store %v1, %out[%i1] : f32, view<[%elements]xf32>
+    view.store %v2, %out[%i2] : f32, view<[%elements]xf32>
+    view.store %v3, %out[%i3] : f32, view<[%elements]xf32>
+  }
+  kernel.return
+}
+
+command.def public @prepare_noise() launch(%request: buffer, %output: buffer) {
+  kernel.launch @request_noise(%request, %output) : (buffer, buffer)
+  command.return
+}
+
+// The payload holds the whole framed prompt: chat prefix, prompt text, and the
+// assistant suffix, contiguous. Text rows below the framed count n take its
+// IDs; the rest hold <|endoftext|> (151643). A framed count above text_tokens
+// keeps the first text_tokens IDs, as the tokenizer's right truncation does.
+// The encoder mask marks the n live rows. The transformer key mask covers the
+// joint [image_tokens + text_tokens] sequence, image rows first: image rows
+// and live caption rows are 1, caption rows n..P-1 with P = n rounded up to 32
+// are 2 (visible, and replaced by the learned caption pad token), and the
+// remaining rows are 0 (absent from the reference sequence).
+kernel.def target(@request_wave32) @request_prompt() {
+  %rows = config.get @zimage.text_tokens : index
+  %images = config.get @zimage.image_tokens : index
+  %count = index.add %rows, %images : index
+  %threads = index.constant 256 : index
+  %extra = index.constant 255 : index
+  %padded = index.add %count, %extra : index
+  %groups = index.div %padded, %threads : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%request: buffer, %tokens: buffer, %encoder_mask: buffer, %key_mask: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %images = config.get @zimage.image_tokens : index
+  %count = index.add %rows, %images : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %element = index.madd %group, %threads, %lane : index
+  %valid = index.cmp ult, %element, %count : index
+  scf.if %valid {
+    %origin = index.constant 0 : offset
+    %c2 = index.constant 2 : index
+    %c31 = index.constant 31 : index
+    %c32 = index.constant 32 : index
+    %yes = scalar.constant 1 : i8
+    %pad_row = scalar.constant 2 : i8
+    %no = scalar.constant 0 : i8
+    %keys = buffer.view %key_mask[%origin] : buffer -> view<[%count]xi8>
+    %image = index.cmp ult, %element, %images : index
+    scf.if %image {
+      view.store %yes, %keys[%element] : i8, view<[%count]xi8>
+    } else {
+      %row = index.sub %element, %images : index
+      %header = buffer.view %request[%origin] : buffer -> view<4xi32>
+      %framed32 = view.load %header[%c2] : view<4xi32> -> i32
+      %framed_value = index.cast %framed32 : i32 to index
+      // Request preparation frames at most 65536 live rows plus a five-row suffix.
+      %framed = index.assume %framed_value [range(%framed_value, 0, 65541)] : index
+      %live_rows = index.min %framed, %rows : index
+      %rounding = index.add %live_rows, %c31 : index
+      %blocks = index.div %rounding, %c32 : index
+      %attended = index.mul %blocks, %c32 : index
+      %live = index.cmp ult, %row, %live_rows : index
+      %padding = index.cmp ult, %row, %attended : index
+      %visible = scf.select %live, %yes, %no : i8
+      %pad_state = scf.select %padding, %pad_row, %no : i8
+      %state = scf.select %live, %yes, %pad_state : i8
+      %encoder_view = buffer.view %encoder_mask[%origin] : buffer -> view<[%rows]xi8>
+      view.store %visible, %encoder_view[%row] : i8, view<[%rows]xi8>
+      view.store %state, %keys[%element] : i8, view<[%count]xi8>
+      %header_bytes = index.constant 16 : offset
+      %source = buffer.view %request[%header_bytes] : buffer -> view<[%rows]xi32>
+      %id = scf.if %live -> (i32) {
+        %token = view.load %source[%row] : view<[%rows]xi32> -> i32
+        scf.yield %token : i32
+      } else {
+        %padding_token = scalar.constant 151643 : i32
+        scf.yield %padding_token : i32
+      }
+      %target = buffer.view %tokens[%origin] : buffer -> view<[%rows]xi32>
+      view.store %id, %target[%row] : i32, view<[%rows]xi32>
+    }
+  }
+  kernel.return
+}
+
+// Qwen3 rotary tables for positions 0..text_tokens-1 (theta 1e6, head width
+// 128), BF16[text_tokens,128] with channel c and c+64 sharing a frequency. The
+// frequency is the F32 reciprocal of F32 1e6^(c/64), and the angle is their F32
+// product, as transformers builds inv_freq and freqs. Cosine and sine evaluate
+// in F64 because angles reach several hundred radians, then round through F32
+// to BF16.
+kernel.def target(@request_wave32) @request_encoder_rotary() {
+  %rows = config.get @zimage.text_tokens : index
+  %channels = index.constant 64 : index
+  %count = index.mul %rows, %channels : index
+  %threads = index.constant 256 : index
+  %extra = index.constant 255 : index
+  %padded = index.add %count, %extra : index
+  %groups = index.div %padded, %threads : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%cosine: buffer, %sine: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %channels = index.constant 64 : index
+  %count = index.mul %rows, %channels : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %element = index.madd %group, %threads, %lane : index
+  %valid = index.cmp ult, %element, %count : index
+  scf.if %valid {
+    %row = index.div %element, %channels : index
+    %channel = index.rem %element, %channels : index
+    %c1_f64 = scalar.constant 1.0 : f64
+    %base = scalar.constant 1000000.0 : f64
+    %levels = index.constant 6 : index
+    %top_bit = index.constant 32 : index
+    %power = template.apply<@zimage.dyadic_power>(%base, %channel, %levels, %top_bit) : (f64, index, index, index) -> (f64)
+    %power32 = scalar.fptrunc %power : f64 to f32
+    %rounded_power = scalar.extf %power32 : f32 to f64
+    %reciprocal = scalar.divf %c1_f64, %rounded_power : f64
+    %frequency = scalar.fptrunc %reciprocal : f64 to f32
+    %row64 = index.cast %row : index to i64
+    %position = scalar.uitofp %row64 : i64 to f32
+    %angle32 = scalar.mulf %position, %frequency : f32
+    %angle = scalar.extf %angle32 : f32 to f64
+    %cosine64, %sine64 = template.apply<@zimage.cosine_sine>(%angle) : (f64) -> (f64, f64)
+    %cosine32 = scalar.fptrunc %cosine64 : f64 to f32
+    %sine32 = scalar.fptrunc %sine64 : f64 to f32
+    %c = scalar.fptrunc %cosine32 : f32 to bf16
+    %s = scalar.fptrunc %sine32 : f32 to bf16
+    %width = index.constant 128 : index
+    %first = index.madd %row, %width, %channel : index
+    %second = index.add %first, %channels : index
+    %extent = index.mul %rows, %width : index
+    %origin = index.constant 0 : offset
+    %cv = buffer.view %cosine[%origin] : buffer -> view<[%extent]xbf16>
+    %sv = buffer.view %sine[%origin] : buffer -> view<[%extent]xbf16>
+    view.store %c, %cv[%first] : bf16, view<[%extent]xbf16>
+    view.store %c, %cv[%second] : bf16, view<[%extent]xbf16>
+    view.store %s, %sv[%first] : bf16, view<[%extent]xbf16>
+    view.store %s, %sv[%second] : bf16, view<[%extent]xbf16>
+  }
+  kernel.return
+}
+
+// Transformer rotary tables, F32[image_tokens+text_tokens,128], image rows
+// first. Axes (frame, height, width) hold 16, 24, and 24 frequency pairs; each
+// pair's cosine and sine repeat on two adjacent channels. With n live caption
+// rows padded to P, caption row i < P has position (1+i, 0, 0), learned pad
+// included, image token y*columns+x has (P+1, y, x), and caption rows the
+// reference never forms have (0, 0, 0). The angle is
+// the F64 product rounded to F32, and cosine and sine of that F32 angle round
+// to F32, as RopeEmbedder builds its complex64 table.
+kernel.def target(@request_wave32) @request_rotary() {
+  %texts = config.get @zimage.text_tokens : index
+  %images = config.get @zimage.image_tokens : index
+  %tokens = index.add %texts, %images : index
+  %pairs = index.constant 64 : index
+  %count = index.mul %tokens, %pairs : index
+  %threads = index.constant 256 : index
+  %extra = index.constant 255 : index
+  %padded = index.add %count, %extra : index
+  %groups = index.div %padded, %threads : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%request: buffer, %cosine: buffer, %sine: buffer) {
+  %texts = config.get @zimage.text_tokens : index
+  %images = config.get @zimage.image_tokens : index
+  %width = config.get @zimage.latent_width : index
+  %c2 = index.constant 2 : index
+  %columns = index.div %width, %c2 : index
+  %tokens = index.add %texts, %images : index
+  %pairs = index.constant 64 : index
+  %count = index.mul %tokens, %pairs : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %element = index.madd %group, %threads, %lane : index
+  %valid = index.cmp ult, %element, %count : index
+  scf.if %valid {
+    %origin = index.constant 0 : offset
+    %token = index.div %element, %pairs : index
+    %pair = index.rem %element, %pairs : index
+    %c0 = index.constant 0 : index
+    %c1 = index.constant 1 : index
+    %c16 = index.constant 16 : index
+    %c31 = index.constant 31 : index
+    %c32 = index.constant 32 : index
+    %c40 = index.constant 40 : index
+    %header = buffer.view %request[%origin] : buffer -> view<4xi32>
+    %framed32 = view.load %header[%c2] : view<4xi32> -> i32
+    %framed_value = index.cast %framed32 : i32 to index
+    // Request preparation frames at most 65536 live rows plus a five-row suffix.
+    %framed = index.assume %framed_value [range(%framed_value, 0, 65541)] : index
+    %live_rows = index.min %framed, %texts : index
+    %rounding = index.add %live_rows, %c31 : index
+    %blocks = index.div %rounding, %c32 : index
+    %attended = index.mul %blocks, %c32 : index
+    %image_frame = index.add %attended, %c1 : index
+    %is_frame = index.cmp ult, %pair, %c16 : index
+    %is_height = index.cmp ult, %pair, %c40 : index
+    %image = index.cmp ult, %token, %images : index
+    %y = index.div %token, %columns : index
+    %x = index.rem %token, %columns : index
+    %image_spatial = scf.select %is_height, %y, %x : index
+    %image_position = scf.select %is_frame, %image_frame, %image_spatial : index
+    %row = index.sub %token, %images : index
+    // The reference lays its caption grid over the 32-aligned length, so
+    // learned-pad rows keep frame 1+row. Rows past that are never formed.
+    %formed = index.cmp ult, %row, %attended : index
+    %caption_frame = index.add %row, %c1 : index
+    %caption_axis = scf.select %is_frame, %caption_frame, %c0 : index
+    %caption_position = scf.select %formed, %caption_axis, %c0 : index
+    %position = scf.select %image, %image_position, %caption_position : index
+    %frequency = template.apply<@zimage.rope_frequency>(%pair) : (index) -> (f64)
+    %position64 = index.cast %position : index to i64
+    %position_value = scalar.uitofp %position64 : i64 to f64
+    %product = scalar.mulf %position_value, %frequency : f64
+    %angle32 = scalar.fptrunc %product : f64 to f32
+    %angle = scalar.extf %angle32 : f32 to f64
+    %cosine64, %sine64 = template.apply<@zimage.cosine_sine>(%angle) : (f64) -> (f64, f64)
+    %c = scalar.fptrunc %cosine64 : f64 to f32
+    %s = scalar.fptrunc %sine64 : f64 to f32
+    %first = index.mul %element, %c2 : index
+    %second = index.add %first, %c1 : index
+    %extent = index.mul %count, %c2 : index
+    %cv = buffer.view %cosine[%origin] : buffer -> view<[%extent]xf32>
+    %sv = buffer.view %sine[%origin] : buffer -> view<[%extent]xf32>
+    view.store %c, %cv[%first] : f32, view<[%extent]xf32>
+    view.store %c, %cv[%second] : f32, view<[%extent]xf32>
+    view.store %s, %sv[%first] : f32, view<[%extent]xf32>
+    view.store %s, %sv[%second] : f32, view<[%extent]xf32>
+  }
+  kernel.return
+}
+
+// The eight-step schedule is fixed: FlowMatchEulerDiscreteScheduler with
+// shift 3 over linspace(1, 1/8, 8) has no resolution-dependent term, so its
+// F32 values are constants here. Times are what the transformer embeds,
+// 1000 * (1000 - timestep) / 1000 in F32; deltas are the F32 Euler step sizes
+// sigma[i+1] - sigma[i] with a final sigma of zero.
+kernel.def target(@request_wave32) @request_constants() {
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index
+} launch(%times: buffer, %deltas: buffer) {
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c5 = index.constant 5 : index
+  %c6 = index.constant 6 : index
+  %c7 = index.constant 7 : index
+  %time_view = buffer.view %times[%origin] : buffer -> view<8xf32>
+  %delta_view = buffer.view %deltas[%origin] : buffer -> view<8xf32>
+  %t0 = scalar.constant 0.0 : f32
+  %t1 = scalar.constant 45.45458984375 : f32
+  %t2 = scalar.constant 100.0 : f32
+  %t3 = scalar.constant 166.66668701171875 : f32
+  %t4 = scalar.constant 250.0 : f32
+  %t5 = scalar.constant 357.14288330078125 : f32
+  %t6 = scalar.constant 500.0 : f32
+  %t7 = scalar.constant 700.0 : f32
+  %d0 = scalar.constant -0.045454561710357666 : f32
+  %d1 = scalar.constant -0.054545462131500244 : f32
+  %d2 = scalar.constant -0.066666662693023682 : f32
+  %d3 = scalar.constant -0.083333313465118408 : f32
+  %d4 = scalar.constant -0.1071428656578064 : f32
+  %d5 = scalar.constant -0.1428571343421936 : f32
+  %d6 = scalar.constant -0.19999998807907104 : f32
+  %d7 = scalar.constant -0.30000001192092896 : f32
+  view.store %t0, %time_view[%c0] : f32, view<8xf32>
+  view.store %t1, %time_view[%c1] : f32, view<8xf32>
+  view.store %t2, %time_view[%c2] : f32, view<8xf32>
+  view.store %t3, %time_view[%c3] : f32, view<8xf32>
+  view.store %t4, %time_view[%c4] : f32, view<8xf32>
+  view.store %t5, %time_view[%c5] : f32, view<8xf32>
+  view.store %t6, %time_view[%c6] : f32, view<8xf32>
+  view.store %t7, %time_view[%c7] : f32, view<8xf32>
+  view.store %d0, %delta_view[%c0] : f32, view<8xf32>
+  view.store %d1, %delta_view[%c1] : f32, view<8xf32>
+  view.store %d2, %delta_view[%c2] : f32, view<8xf32>
+  view.store %d3, %delta_view[%c3] : f32, view<8xf32>
+  view.store %d4, %delta_view[%c4] : f32, view<8xf32>
+  view.store %d5, %delta_view[%c5] : f32, view<8xf32>
+  view.store %d6, %delta_view[%c6] : f32, view<8xf32>
+  view.store %d7, %delta_view[%c7] : f32, view<8xf32>
+  kernel.return
+}

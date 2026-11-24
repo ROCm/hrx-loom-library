@@ -1,0 +1,253 @@
+// Transformer pointwise leaves. SwiGLU reads separate gate and up rows, rounds
+// SiLU before the product, and rounds the product once. Caption rows the key
+// mask does not mark live take the learned caption pad token after embedding,
+// and the refined caption rows are copied behind the image rows of the unified
+// sequence at every step. The F32 latent rounds to BF16 for the image
+// embedding. The velocity is the negated BF16 prediction, so the Euler update
+// subtracts one F32 timestep delta times the prediction from the F32 latent,
+// multiply then subtract.
+
+config.decl @zimage.image_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+config.decl @zimage.text_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+amdgpu.target<gfx11-generic> @zimage_pointwise_wave32 {subgroup_size = 32}
+
+template.decl @activation.silu_bf16(%value: bf16) -> (bf16)
+
+template.decl @zimage.swiglu_rows(%rows: index, %gate: buffer, %up: buffer, %output: buffer)
+
+// Forty 256-thread workgroups cover one 10240-wide row. Each element reads
+// only its own position, so output may alias either input.
+template.def<@zimage.swiglu_rows> device @zimage_swiglu_rows(%rows: index, %gate: buffer, %up: buffer, %output: buffer) {
+  %origin = index.constant 0 : offset
+  %groups_per_row = index.constant 40 : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %row = index.div %group, %groups_per_row : index
+  %block = index.rem %group, %groups_per_row : index
+  %column = index.madd %block, %threads, %lane : index
+  %gate_view = buffer.view %gate[%origin] : buffer -> view<[%rows]x10240xbf16>
+  %up_view = buffer.view %up[%origin] : buffer -> view<[%rows]x10240xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x10240xbf16>
+  %gate_value = view.load %gate_view[%row, %column] : view<[%rows]x10240xbf16> -> bf16
+  %up_value = view.load %up_view[%row, %column] : view<[%rows]x10240xbf16> -> bf16
+  %activated = template.apply<@activation.silu_bf16>(%gate_value) : (bf16) -> (bf16)
+  %activated_f32 = scalar.extf %activated : bf16 to f32
+  %up_f32 = scalar.extf %up_value : bf16 to f32
+  %product = scalar.mulf %activated_f32, %up_f32 : f32
+  %result = scalar.fptrunc %product : f32 to bf16
+  view.store %result, %output_view[%row, %column] : bf16, view<[%rows]x10240xbf16>
+  template.return
+}
+
+kernel.def target(@zimage_pointwise_wave32) @zimage_refiner_swiglu() {
+  %rows = config.get @zimage.image_tokens : index
+  %groups_per_row = index.constant 40 : index
+  %groups = index.mul %rows, %groups_per_row : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%gate: buffer, %up: buffer, %output: buffer) {
+  %rows = config.get @zimage.image_tokens : index
+  template.apply<@zimage.swiglu_rows>(%rows, %gate, %up, %output) : (index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@zimage_pointwise_wave32) @zimage_context_swiglu() {
+  %rows = config.get @zimage.text_tokens : index
+  %groups_per_row = index.constant 40 : index
+  %groups = index.mul %rows, %groups_per_row : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%gate: buffer, %up: buffer, %output: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  template.apply<@zimage.swiglu_rows>(%rows, %gate, %up, %output) : (index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@zimage_pointwise_wave32) @zimage_layer_swiglu() {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %rows = index.add %images, %texts : index
+  %groups_per_row = index.constant 40 : index
+  %groups = index.mul %rows, %groups_per_row : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%gate: buffer, %up: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %rows = index.add %images, %texts : index
+  template.apply<@zimage.swiglu_rows>(%rows, %gate, %up, %output) : (index, buffer, buffer, buffer)
+  kernel.return
+}
+
+// Fifteen 256-thread workgroups cover one 3840-wide caption row. Rows whose
+// mask byte is not 1 take the pad token: learned-pad rows the reference forms,
+// and absent rows, which stay finite and are never visible as keys.
+kernel.def target(@zimage_pointwise_wave32) @zimage_caption_pad() {
+  %rows = config.get @zimage.text_tokens : index
+  %groups_per_row = index.constant 15 : index
+  %groups = index.mul %rows, %groups_per_row : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%mask: buffer, %pad: buffer, %caption: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %groups_per_row = index.constant 15 : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %row = index.div %group, %groups_per_row : index
+  %block = index.rem %group, %groups_per_row : index
+  %column = index.madd %block, %threads, %lane : index
+  %mask_view = buffer.view %mask[%origin] : buffer -> view<[%rows]xi8>
+  %pad_view = buffer.view %pad[%origin] : buffer -> view<1x3840xbf16>
+  %caption_view = buffer.view %caption[%origin] : buffer -> view<[%rows]x3840xbf16>
+  %live = scalar.constant 1 : i8
+  %byte = view.load %mask_view[%row] : view<[%rows]xi8> -> i8
+  %padded = scalar.cmpi ne, %byte, %live : i8
+  scf.if %padded {
+    %value = view.load %pad_view[%c0, %column] : view<1x3840xbf16> -> bf16
+    view.store %value, %caption_view[%row, %column] : bf16, view<[%rows]x3840xbf16>
+  }
+  kernel.return
+}
+
+// Fifteen 256-thread workgroups cover one 3840-wide caption row.
+kernel.def target(@zimage_pointwise_wave32) @zimage_caption_copy() {
+  %rows = config.get @zimage.text_tokens : index
+  %groups_per_row = index.constant 15 : index
+  %groups = index.mul %rows, %groups_per_row : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %output: buffer) {
+  %rows = config.get @zimage.text_tokens : index
+  %origin = index.constant 0 : offset
+  %groups_per_row = index.constant 15 : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %row = index.div %group, %groups_per_row : index
+  %block = index.rem %group, %groups_per_row : index
+  %column = index.madd %block, %threads, %lane : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%rows]x3840xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%rows]x3840xbf16>
+  %value = view.load %input_view[%row, %column] : view<[%rows]x3840xbf16> -> bf16
+  view.store %value, %output_view[%row, %column] : bf16, view<[%rows]x3840xbf16>
+  kernel.return
+}
+
+// Latent patches are 64 channels per token; four tokens per workgroup.
+kernel.def target(@zimage_pointwise_wave32) @zimage_latent_cast() {
+  %rows = config.get @zimage.image_tokens : index
+  %rows_per_group = index.constant 4 : index
+  %groups = index.div %rows, %rows_per_group : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %output: buffer) {
+  %rows = config.get @zimage.image_tokens : index
+  %width = index.constant 64 : index
+  %elements = index.mul %rows, %width : index
+  %origin = index.constant 0 : offset
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %element = index.madd %group, %threads, %lane : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%elements]xf32>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%elements]xbf16>
+  %value = view.load %input_view[%element] : view<[%elements]xf32> -> f32
+  %result = scalar.fptrunc %value : f32 to bf16
+  view.store %result, %output_view[%element] : bf16, view<[%elements]xbf16>
+  kernel.return
+}
+
+// The delta view holds the current step's F32 delta. The velocity is the
+// negated prediction, so the update subtracts delta times the prediction.
+kernel.def target(@zimage_pointwise_wave32) @zimage_dit_update() {
+  %rows = config.get @zimage.image_tokens : index
+  %rows_per_group = index.constant 4 : index
+  %groups = index.div %rows, %rows_per_group : index
+  %c1 = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%sample: buffer, %prediction: buffer, %delta: buffer, %output: buffer) {
+  %rows = config.get @zimage.image_tokens : index
+  %width = index.constant 64 : index
+  %elements = index.mul %rows, %width : index
+  %origin = index.constant 0 : offset
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %element = index.madd %group, %threads, %lane : index
+  %samples = buffer.view %sample[%origin] : buffer -> view<[%elements]xf32>
+  %predictions = buffer.view %prediction[%origin] : buffer -> view<[%elements]xbf16>
+  %duration = buffer.view %delta[%origin] : buffer -> view<1xf32>
+  %results = buffer.view %output[%origin] : buffer -> view<[%elements]xf32>
+  %previous = view.load %samples[%element] : view<[%elements]xf32> -> f32
+  %stored = view.load %predictions[%element] : view<[%elements]xbf16> -> bf16
+  %step = view.load %duration[0] : view<1xf32> -> f32
+  %predicted = scalar.extf %stored : bf16 to f32
+  %change = scalar.mulf %step, %predicted : f32
+  %result = scalar.subf %previous, %change : f32
+  view.store %result, %results[%element] : f32, view<[%elements]xf32>
+  kernel.return
+}
+
+command.def public @zimage.refiner_swiglu() launch(%gate: buffer, %up: buffer, %output: buffer) {
+  kernel.launch @zimage_refiner_swiglu(%gate, %up, %output) : (buffer, buffer, buffer)
+  command.return
+}
+
+command.def public @zimage.context_swiglu() launch(%gate: buffer, %up: buffer, %output: buffer) {
+  kernel.launch @zimage_context_swiglu(%gate, %up, %output) : (buffer, buffer, buffer)
+  command.return
+}
+
+command.def public @zimage.layer_swiglu() launch(%gate: buffer, %up: buffer, %output: buffer) {
+  kernel.launch @zimage_layer_swiglu(%gate, %up, %output) : (buffer, buffer, buffer)
+  command.return
+}
+
+// Caption mask bytes follow the image bytes of the key mask.
+command.def public @zimage.caption_pad() launch(%parameters: buffer, %mask: buffer, %caption: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %mask_byte = index.constant 1 : offset
+  %mask_origin = index.scale %images, %mask_byte : index, offset -> offset
+  %caption_mask = buffer.view %mask[%mask_origin] : buffer -> view<[%texts]xi8>
+  %pad = command.parameter %parameters, "cap_pad_token" : view<1x3840xbf16>
+  kernel.launch @zimage_caption_pad(%caption_mask, %pad, %caption) : (view<[%texts]xi8>, view<1x3840xbf16>, buffer)
+  command.return
+}
+
+// Writes the caption rows of the unified [image, caption] hidden state.
+command.def public @zimage.caption_copy() launch(%caption: buffer, %hidden: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  %row_bytes = index.constant 7680 : offset
+  %text_origin = index.scale %images, %row_bytes : index, offset -> offset
+  %text_rows = buffer.view %hidden[%text_origin] : buffer -> view<[%texts]x3840xbf16>
+  kernel.launch @zimage_caption_copy(%caption, %text_rows) : (buffer, view<[%texts]x3840xbf16>)
+  command.return
+}
+
+command.def public @zimage.latent_cast() launch(%input: buffer, %output: buffer) {
+  kernel.launch @zimage_latent_cast(%input, %output) : (buffer, buffer)
+  command.return
+}
+
+command.def public @zimage.dit_update(%step: index) launch(%sample: buffer, %prediction: buffer, %deltas: buffer, %output: buffer) {
+  %scalar_bytes = index.constant 4 : offset
+  %delta_offset = index.scale %step, %scalar_bytes : index, offset -> offset
+  %delta = buffer.view %deltas[%delta_offset] : buffer -> view<1xf32>
+  kernel.launch @zimage_dit_update(%sample, %prediction, %delta, %output) : (buffer, buffer, view<1xf32>, buffer)
+  command.return
+}

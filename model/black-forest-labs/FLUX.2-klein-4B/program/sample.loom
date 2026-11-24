@@ -1,0 +1,74 @@
+// Complete image sampling from immutable noise, token IDs, and three original
+// checkpoint domains. The encoder runs once and its three retained layer taps
+// feed every denoising step. The final latent feeds VAE decoding into distinct
+// packed RGBA8 pixels at eight times the latent dimensions, with opaque alpha.
+
+config.decl @klein.image_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+config.decl @klein.text_tokens : %value: index where [range(%value, 16, 65536), multiple_of(%value, 16)]
+
+amdgpu.target<gfx11-generic> @sample_mask_wave32 {subgroup_size = 32}
+
+command.decl @text_encoder() launch(%parameters: buffer, %token_ids: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %taps: buffer)
+
+command.decl @denoise() launch(%parameters: buffer, %sample: buffer, %text: buffer, %times: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %deltas: buffer, %output: buffer)
+
+command.decl @vae_decode() launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+// The diffusers transformer receives no attention mask: padded text rows stay
+// visible keys exactly as in the reference. Only the encoder masks padding.
+kernel.def target(@sample_mask_wave32) @sample_mask() {
+  %texts = config.get @klein.text_tokens : index
+  %images = config.get @klein.image_tokens : index
+  %tokens = index.add %texts, %images : index
+  %threads = index.constant 256 : index
+  %padding = index.constant 255 : index
+  %padded = index.add %tokens, %padding : index
+  %groups = index.div %padded, %threads : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%output: buffer) {
+  %texts = config.get @klein.text_tokens : index
+  %images = config.get @klein.image_tokens : index
+  %tokens = index.add %texts, %images : index
+  %threads = index.constant 256 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %token = index.madd %group, %threads, %lane : index
+  %origin = index.constant 0 : offset
+  %target = buffer.view %output[%origin] : buffer -> view<[%tokens]xi8>
+  %valid = index.cmp ult, %token, %tokens : index
+  scf.if %valid {
+    %c1 = scalar.constant 1 : i8
+    view.store %c1, %target[%token] : i8, view<[%tokens]xi8>
+  }
+  kernel.return
+}
+
+// The output is distinct packed RGBA8, with opaque alpha, at eight times
+// latent height/width. Validated IDs and encoder tables/mask follow
+// text_encoder's contract. Initial noise, request data, and all checkpoint
+// domains are immutable. Taps, the transformer key mask, and the final latent
+// are source-owned.
+command.def public @sample_image() launch(%encoder_parameters: buffer, %parameters: buffer, %vae_parameters: buffer, %sample: buffer, %token_ids: buffer, %encoder_cosine: buffer, %encoder_sine: buffer, %encoder_mask: buffer, %times: buffer, %cosine: buffer, %sine: buffer, %deltas: buffer, %output: buffer) {
+  %images = config.get @klein.image_tokens : index
+  %texts = config.get @klein.text_tokens : index
+  %tokens = index.add %texts, %images : index
+  // Three BF16 hidden-state taps of 2560 features per text row.
+  %tap_stride = index.constant 15360 : offset
+  %tap_bytes = index.scale %texts, %tap_stride : index, offset -> offset
+  %taps = buffer.alloca<global> align(256) %tap_bytes : buffer
+  %mask_stride = index.constant 1 : offset
+  %mask_bytes = index.scale %tokens, %mask_stride : index, offset -> offset
+  %mask = buffer.alloca<global> align(256) %mask_bytes : buffer
+  command.concurrent {
+    command.launch @text_encoder(%encoder_parameters, %token_ids, %encoder_cosine, %encoder_sine, %encoder_mask, %taps) : (buffer, buffer, buffer, buffer, buffer, buffer)
+    kernel.launch @sample_mask(%mask) : (buffer)
+  }
+  %patch_bytes = index.constant 256 : offset
+  %latent_bytes = index.scale %images, %patch_bytes : index, offset -> offset
+  %latent = buffer.alloca<global> align(256) %latent_bytes : buffer
+  command.launch @denoise(%parameters, %sample, %taps, %times, %cosine, %sine, %mask, %deltas, %latent) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.launch @vae_decode(%vae_parameters, %latent, %output) : (buffer, buffer, buffer)
+  command.return
+}

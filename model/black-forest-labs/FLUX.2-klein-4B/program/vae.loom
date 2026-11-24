@@ -1,0 +1,127 @@
+// Fresh-frame VAE input path: unpack the DiT's packed BF16 latent, undo the
+// checkpoint batch-norm statistics, and run the post-quantization and input
+// convolutions. The DiT emits one 128-wide row per 2x2 latent patch; packed
+// channel k = 4*c + 2*dy + dx holds channel c at (2*py + dy, 2*px + dx).
+// The statistics apply per packed channel, before unpatchify, as the
+// reference pipeline does.
+
+config.decl @klein.latent_height : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+config.decl @klein.latent_width : %value: index where [range(%value, 2, 1024), multiple_of(%value, 2)]
+
+amdgpu.target<gfx11-generic> @klein_vae_input_wave32 {subgroup_size = 32}
+
+kernel.decl @klein_vae_convolution(%grid_height: index, %grid_width: index, %grid_inputs: index, %grid_outputs: index, %grid_extent: index, %grid_upsample: index, %grid_residual_flag: index) launch(%height: index, %width: index, %inputs: index, %outputs: index, %extent: index, %upsample: index, %residual_flag: index, %input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024), range(%inputs, 32, 512), multiple_of(%inputs, 32), range(%outputs, 32, 512), multiple_of(%outputs, 32), range(%extent, 1, 3), range(%upsample, 1, 2), range(%residual_flag, 0, 1)]
+
+kernel.decl @klein_vae_wide_convolution(%grid_height: index, %grid_width: index, %grid_inputs: index, %grid_outputs: index, %grid_extent: index, %grid_upsample: index, %grid_residual_flag: index) launch(%height: index, %width: index, %inputs: index, %outputs: index, %extent: index, %upsample: index, %residual_flag: index, %input: buffer, %weight: buffer, %bias: buffer, %residual: buffer, %output: buffer) where [range(%height, 1, 1024), range(%width, 1, 1024), range(%inputs, 32, 512), multiple_of(%inputs, 32), range(%outputs, 64, 512), multiple_of(%outputs, 64), range(%extent, 1, 3), range(%upsample, 1, 2), range(%residual_flag, 0, 1)]
+
+// One lane owns one latent pixel of one of the 32 channels and writes F32
+// NCHW: value * sqrt(var + 1e-4) + mean on the BF16 statistics.
+kernel.def target(@klein_vae_input_wave32) @klein_vae_unpack() {
+  %height = config.get @klein.latent_height : index
+  %width = config.get @klein.latent_width : index
+  %pixels = index.mul %height, %width : index
+  %padding = index.constant 127 : index
+  %threads = index.constant 128 : index
+  %rounded = index.add %pixels, %padding : index
+  %groups = index.div %rounded, %threads : index
+  %channels = index.constant 32 : index
+  %c1 = index.constant 1 : index
+  kernel.launch.config workgroups(%groups, %channels, %c1) workgroup_size(%threads, %c1, %c1) : index
+} launch(%input: buffer, %mean: buffer, %variance: buffer, %output: buffer) {
+  %height = config.get @klein.latent_height : index
+  %width = config.get @klein.latent_width : index
+  %channels = index.constant 32 : index
+  %packed = index.constant 128 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %origin = index.constant 0 : offset
+  %threads = index.constant 128 : index
+  %group = kernel.workgroup.id<x> : index
+  %channel = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %pixel = index.madd %group, %threads, %lane : index
+  %pixels = index.mul %height, %width : index
+  %columns = index.div %width, %c2 : index
+  %rows = index.div %height, %c2 : index
+  %tokens = index.mul %rows, %columns : index
+  %input_view = buffer.view %input[%origin] : buffer -> view<[%tokens]x128xbf16>
+  %mean_view = buffer.view %mean[%origin] : buffer -> view<128xbf16>
+  %variance_view = buffer.view %variance[%origin] : buffer -> view<128xbf16>
+  %output_view = buffer.view %output[%origin] : buffer -> view<[%channels]x[%pixels]xf32>
+  %live = index.cmp ult, %pixel, %pixels : index
+  scf.if %live {
+    %y = index.div %pixel, %width : index
+    %x = index.rem %pixel, %width : index
+    %patch_y = index.div %y, %c2 : index
+    %patch_x = index.div %x, %c2 : index
+    %offset_y = index.rem %y, %c2 : index
+    %offset_x = index.rem %x, %c2 : index
+    %token_value = index.madd %patch_y, %columns, %patch_x : index
+    %token = index.assume %token_value [ge(%token_value, 0), lt(%token_value, %tokens)] : index
+    %sub_channel = index.madd %offset_y, %c2, %offset_x : index
+    %packed_value = index.madd %channel, %c4, %sub_channel : index
+    %packed_channel = index.assume %packed_value [ge(%packed_value, 0), lt(%packed_value, %packed)] : index
+    %narrow = view.load %input_view[%token, %packed_channel] : view<[%tokens]x128xbf16> -> bf16
+    %mean_narrow = view.load %mean_view[%packed_channel] : view<128xbf16> -> bf16
+    %variance_narrow = view.load %variance_view[%packed_channel] : view<128xbf16> -> bf16
+    %value = scalar.extf %narrow : bf16 to f32
+    %mean_value = scalar.extf %mean_narrow : bf16 to f32
+    %variance_value = scalar.extf %variance_narrow : bf16 to f32
+    %epsilon = scalar.constant 0.0001 : f32
+    %shifted = scalar.addf %variance_value, %epsilon : f32
+    %deviation = scalar.sqrtf %shifted : f32
+    %result = scalar.fmaf %value, %deviation, %mean_value : f32
+    view.store %result, %output_view[%channel, %pixel] : f32, view<[%channels]x[%pixels]xf32>
+  }
+  kernel.return
+}
+
+command.def public @klein.vae_unpack() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %mean = command.parameter %parameters, "bn.running_mean" : view<128xbf16>
+  %variance = command.parameter %parameters, "bn.running_var" : view<128xbf16>
+  kernel.launch @klein_vae_unpack(%input, %mean, %variance, %output) : (buffer, view<128xbf16>, view<128xbf16>, buffer)
+  command.return
+}
+
+command.def public @klein.vae_post_quant() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %height = config.get @klein.latent_height : index
+  %width = config.get @klein.latent_width : index
+  %channels = index.constant 32 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %weight = command.parameter %parameters, "post_quant_conv.weight" : view<32x32x1x1xbf16>
+  %bias = command.parameter %parameters, "post_quant_conv.bias" : view<32xbf16>
+  kernel.launch @klein_vae_convolution[%height, %width, %channels, %channels, %c1, %c1, %c0](%height, %width, %channels, %channels, %c1, %c1, %c0, %input, %weight, %bias, %output, %output) : [index, index, index, index, index, index, index](index, index, index, index, index, index, index, buffer, view<32x32x1x1xbf16>, view<32xbf16>, buffer, buffer)
+  command.return
+}
+
+command.def public @klein.vae_conv_in() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %height = config.get @klein.latent_height : index
+  %width = config.get @klein.latent_width : index
+  %inputs = index.constant 32 : index
+  %outputs = index.constant 512 : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %weight = command.parameter %parameters, "decoder.conv_in.weight" : view<512x32x3x3xbf16>
+  %bias = command.parameter %parameters, "decoder.conv_in.bias" : view<512xbf16>
+  kernel.launch @klein_vae_wide_convolution[%height, %width, %inputs, %outputs, %c3, %c1, %c0](%height, %width, %inputs, %outputs, %c3, %c1, %c0, %input, %weight, %bias, %output, %output) : [index, index, index, index, index, index, index](index, index, index, index, index, index, index, buffer, view<512x32x3x3xbf16>, view<512xbf16>, buffer, buffer)
+  command.return
+}
+
+// Source-owned prefix of the decoder: packed DiT latent in, 512-channel F32
+// NCHW state out. Both 32-channel planes are transient.
+command.def public @vae_input() launch(%parameters: buffer, %input: buffer, %output: buffer) {
+  %height = config.get @klein.latent_height : index
+  %width = config.get @klein.latent_width : index
+  %pixels = index.mul %height, %width : index
+  %pixel_bytes = index.constant 128 : offset
+  %bytes = index.scale %pixels, %pixel_bytes : index, offset -> offset
+  %unpacked = buffer.alloca<global> align(256) %bytes : buffer
+  %projected = buffer.alloca<global> align(256) %bytes : buffer
+  command.launch @klein.vae_unpack(%parameters, %input, %unpacked) : (buffer, buffer, buffer)
+  command.launch @klein.vae_post_quant(%parameters, %unpacked, %projected) : (buffer, buffer, buffer)
+  command.launch @klein.vae_conv_in(%parameters, %projected, %output) : (buffer, buffer, buffer)
+  command.return
+}

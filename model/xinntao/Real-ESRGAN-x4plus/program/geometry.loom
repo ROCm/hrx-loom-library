@@ -1,0 +1,91 @@
+// Copyright 2026 AMD ROCm™ Software
+// SPDX-License-Identifier: MIT
+
+// One geometry and specialization contract serves the cold default and
+// request-time declarations. The served height and width are the 4x output;
+// the input image is a quarter of each. Checkpoint paths are deliberately
+// absent.
+
+func.decl import("input") @require(%condition: i32, %diagnostic: buffer)
+
+func.decl import("prepare") @stage(%root: buffer, %tag: i64) -> (i32)
+
+func.decl import("prepare") @config_i64(%stage: i32, %key: buffer, %value: i64)
+
+func.decl import("prepare") @parameter(%stage: i32, %binding: i32, %input: i32, %source: i32, %policy: buffer)
+
+// expected an output 16 to 4096 pixels high in multiples of 16 and 256 to 4096 pixels wide in multiples of 256
+global.rodata.def @esrgan.geometry_error = bytes("657870656374656420616e206f757470757420313620746f203430393620706978656c73206869676820696e206d756c7469706c6573206f6620313620616e642032353620746f203430393620706978656c73207769646520696e206d756c7469706c6573206f6620323536")
+
+// generate_image
+global.rodata.def @esrgan.root = bytes("67656e65726174655f696d616765")
+
+// esrgan.height
+global.rodata.def @esrgan.height_key = bytes("65737267616e2e686569676874")
+
+// esrgan.width
+global.rodata.def @esrgan.width_key = bytes("65737267616e2e7769647468")
+
+// weights.loom
+global.rodata.def @esrgan.weights_policy = bytes("776569676874732e6c6f6f6d")
+
+// The input is a quarter of the output on each axis. Its width must divide
+// into the 64-pixel convolution rows and its height into the 4-row RGBA tile,
+// so the output width is a multiple of 256 and the output height of 16.
+// Unsigned comparisons keep rejected inputs well-defined.
+func.def public @esrgan.image_geometry_valid(%height: i64, %width: i64) -> (i1) {
+  %c0 = scalar.constant 0 : i64
+  %c16 = scalar.constant 16 : i64
+  %c256 = scalar.constant 256 : i64
+  %limit = scalar.constant 4096 : i64
+  %height_low = scalar.cmpi uge, %height, %c16 : i64
+  %width_low = scalar.cmpi uge, %width, %c256 : i64
+  %height_high = scalar.cmpi ule, %height, %limit : i64
+  %width_high = scalar.cmpi ule, %width, %limit : i64
+  %height_rem = scalar.remui %height, %c16 : i64
+  %width_rem = scalar.remui %width, %c256 : i64
+  %height_aligned = scalar.cmpi eq, %height_rem, %c0 : i64
+  %width_aligned = scalar.cmpi eq, %width_rem, %c0 : i64
+  %h0 = scalar.andi %height_low, %height_high : i1
+  %w0 = scalar.andi %width_low, %width_high : i1
+  %h = scalar.andi %h0, %height_aligned : i1
+  %w = scalar.andi %w0, %width_aligned : i1
+  %valid = scalar.andi %h, %w : i1
+  func.return %valid : i1
+}
+
+// Geometry is validated before this injective cohort key is formed.
+func.def public @esrgan.image_tag(%height: i64, %width: i64) -> (i64) {
+  %radix = scalar.constant 8193 : i64
+  %row = scalar.muli %height, %radix : i64
+  %tag = scalar.addi %row, %width : i64
+  func.return %tag : i64
+}
+
+func.def public @esrgan.declare_image_stage(%height: i64, %width: i64) -> (i32) {
+  %valid = func.call @esrgan.image_geometry_valid(%height, %width) : (i64, i64) -> (i1)
+  %condition = scalar.extui %valid : i1 to i32
+  %diagnostic = global.load @esrgan.geometry_error : buffer
+  func.call @require(%condition, %diagnostic) : (i32, buffer)
+  %root = global.load @esrgan.root : buffer
+  %tag = func.call @esrgan.image_tag(%height, %width) : (i64, i64) -> (i64)
+  %stage = func.call @stage(%root, %tag) : (buffer, i64) -> (i32)
+  %c4 = scalar.constant 4 : i64
+  %input_height = scalar.divui %height, %c4 : i64
+  %input_width = scalar.divui %width, %c4 : i64
+  %height_key = global.load @esrgan.height_key : buffer
+  %width_key = global.load @esrgan.width_key : buffer
+  func.call @config_i64(%stage, %height_key, %input_height) : (i32, buffer, i64)
+  func.call @config_i64(%stage, %width_key, %input_width) : (i32, buffer, i64)
+  func.return %stage : i32
+}
+
+// Every stage binds the same retained checkpoint domain; native matching
+// reuses its prepared bank.
+func.def public @esrgan.bind_image_parameters(%stage: i32, %source: i32) {
+  %binding = scalar.constant 0 : i32
+  %input = scalar.constant 0 : i32
+  %policy = global.load @esrgan.weights_policy : buffer
+  func.call @parameter(%stage, %binding, %input, %source, %policy) : (i32, i32, i32, i32, buffer)
+  func.return
+}

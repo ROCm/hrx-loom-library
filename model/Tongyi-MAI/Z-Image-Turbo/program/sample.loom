@@ -1,0 +1,38 @@
+// Complete image sampling from immutable noise, token IDs, and three original
+// checkpoint domains. The encoder runs once and its penultimate hidden state
+// feeds every denoising step. The final latent feeds VAE decoding into
+// distinct packed RGBA8 pixels at eight times the latent dimensions, with
+// opaque alpha.
+
+config.decl @zimage.image_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+config.decl @zimage.text_tokens : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
+
+command.decl @text_encoder() launch(%parameters: buffer, %token_ids: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %hidden: buffer)
+
+command.decl @denoise() launch(%parameters: buffer, %sample: buffer, %text: buffer, %times: buffer, %cosine: buffer, %sine: buffer, %mask: buffer, %deltas: buffer, %output: buffer)
+
+command.decl @vae_decode() launch(%parameters: buffer, %input: buffer, %output: buffer)
+
+// The output is distinct packed RGBA8, with opaque alpha, at eight times
+// latent height/width. Validated IDs and encoder tables/mask follow
+// text_encoder's contract. The transformer key mask marks live caption rows
+// 1, learned-pad caption rows 2, and caption rows the reference never forms 0;
+// every image row is 1. Initial noise, request data, and all checkpoint
+// domains are immutable. The hidden state and final latent are source-owned.
+command.def public @sample_image() launch(%encoder_parameters: buffer, %parameters: buffer, %vae_parameters: buffer, %sample: buffer, %token_ids: buffer, %encoder_cosine: buffer, %encoder_sine: buffer, %encoder_mask: buffer, %key_mask: buffer, %times: buffer, %cosine: buffer, %sine: buffer, %deltas: buffer, %output: buffer) {
+  %images = config.get @zimage.image_tokens : index
+  %texts = config.get @zimage.text_tokens : index
+  // One BF16 hidden state of 2560 features per text row.
+  %hidden_stride = index.constant 5120 : offset
+  %hidden_bytes = index.scale %texts, %hidden_stride : index, offset -> offset
+  %hidden = buffer.alloca<global> align(256) %hidden_bytes : buffer
+  command.launch @text_encoder(%encoder_parameters, %token_ids, %encoder_cosine, %encoder_sine, %encoder_mask, %hidden) : (buffer, buffer, buffer, buffer, buffer, buffer)
+  // F32[image_tokens,64] latent patch tokens.
+  %patch_bytes = index.constant 256 : offset
+  %latent_bytes = index.scale %images, %patch_bytes : index, offset -> offset
+  %latent = buffer.alloca<global> align(256) %latent_bytes : buffer
+  command.launch @denoise(%parameters, %sample, %hidden, %times, %cosine, %sine, %key_mask, %deltas, %latent) : (buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer, buffer)
+  command.launch @vae_decode(%vae_parameters, %latent, %output) : (buffer, buffer, buffer)
+  command.return
+}
